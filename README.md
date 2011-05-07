@@ -24,6 +24,8 @@ License
 
 The programs ending in ".rb" in the root directory of this repository are copyright 2011 Chris Mear <chris@feedmechocolate.com>, and are licensed to the public under the MIT License.
 
+The contents of the 'data' directory are copyright their original authors.
+
 [1]: http://www.rubyonrails.org/
 [2]: https://rails.lighthouseapp.com/projects/8994-ruby-on-rails/overview
 [3]: https://github.com/rails/rails/issues
