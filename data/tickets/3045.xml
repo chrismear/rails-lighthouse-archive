@@ -1,0 +1,1200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ticket>
+  <assigned-user-id type="integer" nil="true"></assigned-user-id>
+  <attachments-count type="integer">0</attachments-count>
+  <closed type="boolean">true</closed>
+  <created-at type="datetime">2010-07-26T08:45:45+01:00</created-at>
+  <creator-id type="integer">8050</creator-id>
+  <milestone-due-on type="datetime" nil="true"></milestone-due-on>
+  <milestone-id type="integer">82855</milestone-id>
+  <number type="integer">3045</number>
+  <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+  <priority type="integer">131417</priority>
+  <project-id type="integer">8994</project-id>
+  <raw-data type="binary" nil="true" encoding="base64"></raw-data>
+  <state>stale</state>
+  <tag>2x active_record bugmash callbacks</tag>
+  <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+  <updated-at type="datetime">2011-02-02T16:59:28+00:00</updated-at>
+  <user-id type="integer">40272</user-id>
+  <version type="integer">15</version>
+  <user-name>Santiago Pastorino</user-name>
+  <creator-name>Ben Alavi</creator-name>
+  <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+  <milestone-title>2.3.10</milestone-title>
+  <priority-name nil="true"></priority-name>
+  <original-body>When saving an object and nested models validation errors on the nested models cause the entire save to be aborted. However, if a nested model returns false in a before_save callback, or raises an exception in an after_save callback only the nested model remains unsaved while the parent is still saved.
+
+The related documentation for AutosaveAssociation (http://api.rubyonrails.org/classes/ActiveRecord/AutosaveAssociation.html) only mentions that the autosaved associations will fail on validation, and doesn't mention whether they should fail on callback failures.
+
+This seems inconsistent, at least, with the documentation for ActiveRecord::Callbacks which state that they will rollback the entire transaction.
+
+I've tested by starting a new project, freezing in edge Rails and then setting this up:
+
+    class CreateUsersAndWidgets &lt; ActiveRecord::Migration
+      def self.up
+        create_table :users do |t|
+          t.string :name
+        end
+    
+        create_table :widgets do |t|
+          t.integer :user_id
+          t.string :name
+        end
+      end
+
+      def self.down
+      end
+    end
+
+    app/models/user.rb
+
+    class User &lt; ActiveRecord::Base
+      has_many :widgets
+  
+      accepts_nested_attributes_for :widgets
+    end
+
+    app/models/widget.rb
+
+    class Widget &lt; ActiveRecord::Base  
+      attr_accessor :fail
+      belongs_to :user
+  
+      before_save :cause_before_save_problems
+      after_save :cause_after_save_problems
+      validate :cause_validation_problems
+  
+      def cause_validation_problems
+        errors.add(:fail, 'in validation') if fail == :in_validation
+      end
+  
+      def cause_before_save_problems
+        return false if fail == :before_save
+      end
+  
+      def cause_after_save_problems
+        raise ActiveRecord::Rollback if fail == :after_save
+      end
+    end
+
+    test/unit/user_test.rb
+
+    require File.join(File.dirname(__FILE__), '..', 'test_helper')
+
+    class UserTest &lt; ActiveSupport::TestCase
+      self.use_transactional_fixtures = false 
+  
+      def test_user_rolls_back_when_widget_validation_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :in_validation } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+  
+      def test_user_rolls_back_when_widget_before_save_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :before_save } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+
+      def test_user_rolls_back_when_widget_after_save_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :after_save } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+    end
+
+Here is the test run output:
+
+    Loaded suite test/unit/user_test
+    Started
+    FF.
+    Finished in 0.044073 seconds.
+
+      1) Failure:
+    test_user_rolls_back_when_widget_after_save_fails(UserTest) [/test/unit/user_test.rb:23]:
+    &lt;false&gt; is not true.
+
+      2) Failure:
+    test_user_rolls_back_when_widget_before_save_fails(UserTest) [/test/unit/user_test.rb:17]:
+    &lt;false&gt; is not true.
+
+    3 tests, 5 assertions, 2 failures, 0 errors
+
+And the related log for all 3 tests (running against PostgreSQL):
+
+    SQL (0.1ms)   SET client_min_messages TO 'panic'
+    SQL (0.1ms)   SET client_min_messages TO 'notice'
+    SQL (0.1ms)   BEGIN
+    SQL (0.5ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+    SQL (0.3ms)   INSERT INTO &quot;widgets&quot; (&quot;name&quot;, &quot;user_id&quot;) VALUES(E'Bar', 5) RETURNING &quot;id&quot;
+    SQL (1.3ms)   COMMIT
+    SQL (0.1ms)   BEGIN
+    SQL (0.2ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+    SQL (0.8ms)   COMMIT
+    SQL (0.1ms)   BEGIN
+    SQL (0.1ms)   ROLLBACK
+
+With some digging around I've found that in `database_statement.rb` when the `ActiveRecord::Rollback` exception is raised by the `after_save` or `before_save` callbacks in the child, the value of `transaction_open` is false so no rollback is triggered. With the significant chain of events that happen before this it's hard to tell if that behavior is intended or not.
+
+I'd dig more but the task seems daunting and I thought I would check if anybody knows of a specific reason for this being the intended behavior?
+
+If this *is* the intended behavior it seems counter to what you'd expect from the documentation for ActiveRecord::Callbacks so it probably deserves a note in the docs at least.</original-body>
+  <latest-body>When saving an object and nested models validation errors on the nested models cause the entire save to be aborted. However, if a nested model returns false in a before_save callback, or raises an exception in an after_save callback only the nested model remains unsaved while the parent is still saved.
+
+The related documentation for AutosaveAssociation (http://api.rubyonrails.org/classes/ActiveRecord/AutosaveAssociation.html) only mentions that the autosaved associations will fail on validation, and doesn't mention whether they should fail on callback failures.
+
+This seems inconsistent, at least, with the documentation for ActiveRecord::Callbacks which state that they will rollback the entire transaction.
+
+I've tested by starting a new project, freezing in edge Rails and then setting this up:
+
+    class CreateUsersAndWidgets &lt; ActiveRecord::Migration
+      def self.up
+        create_table :users do |t|
+          t.string :name
+        end
+    
+        create_table :widgets do |t|
+          t.integer :user_id
+          t.string :name
+        end
+      end
+
+      def self.down
+      end
+    end
+
+    app/models/user.rb
+
+    class User &lt; ActiveRecord::Base
+      has_many :widgets
+  
+      accepts_nested_attributes_for :widgets
+    end
+
+    app/models/widget.rb
+
+    class Widget &lt; ActiveRecord::Base  
+      attr_accessor :fail
+      belongs_to :user
+  
+      before_save :cause_before_save_problems
+      after_save :cause_after_save_problems
+      validate :cause_validation_problems
+  
+      def cause_validation_problems
+        errors.add(:fail, 'in validation') if fail == :in_validation
+      end
+  
+      def cause_before_save_problems
+        return false if fail == :before_save
+      end
+  
+      def cause_after_save_problems
+        raise ActiveRecord::Rollback if fail == :after_save
+      end
+    end
+
+    test/unit/user_test.rb
+
+    require File.join(File.dirname(__FILE__), '..', 'test_helper')
+
+    class UserTest &lt; ActiveSupport::TestCase
+      self.use_transactional_fixtures = false 
+  
+      def test_user_rolls_back_when_widget_validation_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :in_validation } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+  
+      def test_user_rolls_back_when_widget_before_save_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :before_save } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+
+      def test_user_rolls_back_when_widget_after_save_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :after_save } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+    end
+
+Here is the test run output:
+
+    Loaded suite test/unit/user_test
+    Started
+    FF.
+    Finished in 0.044073 seconds.
+
+      1) Failure:
+    test_user_rolls_back_when_widget_after_save_fails(UserTest) [/test/unit/user_test.rb:23]:
+    &lt;false&gt; is not true.
+
+      2) Failure:
+    test_user_rolls_back_when_widget_before_save_fails(UserTest) [/test/unit/user_test.rb:17]:
+    &lt;false&gt; is not true.
+
+    3 tests, 5 assertions, 2 failures, 0 errors
+
+And the related log for all 3 tests (running against PostgreSQL):
+
+    SQL (0.1ms)   SET client_min_messages TO 'panic'
+    SQL (0.1ms)   SET client_min_messages TO 'notice'
+    SQL (0.1ms)   BEGIN
+    SQL (0.5ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+    SQL (0.3ms)   INSERT INTO &quot;widgets&quot; (&quot;name&quot;, &quot;user_id&quot;) VALUES(E'Bar', 5) RETURNING &quot;id&quot;
+    SQL (1.3ms)   COMMIT
+    SQL (0.1ms)   BEGIN
+    SQL (0.2ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+    SQL (0.8ms)   COMMIT
+    SQL (0.1ms)   BEGIN
+    SQL (0.1ms)   ROLLBACK
+
+With some digging around I've found that in `database_statement.rb` when the `ActiveRecord::Rollback` exception is raised by the `after_save` or `before_save` callbacks in the child, the value of `transaction_open` is false so no rollback is triggered. With the significant chain of events that happen before this it's hard to tell if that behavior is intended or not.
+
+I'd dig more but the task seems daunting and I thought I would check if anybody knows of a specific reason for this being the intended behavior?
+
+If this *is* the intended behavior it seems counter to what you'd expect from the documentation for ActiveRecord::Callbacks so it probably deserves a note in the docs at least.</latest-body>
+  <original-body-html>&lt;div&gt;&lt;p&gt;When saving an object and nested models validation errors on the
+nested models cause the entire save to be aborted. However, if a
+nested model returns false in a before_save callback, or raises an
+exception in an after_save callback only the nested model remains
+unsaved while the parent is still saved.&lt;/p&gt;
+&lt;p&gt;The related documentation for AutosaveAssociation (&lt;a href=&quot;http://api.rubyonrails.org/classes/ActiveRecord/AutosaveAssociation.html)&quot;&gt;http://api.rubyonrails.org/class...&lt;/a&gt;
+only mentions that the autosaved associations will fail on
+validation, and doesn't mention whether they should fail on
+callback failures.&lt;/p&gt;
+&lt;p&gt;This seems inconsistent, at least, with the documentation for
+ActiveRecord::Callbacks which state that they will rollback the
+entire transaction.&lt;/p&gt;
+&lt;p&gt;I've tested by starting a new project, freezing in edge Rails
+and then setting this up:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;class CreateUsersAndWidgets &amp;lt; ActiveRecord::Migration
+  def self.up
+    create_table :users do |t|
+      t.string :name
+    end
+
+    create_table :widgets do |t|
+      t.integer :user_id
+      t.string :name
+    end
+  end
+
+  def self.down
+  end
+end
+
+app/models/user.rb
+
+class User &amp;lt; ActiveRecord::Base
+  has_many :widgets
+
+  accepts_nested_attributes_for :widgets
+end
+
+app/models/widget.rb
+
+class Widget &amp;lt; ActiveRecord::Base  
+  attr_accessor :fail
+  belongs_to :user
+
+  before_save :cause_before_save_problems
+  after_save :cause_after_save_problems
+  validate :cause_validation_problems
+
+  def cause_validation_problems
+    errors.add(:fail, 'in validation') if fail == :in_validation
+  end
+
+  def cause_before_save_problems
+    return false if fail == :before_save
+  end
+
+  def cause_after_save_problems
+    raise ActiveRecord::Rollback if fail == :after_save
+  end
+end
+
+test/unit/user_test.rb
+
+require File.join(File.dirname(__FILE__), '..', 'test_helper')
+
+class UserTest &amp;lt; ActiveSupport::TestCase
+  self.use_transactional_fixtures = false 
+
+  def test_user_rolls_back_when_widget_validation_fails
+    @user = User.create :name =&amp;gt; 'Foo', :widgets_attributes =&amp;gt; { '0' =&amp;gt; { :name =&amp;gt; 'Bar', :fail =&amp;gt; :in_validation } }
+
+    assert @user.widgets.first.new_record?
+    assert @user.new_record?
+  end
+
+  def test_user_rolls_back_when_widget_before_save_fails
+    @user = User.create :name =&amp;gt; 'Foo', :widgets_attributes =&amp;gt; { '0' =&amp;gt; { :name =&amp;gt; 'Bar', :fail =&amp;gt; :before_save } }
+
+    assert @user.widgets.first.new_record?
+    assert @user.new_record?
+  end
+
+  def test_user_rolls_back_when_widget_after_save_fails
+    @user = User.create :name =&amp;gt; 'Foo', :widgets_attributes =&amp;gt; { '0' =&amp;gt; { :name =&amp;gt; 'Bar', :fail =&amp;gt; :after_save } }
+
+    assert @user.widgets.first.new_record?
+    assert @user.new_record?
+  end
+end
+&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Here is the test run output:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;Loaded suite test/unit/user_test
+Started
+FF.
+Finished in 0.044073 seconds.
+
+  1) Failure:
+test_user_rolls_back_when_widget_after_save_fails(UserTest) [/test/unit/user_test.rb:23]:
+ is not true.
+
+  2) Failure:
+test_user_rolls_back_when_widget_before_save_fails(UserTest) [/test/unit/user_test.rb:17]:
+ is not true.
+
+3 tests, 5 assertions, 2 failures, 0 errors
+&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;And the related log for all 3 tests (running against
+PostgreSQL):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;SQL (0.1ms)   SET client_min_messages TO 'panic'
+SQL (0.1ms)   SET client_min_messages TO 'notice'
+SQL (0.1ms)   BEGIN
+SQL (0.5ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+SQL (0.3ms)   INSERT INTO &quot;widgets&quot; (&quot;name&quot;, &quot;user_id&quot;) VALUES(E'Bar', 5) RETURNING &quot;id&quot;
+SQL (1.3ms)   COMMIT
+SQL (0.1ms)   BEGIN
+SQL (0.2ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+SQL (0.8ms)   COMMIT
+SQL (0.1ms)   BEGIN
+SQL (0.1ms)   ROLLBACK
+&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;With some digging around I've found that in
+&lt;code&gt;database_statement.rb&lt;/code&gt; when the
+&lt;code&gt;ActiveRecord::Rollback&lt;/code&gt; exception is raised by the
+&lt;code&gt;after_save&lt;/code&gt; or &lt;code&gt;before_save&lt;/code&gt; callbacks in
+the child, the value of &lt;code&gt;transaction_open&lt;/code&gt; is false so
+no rollback is triggered. With the significant chain of events that
+happen before this it's hard to tell if that behavior is intended
+or not.&lt;/p&gt;
+&lt;p&gt;I'd dig more but the task seems daunting and I thought I would
+check if anybody knows of a specific reason for this being the
+intended behavior?&lt;/p&gt;
+&lt;p&gt;If this &lt;em&gt;is&lt;/em&gt; the intended behavior it seems counter to
+what you'd expect from the documentation for
+ActiveRecord::Callbacks so it probably deserves a note in the docs
+at least.&lt;/p&gt;&lt;/div&gt;</original-body-html>
+  <versions type="array">
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>When saving an object and nested models validation errors on the nested models cause the entire save to be aborted. However, if a nested model returns false in a before_save callback, or raises an exception in an after_save callback only the nested model remains unsaved while the parent is still saved.
+
+The related documentation for AutosaveAssociation (http://api.rubyonrails.org/classes/ActiveRecord/AutosaveAssociation.html) only mentions that the autosaved associations will fail on validation, and doesn't mention whether they should fail on callback failures.
+
+This seems inconsistent, at least, with the documentation for ActiveRecord::Callbacks which state that they will rollback the entire transaction.
+
+I've tested by starting a new project, freezing in edge Rails and then setting this up:
+
+    class CreateUsersAndWidgets &lt; ActiveRecord::Migration
+      def self.up
+        create_table :users do |t|
+          t.string :name
+        end
+    
+        create_table :widgets do |t|
+          t.integer :user_id
+          t.string :name
+        end
+      end
+
+      def self.down
+      end
+    end
+
+    app/models/user.rb
+
+    class User &lt; ActiveRecord::Base
+      has_many :widgets
+  
+      accepts_nested_attributes_for :widgets
+    end
+
+    app/models/widget.rb
+
+    class Widget &lt; ActiveRecord::Base  
+      attr_accessor :fail
+      belongs_to :user
+  
+      before_save :cause_before_save_problems
+      after_save :cause_after_save_problems
+      validate :cause_validation_problems
+  
+      def cause_validation_problems
+        errors.add(:fail, 'in validation') if fail == :in_validation
+      end
+  
+      def cause_before_save_problems
+        return false if fail == :before_save
+      end
+  
+      def cause_after_save_problems
+        raise ActiveRecord::Rollback if fail == :after_save
+      end
+    end
+
+    test/unit/user_test.rb
+
+    require File.join(File.dirname(__FILE__), '..', 'test_helper')
+
+    class UserTest &lt; ActiveSupport::TestCase
+      self.use_transactional_fixtures = false 
+  
+      def test_user_rolls_back_when_widget_validation_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :in_validation } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+  
+      def test_user_rolls_back_when_widget_before_save_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :before_save } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+
+      def test_user_rolls_back_when_widget_after_save_fails
+        @user = User.create :name =&gt; 'Foo', :widgets_attributes =&gt; { '0' =&gt; { :name =&gt; 'Bar', :fail =&gt; :after_save } }
+    
+        assert @user.widgets.first.new_record?
+        assert @user.new_record?
+      end
+    end
+
+Here is the test run output:
+
+    Loaded suite test/unit/user_test
+    Started
+    FF.
+    Finished in 0.044073 seconds.
+
+      1) Failure:
+    test_user_rolls_back_when_widget_after_save_fails(UserTest) [/test/unit/user_test.rb:23]:
+    &lt;false&gt; is not true.
+
+      2) Failure:
+    test_user_rolls_back_when_widget_before_save_fails(UserTest) [/test/unit/user_test.rb:17]:
+    &lt;false&gt; is not true.
+
+    3 tests, 5 assertions, 2 failures, 0 errors
+
+And the related log for all 3 tests (running against PostgreSQL):
+
+    SQL (0.1ms)   SET client_min_messages TO 'panic'
+    SQL (0.1ms)   SET client_min_messages TO 'notice'
+    SQL (0.1ms)   BEGIN
+    SQL (0.5ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+    SQL (0.3ms)   INSERT INTO &quot;widgets&quot; (&quot;name&quot;, &quot;user_id&quot;) VALUES(E'Bar', 5) RETURNING &quot;id&quot;
+    SQL (1.3ms)   COMMIT
+    SQL (0.1ms)   BEGIN
+    SQL (0.2ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+    SQL (0.8ms)   COMMIT
+    SQL (0.1ms)   BEGIN
+    SQL (0.1ms)   ROLLBACK
+
+With some digging around I've found that in `database_statement.rb` when the `ActiveRecord::Rollback` exception is raised by the `after_save` or `before_save` callbacks in the child, the value of `transaction_open` is false so no rollback is triggered. With the significant chain of events that happen before this it's hard to tell if that behavior is intended or not.
+
+I'd dig more but the task seems daunting and I thought I would check if anybody knows of a specific reason for this being the intended behavior?
+
+If this *is* the intended behavior it seems counter to what you'd expect from the documentation for ActiveRecord::Callbacks so it probably deserves a note in the docs at least.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;When saving an object and nested models validation errors on the
+nested models cause the entire save to be aborted. However, if a
+nested model returns false in a before_save callback, or raises an
+exception in an after_save callback only the nested model remains
+unsaved while the parent is still saved.&lt;/p&gt;
+&lt;p&gt;The related documentation for AutosaveAssociation (&lt;a href=
+&quot;http://api.rubyonrails.org/classes/ActiveRecord/AutosaveAssociation.html&quot;&gt;http://api.rubyonrails.org/classes/ActiveRecord/AutosaveAssociation...&lt;/a&gt;)
+only mentions that the autosaved associations will fail on
+validation, and doesn't mention whether they should fail on
+callback failures.&lt;/p&gt;
+&lt;p&gt;This seems inconsistent, at least, with the documentation for
+ActiveRecord::Callbacks which state that they will rollback the
+entire transaction.&lt;/p&gt;
+&lt;p&gt;I've tested by starting a new project, freezing in edge Rails
+and then setting this up:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;class CreateUsersAndWidgets &amp;lt; ActiveRecord::Migration
+  def self.up
+    create_table :users do |t|
+      t.string :name
+    end
+
+    create_table :widgets do |t|
+      t.integer :user_id
+      t.string :name
+    end
+  end
+
+  def self.down
+  end
+end
+
+app/models/user.rb
+
+class User &amp;lt; ActiveRecord::Base
+  has_many :widgets
+
+  accepts_nested_attributes_for :widgets
+end
+
+app/models/widget.rb
+
+class Widget &amp;lt; ActiveRecord::Base  
+  attr_accessor :fail
+  belongs_to :user
+
+  before_save :cause_before_save_problems
+  after_save :cause_after_save_problems
+  validate :cause_validation_problems
+
+  def cause_validation_problems
+    errors.add(:fail, 'in validation') if fail == :in_validation
+  end
+
+  def cause_before_save_problems
+    return false if fail == :before_save
+  end
+
+  def cause_after_save_problems
+    raise ActiveRecord::Rollback if fail == :after_save
+  end
+end
+
+test/unit/user_test.rb
+
+require File.join(File.dirname(__FILE__), '..', 'test_helper')
+
+class UserTest &amp;lt; ActiveSupport::TestCase
+  self.use_transactional_fixtures = false 
+
+  def test_user_rolls_back_when_widget_validation_fails
+    @user = User.create :name =&amp;gt; 'Foo', :widgets_attributes =&amp;gt; { '0' =&amp;gt; { :name =&amp;gt; 'Bar', :fail =&amp;gt; :in_validation } }
+
+    assert @user.widgets.first.new_record?
+    assert @user.new_record?
+  end
+
+  def test_user_rolls_back_when_widget_before_save_fails
+    @user = User.create :name =&amp;gt; 'Foo', :widgets_attributes =&amp;gt; { '0' =&amp;gt; { :name =&amp;gt; 'Bar', :fail =&amp;gt; :before_save } }
+
+    assert @user.widgets.first.new_record?
+    assert @user.new_record?
+  end
+
+  def test_user_rolls_back_when_widget_after_save_fails
+    @user = User.create :name =&amp;gt; 'Foo', :widgets_attributes =&amp;gt; { '0' =&amp;gt; { :name =&amp;gt; 'Bar', :fail =&amp;gt; :after_save } }
+
+    assert @user.widgets.first.new_record?
+    assert @user.new_record?
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Here is the test run output:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;Loaded suite test/unit/user_test
+Started
+FF.
+Finished in 0.044073 seconds.
+
+  1) Failure:
+test_user_rolls_back_when_widget_after_save_fails(UserTest) [/test/unit/user_test.rb:23]:
+&amp;lt;false&amp;gt; is not true.
+
+  2) Failure:
+test_user_rolls_back_when_widget_before_save_fails(UserTest) [/test/unit/user_test.rb:17]:
+&amp;lt;false&amp;gt; is not true.
+
+3 tests, 5 assertions, 2 failures, 0 errors&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;And the related log for all 3 tests (running against
+PostgreSQL):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;SQL (0.1ms)   SET client_min_messages TO 'panic'
+SQL (0.1ms)   SET client_min_messages TO 'notice'
+SQL (0.1ms)   BEGIN
+SQL (0.5ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+SQL (0.3ms)   INSERT INTO &quot;widgets&quot; (&quot;name&quot;, &quot;user_id&quot;) VALUES(E'Bar', 5) RETURNING &quot;id&quot;
+SQL (1.3ms)   COMMIT
+SQL (0.1ms)   BEGIN
+SQL (0.2ms)   INSERT INTO &quot;users&quot; (&quot;name&quot;) VALUES(E'Foo') RETURNING &quot;id&quot;
+SQL (0.8ms)   COMMIT
+SQL (0.1ms)   BEGIN
+SQL (0.1ms)   ROLLBACK&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;With some digging around I've found that in
+&lt;code&gt;database_statement.rb&lt;/code&gt; when the
+&lt;code&gt;ActiveRecord::Rollback&lt;/code&gt; exception is raised by the
+&lt;code&gt;after_save&lt;/code&gt; or &lt;code&gt;before_save&lt;/code&gt; callbacks in
+the child, the value of &lt;code&gt;transaction_open&lt;/code&gt; is false so
+no rollback is triggered. With the significant chain of events that
+happen before this it's hard to tell if that behavior is intended
+or not.&lt;/p&gt;
+&lt;p&gt;I'd dig more but the task seems daunting and I thought I would
+check if anybody knows of a specific reason for this being the
+intended behavior?&lt;/p&gt;
+&lt;p&gt;If this &lt;em&gt;is&lt;/em&gt; the intended behavior it seems counter to
+what you'd expect from the documentation for
+ActiveRecord::Callbacks so it probably deserves a note in the docs
+at least.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2009-08-12T21:08:35+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>2.x active_record callbacks nested_attributes_for</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2009-08-12T21:08:37+01:00</updated-at>
+      <user-id type="integer">8050</user-id>
+      <version type="integer">1</version>
+      <user-name>Ben Alavi</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title nil="true"></milestone-title>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">8406</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body></body>
+      <body-html></body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2009-12-30T19:42:52+00:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:milestone: 
+:assigned_user: 
+</diffable-attributes>
+      <milestone-id type="integer">50064</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>2.x active_record callbacks nested_attributes_for</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2009-12-30T19:42:56+00:00</updated-at>
+      <user-id type="integer">8406</user-id>
+      <version type="integer">2</version>
+      <user-name>Eloy Duran</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.6</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Eloy Duran</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">8406</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>This is not intended, please do investigate further.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;This is not intended, please do investigate further.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-01-07T16:18:47+00:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: new
+</diffable-attributes>
+      <milestone-id type="integer">50064</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record callbacks nested_attributes_for</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-01-07T16:18:49+00:00</updated-at>
+      <user-id type="integer">8406</user-id>
+      <version type="integer">3</version>
+      <user-name>Eloy Duran</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.6</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Eloy Duran</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">8406</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>Also it doesn't really seem to have to do with nested attributes, but more with the association callbacks and possible some autosave association code.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;Also it doesn't really seem to have to do with nested
+attributes, but more with the association callbacks and possible
+some autosave association code.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-01-07T16:21:24+00:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:tag: 2.x active_record callbacks nested_attributes_for
+</diffable-attributes>
+      <milestone-id type="integer">50064</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-01-07T16:21:25+00:00</updated-at>
+      <user-id type="integer">8406</user-id>
+      <version type="integer">4</version>
+      <user-name>Eloy Duran</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.6</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Eloy Duran</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">8406</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>[[bulk edit](/projects/8994/bulk_edits/20088)]</body>
+      <body-html>&lt;div&gt;&lt;p&gt;[&lt;a href=&quot;/projects/8994/bulk_edits/20088&quot;&gt;bulk edit&lt;/a&gt;]&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-05-16T02:41:10+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:tag: 2.x active_record callbacks
+</diffable-attributes>
+      <milestone-id type="integer">50064</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-05-16T02:41:10+01:00</updated-at>
+      <user-id type="integer">65556</user-id>
+      <version type="integer">5</version>
+      <user-name>Rizwan Reza</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.6</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Eloy Duran</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">8406</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>[[bulk edit](/projects/8994/bulk_edits/20606)]</body>
+      <body-html>&lt;div&gt;&lt;p&gt;[&lt;a href=&quot;/projects/8994/bulk_edits/20606&quot;&gt;bulk edit&lt;/a&gt;]&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-05-23T17:54:43+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:milestone: 50064
+</diffable-attributes>
+      <milestone-id type="integer">73241</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-05-23T17:54:43+01:00</updated-at>
+      <user-id type="integer">85</user-id>
+      <version type="integer">6</version>
+      <user-name>Jeremy Kemper</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.7</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Eloy Duran</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">8406</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>[[bulk edit](/projects/8994/bulk_edits/20631)]</body>
+      <body-html>&lt;div&gt;&lt;p&gt;[&lt;a href=&quot;/projects/8994/bulk_edits/20631&quot;&gt;bulk edit&lt;/a&gt;]&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-05-24T09:40:51+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:milestone: 73241
+</diffable-attributes>
+      <milestone-id type="integer">73273</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-05-24T09:40:52+01:00</updated-at>
+      <user-id type="integer">85</user-id>
+      <version type="integer">7</version>
+      <user-name>Jeremy Kemper</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.8</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Eloy Duran</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">8406</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>[[bulk edit](/projects/8994/bulk_edits/20816)]</body>
+      <body-html>&lt;div&gt;&lt;p&gt;[&lt;a href=&quot;/projects/8994/bulk_edits/20816&quot;&gt;bulk edit&lt;/a&gt;]&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-05-25T23:45:39+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:milestone: 73273
+</diffable-attributes>
+      <milestone-id type="integer">73534</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-05-25T23:45:39+01:00</updated-at>
+      <user-id type="integer">85</user-id>
+      <version type="integer">8</version>
+      <user-name>Jeremy Kemper</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.9</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Eloy Duran</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">19965</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body></body>
+      <body-html></body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-08T08:39:51+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:priority: 0
+:assigned_user: 8406
+</diffable-attributes>
+      <milestone-id type="integer">73534</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">131417</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-07-08T08:39:56+01:00</updated-at>
+      <user-id type="integer">8406</user-id>
+      <version type="integer">9</version>
+      <user-name>Eloy Duran</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.9</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Jos&#233; Valim</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">40263</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>I am working on #5053. Will take a look at this ticket too . For the time being assigning it to myself.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;I am working on &lt;a href=&quot;/projects/8994/tickets/5053&quot; title=
+&quot;Ticket #5053&quot;&gt;#5053&lt;/a&gt;. Will take a look at this ticket too . For
+the time being assigning it to myself.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-08T11:28:50+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:assigned_user: 19965
+</diffable-attributes>
+      <milestone-id type="integer">73534</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">131417</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-07-08T11:28:51+01:00</updated-at>
+      <user-id type="integer">40263</user-id>
+      <version type="integer">10</version>
+      <user-name>Neeraj Singh</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.9</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Neeraj Singh</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">40263</assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>@Ben
+
+You have following callback.
+
+@@@ ruby
+def cause_after_save_problems
+  raise ActiveRecord::Rollback if fail == :after_save
+end
+@@@
+
+I am able to reproduce this problem with above callback. 
+
+However problem goes away if I change the method to this
+
+@@@ ruby
+def cause_after_save_problems
+  raise 'boom' if fail == :after_save
+end
+@@@
+
+looking at code I found following snippet
+ 
+@@@ ruby
+rescue Exception =&gt; database_transaction_rollback
+  if transaction_open &amp;&amp; !outside_transaction?
+    transaction_open = false
+    decrement_open_transactions
+    if open_transactions == 0
+      rollback_db_transaction
+    else
+      rollback_to_savepoint
+    end
+  end
+  raise unless database_transaction_rollback.is_a?(ActiveRecord::Rollback)
+end
+@@@
+
+This is one place I found where my code will behave differently from yours. In mycase database_transaction_rollback will be a RuntimeError and in your case it will be ActiveRecord::Rollback. And that influences this piece of code
+
+@@@ ruby
+raise unless database_transaction_rollback.is_a?(ActiveRecord::Rollback)
+@@@</body>
+      <body-html>&lt;div&gt;&lt;p&gt;@Ben&lt;/p&gt;
+&lt;p&gt;You have following callback.&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=&quot;ruby&quot;&gt;def cause_after_save_problems
+  raise ActiveRecord::Rollback if fail == :after_save
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;I am able to reproduce this problem with above callback.&lt;/p&gt;
+&lt;p&gt;However problem goes away if I change the method to this&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=&quot;ruby&quot;&gt;def cause_after_save_problems
+  raise 'boom' if fail == :after_save
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;looking at code I found following snippet&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=
+&quot;ruby&quot;&gt;rescue Exception =&amp;gt; database_transaction_rollback
+  if transaction_open &amp;amp;&amp;amp; !outside_transaction?
+    transaction_open = false
+    decrement_open_transactions
+    if open_transactions == 0
+      rollback_db_transaction
+    else
+      rollback_to_savepoint
+    end
+  end
+  raise unless database_transaction_rollback.is_a?(ActiveRecord::Rollback)
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;This is one place I found where my code will behave differently
+from yours. In mycase database_transaction_rollback will be a
+RuntimeError and in your case it will be ActiveRecord::Rollback.
+And that influences this piece of code&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=
+&quot;ruby&quot;&gt;raise unless database_transaction_rollback.is_a?(ActiveRecord::Rollback)&lt;/code&gt;
+&lt;/pre&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-09T16:16:30+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer">73534</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">131417</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-07-09T16:16:35+01:00</updated-at>
+      <user-id type="integer">40263</user-id>
+      <version type="integer">11</version>
+      <user-name>Neeraj Singh</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.9</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name>Neeraj Singh</assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body></body>
+      <body-html></body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-18T15:47:05+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:assigned_user: 40263
+</diffable-attributes>
+      <milestone-id type="integer">73534</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">131417</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-07-18T15:47:07+01:00</updated-at>
+      <user-id type="integer">40263</user-id>
+      <version type="integer">12</version>
+      <user-name>Neeraj Singh</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.9</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>[[bulk edit](/projects/8994/bulk_edits/27613)]</body>
+      <body-html>&lt;div&gt;&lt;p&gt;[&lt;a href=&quot;/projects/8994/bulk_edits/27613&quot;&gt;bulk edit&lt;/a&gt;]&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-08-30T02:28:49+01:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:milestone: 73534
+</diffable-attributes>
+      <milestone-id type="integer">82855</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">131417</priority>
+      <project-id type="integer">8994</project-id>
+      <state>incomplete</state>
+      <tag>2.x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2010-08-30T02:28:49+01:00</updated-at>
+      <user-id type="integer">85</user-id>
+      <version type="integer">13</version>
+      <user-name>Jeremy Kemper</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.10</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>This issue has been automatically marked as stale because it has not been commented on for at least three months.
+
+The resources of the Rails core team are limited, and so we are asking for your help. If you can still reproduce this error on the 3-0-stable branch or on master, please reply with all of the information you have about it and add &quot;[state:open]&quot; to your comment. This will reopen the ticket for review. Likewise, if you feel that this is a very important feature for Rails to include, please reply with your explanation so we can consider it.
+
+Thank you for all your contributions, and we hope you will understand this step to focus our efforts where they are most helpful.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;This issue has been automatically marked as stale because it has
+not been commented on for at least three months.&lt;/p&gt;
+&lt;p&gt;The resources of the Rails core team are limited, and so we are
+asking for your help. If you can still reproduce this error on the
+3-0-stable branch or on master, please reply with all of the
+information you have about it and add &quot;[state:open]&quot; to your
+comment. This will reopen the ticket for review. Likewise, if you
+feel that this is a very important feature for Rails to include,
+please reply with your explanation so we can consider it.&lt;/p&gt;
+&lt;p&gt;Thank you for all your contributions, and we hope you will
+understand this step to focus our efforts where they are most
+helpful.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2011-02-02T16:32:54+00:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:tag: 2.x active_record bugmash callbacks
+:state: incomplete
+</diffable-attributes>
+      <milestone-id type="integer">82855</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">131417</priority>
+      <project-id type="integer">8994</project-id>
+      <state>open</state>
+      <tag>2x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2011-02-02T16:57:50+00:00</updated-at>
+      <user-id type="integer">40272</user-id>
+      <version type="integer">14</version>
+      <user-name>Santiago Pastorino</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.10</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body nil="true"></body>
+      <body-html nil="true"></body-html>
+      <closed type="boolean">true</closed>
+      <created-at type="datetime">2011-02-02T16:32:55+00:00</created-at>
+      <creator-id type="integer">8050</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: open
+</diffable-attributes>
+      <milestone-id type="integer">82855</milestone-id>
+      <number type="integer">3045</number>
+      <permalink>nested_attributes-doesnt-rollback-parent-when-before_saveafter_save-callbacks-fail</permalink>
+      <priority type="integer">131417</priority>
+      <project-id type="integer">8994</project-id>
+      <state>stale</state>
+      <tag>2x active_record bugmash callbacks</tag>
+      <title>nested_attributes doesn't rollback parent when before_save/after_save callbacks fail</title>
+      <updated-at type="datetime">2011-02-02T16:59:28+00:00</updated-at>
+      <user-id type="integer">40272</user-id>
+      <version type="integer">15</version>
+      <user-name>Santiago Pastorino</user-name>
+      <creator-name>Ben Alavi</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/3045</url>
+      <milestone-title>2.3.10</milestone-title>
+      <priority-name nil="true"></priority-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+    </version>
+  </versions>
+</ticket>

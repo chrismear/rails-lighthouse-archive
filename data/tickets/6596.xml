@@ -1,0 +1,621 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ticket>
+  <assigned-user-id type="integer" nil="true"></assigned-user-id>
+  <attachments-count type="integer">0</attachments-count>
+  <closed type="boolean">false</closed>
+  <created-at type="datetime">2011-03-19T21:03:30+00:00</created-at>
+  <creator-id type="integer">130936</creator-id>
+  <milestone-due-on type="datetime" nil="true"></milestone-due-on>
+  <milestone-id type="integer" nil="true"></milestone-id>
+  <number type="integer">6596</number>
+  <permalink>what-are-best-practices-for-dealing-with-transient-database-errors-like-deadlocks-and-constraint-violations-in-a-highly-concurrent-rails-system</permalink>
+  <priority type="integer">0</priority>
+  <project-id type="integer">8994</project-id>
+  <raw-data type="binary" nil="true" encoding="base64"></raw-data>
+  <state>new</state>
+  <tag nil="true"></tag>
+  <title>What are 'best practices' for dealing with transient database errors (like Deadlocks and constraint violations) in a highly concurrent Rails system?</title>
+  <updated-at type="datetime">2011-03-19T21:03:32+00:00</updated-at>
+  <user-id type="integer">130936</user-id>
+  <version type="integer">1</version>
+  <user-name>Jay Crouch</user-name>
+  <creator-name>Jay Crouch</creator-name>
+  <url>http://rails.lighthouseapp.com/projects/8994/tickets/6596</url>
+  <priority-name nil="true"></priority-name>
+  <original-body>### Question: what are 'best practices' for dealing with transient database errors (like Deadlocks and constraint violations) in a highly concurrent Rails system? ###
+
+
+Thank you in advance to anyone reading this; I spoke with Yehuda Katz yesterday at #mwrc and he thought ithis was a deep enough question to open here. ***Disclaimer** My understanding of the database adapters supported by Rails is limited to MySQL, so any statement below relating to database behavior should be read as MySQL behavior. We are also running Rails 2.3.9 and might be unfamiliar with new functionality available in 3.x*
+
+---
+
+We have recently scaled our app horizontally using the 'shared nothing' architecture approach, and now that we have multiple servers (and background processes) acting concurrently on the Database we are tracing several ActiveRecord::StatementInvalid exceptions related to deadlock or other constraint violations that are transient and thus retryable.
+
+The MySQL team believes deadlocks are transient, frequent and inherently safe in transactional databases - and that consuming applications should be *'always prepared to re-issue a transaction'*; see http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html
+
+&gt; ###13.2.8.9.&#160;How to Cope with Deadlocks###
+
+&gt; Deadlocks are a classic problem in transactional databases, but they are not 
+&gt; dangerous unless they are so frequent that you cannot run certain 
+&gt; transactions at all. Normally, you must write your applications so that they are 
+&gt; always prepared to re-issue a transaction if it gets rolled back because of a deadlock.
+
+&gt; **InnoDB** uses automatic row-level locking. You can get deadlocks even in the 
+&gt; case of transactions that just insert or delete a single row. That is because 
+&gt; these operations are not really &#8220;atomic&#8221;; they automatically set locks on the 
+&gt; (possibly several) index records of the row inserted or deleted.
+
+---
+
+
+####My Team has been looking into this for several weeks now and have made the following observations:####
+
+1. Why not use `SHOW ENGINE INNODB STATUS` to identify and remediate deadlocks? While a useful tool, we believe this approach represents an anti-pattern:
+    * because MySQL states as policy that deadlocks are a common occurrence that should be retried as opposed to eliminated
+    * because MySQL states even single statement transactions `INSERT INTO&#8230;` will produce deadlocks and are thus at some level deadlocks are unable to be eliminated (reproduced often in our system)
+    * because anticipating deadlocks is an impossible task, and relying on deadlock reports in order to resolve them means that we are creating a poor user experience while we wait for data to respond to
+    * because pessimistic locking to ensure data integrity in situations like 'counters' is expensive and creates more frequent deadlocks
+    * because modifying extensive blocks of execution (theoretically all controller actions) to avoid deadlocks is hardly concise; nor within the ability of many junior members of the community
+2. Why not extend the `ActiveRecord::Base.transaction` method to include automatic retry mechanisms? While this could theoretically solve the problem, we believe this approach also represents an anti-pattern:
+    * because the definition of `transaction` is inherently different in Rails and the Database layer. In the database, a single statement under auto-commit represents a transaction; in Rails a transaction typically represents multiple statements that form an atomic process. In order to use transaction auto-retry, every statement would have to be wrapped in a transaction block - which is hardly readable - or DRY. *caveat: perhaps Rails could wrap single statements in a transparent retry block that the programmer wouldn't see; but I don't know how to go about doing this*
+    * because multi-statement transactions in Rails operate within a lexical scope (typically controller) instance and local variables may be modified during multi-statement blocks; automatic retry of the block would likely fail due to unintended behavior caused by programmers' expectation that statements would only be executed once&#8230; *caveat: perhaps it would be possible to create a binding closure of all variables in scope before performing the transaction block, and to restore this closure before re-trying; however this approach seems to me to very inefficient - and I do not understand Ruby to the degree necessary to implement this*
+    * because IMHO, there are transient database errors caused by concurrency other than deadlocks which I believe should be gracefully retried, and which are not necessarily encapsulated in a single SQL Statement:
+
+####Example constraint violation####
+@@@ 
+class CreateUsers &lt; ActiveRecord::Migration
+  def self.up
+    create_table :users, :options =&gt; 'ENGINE=InnoDB DEFAULT CHARSET=utf8' do |t|
+      &#8230;
+      t.string :email, :null =&gt; false, :limit =&gt; 255
+      &#8230;
+    end
+    add_index :users, :email, :unique =&gt; true, :name =&gt; 'index_users_unique'
+  end
+end
+
+@@@
+---
+@@@
+class User &lt; ActiveRecord::Base
+&#8230;
+validates_uniqueness_of :email, :allow_blank =&gt; true
+&#8230;
+end
+
+@@@
+---
+@@@
+### I am using two statements here which effectively implement find_or_create_by to illustrate how multi-statement scenarios exist which should be retried.
+Process #1: User.create(:email =&gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+Process #2: User.create(:email =&gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+@@@
+
+Here, we've implemented a unique index on the email column for the users table to guarantee data integrity under concurrent conditions, matched with an 'optimistic' validation in the model. In this scenario neither process finds a user matching the email attribute and thus attempts a create. The create then executes the validates_uniqueness_of validation in both processes, which succeed. The `INSERT INTO USER` statements are then sent to the database which responds with a duplicate key violation.
+
+
+### What we have done ###
+
+Based on our observations, we believe that wholesale retry of requests instead of transactions is the preferred approach. We believe proper controller actions should be implemented to never leave data in an inconsistent state, thus it should be safe to retry any action in its entirety.
+
+Due to our limited knowledge of the Rails core, we have implemented a rescue_from ActiveRecord::StatementInvalid at the ApplicationController base point, and respond with Javascript embedded in a blank HTML document which resubmits the request using the same method as the original attempt.
+
+**We know this is a hack. We know this hack increases network traffic and only works for HTML requests from browsers supporting JS; any actions which respond to any other formats are still hosed.**
+
+We originally attempted to use the rescue_from to interrupt the exception event and re-envoke the controller action; however, this led to duplicate render errors and a myriad of other problems because instance variables had been set/changed in the controller object. 
+
+We also tried to use a background NetHTTP process to attempt a second request that the user wouldn't experience&#8230; however this approach failed to supply the request context; i.e. the users session and cookies weren't available - much less the request headers.
+
+What approach can you Rails geniuses come up with?</original-body>
+  <latest-body>### Question: what are 'best practices' for dealing with transient database errors (like Deadlocks and constraint violations) in a highly concurrent Rails system? ###
+
+
+Thank you in advance to anyone reading this; I spoke with Yehuda Katz yesterday at #mwrc and he thought ithis was a deep enough question to open here. ***Disclaimer** My understanding of the database adapters supported by Rails is limited to MySQL, so any statement below relating to database behavior should be read as MySQL behavior. We are also running Rails 2.3.9 and might be unfamiliar with new functionality available in 3.x*
+
+---
+
+We have recently scaled our app horizontally using the 'shared nothing' architecture approach, and now that we have multiple servers (and background processes) acting concurrently on the Database we are tracing several ActiveRecord::StatementInvalid exceptions related to deadlock or other constraint violations that are transient and thus retryable.
+
+The MySQL team believes deadlocks are transient, frequent and inherently safe in transactional databases - and that consuming applications should be *'always prepared to re-issue a transaction'*; see http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html
+
+&gt; ###13.2.8.9.&#160;How to Cope with Deadlocks###
+
+&gt; Deadlocks are a classic problem in transactional databases, but they are not 
+&gt; dangerous unless they are so frequent that you cannot run certain 
+&gt; transactions at all. Normally, you must write your applications so that they are 
+&gt; always prepared to re-issue a transaction if it gets rolled back because of a deadlock.
+
+&gt; **InnoDB** uses automatic row-level locking. You can get deadlocks even in the 
+&gt; case of transactions that just insert or delete a single row. That is because 
+&gt; these operations are not really &#8220;atomic&#8221;; they automatically set locks on the 
+&gt; (possibly several) index records of the row inserted or deleted.
+
+---
+
+
+####My Team has been looking into this for several weeks now and have made the following observations:####
+
+1. Why not use `SHOW ENGINE INNODB STATUS` to identify and remediate deadlocks? While a useful tool, we believe this approach represents an anti-pattern:
+    * because MySQL states as policy that deadlocks are a common occurrence that should be retried as opposed to eliminated
+    * because MySQL states even single statement transactions `INSERT INTO&#8230;` will produce deadlocks and are thus at some level deadlocks are unable to be eliminated (reproduced often in our system)
+    * because anticipating deadlocks is an impossible task, and relying on deadlock reports in order to resolve them means that we are creating a poor user experience while we wait for data to respond to
+    * because pessimistic locking to ensure data integrity in situations like 'counters' is expensive and creates more frequent deadlocks
+    * because modifying extensive blocks of execution (theoretically all controller actions) to avoid deadlocks is hardly concise; nor within the ability of many junior members of the community
+2. Why not extend the `ActiveRecord::Base.transaction` method to include automatic retry mechanisms? While this could theoretically solve the problem, we believe this approach also represents an anti-pattern:
+    * because the definition of `transaction` is inherently different in Rails and the Database layer. In the database, a single statement under auto-commit represents a transaction; in Rails a transaction typically represents multiple statements that form an atomic process. In order to use transaction auto-retry, every statement would have to be wrapped in a transaction block - which is hardly readable - or DRY. *caveat: perhaps Rails could wrap single statements in a transparent retry block that the programmer wouldn't see; but I don't know how to go about doing this*
+    * because multi-statement transactions in Rails operate within a lexical scope (typically controller) instance and local variables may be modified during multi-statement blocks; automatic retry of the block would likely fail due to unintended behavior caused by programmers' expectation that statements would only be executed once&#8230; *caveat: perhaps it would be possible to create a binding closure of all variables in scope before performing the transaction block, and to restore this closure before re-trying; however this approach seems to me to very inefficient - and I do not understand Ruby to the degree necessary to implement this*
+    * because IMHO, there are transient database errors caused by concurrency other than deadlocks which I believe should be gracefully retried, and which are not necessarily encapsulated in a single SQL Statement:
+
+####Example constraint violation####
+@@@ 
+class CreateUsers &lt; ActiveRecord::Migration
+  def self.up
+    create_table :users, :options =&gt; 'ENGINE=InnoDB DEFAULT CHARSET=utf8' do |t|
+      &#8230;
+      t.string :email, :null =&gt; false, :limit =&gt; 255
+      &#8230;
+    end
+    add_index :users, :email, :unique =&gt; true, :name =&gt; 'index_users_unique'
+  end
+end
+
+@@@
+---
+@@@
+class User &lt; ActiveRecord::Base
+&#8230;
+validates_uniqueness_of :email, :allow_blank =&gt; true
+&#8230;
+end
+
+@@@
+---
+@@@
+### I am using two statements here which effectively implement find_or_create_by to illustrate how multi-statement scenarios exist which should be retried.
+Process #1: User.create(:email =&gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+Process #2: User.create(:email =&gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+@@@
+
+Here, we've implemented a unique index on the email column for the users table to guarantee data integrity under concurrent conditions, matched with an 'optimistic' validation in the model. In this scenario neither process finds a user matching the email attribute and thus attempts a create. The create then executes the validates_uniqueness_of validation in both processes, which succeed. The `INSERT INTO USER` statements are then sent to the database which responds with a duplicate key violation.
+
+
+### What we have done ###
+
+Based on our observations, we believe that wholesale retry of requests instead of transactions is the preferred approach. We believe proper controller actions should be implemented to never leave data in an inconsistent state, thus it should be safe to retry any action in its entirety.
+
+Due to our limited knowledge of the Rails core, we have implemented a rescue_from ActiveRecord::StatementInvalid at the ApplicationController base point, and respond with Javascript embedded in a blank HTML document which resubmits the request using the same method as the original attempt.
+
+**We know this is a hack. We know this hack increases network traffic and only works for HTML requests from browsers supporting JS; any actions which respond to any other formats are still hosed.**
+
+We originally attempted to use the rescue_from to interrupt the exception event and re-envoke the controller action; however, this led to duplicate render errors and a myriad of other problems because instance variables had been set/changed in the controller object. 
+
+We also tried to use a background NetHTTP process to attempt a second request that the user wouldn't experience&#8230; however this approach failed to supply the request context; i.e. the users session and cookies weren't available - much less the request headers.
+
+What approach can you Rails geniuses come up with?</latest-body>
+  <original-body-html>&lt;div&gt;&lt;h3&gt;Question: what are 'best practices' for dealing with transient
+database errors (like Deadlocks and constraint violations) in a
+highly concurrent Rails system?&lt;/h3&gt;
+&lt;p&gt;Thank you in advance to anyone reading this; I spoke with Yehuda
+Katz yesterday at #mwrc and he thought ithis was a deep enough
+question to open here. &lt;em&gt;&lt;strong&gt;Disclaimer&lt;/strong&gt; My
+understanding of the database adapters supported by Rails is
+limited to MySQL, so any statement below relating to database
+behavior should be read as MySQL behavior. We are also running
+Rails 2.3.9 and might be unfamiliar with new functionality
+available in 3.x&lt;/em&gt;&lt;/p&gt;
+&lt;hr&gt;
+&lt;p&gt;We have recently scaled our app horizontally using the 'shared
+nothing' architecture approach, and now that we have multiple
+servers (and background processes) acting concurrently on the
+Database we are tracing several ActiveRecord::StatementInvalid
+exceptions related to deadlock or other constraint violations that
+are transient and thus retryable.&lt;/p&gt;
+&lt;p&gt;The MySQL team believes deadlocks are transient, frequent and
+inherently safe in transactional databases - and that consuming
+applications should be &lt;em&gt;'always prepared to re-issue a
+transaction'&lt;/em&gt;; see &lt;a href=
+&quot;http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html&quot;&gt;http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html&lt;/a&gt;&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;h3&gt;13.2.8.9.&amp;nbsp;How to Cope with Deadlocks&lt;/h3&gt;
+&lt;p&gt;Deadlocks are a classic problem in transactional databases, but
+they are not dangerous unless they are so frequent that you cannot
+run certain transactions at all. Normally, you must write your
+applications so that they are always prepared to re-issue a
+transaction if it gets rolled back because of a deadlock.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;InnoDB&lt;/strong&gt; uses automatic row-level locking. You
+can get deadlocks even in the case of transactions that just insert
+or delete a single row. That is because these operations are not
+really &amp;#8220;atomic&amp;#8221;; they automatically set locks on the
+(possibly several) index records of the row inserted or
+deleted.&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr&gt;
+&lt;h4&gt;My Team has been looking into this for several weeks now and
+have made the following observations:&lt;/h4&gt;
+&lt;ol&gt;
+&lt;li&gt;Why not use &lt;code&gt;SHOW ENGINE INNODB STATUS&lt;/code&gt; to identify
+and remediate deadlocks? While a useful tool, we believe this
+approach represents an anti-pattern:&lt;br&gt;
+&lt;ul&gt;
+&lt;li&gt;because MySQL states as policy that deadlocks are a common
+occurrence that should be retried as opposed to eliminated&lt;/li&gt;
+&lt;li&gt;because MySQL states even single statement transactions
+&lt;code&gt;INSERT INTO&amp;#8230;&lt;/code&gt; will produce deadlocks and are thus
+at some level deadlocks are unable to be eliminated (reproduced
+often in our system)&lt;/li&gt;
+&lt;li&gt;because anticipating deadlocks is an impossible task, and
+relying on deadlock reports in order to resolve them means that we
+are creating a poor user experience while we wait for data to
+respond to&lt;/li&gt;
+&lt;li&gt;because pessimistic locking to ensure data integrity in
+situations like 'counters' is expensive and creates more frequent
+deadlocks&lt;/li&gt;
+&lt;li&gt;because modifying extensive blocks of execution (theoretically
+all controller actions) to avoid deadlocks is hardly concise; nor
+within the ability of many junior members of the community&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;Why not extend the &lt;code&gt;ActiveRecord::Base.transaction&lt;/code&gt;
+method to include automatic retry mechanisms? While this could
+theoretically solve the problem, we believe this approach also
+represents an anti-pattern:&lt;br&gt;
+&lt;ul&gt;
+&lt;li&gt;because the definition of &lt;code&gt;transaction&lt;/code&gt; is
+inherently different in Rails and the Database layer. In the
+database, a single statement under auto-commit represents a
+transaction; in Rails a transaction typically represents multiple
+statements that form an atomic process. In order to use transaction
+auto-retry, every statement would have to be wrapped in a
+transaction block - which is hardly readable - or DRY. &lt;em&gt;caveat:
+perhaps Rails could wrap single statements in a transparent retry
+block that the programmer wouldn't see; but I don't know how to go
+about doing this&lt;/em&gt;&lt;/li&gt;
+&lt;li&gt;because multi-statement transactions in Rails operate within a
+lexical scope (typically controller) instance and local variables
+may be modified during multi-statement blocks; automatic retry of
+the block would likely fail due to unintended behavior caused by
+programmers' expectation that statements would only be executed
+once&amp;#8230; &lt;em&gt;caveat: perhaps it would be possible to create a
+binding closure of all variables in scope before performing the
+transaction block, and to restore this closure before re-trying;
+however this approach seems to me to very inefficient - and I do
+not understand Ruby to the degree necessary to implement
+this&lt;/em&gt;&lt;/li&gt;
+&lt;li&gt;because IMHO, there are transient database errors caused by
+concurrency other than deadlocks which I believe should be
+gracefully retried, and which are not necessarily encapsulated in a
+single SQL Statement:&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h4&gt;Example constraint violation&lt;/h4&gt;
+&lt;pre&gt;
+&lt;code&gt;class CreateUsers &amp;lt; ActiveRecord::Migration
+  def self.up
+    create_table :users, :options =&amp;gt; 'ENGINE=InnoDB DEFAULT CHARSET=utf8' do |t|
+      &amp;#8230;
+      t.string :email, :null =&amp;gt; false, :limit =&amp;gt; 255
+      &amp;#8230;
+    end
+    add_index :users, :email, :unique =&amp;gt; true, :name =&amp;gt; 'index_users_unique'
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;hr&gt;
+&lt;pre&gt;
+&lt;code&gt;class User &amp;lt; ActiveRecord::Base
+&amp;#8230;
+validates_uniqueness_of :email, :allow_blank =&amp;gt; true
+&amp;#8230;
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;hr&gt;
+&lt;pre&gt;
+&lt;code&gt;### I am using two statements here which effectively implement find_or_create_by to illustrate how multi-statement scenarios exist which should be retried.
+Process #1: User.create(:email =&amp;gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+Process #2: User.create(:email =&amp;gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com')&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Here, we've implemented a unique index on the email column for
+the users table to guarantee data integrity under concurrent
+conditions, matched with an 'optimistic' validation in the model.
+In this scenario neither process finds a user matching the email
+attribute and thus attempts a create. The create then executes the
+validates_uniqueness_of validation in both processes, which
+succeed. The &lt;code&gt;INSERT INTO USER&lt;/code&gt; statements are then sent
+to the database which responds with a duplicate key violation.&lt;/p&gt;
+&lt;h3&gt;What we have done&lt;/h3&gt;
+&lt;p&gt;Based on our observations, we believe that wholesale retry of
+requests instead of transactions is the preferred approach. We
+believe proper controller actions should be implemented to never
+leave data in an inconsistent state, thus it should be safe to
+retry any action in its entirety.&lt;/p&gt;
+&lt;p&gt;Due to our limited knowledge of the Rails core, we have
+implemented a rescue_from ActiveRecord::StatementInvalid at the
+ApplicationController base point, and respond with Javascript
+embedded in a blank HTML document which resubmits the request using
+the same method as the original attempt.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;We know this is a hack. We know this hack increases
+network traffic and only works for HTML requests from browsers
+supporting JS; any actions which respond to any other formats are
+still hosed.&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;We originally attempted to use the rescue_from to interrupt the
+exception event and re-envoke the controller action; however, this
+led to duplicate render errors and a myriad of other problems
+because instance variables had been set/changed in the controller
+object.&lt;/p&gt;
+&lt;p&gt;We also tried to use a background NetHTTP process to attempt a
+second request that the user wouldn't experience&amp;#8230; however
+this approach failed to supply the request context; i.e. the users
+session and cookies weren't available - much less the request
+headers.&lt;/p&gt;
+&lt;p&gt;What approach can you Rails geniuses come up with?&lt;/p&gt;&lt;/div&gt;</original-body-html>
+  <versions type="array">
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>### Question: what are 'best practices' for dealing with transient database errors (like Deadlocks and constraint violations) in a highly concurrent Rails system? ###
+
+
+Thank you in advance to anyone reading this; I spoke with Yehuda Katz yesterday at #mwrc and he thought ithis was a deep enough question to open here. ***Disclaimer** My understanding of the database adapters supported by Rails is limited to MySQL, so any statement below relating to database behavior should be read as MySQL behavior. We are also running Rails 2.3.9 and might be unfamiliar with new functionality available in 3.x*
+
+---
+
+We have recently scaled our app horizontally using the 'shared nothing' architecture approach, and now that we have multiple servers (and background processes) acting concurrently on the Database we are tracing several ActiveRecord::StatementInvalid exceptions related to deadlock or other constraint violations that are transient and thus retryable.
+
+The MySQL team believes deadlocks are transient, frequent and inherently safe in transactional databases - and that consuming applications should be *'always prepared to re-issue a transaction'*; see http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html
+
+&gt; ###13.2.8.9.&#160;How to Cope with Deadlocks###
+
+&gt; Deadlocks are a classic problem in transactional databases, but they are not 
+&gt; dangerous unless they are so frequent that you cannot run certain 
+&gt; transactions at all. Normally, you must write your applications so that they are 
+&gt; always prepared to re-issue a transaction if it gets rolled back because of a deadlock.
+
+&gt; **InnoDB** uses automatic row-level locking. You can get deadlocks even in the 
+&gt; case of transactions that just insert or delete a single row. That is because 
+&gt; these operations are not really &#8220;atomic&#8221;; they automatically set locks on the 
+&gt; (possibly several) index records of the row inserted or deleted.
+
+---
+
+
+####My Team has been looking into this for several weeks now and have made the following observations:####
+
+1. Why not use `SHOW ENGINE INNODB STATUS` to identify and remediate deadlocks? While a useful tool, we believe this approach represents an anti-pattern:
+    * because MySQL states as policy that deadlocks are a common occurrence that should be retried as opposed to eliminated
+    * because MySQL states even single statement transactions `INSERT INTO&#8230;` will produce deadlocks and are thus at some level deadlocks are unable to be eliminated (reproduced often in our system)
+    * because anticipating deadlocks is an impossible task, and relying on deadlock reports in order to resolve them means that we are creating a poor user experience while we wait for data to respond to
+    * because pessimistic locking to ensure data integrity in situations like 'counters' is expensive and creates more frequent deadlocks
+    * because modifying extensive blocks of execution (theoretically all controller actions) to avoid deadlocks is hardly concise; nor within the ability of many junior members of the community
+2. Why not extend the `ActiveRecord::Base.transaction` method to include automatic retry mechanisms? While this could theoretically solve the problem, we believe this approach also represents an anti-pattern:
+    * because the definition of `transaction` is inherently different in Rails and the Database layer. In the database, a single statement under auto-commit represents a transaction; in Rails a transaction typically represents multiple statements that form an atomic process. In order to use transaction auto-retry, every statement would have to be wrapped in a transaction block - which is hardly readable - or DRY. *caveat: perhaps Rails could wrap single statements in a transparent retry block that the programmer wouldn't see; but I don't know how to go about doing this*
+    * because multi-statement transactions in Rails operate within a lexical scope (typically controller) instance and local variables may be modified during multi-statement blocks; automatic retry of the block would likely fail due to unintended behavior caused by programmers' expectation that statements would only be executed once&#8230; *caveat: perhaps it would be possible to create a binding closure of all variables in scope before performing the transaction block, and to restore this closure before re-trying; however this approach seems to me to very inefficient - and I do not understand Ruby to the degree necessary to implement this*
+    * because IMHO, there are transient database errors caused by concurrency other than deadlocks which I believe should be gracefully retried, and which are not necessarily encapsulated in a single SQL Statement:
+
+####Example constraint violation####
+@@@ 
+class CreateUsers &lt; ActiveRecord::Migration
+  def self.up
+    create_table :users, :options =&gt; 'ENGINE=InnoDB DEFAULT CHARSET=utf8' do |t|
+      &#8230;
+      t.string :email, :null =&gt; false, :limit =&gt; 255
+      &#8230;
+    end
+    add_index :users, :email, :unique =&gt; true, :name =&gt; 'index_users_unique'
+  end
+end
+
+@@@
+---
+@@@
+class User &lt; ActiveRecord::Base
+&#8230;
+validates_uniqueness_of :email, :allow_blank =&gt; true
+&#8230;
+end
+
+@@@
+---
+@@@
+### I am using two statements here which effectively implement find_or_create_by to illustrate how multi-statement scenarios exist which should be retried.
+Process #1: User.create(:email =&gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+Process #2: User.create(:email =&gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+@@@
+
+Here, we've implemented a unique index on the email column for the users table to guarantee data integrity under concurrent conditions, matched with an 'optimistic' validation in the model. In this scenario neither process finds a user matching the email attribute and thus attempts a create. The create then executes the validates_uniqueness_of validation in both processes, which succeed. The `INSERT INTO USER` statements are then sent to the database which responds with a duplicate key violation.
+
+
+### What we have done ###
+
+Based on our observations, we believe that wholesale retry of requests instead of transactions is the preferred approach. We believe proper controller actions should be implemented to never leave data in an inconsistent state, thus it should be safe to retry any action in its entirety.
+
+Due to our limited knowledge of the Rails core, we have implemented a rescue_from ActiveRecord::StatementInvalid at the ApplicationController base point, and respond with Javascript embedded in a blank HTML document which resubmits the request using the same method as the original attempt.
+
+**We know this is a hack. We know this hack increases network traffic and only works for HTML requests from browsers supporting JS; any actions which respond to any other formats are still hosed.**
+
+We originally attempted to use the rescue_from to interrupt the exception event and re-envoke the controller action; however, this led to duplicate render errors and a myriad of other problems because instance variables had been set/changed in the controller object. 
+
+We also tried to use a background NetHTTP process to attempt a second request that the user wouldn't experience&#8230; however this approach failed to supply the request context; i.e. the users session and cookies weren't available - much less the request headers.
+
+What approach can you Rails geniuses come up with?</body>
+      <body-html>&lt;div&gt;&lt;h3&gt;Question: what are 'best practices' for dealing with transient
+database errors (like Deadlocks and constraint violations) in a
+highly concurrent Rails system?&lt;/h3&gt;
+&lt;p&gt;Thank you in advance to anyone reading this; I spoke with Yehuda
+Katz yesterday at #mwrc and he thought ithis was a deep enough
+question to open here. &lt;em&gt;&lt;strong&gt;Disclaimer&lt;/strong&gt; My
+understanding of the database adapters supported by Rails is
+limited to MySQL, so any statement below relating to database
+behavior should be read as MySQL behavior. We are also running
+Rails 2.3.9 and might be unfamiliar with new functionality
+available in 3.x&lt;/em&gt;&lt;/p&gt;
+&lt;hr&gt;
+&lt;p&gt;We have recently scaled our app horizontally using the 'shared
+nothing' architecture approach, and now that we have multiple
+servers (and background processes) acting concurrently on the
+Database we are tracing several ActiveRecord::StatementInvalid
+exceptions related to deadlock or other constraint violations that
+are transient and thus retryable.&lt;/p&gt;
+&lt;p&gt;The MySQL team believes deadlocks are transient, frequent and
+inherently safe in transactional databases - and that consuming
+applications should be &lt;em&gt;'always prepared to re-issue a
+transaction'&lt;/em&gt;; see &lt;a href=
+&quot;http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html&quot;&gt;http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html&lt;/a&gt;&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;h3&gt;13.2.8.9.&amp;nbsp;How to Cope with Deadlocks&lt;/h3&gt;
+&lt;p&gt;Deadlocks are a classic problem in transactional databases, but
+they are not dangerous unless they are so frequent that you cannot
+run certain transactions at all. Normally, you must write your
+applications so that they are always prepared to re-issue a
+transaction if it gets rolled back because of a deadlock.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;InnoDB&lt;/strong&gt; uses automatic row-level locking. You
+can get deadlocks even in the case of transactions that just insert
+or delete a single row. That is because these operations are not
+really &amp;#8220;atomic&amp;#8221;; they automatically set locks on the
+(possibly several) index records of the row inserted or
+deleted.&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr&gt;
+&lt;h4&gt;My Team has been looking into this for several weeks now and
+have made the following observations:&lt;/h4&gt;
+&lt;ol&gt;
+&lt;li&gt;Why not use &lt;code&gt;SHOW ENGINE INNODB STATUS&lt;/code&gt; to identify
+and remediate deadlocks? While a useful tool, we believe this
+approach represents an anti-pattern:&lt;br&gt;
+&lt;ul&gt;
+&lt;li&gt;because MySQL states as policy that deadlocks are a common
+occurrence that should be retried as opposed to eliminated&lt;/li&gt;
+&lt;li&gt;because MySQL states even single statement transactions
+&lt;code&gt;INSERT INTO&amp;#8230;&lt;/code&gt; will produce deadlocks and are thus
+at some level deadlocks are unable to be eliminated (reproduced
+often in our system)&lt;/li&gt;
+&lt;li&gt;because anticipating deadlocks is an impossible task, and
+relying on deadlock reports in order to resolve them means that we
+are creating a poor user experience while we wait for data to
+respond to&lt;/li&gt;
+&lt;li&gt;because pessimistic locking to ensure data integrity in
+situations like 'counters' is expensive and creates more frequent
+deadlocks&lt;/li&gt;
+&lt;li&gt;because modifying extensive blocks of execution (theoretically
+all controller actions) to avoid deadlocks is hardly concise; nor
+within the ability of many junior members of the community&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;Why not extend the &lt;code&gt;ActiveRecord::Base.transaction&lt;/code&gt;
+method to include automatic retry mechanisms? While this could
+theoretically solve the problem, we believe this approach also
+represents an anti-pattern:&lt;br&gt;
+&lt;ul&gt;
+&lt;li&gt;because the definition of &lt;code&gt;transaction&lt;/code&gt; is
+inherently different in Rails and the Database layer. In the
+database, a single statement under auto-commit represents a
+transaction; in Rails a transaction typically represents multiple
+statements that form an atomic process. In order to use transaction
+auto-retry, every statement would have to be wrapped in a
+transaction block - which is hardly readable - or DRY. &lt;em&gt;caveat:
+perhaps Rails could wrap single statements in a transparent retry
+block that the programmer wouldn't see; but I don't know how to go
+about doing this&lt;/em&gt;&lt;/li&gt;
+&lt;li&gt;because multi-statement transactions in Rails operate within a
+lexical scope (typically controller) instance and local variables
+may be modified during multi-statement blocks; automatic retry of
+the block would likely fail due to unintended behavior caused by
+programmers' expectation that statements would only be executed
+once&amp;#8230; &lt;em&gt;caveat: perhaps it would be possible to create a
+binding closure of all variables in scope before performing the
+transaction block, and to restore this closure before re-trying;
+however this approach seems to me to very inefficient - and I do
+not understand Ruby to the degree necessary to implement
+this&lt;/em&gt;&lt;/li&gt;
+&lt;li&gt;because IMHO, there are transient database errors caused by
+concurrency other than deadlocks which I believe should be
+gracefully retried, and which are not necessarily encapsulated in a
+single SQL Statement:&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h4&gt;Example constraint violation&lt;/h4&gt;
+&lt;pre&gt;
+&lt;code&gt;class CreateUsers &amp;lt; ActiveRecord::Migration
+  def self.up
+    create_table :users, :options =&amp;gt; 'ENGINE=InnoDB DEFAULT CHARSET=utf8' do |t|
+      &amp;#8230;
+      t.string :email, :null =&amp;gt; false, :limit =&amp;gt; 255
+      &amp;#8230;
+    end
+    add_index :users, :email, :unique =&amp;gt; true, :name =&amp;gt; 'index_users_unique'
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;hr&gt;
+&lt;pre&gt;
+&lt;code&gt;class User &amp;lt; ActiveRecord::Base
+&amp;#8230;
+validates_uniqueness_of :email, :allow_blank =&amp;gt; true
+&amp;#8230;
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;hr&gt;
+&lt;pre&gt;
+&lt;code&gt;### I am using two statements here which effectively implement find_or_create_by to illustrate how multi-statement scenarios exist which should be retried.
+Process #1: User.create(:email =&amp;gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com') 
+Process #2: User.create(:email =&amp;gt; 'somebody@some.host.com') unless User.find_by_email('somebody@some.host.com')&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Here, we've implemented a unique index on the email column for
+the users table to guarantee data integrity under concurrent
+conditions, matched with an 'optimistic' validation in the model.
+In this scenario neither process finds a user matching the email
+attribute and thus attempts a create. The create then executes the
+validates_uniqueness_of validation in both processes, which
+succeed. The &lt;code&gt;INSERT INTO USER&lt;/code&gt; statements are then sent
+to the database which responds with a duplicate key violation.&lt;/p&gt;
+&lt;h3&gt;What we have done&lt;/h3&gt;
+&lt;p&gt;Based on our observations, we believe that wholesale retry of
+requests instead of transactions is the preferred approach. We
+believe proper controller actions should be implemented to never
+leave data in an inconsistent state, thus it should be safe to
+retry any action in its entirety.&lt;/p&gt;
+&lt;p&gt;Due to our limited knowledge of the Rails core, we have
+implemented a rescue_from ActiveRecord::StatementInvalid at the
+ApplicationController base point, and respond with Javascript
+embedded in a blank HTML document which resubmits the request using
+the same method as the original attempt.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;We know this is a hack. We know this hack increases
+network traffic and only works for HTML requests from browsers
+supporting JS; any actions which respond to any other formats are
+still hosed.&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;We originally attempted to use the rescue_from to interrupt the
+exception event and re-envoke the controller action; however, this
+led to duplicate render errors and a myriad of other problems
+because instance variables had been set/changed in the controller
+object.&lt;/p&gt;
+&lt;p&gt;We also tried to use a background NetHTTP process to attempt a
+second request that the user wouldn't experience&amp;#8230; however
+this approach failed to supply the request context; i.e. the users
+session and cookies weren't available - much less the request
+headers.&lt;/p&gt;
+&lt;p&gt;What approach can you Rails geniuses come up with?&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2011-03-19T21:03:30+00:00</created-at>
+      <creator-id type="integer">130936</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">6596</number>
+      <permalink>what-are-best-practices-for-dealing-with-transient-database-errors-like-deadlocks-and-constraint-violations-in-a-highly-concurrent-rails-system</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag nil="true"></tag>
+      <title>What are 'best practices' for dealing with transient database errors (like Deadlocks and constraint violations) in a highly concurrent Rails system?</title>
+      <updated-at type="datetime">2011-03-19T21:03:32+00:00</updated-at>
+      <user-id type="integer">130936</user-id>
+      <version type="integer">1</version>
+      <user-name>Jay Crouch</user-name>
+      <creator-name>Jay Crouch</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/6596</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+  </versions>
+</ticket>

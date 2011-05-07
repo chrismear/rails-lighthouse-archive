@@ -1,0 +1,1692 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ticket>
+  <assigned-user-id type="integer" nil="true"></assigned-user-id>
+  <attachments-count type="integer">0</attachments-count>
+  <closed type="boolean">false</closed>
+  <created-at type="datetime">2010-12-22T22:01:58+00:00</created-at>
+  <creator-id type="integer">129994</creator-id>
+  <milestone-due-on type="datetime" nil="true"></milestone-due-on>
+  <milestone-id type="integer" nil="true"></milestone-id>
+  <number type="integer">6211</number>
+  <permalink>rails-303-eager-loading-associations-with-additional-conditions-causes-the-on-statement-to-be-improperly-constructed</permalink>
+  <priority type="integer">0</priority>
+  <project-id type="integer">8994</project-id>
+  <raw-data type="binary" nil="true" encoding="base64"></raw-data>
+  <state>open</state>
+  <tag nil="true"></tag>
+  <title>Rails 3.0.3 Eager Loading associations with additional conditions causes the ON statement to be improperly constructed</title>
+  <updated-at type="datetime">2011-03-23T06:28:37+00:00</updated-at>
+  <user-id type="integer">140599</user-id>
+  <version type="integer">4</version>
+  <user-name>Jarrett Irons</user-name>
+  <creator-name>Orion Delwaterman</creator-name>
+  <url>http://rails.lighthouseapp.com/projects/8994/tickets/6211</url>
+  <priority-name nil="true"></priority-name>
+  <original-body># Summary #
+
+When an association with conditions is chained together with additional conditions using Relations, ActiveRecord and Arel shifts the association's conditions from the `WHERE` clause to the `ON` clause. But in doing so it drops the foreign key relationship and improperly quotes conditions. Quick example:
+
+@@@ ruby
+   Post.includes(:special_tags).where(:user_id =&gt; 10).all
+@@@
+
+will result in the following SQL (using sqlite3):
+
+@@@ sql
+  SELECT &quot;posts&quot;.&quot;id&quot; as t0_r0, &quot;posts&quot;.&quot;title&quot; AS t0_r0, &quot;user_id&quot; AS t0_r1, &quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;post_id&quot; AS t1_r1, &quot;tags&quot;.&quot;name&quot; AS t1_r2, &quot;tags&quot;.&quot;context_type&quot; AS t1_r3
+  FROM &quot;posts&quot; 
+  LEFT OUTER JOIN &quot;taggings&quot; ON &quot;posts&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;post_id&quot; 
+  LEFT OUTER JOIN &quot;tags&quot; ON &quot;tags&quot;.&quot;name&quot; = ''special''
+  WHERE &quot;posts&quot;.&quot;id&quot; = 10
+@@@
+
+There are two issues with the second `LEFT OUTER JOIN` statement. First its missing the foreign key relationship condition `&quot;taggings&quot;.&quot;tag_id&quot; = &quot;tags&quot;.&quot;id&quot;`. Second it's improperly double quoting (two single quotes on each side) the word &quot;special&quot; with `&quot;tags&quot;.&quot;name&quot; = ''special''`
+
+# Recreating the issue #
+
+This is a modified version of our code at work where we originally discovered the issue.
+
+Schema:
+
+    create_table &quot;recipes&quot;, :force =&gt; true do |t|
+      t.string   &quot;name&quot;    
+    end
+    create_table &quot;taggings&quot;, :force =&gt; true do |t|
+      t.integer  &quot;taggable_id&quot;
+      t.string   &quot;taggable_type&quot;
+      t.integer  &quot;position&quot;
+      t.integer  &quot;tag_id&quot;
+      t.datetime &quot;created_at&quot;
+      t.datetime &quot;updated_at&quot;
+    end
+    create_table &quot;tags&quot;, :force =&gt; true do |t|
+      t.string   &quot;name&quot;
+      t.string   &quot;context_type&quot;
+      t.datetime &quot;created_at&quot;
+      t.datetime &quot;updated_at&quot;
+    end
+
+
+models:
+
+    class Recipe &lt; ActiveRecord::Base
+      has_many :taggings, :as =&gt; :taggable, :dependent =&gt; :destroy
+      has_many :courses, :through =&gt; :taggings, :source =&gt; :tag, :conditions =&gt; {:tags =&gt; {:context_type =&gt;  'course'}}
+      scope :ordered_by_course, includes(:courses).where(:taggings =&gt; {:position =&gt; 0}).order(&quot;UPPER(tags.name) ASC&quot;).order(&quot;UPPER(recipes.name) ASC&quot;)
+    end
+    
+    class Tagging &lt; ActiveRecord::Base
+      belongs_to :taggable, :polymorphic =&gt; true
+      belongs_to :tag
+      
+      before_create do
+        self.position = self.taggable.send(self.tag.context_type.to_s.pluralize).count + 1
+      end
+    end
+
+    class Tag &lt; ActiveRecord::Base
+      has_many :taggings, :dependent =&gt; :destroy
+
+      class &lt;&lt; self
+	    [&quot;course&quot;, &quot;main_ingredient&quot;, &quot;cuisine&quot;, &quot;occasion&quot;, &quot;convenience&quot;, &quot;cooking_method&quot;].each do |context|
+	      define_method context.pluralize do
+	        where(&quot;tags.context_type = '#{context}'&quot;)
+	      end
+	    end
+	  end
+
+    end
+
+Create some dummy data with IRB:
+
+    recipe = Recipe.create!(:name =&gt; &quot;foo&quot;)
+    tag = Tag.create!(:name =&gt; &quot;Main Dish&quot;, :context_type =&gt; &quot;course&quot;)
+    recipe.courses &lt;&lt; tag
+
+Now using IRB and do a normal load of the association:
+
+    recipe = Recipe.first
+    recipe.courses # =&gt; [#&lt;Tag id: 1, name: &quot;Main Dish&quot;, context_type: &quot;course&quot;, created_at: &quot;2010-11-19 17:04:14&quot;, updated_at: &quot;2010-11-19 17:04:14&quot;&gt;]
+
+SQL in the log:
+     SELECT &quot;tags&quot;.* FROM &quot;tags&quot; INNER JOIN &quot;taggings&quot; ON &quot;tags&quot;.id = &quot;taggings&quot;.tag_id WHERE ((&quot;taggings&quot;.taggable_id = 1) AND (&quot;taggings&quot;.taggable_type = 'Recipe') AND ((&quot;tags&quot;.&quot;context_type&quot; = 'course')))
+
+Back to IRB now lets try the scope:
+    recipes = Recipe.ordered_by_course
+    recipes.first.courses # =&gt; []
+    
+That's wrong check the SQL in the log:
+    SELECT &quot;recipes&quot;.&quot;id&quot; AS t0_r0, &quot;recipes&quot;.&quot;name&quot; AS t0_r1,&quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;name&quot; AS t1_r1, &quot;tags&quot;.&quot;context_type&quot; AS t1_r2, &quot;tags&quot;.&quot;created_at&quot; AS t1_r3, &quot;tags&quot;.&quot;updated_at&quot; AS t1_r4 
+    FROM &quot;recipes&quot; 
+    LEFT OUTER JOIN &quot;taggings&quot; ON &quot;recipes&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;taggable_id&quot; AND &quot;taggings&quot;.&quot;taggable_type&quot; = 'Recipe' 
+    LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course'' 
+    WHERE (recipes.deleted_at IS NULL) AND (&quot;taggings&quot;.&quot;position&quot; = 1) 
+    ORDER BY UPPER(tags.name) ASC, UPPER(recipes.name) ASC
+
+Wow this is a bit of an issue.
+
+# The Two Nasty Issues #
+
+## Dirty Nasty Issue 1 - Where did the foreign keys go? ##
+
+The first problem is within ActiveRecord::QueryMethods#build_joins and ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join. ActiveRecord::QueryMethods#build_joins is responsible for building the joins for the query (lib/active_record/relation/query_methods.rb:215). Check out this snippet here at line 235-243
+
+    to_join = []
+    join_dependency.join_associations.each do |association|
+      if (association_relation = association.relation).is_a?(Array)
+        to_join &lt;&lt; [association_relation.first, association.join_type, association.association_join.first]
+        to_join &lt;&lt; [association_relation.last, association.join_type, association.association_join.last]
+      else
+        to_join &lt;&lt; [association_relation, association.join_type, association.association_join]
+      end
+    end
+
+Essentially if the association relation is an array (array of ARel Nodes) we are dealing some type of `has_many :through` relationship. And this snippet assumes that there are only two items in the array (the first should be all the joins for the recipes to taggings and the secound should be for the taggings to tags). 
+
+But now take a look at ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join (in the rails 3-0-stable branch that would be activerecord/lib/active_record/associations.rb:2135). The first part of the function (lines 2136-2207) will set @join to be an array of two length:
+	def association_join
+		return @join if @join
+
+		aliased_table = Arel::Table.new(table_name, :as      =&gt; @aliased_table_name,
+		                                            :engine  =&gt; arel_engine,
+		                                            :columns =&gt; klass.columns)
+
+		parent_table = Arel::Table.new(parent.table_name, :as      =&gt; parent.aliased_table_name,
+		                                                  :engine  =&gt; arel_engine,
+		                                                  :columns =&gt; parent.active_record.columns)
+
+		@join = case reflection.macro
+		when :has_and_belongs_to_many
+		  join_table = Arel::Table.new(options[:join_table], :as =&gt; aliased_join_table_name, :engine =&gt; arel_engine)
+		  fk = options[:foreign_key] || reflection.active_record.to_s.foreign_key
+		  klass_fk = options[:association_foreign_key] || klass.to_s.foreign_key
+
+		  [
+		    join_table[fk].eq(parent_table[reflection.active_record.primary_key]),
+		    aliased_table[klass.primary_key].eq(join_table[klass_fk])
+		  ]
+		when :has_many, :has_one
+		  if reflection.options[:through]
+		    join_table = Arel::Table.new(through_reflection.klass.table_name, :as =&gt; aliased_join_table_name, :engine =&gt; arel_engine)
+		    jt_foreign_key = jt_as_extra = jt_source_extra = jt_sti_extra = nil
+		    first_key = second_key = as_extra = nil
+
+		    if through_reflection.options[:as] # has_many :through against a polymorphic join
+		      jt_foreign_key = through_reflection.options[:as].to_s + '_id'
+		      jt_as_extra = join_table[through_reflection.options[:as].to_s + '_type'].eq(parent.active_record.base_class.name)
+		    else
+		      jt_foreign_key = through_reflection.primary_key_name
+		    end
+
+		    case source_reflection.macro
+		    when :has_many
+		      if source_reflection.options[:as]
+		        first_key   = &quot;#{source_reflection.options[:as]}_id&quot;
+		        second_key  = options[:foreign_key] || primary_key
+		        as_extra    = aliased_table[&quot;#{source_reflection.options[:as]}_type&quot;].eq(source_reflection.active_record.base_class.name)
+		      else
+		        first_key   = through_reflection.klass.base_class.to_s.foreign_key
+		        second_key  = options[:foreign_key] || primary_key
+		      end
+
+		      unless through_reflection.klass.descends_from_active_record?
+		        jt_sti_extra = join_table[through_reflection.active_record.inheritance_column].eq(through_reflection.klass.sti_name)
+		      end
+		    when :belongs_to
+		      first_key = primary_key
+		      if reflection.options[:source_type]
+		        second_key = source_reflection.association_foreign_key
+		        jt_source_extra = join_table[reflection.source_reflection.options[:foreign_type]].eq(reflection.options[:source_type])
+		      else
+		        second_key = source_reflection.primary_key_name
+		      end
+		    end
+
+		    [
+		      [parent_table[parent.primary_key].eq(join_table[jt_foreign_key]), jt_as_extra, jt_source_extra, jt_sti_extra].reject{|x| x.blank? },
+		      aliased_table[first_key].eq(join_table[second_key])
+		    ]
+		  elsif reflection.options[:as]
+		    id_rel = aliased_table[&quot;#{reflection.options[:as]}_id&quot;].eq(parent_table[parent.primary_key])
+		    type_rel = aliased_table[&quot;#{reflection.options[:as]}_type&quot;].eq(parent.active_record.base_class.name)
+		    [id_rel, type_rel]
+		  else
+		    foreign_key = options[:foreign_key] || reflection.active_record.name.foreign_key
+		    [aliased_table[foreign_key].eq(parent_table[reflection.options[:primary_key] || parent.primary_key])]
+		  end
+		when :belongs_to
+		  [aliased_table[options[:primary_key] || reflection.klass.primary_key].eq(parent_table[options[:foreign_key] || reflection.primary_key_name])]
+		end
+
+Awesome. But the rest of the function now breaks the assumption that its only going to return that it will return an array of length 2 (lines 2209-2225):
+
+	  unless klass.descends_from_active_record?
+	    sti_column = aliased_table[klass.inheritance_column]
+	    sti_condition = sti_column.eq(klass.sti_name)
+	    klass.descendants.each {|subclass| sti_condition = sti_condition.or(sti_column.eq(subclass.sti_name)) }
+
+	    @join &lt;&lt; sti_condition
+	  end
+
+
+	  [through_reflection, reflection].each do |ref|
+	    if ref &amp;&amp; ref.options[:conditions]
+	      @join &lt;&lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+	    end
+	  end
+
+	  @join
+	end
+
+If the reflection has conditions or if the underlying klass is an STI you now have 3 or more items in your array. In the example I am using we would have three: 
+1. the Arel AST nodes for the recipes to taggings table
+2. the Arel AST nodes for the foreign key of taggings to tags
+3. the condition clauses checking the context type of the tag.  
+
+Now look back at  ActiveRecord::QueryMethods#build_joins (lib/active_record/relation/query_methods.rb:235-243).
+
+    to_join = []
+    join_dependency.join_associations.each do |association|
+      if (association_relation = association.relation).is_a?(Array)
+        to_join &lt;&lt; [association_relation.first, association.join_type, association.association_join.first]
+        to_join &lt;&lt; [association_relation.last, association.join_type, association.association_join.last]
+      else
+        to_join &lt;&lt; [association_relation, association.join_type, association.association_join]
+      end
+    end
+
+Yup its totally going to drop the middle condition. So we need to patch ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join to only return an array of length two (since its grouping the joins for each relationship in an array).  I'm just not sure what else this is going to break.
+
+## Dirty Nasty Issue 2 - What's with the double single quotes? ##
+
+Recall that the generated SQL had this little snippet `LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course''`. Why is it doing this? Well the problem turns out to be ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join again. Re-examine this snippet (activerecord/lib/active_record/associations.rb:218-223)
+
+    [through_reflection, reflection].each do |ref|
+      if ref &amp;&amp; ref.options[:conditions]
+         @join &lt;&lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+      end
+    end
+
+The #sanitize_sql (which is delegated to the active_record) returns a sql string. That is its not passing ARel AST nodes but actual SQL. That might not seem like much of an issue until you realize that ARel will treat this a string value, NOT a sql expression.  We have to look at the ARel code to see what happens (I am using the 2.0.6 gem as reference). Let's look at how ARel's ToSql visitor handles the ON node (lib/arel/visitors/to_sql.rb:190-192):
+
+    def visit_Arel_Nodes_On o
+      &quot;ON #{visit o.expr}&quot;
+    end
+Now remember that ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join set one the condition here to be a string. That means `o.expr # =&gt; &quot;\&quot;tags\&quot;.\&quot;content_type\&quot; = 'course'&quot;. Well look what happens next (lib/arel/visitors/to_sql.rb:278):
+
+    def visit_String o; quote(o, @last_column) end
+
+It's going to quote the string as if its a String value to be passed into the database, not the actual sql to be run (lib/arel/visitors/to_sql.rb:294-296)
+
+    def quote value, column = nil
+      @connection.quote value, column
+    end
+
+And sure enough when we trace this down in activerecord we find (lib/active_record/connection_adapters/abstract/quoting.rb:40-42)
+
+    def quote_string(s)
+      s.gsub(/\\/, '\&amp;\&amp;').gsub(/'/, &quot;''&quot;) # ' (for ruby-mode)
+    end
+
+Wow. At least we know where the issue is. The solution seems to be to patch ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join so that it does not just give a string, but actual ARel ast nodes. But its going to require some work.
+
+# Patches #
+I am currently working on the patches for this issue, but it may take me a while to test. Not to mention that I currently do not have MySQL or PostgreSQL installed on my mac and I've already spent way too much time tracking this down. But I will give it my best shot and hopefully whoever can check as needed. I'll post patches as soon as I have them. I am working off the Rails 3-0-stable branch.
+
+# Side Note #
+I checked out 'master' of activerecord, and its gone through a major rewrite. I am not sure if the rewrite addressed this issue, but once I complete my patches for the 3.0 line I can port the tests over to double check</original-body>
+  <latest-body># Summary #
+
+When an association with conditions is chained together with additional conditions using Relations, ActiveRecord and Arel shifts the association's conditions from the `WHERE` clause to the `ON` clause. But in doing so it drops the foreign key relationship and improperly quotes conditions. Quick example:
+
+@@@ ruby
+   Post.includes(:special_tags).where(:user_id =&gt; 10).all
+@@@
+
+will result in the following SQL (using sqlite3):
+
+@@@ sql
+  SELECT &quot;posts&quot;.&quot;id&quot; as t0_r0, &quot;posts&quot;.&quot;title&quot; AS t0_r0, &quot;user_id&quot; AS t0_r1, &quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;post_id&quot; AS t1_r1, &quot;tags&quot;.&quot;name&quot; AS t1_r2, &quot;tags&quot;.&quot;context_type&quot; AS t1_r3
+  FROM &quot;posts&quot; 
+  LEFT OUTER JOIN &quot;taggings&quot; ON &quot;posts&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;post_id&quot; 
+  LEFT OUTER JOIN &quot;tags&quot; ON &quot;tags&quot;.&quot;name&quot; = ''special''
+  WHERE &quot;posts&quot;.&quot;id&quot; = 10
+@@@
+
+There are two issues with the second `LEFT OUTER JOIN` statement. First its missing the foreign key relationship condition `&quot;taggings&quot;.&quot;tag_id&quot; = &quot;tags&quot;.&quot;id&quot;`. Second it's improperly double quoting (two single quotes on each side) the word &quot;special&quot; with `&quot;tags&quot;.&quot;name&quot; = ''special''`
+
+# Recreating the issue #
+
+This is a modified version of our code at work where we originally discovered the issue.
+
+Schema:
+
+    create_table &quot;recipes&quot;, :force =&gt; true do |t|
+      t.string   &quot;name&quot;    
+    end
+    create_table &quot;taggings&quot;, :force =&gt; true do |t|
+      t.integer  &quot;taggable_id&quot;
+      t.string   &quot;taggable_type&quot;
+      t.integer  &quot;position&quot;
+      t.integer  &quot;tag_id&quot;
+      t.datetime &quot;created_at&quot;
+      t.datetime &quot;updated_at&quot;
+    end
+    create_table &quot;tags&quot;, :force =&gt; true do |t|
+      t.string   &quot;name&quot;
+      t.string   &quot;context_type&quot;
+      t.datetime &quot;created_at&quot;
+      t.datetime &quot;updated_at&quot;
+    end
+
+
+models:
+
+    class Recipe &lt; ActiveRecord::Base
+      has_many :taggings, :as =&gt; :taggable, :dependent =&gt; :destroy
+      has_many :courses, :through =&gt; :taggings, :source =&gt; :tag, :conditions =&gt; {:tags =&gt; {:context_type =&gt;  'course'}}
+      scope :ordered_by_course, includes(:courses).where(:taggings =&gt; {:position =&gt; 0}).order(&quot;UPPER(tags.name) ASC&quot;).order(&quot;UPPER(recipes.name) ASC&quot;)
+    end
+    
+    class Tagging &lt; ActiveRecord::Base
+      belongs_to :taggable, :polymorphic =&gt; true
+      belongs_to :tag
+      
+      before_create do
+        self.position = self.taggable.send(self.tag.context_type.to_s.pluralize).count + 1
+      end
+    end
+
+    class Tag &lt; ActiveRecord::Base
+      has_many :taggings, :dependent =&gt; :destroy
+
+      class &lt;&lt; self
+	    [&quot;course&quot;, &quot;main_ingredient&quot;, &quot;cuisine&quot;, &quot;occasion&quot;, &quot;convenience&quot;, &quot;cooking_method&quot;].each do |context|
+	      define_method context.pluralize do
+	        where(&quot;tags.context_type = '#{context}'&quot;)
+	      end
+	    end
+	  end
+
+    end
+
+Create some dummy data with IRB:
+
+    recipe = Recipe.create!(:name =&gt; &quot;foo&quot;)
+    tag = Tag.create!(:name =&gt; &quot;Main Dish&quot;, :context_type =&gt; &quot;course&quot;)
+    recipe.courses &lt;&lt; tag
+
+Now using IRB and do a normal load of the association:
+
+    recipe = Recipe.first
+    recipe.courses # =&gt; [#&lt;Tag id: 1, name: &quot;Main Dish&quot;, context_type: &quot;course&quot;, created_at: &quot;2010-11-19 17:04:14&quot;, updated_at: &quot;2010-11-19 17:04:14&quot;&gt;]
+
+SQL in the log:
+     SELECT &quot;tags&quot;.* FROM &quot;tags&quot; INNER JOIN &quot;taggings&quot; ON &quot;tags&quot;.id = &quot;taggings&quot;.tag_id WHERE ((&quot;taggings&quot;.taggable_id = 1) AND (&quot;taggings&quot;.taggable_type = 'Recipe') AND ((&quot;tags&quot;.&quot;context_type&quot; = 'course')))
+
+Back to IRB now lets try the scope:
+    recipes = Recipe.ordered_by_course
+    recipes.first.courses # =&gt; []
+    
+That's wrong check the SQL in the log:
+    SELECT &quot;recipes&quot;.&quot;id&quot; AS t0_r0, &quot;recipes&quot;.&quot;name&quot; AS t0_r1,&quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;name&quot; AS t1_r1, &quot;tags&quot;.&quot;context_type&quot; AS t1_r2, &quot;tags&quot;.&quot;created_at&quot; AS t1_r3, &quot;tags&quot;.&quot;updated_at&quot; AS t1_r4 
+    FROM &quot;recipes&quot; 
+    LEFT OUTER JOIN &quot;taggings&quot; ON &quot;recipes&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;taggable_id&quot; AND &quot;taggings&quot;.&quot;taggable_type&quot; = 'Recipe' 
+    LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course'' 
+    WHERE (recipes.deleted_at IS NULL) AND (&quot;taggings&quot;.&quot;position&quot; = 1) 
+    ORDER BY UPPER(tags.name) ASC, UPPER(recipes.name) ASC
+
+Wow this is a bit of an issue.
+
+# The Two Nasty Issues #
+
+## Dirty Nasty Issue 1 - Where did the foreign keys go? ##
+
+The first problem is within ActiveRecord::QueryMethods#build_joins and ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join. ActiveRecord::QueryMethods#build_joins is responsible for building the joins for the query (lib/active_record/relation/query_methods.rb:215). Check out this snippet here at line 235-243
+
+    to_join = []
+    join_dependency.join_associations.each do |association|
+      if (association_relation = association.relation).is_a?(Array)
+        to_join &lt;&lt; [association_relation.first, association.join_type, association.association_join.first]
+        to_join &lt;&lt; [association_relation.last, association.join_type, association.association_join.last]
+      else
+        to_join &lt;&lt; [association_relation, association.join_type, association.association_join]
+      end
+    end
+
+Essentially if the association relation is an array (array of ARel Nodes) we are dealing some type of `has_many :through` relationship. And this snippet assumes that there are only two items in the array (the first should be all the joins for the recipes to taggings and the secound should be for the taggings to tags). 
+
+But now take a look at ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join (in the rails 3-0-stable branch that would be activerecord/lib/active_record/associations.rb:2135). The first part of the function (lines 2136-2207) will set @join to be an array of two length:
+	def association_join
+		return @join if @join
+
+		aliased_table = Arel::Table.new(table_name, :as      =&gt; @aliased_table_name,
+		                                            :engine  =&gt; arel_engine,
+		                                            :columns =&gt; klass.columns)
+
+		parent_table = Arel::Table.new(parent.table_name, :as      =&gt; parent.aliased_table_name,
+		                                                  :engine  =&gt; arel_engine,
+		                                                  :columns =&gt; parent.active_record.columns)
+
+		@join = case reflection.macro
+		when :has_and_belongs_to_many
+		  join_table = Arel::Table.new(options[:join_table], :as =&gt; aliased_join_table_name, :engine =&gt; arel_engine)
+		  fk = options[:foreign_key] || reflection.active_record.to_s.foreign_key
+		  klass_fk = options[:association_foreign_key] || klass.to_s.foreign_key
+
+		  [
+		    join_table[fk].eq(parent_table[reflection.active_record.primary_key]),
+		    aliased_table[klass.primary_key].eq(join_table[klass_fk])
+		  ]
+		when :has_many, :has_one
+		  if reflection.options[:through]
+		    join_table = Arel::Table.new(through_reflection.klass.table_name, :as =&gt; aliased_join_table_name, :engine =&gt; arel_engine)
+		    jt_foreign_key = jt_as_extra = jt_source_extra = jt_sti_extra = nil
+		    first_key = second_key = as_extra = nil
+
+		    if through_reflection.options[:as] # has_many :through against a polymorphic join
+		      jt_foreign_key = through_reflection.options[:as].to_s + '_id'
+		      jt_as_extra = join_table[through_reflection.options[:as].to_s + '_type'].eq(parent.active_record.base_class.name)
+		    else
+		      jt_foreign_key = through_reflection.primary_key_name
+		    end
+
+		    case source_reflection.macro
+		    when :has_many
+		      if source_reflection.options[:as]
+		        first_key   = &quot;#{source_reflection.options[:as]}_id&quot;
+		        second_key  = options[:foreign_key] || primary_key
+		        as_extra    = aliased_table[&quot;#{source_reflection.options[:as]}_type&quot;].eq(source_reflection.active_record.base_class.name)
+		      else
+		        first_key   = through_reflection.klass.base_class.to_s.foreign_key
+		        second_key  = options[:foreign_key] || primary_key
+		      end
+
+		      unless through_reflection.klass.descends_from_active_record?
+		        jt_sti_extra = join_table[through_reflection.active_record.inheritance_column].eq(through_reflection.klass.sti_name)
+		      end
+		    when :belongs_to
+		      first_key = primary_key
+		      if reflection.options[:source_type]
+		        second_key = source_reflection.association_foreign_key
+		        jt_source_extra = join_table[reflection.source_reflection.options[:foreign_type]].eq(reflection.options[:source_type])
+		      else
+		        second_key = source_reflection.primary_key_name
+		      end
+		    end
+
+		    [
+		      [parent_table[parent.primary_key].eq(join_table[jt_foreign_key]), jt_as_extra, jt_source_extra, jt_sti_extra].reject{|x| x.blank? },
+		      aliased_table[first_key].eq(join_table[second_key])
+		    ]
+		  elsif reflection.options[:as]
+		    id_rel = aliased_table[&quot;#{reflection.options[:as]}_id&quot;].eq(parent_table[parent.primary_key])
+		    type_rel = aliased_table[&quot;#{reflection.options[:as]}_type&quot;].eq(parent.active_record.base_class.name)
+		    [id_rel, type_rel]
+		  else
+		    foreign_key = options[:foreign_key] || reflection.active_record.name.foreign_key
+		    [aliased_table[foreign_key].eq(parent_table[reflection.options[:primary_key] || parent.primary_key])]
+		  end
+		when :belongs_to
+		  [aliased_table[options[:primary_key] || reflection.klass.primary_key].eq(parent_table[options[:foreign_key] || reflection.primary_key_name])]
+		end
+
+Awesome. But the rest of the function now breaks the assumption that its only going to return that it will return an array of length 2 (lines 2209-2225):
+
+	  unless klass.descends_from_active_record?
+	    sti_column = aliased_table[klass.inheritance_column]
+	    sti_condition = sti_column.eq(klass.sti_name)
+	    klass.descendants.each {|subclass| sti_condition = sti_condition.or(sti_column.eq(subclass.sti_name)) }
+
+	    @join &lt;&lt; sti_condition
+	  end
+
+
+	  [through_reflection, reflection].each do |ref|
+	    if ref &amp;&amp; ref.options[:conditions]
+	      @join &lt;&lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+	    end
+	  end
+
+	  @join
+	end
+
+If the reflection has conditions or if the underlying klass is an STI you now have 3 or more items in your array. In the example I am using we would have three: 
+1. the Arel AST nodes for the recipes to taggings table
+2. the Arel AST nodes for the foreign key of taggings to tags
+3. the condition clauses checking the context type of the tag.  
+
+Now look back at  ActiveRecord::QueryMethods#build_joins (lib/active_record/relation/query_methods.rb:235-243).
+
+    to_join = []
+    join_dependency.join_associations.each do |association|
+      if (association_relation = association.relation).is_a?(Array)
+        to_join &lt;&lt; [association_relation.first, association.join_type, association.association_join.first]
+        to_join &lt;&lt; [association_relation.last, association.join_type, association.association_join.last]
+      else
+        to_join &lt;&lt; [association_relation, association.join_type, association.association_join]
+      end
+    end
+
+Yup its totally going to drop the middle condition. So we need to patch ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join to only return an array of length two (since its grouping the joins for each relationship in an array).  I'm just not sure what else this is going to break.
+
+## Dirty Nasty Issue 2 - What's with the double single quotes? ##
+
+Recall that the generated SQL had this little snippet `LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course''`. Why is it doing this? Well the problem turns out to be ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join again. Re-examine this snippet (activerecord/lib/active_record/associations.rb:218-223)
+
+    [through_reflection, reflection].each do |ref|
+      if ref &amp;&amp; ref.options[:conditions]
+         @join &lt;&lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+      end
+    end
+
+The #sanitize_sql (which is delegated to the active_record) returns a sql string. That is its not passing ARel AST nodes but actual SQL. That might not seem like much of an issue until you realize that ARel will treat this a string value, NOT a sql expression.  We have to look at the ARel code to see what happens (I am using the 2.0.6 gem as reference). Let's look at how ARel's ToSql visitor handles the ON node (lib/arel/visitors/to_sql.rb:190-192):
+
+    def visit_Arel_Nodes_On o
+      &quot;ON #{visit o.expr}&quot;
+    end
+Now remember that ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join set one the condition here to be a string. That means `o.expr # =&gt; &quot;\&quot;tags\&quot;.\&quot;content_type\&quot; = 'course'&quot;. Well look what happens next (lib/arel/visitors/to_sql.rb:278):
+
+    def visit_String o; quote(o, @last_column) end
+
+It's going to quote the string as if its a String value to be passed into the database, not the actual sql to be run (lib/arel/visitors/to_sql.rb:294-296)
+
+    def quote value, column = nil
+      @connection.quote value, column
+    end
+
+And sure enough when we trace this down in activerecord we find (lib/active_record/connection_adapters/abstract/quoting.rb:40-42)
+
+    def quote_string(s)
+      s.gsub(/\\/, '\&amp;\&amp;').gsub(/'/, &quot;''&quot;) # ' (for ruby-mode)
+    end
+
+Wow. At least we know where the issue is. The solution seems to be to patch ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join so that it does not just give a string, but actual ARel ast nodes. But its going to require some work.
+
+# Patches #
+I am currently working on the patches for this issue, but it may take me a while to test. Not to mention that I currently do not have MySQL or PostgreSQL installed on my mac and I've already spent way too much time tracking this down. But I will give it my best shot and hopefully whoever can check as needed. I'll post patches as soon as I have them. I am working off the Rails 3-0-stable branch.
+
+# Side Note #
+I checked out 'master' of activerecord, and its gone through a major rewrite. I am not sure if the rewrite addressed this issue, but once I complete my patches for the 3.0 line I can port the tests over to double check</latest-body>
+  <original-body-html>&lt;div&gt;&lt;h1&gt;Summary&lt;/h1&gt;
+&lt;p&gt;When an association with conditions is chained together with
+additional conditions using Relations, ActiveRecord and Arel shifts
+the association's conditions from the &lt;code&gt;WHERE&lt;/code&gt; clause to
+the &lt;code&gt;ON&lt;/code&gt; clause. But in doing so it drops the foreign
+key relationship and improperly quotes conditions. Quick
+example:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=
+&quot;ruby&quot;&gt;   Post.includes(:special_tags).where(:user_id =&amp;gt; 10).all&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;will result in the following SQL (using sqlite3):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=
+&quot;sql&quot;&gt;  SELECT &quot;posts&quot;.&quot;id&quot; as t0_r0, &quot;posts&quot;.&quot;title&quot; AS t0_r0, &quot;user_id&quot; AS t0_r1, &quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;post_id&quot; AS t1_r1, &quot;tags&quot;.&quot;name&quot; AS t1_r2, &quot;tags&quot;.&quot;context_type&quot; AS t1_r3
+  FROM &quot;posts&quot; 
+  LEFT OUTER JOIN &quot;taggings&quot; ON &quot;posts&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;post_id&quot; 
+  LEFT OUTER JOIN &quot;tags&quot; ON &quot;tags&quot;.&quot;name&quot; = ''special''
+  WHERE &quot;posts&quot;.&quot;id&quot; = 10&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;There are two issues with the second &lt;code&gt;LEFT OUTER
+JOIN&lt;/code&gt; statement. First its missing the foreign key
+relationship condition &lt;code&gt;&quot;taggings&quot;.&quot;tag_id&quot; =
+&quot;tags&quot;.&quot;id&quot;&lt;/code&gt;. Second it's improperly double quoting (two
+single quotes on each side) the word &quot;special&quot; with
+&lt;code&gt;&quot;tags&quot;.&quot;name&quot; = ''special''&lt;/code&gt;&lt;/p&gt;
+&lt;h1&gt;Recreating the issue&lt;/h1&gt;
+&lt;p&gt;This is a modified version of our code at work where we
+originally discovered the issue.&lt;/p&gt;
+&lt;p&gt;Schema:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;create_table &quot;recipes&quot;, :force =&amp;gt; true do |t|
+  t.string   &quot;name&quot;    
+end
+create_table &quot;taggings&quot;, :force =&amp;gt; true do |t|
+  t.integer  &quot;taggable_id&quot;
+  t.string   &quot;taggable_type&quot;
+  t.integer  &quot;position&quot;
+  t.integer  &quot;tag_id&quot;
+  t.datetime &quot;created_at&quot;
+  t.datetime &quot;updated_at&quot;
+end
+create_table &quot;tags&quot;, :force =&amp;gt; true do |t|
+  t.string   &quot;name&quot;
+  t.string   &quot;context_type&quot;
+  t.datetime &quot;created_at&quot;
+  t.datetime &quot;updated_at&quot;
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;models:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;class Recipe &amp;lt; ActiveRecord::Base
+  has_many :taggings, :as =&amp;gt; :taggable, :dependent =&amp;gt; :destroy
+  has_many :courses, :through =&amp;gt; :taggings, :source =&amp;gt; :tag, :conditions =&amp;gt; {:tags =&amp;gt; {:context_type =&amp;gt;  'course'}}
+  scope :ordered_by_course, includes(:courses).where(:taggings =&amp;gt; {:position =&amp;gt; 0}).order(&quot;UPPER(tags.name) ASC&quot;).order(&quot;UPPER(recipes.name) ASC&quot;)
+end
+
+class Tagging &amp;lt; ActiveRecord::Base
+  belongs_to :taggable, :polymorphic =&amp;gt; true
+  belongs_to :tag
+
+  before_create do
+    self.position = self.taggable.send(self.tag.context_type.to_s.pluralize).count + 1
+  end
+end
+
+class Tag &amp;lt; ActiveRecord::Base
+  has_many :taggings, :dependent =&amp;gt; :destroy
+
+  class &amp;lt;&amp;lt; self
+    [&quot;course&quot;, &quot;main_ingredient&quot;, &quot;cuisine&quot;, &quot;occasion&quot;, &quot;convenience&quot;, &quot;cooking_method&quot;].each do |context|
+      define_method context.pluralize do
+        where(&quot;tags.context_type = '#{context}'&quot;)
+      end
+    end
+  end
+
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Create some dummy data with IRB:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;recipe = Recipe.create!(:name =&amp;gt; &quot;foo&quot;)
+tag = Tag.create!(:name =&amp;gt; &quot;Main Dish&quot;, :context_type =&amp;gt; &quot;course&quot;)
+recipe.courses &amp;lt;&amp;lt; tag&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Now using IRB and do a normal load of the association:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;recipe = Recipe.first
+recipe.courses # =&amp;gt; [#&amp;lt;Tag id: 1, name: &quot;Main Dish&quot;, context_type: &quot;course&quot;, created_at: &quot;2010-11-19 17:04:14&quot;, updated_at: &quot;2010-11-19 17:04:14&quot;&amp;gt;]&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;SQL in the log:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt; SELECT &quot;tags&quot;.* FROM &quot;tags&quot; INNER JOIN &quot;taggings&quot; ON &quot;tags&quot;.id = &quot;taggings&quot;.tag_id WHERE ((&quot;taggings&quot;.taggable_id = 1) AND (&quot;taggings&quot;.taggable_type = 'Recipe') AND ((&quot;tags&quot;.&quot;context_type&quot; = 'course')))&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Back to IRB now lets try the scope:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;recipes = Recipe.ordered_by_course
+recipes.first.courses # =&amp;gt; []&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;That's wrong check the SQL in the log:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;SELECT &quot;recipes&quot;.&quot;id&quot; AS t0_r0, &quot;recipes&quot;.&quot;name&quot; AS t0_r1,&quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;name&quot; AS t1_r1, &quot;tags&quot;.&quot;context_type&quot; AS t1_r2, &quot;tags&quot;.&quot;created_at&quot; AS t1_r3, &quot;tags&quot;.&quot;updated_at&quot; AS t1_r4
+FROM &quot;recipes&quot; 
+LEFT OUTER JOIN &quot;taggings&quot; ON &quot;recipes&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;taggable_id&quot; AND &quot;taggings&quot;.&quot;taggable_type&quot; = 'Recipe' 
+LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course'' 
+WHERE (recipes.deleted_at IS NULL) AND (&quot;taggings&quot;.&quot;position&quot; = 1) 
+ORDER BY UPPER(tags.name) ASC, UPPER(recipes.name) ASC&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Wow this is a bit of an issue.&lt;/p&gt;
+&lt;h1&gt;The Two Nasty Issues&lt;/h1&gt;
+&lt;h2&gt;Dirty Nasty Issue 1 - Where did the foreign keys go?&lt;/h2&gt;
+&lt;p&gt;The first problem is within
+ActiveRecord::QueryMethods#build_joins and
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join.
+ActiveRecord::QueryMethods#build_joins is responsible for building
+the joins for the query
+(lib/active_record/relation/query_methods.rb:215). Check out this
+snippet here at line 235-243&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;to_join = []
+join_dependency.join_associations.each do |association|
+  if (association_relation = association.relation).is_a?(Array)
+    to_join &amp;lt;&amp;lt; [association_relation.first, association.join_type, association.association_join.first]
+    to_join &amp;lt;&amp;lt; [association_relation.last, association.join_type, association.association_join.last]
+  else
+    to_join &amp;lt;&amp;lt; [association_relation, association.join_type, association.association_join]
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Essentially if the association relation is an array (array of
+ARel Nodes) we are dealing some type of &lt;code&gt;has_many
+:through&lt;/code&gt; relationship. And this snippet assumes that there
+are only two items in the array (the first should be all the joins
+for the recipes to taggings and the secound should be for the
+taggings to tags).&lt;/p&gt;
+&lt;p&gt;But now take a look at
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+(in the rails 3-0-stable branch that would be
+activerecord/lib/active_record/associations.rb:2135). The first
+part of the function (lines 2136-2207) will set @join to be an
+array of two length:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def association_join
+    return @join if @join
+
+    aliased_table = Arel::Table.new(table_name, :as      =&amp;gt; @aliased_table_name,
+                                                :engine  =&amp;gt; arel_engine,
+                                                :columns =&amp;gt; klass.columns)
+
+    parent_table = Arel::Table.new(parent.table_name, :as      =&amp;gt; parent.aliased_table_name,
+                                                      :engine  =&amp;gt; arel_engine,
+                                                      :columns =&amp;gt; parent.active_record.columns)
+
+    @join = case reflection.macro
+    when :has_and_belongs_to_many
+      join_table = Arel::Table.new(options[:join_table], :as =&amp;gt; aliased_join_table_name, :engine =&amp;gt; arel_engine)
+      fk = options[:foreign_key] || reflection.active_record.to_s.foreign_key
+      klass_fk = options[:association_foreign_key] || klass.to_s.foreign_key
+
+      [
+        join_table[fk].eq(parent_table[reflection.active_record.primary_key]),
+        aliased_table[klass.primary_key].eq(join_table[klass_fk])
+      ]
+    when :has_many, :has_one
+      if reflection.options[:through]
+        join_table = Arel::Table.new(through_reflection.klass.table_name, :as =&amp;gt; aliased_join_table_name, :engine =&amp;gt; arel_engine)
+        jt_foreign_key = jt_as_extra = jt_source_extra = jt_sti_extra = nil
+        first_key = second_key = as_extra = nil
+
+        if through_reflection.options[:as] # has_many :through against a polymorphic join
+          jt_foreign_key = through_reflection.options[:as].to_s + '_id'
+          jt_as_extra = join_table[through_reflection.options[:as].to_s + '_type'].eq(parent.active_record.base_class.name)
+        else
+          jt_foreign_key = through_reflection.primary_key_name
+        end
+
+        case source_reflection.macro
+        when :has_many
+          if source_reflection.options[:as]
+            first_key   = &quot;#{source_reflection.options[:as]}_id&quot;
+            second_key  = options[:foreign_key] || primary_key
+            as_extra    = aliased_table[&quot;#{source_reflection.options[:as]}_type&quot;].eq(source_reflection.active_record.base_class.name)
+          else
+            first_key   = through_reflection.klass.base_class.to_s.foreign_key
+            second_key  = options[:foreign_key] || primary_key
+          end
+
+          unless through_reflection.klass.descends_from_active_record?
+            jt_sti_extra = join_table[through_reflection.active_record.inheritance_column].eq(through_reflection.klass.sti_name)
+          end
+        when :belongs_to
+          first_key = primary_key
+          if reflection.options[:source_type]
+            second_key = source_reflection.association_foreign_key
+            jt_source_extra = join_table[reflection.source_reflection.options[:foreign_type]].eq(reflection.options[:source_type])
+          else
+            second_key = source_reflection.primary_key_name
+          end
+        end
+
+        [
+          [parent_table[parent.primary_key].eq(join_table[jt_foreign_key]), jt_as_extra, jt_source_extra, jt_sti_extra].reject{|x| x.blank? },
+          aliased_table[first_key].eq(join_table[second_key])
+        ]
+      elsif reflection.options[:as]
+        id_rel = aliased_table[&quot;#{reflection.options[:as]}_id&quot;].eq(parent_table[parent.primary_key])
+        type_rel = aliased_table[&quot;#{reflection.options[:as]}_type&quot;].eq(parent.active_record.base_class.name)
+        [id_rel, type_rel]
+      else
+        foreign_key = options[:foreign_key] || reflection.active_record.name.foreign_key
+        [aliased_table[foreign_key].eq(parent_table[reflection.options[:primary_key] || parent.primary_key])]
+      end
+    when :belongs_to
+      [aliased_table[options[:primary_key] || reflection.klass.primary_key].eq(parent_table[options[:foreign_key] || reflection.primary_key_name])]
+    end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Awesome. But the rest of the function now breaks the assumption
+that its only going to return that it will return an array of
+length 2 (lines 2209-2225):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;  unless klass.descends_from_active_record?
+    sti_column = aliased_table[klass.inheritance_column]
+    sti_condition = sti_column.eq(klass.sti_name)
+    klass.descendants.each {|subclass| sti_condition = sti_condition.or(sti_column.eq(subclass.sti_name)) }
+
+    @join &amp;lt;&amp;lt; sti_condition
+  end
+
+
+  [through_reflection, reflection].each do |ref|
+    if ref &amp;amp;&amp;amp; ref.options[:conditions]
+      @join &amp;lt;&amp;lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+    end
+  end
+
+  @join
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;If the reflection has conditions or if the underlying klass is
+an STI you now have 3 or more items in your array. In the example I
+am using we would have three:&lt;br&gt;
+1. the Arel AST nodes for the recipes to taggings table&lt;br&gt;
+2. the Arel AST nodes for the foreign key of taggings to tags&lt;br&gt;
+3. the condition clauses checking the context type of the
+tag.&lt;br&gt;&lt;/p&gt;
+&lt;p&gt;Now look back at ActiveRecord::QueryMethods#build_joins
+(lib/active_record/relation/query_methods.rb:235-243).&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;to_join = []
+join_dependency.join_associations.each do |association|
+  if (association_relation = association.relation).is_a?(Array)
+    to_join &amp;lt;&amp;lt; [association_relation.first, association.join_type, association.association_join.first]
+    to_join &amp;lt;&amp;lt; [association_relation.last, association.join_type, association.association_join.last]
+  else
+    to_join &amp;lt;&amp;lt; [association_relation, association.join_type, association.association_join]
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Yup its totally going to drop the middle condition. So we need
+to patch
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+to only return an array of length two (since its grouping the joins
+for each relationship in an array). I'm just not sure what else
+this is going to break.&lt;/p&gt;
+&lt;h2&gt;Dirty Nasty Issue 2 - What's with the double single
+quotes?&lt;/h2&gt;
+&lt;p&gt;Recall that the generated SQL had this little snippet &lt;code&gt;LEFT
+OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course''&lt;/code&gt;.
+Why is it doing this? Well the problem turns out to be
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+again. Re-examine this snippet
+(activerecord/lib/active_record/associations.rb:218-223)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;[through_reflection, reflection].each do |ref|
+  if ref &amp;amp;&amp;amp; ref.options[:conditions]
+     @join &amp;lt;&amp;lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;The #sanitize_sql (which is delegated to the active_record)
+returns a sql string. That is its not passing ARel AST nodes but
+actual SQL. That might not seem like much of an issue until you
+realize that ARel will treat this a string value, NOT a sql
+expression. We have to look at the ARel code to see what happens (I
+am using the 2.0.6 gem as reference). Let's look at how ARel's
+ToSql visitor handles the ON node
+(lib/arel/visitors/to_sql.rb:190-192):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def visit_Arel_Nodes_On o
+  &quot;ON #{visit o.expr}&quot;
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Now remember that
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+set one the condition here to be a string. That means &lt;code&gt;o.expr
+# =&amp;gt; &quot;\&quot;tags\&quot;.\&quot;content_type\&quot; = 'course'&quot;. Well look what
+happens next (lib/arel/visitors/to_sql.rb:278):&lt;/code&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def visit_String o; quote(o, @last_column) end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;It's going to quote the string as if its a String value to be
+passed into the database, not the actual sql to be run
+(lib/arel/visitors/to_sql.rb:294-296)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def quote value, column = nil
+  @connection.quote value, column
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;And sure enough when we trace this down in activerecord we find
+(lib/active_record/connection_adapters/abstract/quoting.rb:40-42)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def quote_string(s)
+  s.gsub(/\\/, '\&amp;amp;\&amp;amp;').gsub(/'/, &quot;''&quot;) # ' (for ruby-mode)
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Wow. At least we know where the issue is. The solution seems to
+be to patch
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+so that it does not just give a string, but actual ARel ast nodes.
+But its going to require some work.&lt;/p&gt;
+&lt;h1&gt;Patches&lt;/h1&gt;
+&lt;p&gt;I am currently working on the patches for this issue, but it may
+take me a while to test. Not to mention that I currently do not
+have MySQL or PostgreSQL installed on my mac and I've already spent
+way too much time tracking this down. But I will give it my best
+shot and hopefully whoever can check as needed. I'll post patches
+as soon as I have them. I am working off the Rails 3-0-stable
+branch.&lt;/p&gt;
+&lt;h1&gt;Side Note&lt;/h1&gt;
+&lt;p&gt;I checked out 'master' of activerecord, and its gone through a
+major rewrite. I am not sure if the rewrite addressed this issue,
+but once I complete my patches for the 3.0 line I can port the
+tests over to double check&lt;/p&gt;&lt;/div&gt;</original-body-html>
+  <versions type="array">
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body># Summary #
+
+When an association with conditions is chained together with additional conditions using Relations, ActiveRecord and Arel shifts the association's conditions from the `WHERE` clause to the `ON` clause. But in doing so it drops the foreign key relationship and improperly quotes conditions. Quick example:
+
+@@@ ruby
+   Post.includes(:special_tags).where(:user_id =&gt; 10).all
+@@@
+
+will result in the following SQL (using sqlite3):
+
+@@@ sql
+  SELECT &quot;posts&quot;.&quot;id&quot; as t0_r0, &quot;posts&quot;.&quot;title&quot; AS t0_r0, &quot;user_id&quot; AS t0_r1, &quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;post_id&quot; AS t1_r1, &quot;tags&quot;.&quot;name&quot; AS t1_r2, &quot;tags&quot;.&quot;context_type&quot; AS t1_r3
+  FROM &quot;posts&quot; 
+  LEFT OUTER JOIN &quot;taggings&quot; ON &quot;posts&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;post_id&quot; 
+  LEFT OUTER JOIN &quot;tags&quot; ON &quot;tags&quot;.&quot;name&quot; = ''special''
+  WHERE &quot;posts&quot;.&quot;id&quot; = 10
+@@@
+
+There are two issues with the second `LEFT OUTER JOIN` statement. First its missing the foreign key relationship condition `&quot;taggings&quot;.&quot;tag_id&quot; = &quot;tags&quot;.&quot;id&quot;`. Second it's improperly double quoting (two single quotes on each side) the word &quot;special&quot; with `&quot;tags&quot;.&quot;name&quot; = ''special''`
+
+# Recreating the issue #
+
+This is a modified version of our code at work where we originally discovered the issue.
+
+Schema:
+
+    create_table &quot;recipes&quot;, :force =&gt; true do |t|
+      t.string   &quot;name&quot;    
+    end
+    create_table &quot;taggings&quot;, :force =&gt; true do |t|
+      t.integer  &quot;taggable_id&quot;
+      t.string   &quot;taggable_type&quot;
+      t.integer  &quot;position&quot;
+      t.integer  &quot;tag_id&quot;
+      t.datetime &quot;created_at&quot;
+      t.datetime &quot;updated_at&quot;
+    end
+    create_table &quot;tags&quot;, :force =&gt; true do |t|
+      t.string   &quot;name&quot;
+      t.string   &quot;context_type&quot;
+      t.datetime &quot;created_at&quot;
+      t.datetime &quot;updated_at&quot;
+    end
+
+
+models:
+
+    class Recipe &lt; ActiveRecord::Base
+      has_many :taggings, :as =&gt; :taggable, :dependent =&gt; :destroy
+      has_many :courses, :through =&gt; :taggings, :source =&gt; :tag, :conditions =&gt; {:tags =&gt; {:context_type =&gt;  'course'}}
+      scope :ordered_by_course, includes(:courses).where(:taggings =&gt; {:position =&gt; 0}).order(&quot;UPPER(tags.name) ASC&quot;).order(&quot;UPPER(recipes.name) ASC&quot;)
+    end
+    
+    class Tagging &lt; ActiveRecord::Base
+      belongs_to :taggable, :polymorphic =&gt; true
+      belongs_to :tag
+      
+      before_create do
+        self.position = self.taggable.send(self.tag.context_type.to_s.pluralize).count + 1
+      end
+    end
+
+    class Tag &lt; ActiveRecord::Base
+      has_many :taggings, :dependent =&gt; :destroy
+
+      class &lt;&lt; self
+	    [&quot;course&quot;, &quot;main_ingredient&quot;, &quot;cuisine&quot;, &quot;occasion&quot;, &quot;convenience&quot;, &quot;cooking_method&quot;].each do |context|
+	      define_method context.pluralize do
+	        where(&quot;tags.context_type = '#{context}'&quot;)
+	      end
+	    end
+	  end
+
+    end
+
+Create some dummy data with IRB:
+
+    recipe = Recipe.create!(:name =&gt; &quot;foo&quot;)
+    tag = Tag.create!(:name =&gt; &quot;Main Dish&quot;, :context_type =&gt; &quot;course&quot;)
+    recipe.courses &lt;&lt; tag
+
+Now using IRB and do a normal load of the association:
+
+    recipe = Recipe.first
+    recipe.courses # =&gt; [#&lt;Tag id: 1, name: &quot;Main Dish&quot;, context_type: &quot;course&quot;, created_at: &quot;2010-11-19 17:04:14&quot;, updated_at: &quot;2010-11-19 17:04:14&quot;&gt;]
+
+SQL in the log:
+     SELECT &quot;tags&quot;.* FROM &quot;tags&quot; INNER JOIN &quot;taggings&quot; ON &quot;tags&quot;.id = &quot;taggings&quot;.tag_id WHERE ((&quot;taggings&quot;.taggable_id = 1) AND (&quot;taggings&quot;.taggable_type = 'Recipe') AND ((&quot;tags&quot;.&quot;context_type&quot; = 'course')))
+
+Back to IRB now lets try the scope:
+    recipes = Recipe.ordered_by_course
+    recipes.first.courses # =&gt; []
+    
+That's wrong check the SQL in the log:
+    SELECT &quot;recipes&quot;.&quot;id&quot; AS t0_r0, &quot;recipes&quot;.&quot;name&quot; AS t0_r1,&quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;name&quot; AS t1_r1, &quot;tags&quot;.&quot;context_type&quot; AS t1_r2, &quot;tags&quot;.&quot;created_at&quot; AS t1_r3, &quot;tags&quot;.&quot;updated_at&quot; AS t1_r4 
+    FROM &quot;recipes&quot; 
+    LEFT OUTER JOIN &quot;taggings&quot; ON &quot;recipes&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;taggable_id&quot; AND &quot;taggings&quot;.&quot;taggable_type&quot; = 'Recipe' 
+    LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course'' 
+    WHERE (recipes.deleted_at IS NULL) AND (&quot;taggings&quot;.&quot;position&quot; = 1) 
+    ORDER BY UPPER(tags.name) ASC, UPPER(recipes.name) ASC
+
+Wow this is a bit of an issue.
+
+# The Two Nasty Issues #
+
+## Dirty Nasty Issue 1 - Where did the foreign keys go? ##
+
+The first problem is within ActiveRecord::QueryMethods#build_joins and ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join. ActiveRecord::QueryMethods#build_joins is responsible for building the joins for the query (lib/active_record/relation/query_methods.rb:215). Check out this snippet here at line 235-243
+
+    to_join = []
+    join_dependency.join_associations.each do |association|
+      if (association_relation = association.relation).is_a?(Array)
+        to_join &lt;&lt; [association_relation.first, association.join_type, association.association_join.first]
+        to_join &lt;&lt; [association_relation.last, association.join_type, association.association_join.last]
+      else
+        to_join &lt;&lt; [association_relation, association.join_type, association.association_join]
+      end
+    end
+
+Essentially if the association relation is an array (array of ARel Nodes) we are dealing some type of `has_many :through` relationship. And this snippet assumes that there are only two items in the array (the first should be all the joins for the recipes to taggings and the secound should be for the taggings to tags). 
+
+But now take a look at ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join (in the rails 3-0-stable branch that would be activerecord/lib/active_record/associations.rb:2135). The first part of the function (lines 2136-2207) will set @join to be an array of two length:
+	def association_join
+		return @join if @join
+
+		aliased_table = Arel::Table.new(table_name, :as      =&gt; @aliased_table_name,
+		                                            :engine  =&gt; arel_engine,
+		                                            :columns =&gt; klass.columns)
+
+		parent_table = Arel::Table.new(parent.table_name, :as      =&gt; parent.aliased_table_name,
+		                                                  :engine  =&gt; arel_engine,
+		                                                  :columns =&gt; parent.active_record.columns)
+
+		@join = case reflection.macro
+		when :has_and_belongs_to_many
+		  join_table = Arel::Table.new(options[:join_table], :as =&gt; aliased_join_table_name, :engine =&gt; arel_engine)
+		  fk = options[:foreign_key] || reflection.active_record.to_s.foreign_key
+		  klass_fk = options[:association_foreign_key] || klass.to_s.foreign_key
+
+		  [
+		    join_table[fk].eq(parent_table[reflection.active_record.primary_key]),
+		    aliased_table[klass.primary_key].eq(join_table[klass_fk])
+		  ]
+		when :has_many, :has_one
+		  if reflection.options[:through]
+		    join_table = Arel::Table.new(through_reflection.klass.table_name, :as =&gt; aliased_join_table_name, :engine =&gt; arel_engine)
+		    jt_foreign_key = jt_as_extra = jt_source_extra = jt_sti_extra = nil
+		    first_key = second_key = as_extra = nil
+
+		    if through_reflection.options[:as] # has_many :through against a polymorphic join
+		      jt_foreign_key = through_reflection.options[:as].to_s + '_id'
+		      jt_as_extra = join_table[through_reflection.options[:as].to_s + '_type'].eq(parent.active_record.base_class.name)
+		    else
+		      jt_foreign_key = through_reflection.primary_key_name
+		    end
+
+		    case source_reflection.macro
+		    when :has_many
+		      if source_reflection.options[:as]
+		        first_key   = &quot;#{source_reflection.options[:as]}_id&quot;
+		        second_key  = options[:foreign_key] || primary_key
+		        as_extra    = aliased_table[&quot;#{source_reflection.options[:as]}_type&quot;].eq(source_reflection.active_record.base_class.name)
+		      else
+		        first_key   = through_reflection.klass.base_class.to_s.foreign_key
+		        second_key  = options[:foreign_key] || primary_key
+		      end
+
+		      unless through_reflection.klass.descends_from_active_record?
+		        jt_sti_extra = join_table[through_reflection.active_record.inheritance_column].eq(through_reflection.klass.sti_name)
+		      end
+		    when :belongs_to
+		      first_key = primary_key
+		      if reflection.options[:source_type]
+		        second_key = source_reflection.association_foreign_key
+		        jt_source_extra = join_table[reflection.source_reflection.options[:foreign_type]].eq(reflection.options[:source_type])
+		      else
+		        second_key = source_reflection.primary_key_name
+		      end
+		    end
+
+		    [
+		      [parent_table[parent.primary_key].eq(join_table[jt_foreign_key]), jt_as_extra, jt_source_extra, jt_sti_extra].reject{|x| x.blank? },
+		      aliased_table[first_key].eq(join_table[second_key])
+		    ]
+		  elsif reflection.options[:as]
+		    id_rel = aliased_table[&quot;#{reflection.options[:as]}_id&quot;].eq(parent_table[parent.primary_key])
+		    type_rel = aliased_table[&quot;#{reflection.options[:as]}_type&quot;].eq(parent.active_record.base_class.name)
+		    [id_rel, type_rel]
+		  else
+		    foreign_key = options[:foreign_key] || reflection.active_record.name.foreign_key
+		    [aliased_table[foreign_key].eq(parent_table[reflection.options[:primary_key] || parent.primary_key])]
+		  end
+		when :belongs_to
+		  [aliased_table[options[:primary_key] || reflection.klass.primary_key].eq(parent_table[options[:foreign_key] || reflection.primary_key_name])]
+		end
+
+Awesome. But the rest of the function now breaks the assumption that its only going to return that it will return an array of length 2 (lines 2209-2225):
+
+	  unless klass.descends_from_active_record?
+	    sti_column = aliased_table[klass.inheritance_column]
+	    sti_condition = sti_column.eq(klass.sti_name)
+	    klass.descendants.each {|subclass| sti_condition = sti_condition.or(sti_column.eq(subclass.sti_name)) }
+
+	    @join &lt;&lt; sti_condition
+	  end
+
+
+	  [through_reflection, reflection].each do |ref|
+	    if ref &amp;&amp; ref.options[:conditions]
+	      @join &lt;&lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+	    end
+	  end
+
+	  @join
+	end
+
+If the reflection has conditions or if the underlying klass is an STI you now have 3 or more items in your array. In the example I am using we would have three: 
+1. the Arel AST nodes for the recipes to taggings table
+2. the Arel AST nodes for the foreign key of taggings to tags
+3. the condition clauses checking the context type of the tag.  
+
+Now look back at  ActiveRecord::QueryMethods#build_joins (lib/active_record/relation/query_methods.rb:235-243).
+
+    to_join = []
+    join_dependency.join_associations.each do |association|
+      if (association_relation = association.relation).is_a?(Array)
+        to_join &lt;&lt; [association_relation.first, association.join_type, association.association_join.first]
+        to_join &lt;&lt; [association_relation.last, association.join_type, association.association_join.last]
+      else
+        to_join &lt;&lt; [association_relation, association.join_type, association.association_join]
+      end
+    end
+
+Yup its totally going to drop the middle condition. So we need to patch ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join to only return an array of length two (since its grouping the joins for each relationship in an array).  I'm just not sure what else this is going to break.
+
+## Dirty Nasty Issue 2 - What's with the double single quotes? ##
+
+Recall that the generated SQL had this little snippet `LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course''`. Why is it doing this? Well the problem turns out to be ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join again. Re-examine this snippet (activerecord/lib/active_record/associations.rb:218-223)
+
+    [through_reflection, reflection].each do |ref|
+      if ref &amp;&amp; ref.options[:conditions]
+         @join &lt;&lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+      end
+    end
+
+The #sanitize_sql (which is delegated to the active_record) returns a sql string. That is its not passing ARel AST nodes but actual SQL. That might not seem like much of an issue until you realize that ARel will treat this a string value, NOT a sql expression.  We have to look at the ARel code to see what happens (I am using the 2.0.6 gem as reference). Let's look at how ARel's ToSql visitor handles the ON node (lib/arel/visitors/to_sql.rb:190-192):
+
+    def visit_Arel_Nodes_On o
+      &quot;ON #{visit o.expr}&quot;
+    end
+Now remember that ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join set one the condition here to be a string. That means `o.expr # =&gt; &quot;\&quot;tags\&quot;.\&quot;content_type\&quot; = 'course'&quot;. Well look what happens next (lib/arel/visitors/to_sql.rb:278):
+
+    def visit_String o; quote(o, @last_column) end
+
+It's going to quote the string as if its a String value to be passed into the database, not the actual sql to be run (lib/arel/visitors/to_sql.rb:294-296)
+
+    def quote value, column = nil
+      @connection.quote value, column
+    end
+
+And sure enough when we trace this down in activerecord we find (lib/active_record/connection_adapters/abstract/quoting.rb:40-42)
+
+    def quote_string(s)
+      s.gsub(/\\/, '\&amp;\&amp;').gsub(/'/, &quot;''&quot;) # ' (for ruby-mode)
+    end
+
+Wow. At least we know where the issue is. The solution seems to be to patch ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join so that it does not just give a string, but actual ARel ast nodes. But its going to require some work.
+
+# Patches #
+I am currently working on the patches for this issue, but it may take me a while to test. Not to mention that I currently do not have MySQL or PostgreSQL installed on my mac and I've already spent way too much time tracking this down. But I will give it my best shot and hopefully whoever can check as needed. I'll post patches as soon as I have them. I am working off the Rails 3-0-stable branch.
+
+# Side Note #
+I checked out 'master' of activerecord, and its gone through a major rewrite. I am not sure if the rewrite addressed this issue, but once I complete my patches for the 3.0 line I can port the tests over to double check</body>
+      <body-html>&lt;div&gt;&lt;h1&gt;Summary&lt;/h1&gt;
+&lt;p&gt;When an association with conditions is chained together with
+additional conditions using Relations, ActiveRecord and Arel shifts
+the association's conditions from the &lt;code&gt;WHERE&lt;/code&gt; clause to
+the &lt;code&gt;ON&lt;/code&gt; clause. But in doing so it drops the foreign
+key relationship and improperly quotes conditions. Quick
+example:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=
+&quot;ruby&quot;&gt;   Post.includes(:special_tags).where(:user_id =&amp;gt; 10).all&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;will result in the following SQL (using sqlite3):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=
+&quot;sql&quot;&gt;  SELECT &quot;posts&quot;.&quot;id&quot; as t0_r0, &quot;posts&quot;.&quot;title&quot; AS t0_r0, &quot;user_id&quot; AS t0_r1, &quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;post_id&quot; AS t1_r1, &quot;tags&quot;.&quot;name&quot; AS t1_r2, &quot;tags&quot;.&quot;context_type&quot; AS t1_r3
+  FROM &quot;posts&quot; 
+  LEFT OUTER JOIN &quot;taggings&quot; ON &quot;posts&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;post_id&quot; 
+  LEFT OUTER JOIN &quot;tags&quot; ON &quot;tags&quot;.&quot;name&quot; = ''special''
+  WHERE &quot;posts&quot;.&quot;id&quot; = 10&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;There are two issues with the second &lt;code&gt;LEFT OUTER
+JOIN&lt;/code&gt; statement. First its missing the foreign key
+relationship condition &lt;code&gt;&quot;taggings&quot;.&quot;tag_id&quot; =
+&quot;tags&quot;.&quot;id&quot;&lt;/code&gt;. Second it's improperly double quoting (two
+single quotes on each side) the word &quot;special&quot; with
+&lt;code&gt;&quot;tags&quot;.&quot;name&quot; = ''special''&lt;/code&gt;&lt;/p&gt;
+&lt;h1&gt;Recreating the issue&lt;/h1&gt;
+&lt;p&gt;This is a modified version of our code at work where we
+originally discovered the issue.&lt;/p&gt;
+&lt;p&gt;Schema:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;create_table &quot;recipes&quot;, :force =&amp;gt; true do |t|
+  t.string   &quot;name&quot;    
+end
+create_table &quot;taggings&quot;, :force =&amp;gt; true do |t|
+  t.integer  &quot;taggable_id&quot;
+  t.string   &quot;taggable_type&quot;
+  t.integer  &quot;position&quot;
+  t.integer  &quot;tag_id&quot;
+  t.datetime &quot;created_at&quot;
+  t.datetime &quot;updated_at&quot;
+end
+create_table &quot;tags&quot;, :force =&amp;gt; true do |t|
+  t.string   &quot;name&quot;
+  t.string   &quot;context_type&quot;
+  t.datetime &quot;created_at&quot;
+  t.datetime &quot;updated_at&quot;
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;models:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;class Recipe &amp;lt; ActiveRecord::Base
+  has_many :taggings, :as =&amp;gt; :taggable, :dependent =&amp;gt; :destroy
+  has_many :courses, :through =&amp;gt; :taggings, :source =&amp;gt; :tag, :conditions =&amp;gt; {:tags =&amp;gt; {:context_type =&amp;gt;  'course'}}
+  scope :ordered_by_course, includes(:courses).where(:taggings =&amp;gt; {:position =&amp;gt; 0}).order(&quot;UPPER(tags.name) ASC&quot;).order(&quot;UPPER(recipes.name) ASC&quot;)
+end
+
+class Tagging &amp;lt; ActiveRecord::Base
+  belongs_to :taggable, :polymorphic =&amp;gt; true
+  belongs_to :tag
+
+  before_create do
+    self.position = self.taggable.send(self.tag.context_type.to_s.pluralize).count + 1
+  end
+end
+
+class Tag &amp;lt; ActiveRecord::Base
+  has_many :taggings, :dependent =&amp;gt; :destroy
+
+  class &amp;lt;&amp;lt; self
+    [&quot;course&quot;, &quot;main_ingredient&quot;, &quot;cuisine&quot;, &quot;occasion&quot;, &quot;convenience&quot;, &quot;cooking_method&quot;].each do |context|
+      define_method context.pluralize do
+        where(&quot;tags.context_type = '#{context}'&quot;)
+      end
+    end
+  end
+
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Create some dummy data with IRB:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;recipe = Recipe.create!(:name =&amp;gt; &quot;foo&quot;)
+tag = Tag.create!(:name =&amp;gt; &quot;Main Dish&quot;, :context_type =&amp;gt; &quot;course&quot;)
+recipe.courses &amp;lt;&amp;lt; tag&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Now using IRB and do a normal load of the association:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;recipe = Recipe.first
+recipe.courses # =&amp;gt; [#&amp;lt;Tag id: 1, name: &quot;Main Dish&quot;, context_type: &quot;course&quot;, created_at: &quot;2010-11-19 17:04:14&quot;, updated_at: &quot;2010-11-19 17:04:14&quot;&amp;gt;]&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;SQL in the log:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt; SELECT &quot;tags&quot;.* FROM &quot;tags&quot; INNER JOIN &quot;taggings&quot; ON &quot;tags&quot;.id = &quot;taggings&quot;.tag_id WHERE ((&quot;taggings&quot;.taggable_id = 1) AND (&quot;taggings&quot;.taggable_type = 'Recipe') AND ((&quot;tags&quot;.&quot;context_type&quot; = 'course')))&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Back to IRB now lets try the scope:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;recipes = Recipe.ordered_by_course
+recipes.first.courses # =&amp;gt; []&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;That's wrong check the SQL in the log:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;SELECT &quot;recipes&quot;.&quot;id&quot; AS t0_r0, &quot;recipes&quot;.&quot;name&quot; AS t0_r1,&quot;tags&quot;.&quot;id&quot; AS t1_r0, &quot;tags&quot;.&quot;name&quot; AS t1_r1, &quot;tags&quot;.&quot;context_type&quot; AS t1_r2, &quot;tags&quot;.&quot;created_at&quot; AS t1_r3, &quot;tags&quot;.&quot;updated_at&quot; AS t1_r4
+FROM &quot;recipes&quot; 
+LEFT OUTER JOIN &quot;taggings&quot; ON &quot;recipes&quot;.&quot;id&quot; = &quot;taggings&quot;.&quot;taggable_id&quot; AND &quot;taggings&quot;.&quot;taggable_type&quot; = 'Recipe' 
+LEFT OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course'' 
+WHERE (recipes.deleted_at IS NULL) AND (&quot;taggings&quot;.&quot;position&quot; = 1) 
+ORDER BY UPPER(tags.name) ASC, UPPER(recipes.name) ASC&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Wow this is a bit of an issue.&lt;/p&gt;
+&lt;h1&gt;The Two Nasty Issues&lt;/h1&gt;
+&lt;h2&gt;Dirty Nasty Issue 1 - Where did the foreign keys go?&lt;/h2&gt;
+&lt;p&gt;The first problem is within
+ActiveRecord::QueryMethods#build_joins and
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join.
+ActiveRecord::QueryMethods#build_joins is responsible for building
+the joins for the query
+(lib/active_record/relation/query_methods.rb:215). Check out this
+snippet here at line 235-243&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;to_join = []
+join_dependency.join_associations.each do |association|
+  if (association_relation = association.relation).is_a?(Array)
+    to_join &amp;lt;&amp;lt; [association_relation.first, association.join_type, association.association_join.first]
+    to_join &amp;lt;&amp;lt; [association_relation.last, association.join_type, association.association_join.last]
+  else
+    to_join &amp;lt;&amp;lt; [association_relation, association.join_type, association.association_join]
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Essentially if the association relation is an array (array of
+ARel Nodes) we are dealing some type of &lt;code&gt;has_many
+:through&lt;/code&gt; relationship. And this snippet assumes that there
+are only two items in the array (the first should be all the joins
+for the recipes to taggings and the secound should be for the
+taggings to tags).&lt;/p&gt;
+&lt;p&gt;But now take a look at
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+(in the rails 3-0-stable branch that would be
+activerecord/lib/active_record/associations.rb:2135). The first
+part of the function (lines 2136-2207) will set @join to be an
+array of two length:&lt;br&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def association_join
+    return @join if @join
+
+    aliased_table = Arel::Table.new(table_name, :as      =&amp;gt; @aliased_table_name,
+                                                :engine  =&amp;gt; arel_engine,
+                                                :columns =&amp;gt; klass.columns)
+
+    parent_table = Arel::Table.new(parent.table_name, :as      =&amp;gt; parent.aliased_table_name,
+                                                      :engine  =&amp;gt; arel_engine,
+                                                      :columns =&amp;gt; parent.active_record.columns)
+
+    @join = case reflection.macro
+    when :has_and_belongs_to_many
+      join_table = Arel::Table.new(options[:join_table], :as =&amp;gt; aliased_join_table_name, :engine =&amp;gt; arel_engine)
+      fk = options[:foreign_key] || reflection.active_record.to_s.foreign_key
+      klass_fk = options[:association_foreign_key] || klass.to_s.foreign_key
+
+      [
+        join_table[fk].eq(parent_table[reflection.active_record.primary_key]),
+        aliased_table[klass.primary_key].eq(join_table[klass_fk])
+      ]
+    when :has_many, :has_one
+      if reflection.options[:through]
+        join_table = Arel::Table.new(through_reflection.klass.table_name, :as =&amp;gt; aliased_join_table_name, :engine =&amp;gt; arel_engine)
+        jt_foreign_key = jt_as_extra = jt_source_extra = jt_sti_extra = nil
+        first_key = second_key = as_extra = nil
+
+        if through_reflection.options[:as] # has_many :through against a polymorphic join
+          jt_foreign_key = through_reflection.options[:as].to_s + '_id'
+          jt_as_extra = join_table[through_reflection.options[:as].to_s + '_type'].eq(parent.active_record.base_class.name)
+        else
+          jt_foreign_key = through_reflection.primary_key_name
+        end
+
+        case source_reflection.macro
+        when :has_many
+          if source_reflection.options[:as]
+            first_key   = &quot;#{source_reflection.options[:as]}_id&quot;
+            second_key  = options[:foreign_key] || primary_key
+            as_extra    = aliased_table[&quot;#{source_reflection.options[:as]}_type&quot;].eq(source_reflection.active_record.base_class.name)
+          else
+            first_key   = through_reflection.klass.base_class.to_s.foreign_key
+            second_key  = options[:foreign_key] || primary_key
+          end
+
+          unless through_reflection.klass.descends_from_active_record?
+            jt_sti_extra = join_table[through_reflection.active_record.inheritance_column].eq(through_reflection.klass.sti_name)
+          end
+        when :belongs_to
+          first_key = primary_key
+          if reflection.options[:source_type]
+            second_key = source_reflection.association_foreign_key
+            jt_source_extra = join_table[reflection.source_reflection.options[:foreign_type]].eq(reflection.options[:source_type])
+          else
+            second_key = source_reflection.primary_key_name
+          end
+        end
+
+        [
+          [parent_table[parent.primary_key].eq(join_table[jt_foreign_key]), jt_as_extra, jt_source_extra, jt_sti_extra].reject{|x| x.blank? },
+          aliased_table[first_key].eq(join_table[second_key])
+        ]
+      elsif reflection.options[:as]
+        id_rel = aliased_table[&quot;#{reflection.options[:as]}_id&quot;].eq(parent_table[parent.primary_key])
+        type_rel = aliased_table[&quot;#{reflection.options[:as]}_type&quot;].eq(parent.active_record.base_class.name)
+        [id_rel, type_rel]
+      else
+        foreign_key = options[:foreign_key] || reflection.active_record.name.foreign_key
+        [aliased_table[foreign_key].eq(parent_table[reflection.options[:primary_key] || parent.primary_key])]
+      end
+    when :belongs_to
+      [aliased_table[options[:primary_key] || reflection.klass.primary_key].eq(parent_table[options[:foreign_key] || reflection.primary_key_name])]
+    end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Awesome. But the rest of the function now breaks the assumption
+that its only going to return that it will return an array of
+length 2 (lines 2209-2225):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;  unless klass.descends_from_active_record?
+    sti_column = aliased_table[klass.inheritance_column]
+    sti_condition = sti_column.eq(klass.sti_name)
+    klass.descendants.each {|subclass| sti_condition = sti_condition.or(sti_column.eq(subclass.sti_name)) }
+
+    @join &amp;lt;&amp;lt; sti_condition
+  end
+
+
+  [through_reflection, reflection].each do |ref|
+    if ref &amp;amp;&amp;amp; ref.options[:conditions]
+      @join &amp;lt;&amp;lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+    end
+  end
+
+  @join
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;If the reflection has conditions or if the underlying klass is
+an STI you now have 3 or more items in your array. In the example I
+am using we would have three:&lt;br&gt;
+1. the Arel AST nodes for the recipes to taggings table&lt;br&gt;
+2. the Arel AST nodes for the foreign key of taggings to tags&lt;br&gt;
+3. the condition clauses checking the context type of the
+tag.&lt;br&gt;&lt;/p&gt;
+&lt;p&gt;Now look back at ActiveRecord::QueryMethods#build_joins
+(lib/active_record/relation/query_methods.rb:235-243).&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;to_join = []
+join_dependency.join_associations.each do |association|
+  if (association_relation = association.relation).is_a?(Array)
+    to_join &amp;lt;&amp;lt; [association_relation.first, association.join_type, association.association_join.first]
+    to_join &amp;lt;&amp;lt; [association_relation.last, association.join_type, association.association_join.last]
+  else
+    to_join &amp;lt;&amp;lt; [association_relation, association.join_type, association.association_join]
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Yup its totally going to drop the middle condition. So we need
+to patch
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+to only return an array of length two (since its grouping the joins
+for each relationship in an array). I'm just not sure what else
+this is going to break.&lt;/p&gt;
+&lt;h2&gt;Dirty Nasty Issue 2 - What's with the double single
+quotes?&lt;/h2&gt;
+&lt;p&gt;Recall that the generated SQL had this little snippet &lt;code&gt;LEFT
+OUTER JOIN &quot;tags&quot; ON '&quot;tags&quot;.&quot;context_type&quot; = ''course''&lt;/code&gt;.
+Why is it doing this? Well the problem turns out to be
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+again. Re-examine this snippet
+(activerecord/lib/active_record/associations.rb:218-223)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;[through_reflection, reflection].each do |ref|
+  if ref &amp;amp;&amp;amp; ref.options[:conditions]
+     @join &amp;lt;&amp;lt; interpolate_sql(sanitize_sql(ref.options[:conditions], aliased_table_name))
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;The #sanitize_sql (which is delegated to the active_record)
+returns a sql string. That is its not passing ARel AST nodes but
+actual SQL. That might not seem like much of an issue until you
+realize that ARel will treat this a string value, NOT a sql
+expression. We have to look at the ARel code to see what happens (I
+am using the 2.0.6 gem as reference). Let's look at how ARel's
+ToSql visitor handles the ON node
+(lib/arel/visitors/to_sql.rb:190-192):&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def visit_Arel_Nodes_On o
+  &quot;ON #{visit o.expr}&quot;
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Now remember that
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+set one the condition here to be a string. That means &lt;code&gt;o.expr
+# =&amp;gt; &quot;\&quot;tags\&quot;.\&quot;content_type\&quot; = 'course'&quot;. Well look what
+happens next (lib/arel/visitors/to_sql.rb:278):&lt;/code&gt;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def visit_String o; quote(o, @last_column) end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;It's going to quote the string as if its a String value to be
+passed into the database, not the actual sql to be run
+(lib/arel/visitors/to_sql.rb:294-296)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def quote value, column = nil
+  @connection.quote value, column
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;And sure enough when we trace this down in activerecord we find
+(lib/active_record/connection_adapters/abstract/quoting.rb:40-42)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def quote_string(s)
+  s.gsub(/\\/, '\&amp;amp;\&amp;amp;').gsub(/'/, &quot;''&quot;) # ' (for ruby-mode)
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Wow. At least we know where the issue is. The solution seems to
+be to patch
+ActiveRecord::Associations::ClassMethods::JoinDependency::JoinAssociation#association_join
+so that it does not just give a string, but actual ARel ast nodes.
+But its going to require some work.&lt;/p&gt;
+&lt;h1&gt;Patches&lt;/h1&gt;
+&lt;p&gt;I am currently working on the patches for this issue, but it may
+take me a while to test. Not to mention that I currently do not
+have MySQL or PostgreSQL installed on my mac and I've already spent
+way too much time tracking this down. But I will give it my best
+shot and hopefully whoever can check as needed. I'll post patches
+as soon as I have them. I am working off the Rails 3-0-stable
+branch.&lt;/p&gt;
+&lt;h1&gt;Side Note&lt;/h1&gt;
+&lt;p&gt;I checked out 'master' of activerecord, and its gone through a
+major rewrite. I am not sure if the rewrite addressed this issue,
+but once I complete my patches for the 3.0 line I can port the
+tests over to double check&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-12-22T22:01:58+00:00</created-at>
+      <creator-id type="integer">129994</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">6211</number>
+      <permalink>rails-303-eager-loading-associations-with-additional-conditions-causes-the-on-statement-to-be-improperly-constructed</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag nil="true"></tag>
+      <title>Rails 3.0.3 Eager Loading associations with additional conditions causes the ON statement to be improperly constructed</title>
+      <updated-at type="datetime">2010-12-22T22:03:10+00:00</updated-at>
+      <user-id type="integer">129994</user-id>
+      <version type="integer">1</version>
+      <user-name>Orion Delwaterman</user-name>
+      <creator-name>Orion Delwaterman</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/6211</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>This issue has been automatically marked as stale because it has not been commented on for at least three months.
+
+The resources of the Rails core team are limited, and so we are asking for your help. If you can still reproduce this error on the 3-0-stable branch or on master, please reply with all of the information you have about it and add &quot;[state:open]&quot; to your comment. This will reopen the ticket for review. Likewise, if you feel that this is a very important feature for Rails to include, please reply with your explanation so we can consider it.
+
+Thank you for all your contributions, and we hope you will understand this step to focus our efforts where they are most helpful.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;This issue has been automatically marked as stale because it has
+not been commented on for at least three months.&lt;/p&gt;
+&lt;p&gt;The resources of the Rails core team are limited, and so we are
+asking for your help. If you can still reproduce this error on the
+3-0-stable branch or on master, please reply with all of the
+information you have about it and add &quot;[state:open]&quot; to your
+comment. This will reopen the ticket for review. Likewise, if you
+feel that this is a very important feature for Rails to include,
+please reply with your explanation so we can consider it.&lt;/p&gt;
+&lt;p&gt;Thank you for all your contributions, and we hope you will
+understand this step to focus our efforts where they are most
+helpful.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2011-03-23T00:00:09+00:00</created-at>
+      <creator-id type="integer">129994</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: new
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">6211</number>
+      <permalink>rails-303-eager-loading-associations-with-additional-conditions-causes-the-on-statement-to-be-improperly-constructed</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>open</state>
+      <tag nil="true"></tag>
+      <title>Rails 3.0.3 Eager Loading associations with additional conditions causes the ON statement to be improperly constructed</title>
+      <updated-at type="datetime">2011-03-23T00:00:29+00:00</updated-at>
+      <user-id type="integer">136779</user-id>
+      <version type="integer">2</version>
+      <user-name>rails</user-name>
+      <creator-name>Orion Delwaterman</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/6211</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body nil="true"></body>
+      <body-html nil="true"></body-html>
+      <closed type="boolean">true</closed>
+      <created-at type="datetime">2011-03-23T00:00:10+00:00</created-at>
+      <creator-id type="integer">129994</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: open
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">6211</number>
+      <permalink>rails-303-eager-loading-associations-with-additional-conditions-causes-the-on-statement-to-be-improperly-constructed</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>stale</state>
+      <tag nil="true"></tag>
+      <title>Rails 3.0.3 Eager Loading associations with additional conditions causes the ON statement to be improperly constructed</title>
+      <updated-at type="datetime">2011-03-23T00:00:36+00:00</updated-at>
+      <user-id type="integer">136779</user-id>
+      <version type="integer">3</version>
+      <user-name>rails</user-name>
+      <creator-name>Orion Delwaterman</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/6211</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>I am having the same issue where i have a model that has a has_many association.  When using 'includes' and 'where' when looking for a column through another table it seems as though the foreign_key is nil. 
+
+@@@ ruby
+ruby-1.9.2-p136 :001 &gt; User.includes('products').where(&quot;products.name LIKE ?&quot;, &quot;%futura-profileidentity%&quot; ).all
+NoMethodError: undefined method `eq' for nil:NilClass
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activesupport-3.0.5/lib/active_support/whiny_nil.rb:48:in `method_missing'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/associations.rb:2208:in `association_join'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:260:in `block in build_joins'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:255:in `each'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:255:in `build_joins'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:177:in `build_arel'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:150:in `arel'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation.rb:64:in `to_a'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/finder_methods.rb:189:in `find_with_associations'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation.rb:64:in `to_a'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/finder_methods.rb:143:in `all'
+	from (irb):1
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/railties-3.0.5/lib/rails/commands/console.rb:44:in `start'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/railties-3.0.5/lib/rails/commands/console.rb:8:in `start'
+	from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/railties-3.0.5/lib/rails/commands.rb:23:in `&lt;top (required)&gt;'
+	from script/rails:6:in `require'
+	from script/rails:6:in `&lt;main&gt;'ruby-1.9.2-p136 :002 &gt; 
+@@@
+
+This is happening in ruby 1.8.7, 1.9.2 and rails 3.0.3, 3.0.5 in all combinations.
+
+Thanks,
+Jarrett
+
+[state:open]</body>
+      <body-html>&lt;div&gt;&lt;p&gt;I am having the same issue where i have a model that has a
+has_many association. When using 'includes' and 'where' when
+looking for a column through another table it seems as though the
+foreign_key is nil.&lt;/p&gt;
+&lt;pre&gt;
+&lt;code class=
+&quot;ruby&quot;&gt;ruby-1.9.2-p136 :001 &amp;gt; User.includes('products').where(&quot;products.name LIKE ?&quot;, &quot;%futura-profileidentity%&quot; ).all
+NoMethodError: undefined method `eq' for nil:NilClass
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activesupport-3.0.5/lib/active_support/whiny_nil.rb:48:in `method_missing'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/associations.rb:2208:in `association_join'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:260:in `block in build_joins'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:255:in `each'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:255:in `build_joins'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:177:in `build_arel'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/query_methods.rb:150:in `arel'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation.rb:64:in `to_a'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/finder_methods.rb:189:in `find_with_associations'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation.rb:64:in `to_a'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/activerecord-3.0.5/lib/active_record/relation/finder_methods.rb:143:in `all'
+    from (irb):1
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/railties-3.0.5/lib/rails/commands/console.rb:44:in `start'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/railties-3.0.5/lib/rails/commands/console.rb:8:in `start'
+    from /Users/cyberpunk/.rvm/gems/ruby-1.9.2-p136/gems/railties-3.0.5/lib/rails/commands.rb:23:in `&amp;lt;top (required)&amp;gt;'
+    from script/rails:6:in `require'
+    from script/rails:6:in `&amp;lt;main&amp;gt;'ruby-1.9.2-p136 :002 &amp;gt;&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;This is happening in ruby 1.8.7, 1.9.2 and rails 3.0.3, 3.0.5 in
+all combinations.&lt;/p&gt;
+&lt;p&gt;Thanks,&lt;br&gt;
+Jarrett&lt;/p&gt;
+&lt;p&gt;[state:open]&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2011-03-23T06:28:28+00:00</created-at>
+      <creator-id type="integer">129994</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: stale
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">6211</number>
+      <permalink>rails-303-eager-loading-associations-with-additional-conditions-causes-the-on-statement-to-be-improperly-constructed</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>open</state>
+      <tag nil="true"></tag>
+      <title>Rails 3.0.3 Eager Loading associations with additional conditions causes the ON statement to be improperly constructed</title>
+      <updated-at type="datetime">2011-03-23T06:28:37+00:00</updated-at>
+      <user-id type="integer">140599</user-id>
+      <version type="integer">4</version>
+      <user-name>Jarrett Irons</user-name>
+      <creator-name>Orion Delwaterman</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/6211</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+  </versions>
+</ticket>

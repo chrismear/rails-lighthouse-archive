@@ -1,0 +1,1609 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ticket>
+  <assigned-user-id type="integer">85</assigned-user-id>
+  <attachments-count type="integer">2</attachments-count>
+  <closed type="boolean">true</closed>
+  <created-at type="datetime">2010-08-17T16:22:24+01:00</created-at>
+  <creator-id type="integer">53891</creator-id>
+  <milestone-due-on type="datetime" nil="true"></milestone-due-on>
+  <milestone-id type="integer" nil="true"></milestone-id>
+  <number type="integer">5086</number>
+  <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+  <priority type="integer">0</priority>
+  <project-id type="integer">8994</project-id>
+  <raw-data type="binary" nil="true" encoding="base64"></raw-data>
+  <state>stale</state>
+  <tag>abstract_storerb activerecord active_record_storerb cookie session</tag>
+  <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+  <updated-at type="datetime">2011-02-02T17:02:21+00:00</updated-at>
+  <user-id type="integer">40272</user-id>
+  <version type="integer">11</version>
+  <user-name>Santiago Pastorino</user-name>
+  <creator-name>Chris Wilson</creator-name>
+  <assigned-user-name>Jeremy Kemper</assigned-user-name>
+  <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+  <priority-name nil="true"></priority-name>
+  <original-body>reset_session doesn't work properly when using ActiveRecordStore, or probably other derivatives of ActionController::Session::AbstractStore.
+
+After a reset_session, when ActionController::Session::AbstractStore generates a new session ID and tries to set the session cookie, it creates an invalid header instead.
+
+Here are the relevant extracts from a debugging session with rails 2.3.8 and rack 1.1.0, although the problem was not fixed by upgrading rack to 1.2.1.
+
+ [127, 136] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    130        	puts &quot;abstract_store env session before call = #{env[ENV_SESSION_KEY]}&quot;
+    131          response = @app.call(env)
+ =&gt; 132        	puts &quot;abstract_store env session after call = #{env[ENV_SESSION_KEY]}&quot;
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:132
+ puts &quot;abstract_store env session after call = #{env[ENV_SESSION_KEY]}&quot;
+ 
+ (rdb:1) p env['rack.session.options']
+ {:path=&gt;&quot;/&quot;, :httponly=&gt;true, :domain=&gt;nil, :expire_after=&gt;nil, :cookie_only=&gt;true, :key=&gt;&quot;_session_id&quot;, :secret=&gt;&quot;35be19722d70e3549c1707b87baf40f341585c32bd2c9c63cfb19902675647d6b94f07fdcc2b1dc77a5a62a03851bb1e2ccdff7722e6718b367a064a034ade01&quot;, :secure=&gt;false}
+
+There is no saved session ID in `rack.session.options` at this point...
+
+ [135, 144] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    135          options = env[ENV_SESSION_OPTIONS_KEY]
+    136  
+    137          if !session_data.is_a?(AbstractStore::SessionHash) || session_data.send(:loaded?) || options[:expire_after]
+    138            session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) &amp;&amp; !session_data.send(:loaded?)
+    139  
+ =&gt; 140            sid = options[:id] || generate_sid
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:140
+ sid = options[:id] || generate_sid
+ 
+ (rdb:1) p options[:id]
+ nil
+
+So we generate a new session ID here, and save it in the database, then generate a new cookie:
+
+ [141, 150] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+    145  
+ =&gt; 146            cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+    147            cookie &lt;&lt; &quot;; domain=#{options[:domain]}&quot; if options[:domain]
+    148            cookie &lt;&lt; &quot;; path=#{options[:path]}&quot; if options[:path]
+    149            if options[:expire_after]
+    150              expiry = Time.now + options[:expire_after]
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:146 
+ cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+ 
+ (rdb:1) p @key
+ &quot;_session_id&quot;
+ 
+ (rdb:1) p sid
+ &quot;fca9862ce0015820072e85ae40262159&quot;
+
+Stepped through the rest of the cookie creation to the header setting:
+
+ [153, 162] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    153            cookie &lt;&lt; &quot;; Secure&quot; if options[:secure]
+    154            cookie &lt;&lt; &quot;; HttpOnly&quot; if options[:httponly]
+    155  
+    156            headers = response[1]
+    157            unless headers[SET_COOKIE].blank?
+ =&gt; 158              headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:158
+ headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ [&quot;auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;]
+ 
+Whoops, it's an Array, not a String, but we're about to append a new element:
+ 
+ [159, 168] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+    163  
+ =&gt; 164          response
+    165        end
+    166  
+    167        private
+    168          def generate_sid
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164
+ response
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ [&quot;auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;, &quot;\n_session_id=fca9862ce0015820072e85ae40262159; path=/; HttpOnly&quot;]
+ 
+Boom, this is not a good cookie. Note the newline before _session_id, which will prevent it being used as the actual session ID, so the next request resumes the old session rather than starting a new one, meaning that reset_session had no effect.
+
+We are now here:
+ 
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/query_cache.rb:34:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:9:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:28:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb:361:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/failsafe.rb:26:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `synchronize'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/dispatcher.rb:110:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:47:in `_call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:35:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:316:in `process'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:197:in `get'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `get'
+ - test/functional/about_controller_test.rb:329:in `test_about_page'
+ - test/functional/about_controller_test.rb:284:in `each'
+ - test/functional/about_controller_test.rb:284:in `test_about_page'
+ - test/functional/about_controller_test.rb:281:in `each'
+ - test/functional/about_controller_test.rb:281:in `test_about_page'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `run'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:661:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnermediator.rb:46:in `run_suite'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:67:in `start_mediator'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:41:in `start'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnerutilities.rb:29:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:216:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:12:in `run'
+ - /usr/lib/ruby/1.8/test/unit.rb:278
+ - test/functional/about_controller_test.rb:280
+
+I think this is the same problem as #4743, but was not resolved along with #4743 because AbstractStore contains a (still broken) copy of the old header code that CookieStore used to have, which assumed that headers were Strings. It seems from #4743 that Rack recently changed headers to be Arrays instead of Strings, and all the duplicated copies of this header handling code in Rails need to be updated.
+
+I think you could demonstrate this bug by applying the same tests written for #4743 (from [85b6d79d8a17fdef667770e31b44ac6647f8b584]) with an ActiveRecordStore session store instead of CookieStore, but I don't know how to run these tests or how to switch session store on the fly.
+
+I was able to resolve the problem with the following patch:
+
+ --- /usr/lib/ruby/gems/1.8/gems/actionpack-2.3.8/lib/action_controller/session/abstract_store.rb	2010-07-11 15:55:36.000000000 +0200
+ +++ vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb	2010-07-11 16:04:43.000000000 +0200
+ @@ -150,11 +154,8 @@
+            cookie &lt;&lt; &quot;; HttpOnly&quot; if options[:httponly]
+  
+            headers = response[1]
+ -          unless headers[SET_COOKIE].blank?
+ -            headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+ -          else
+ -            headers[SET_COOKIE] = cookie
+ -          end
+ +					headers[SET_COOKIE] = [] if headers[SET_COOKIE].blank?
+ +					headers[SET_COOKIE] &lt;&lt; cookie
+          end
+  
+          response</original-body>
+  <latest-body>reset_session doesn't work properly when using ActiveRecordStore, or probably other derivatives of ActionController::Session::AbstractStore.
+
+After a reset_session, when ActionController::Session::AbstractStore generates a new session ID and tries to set the session cookie, it creates an invalid header instead.
+
+Here are the relevant extracts from a debugging session with rails 2.3.8 and rack 1.1.0, although the problem was not fixed by upgrading rack to 1.2.1.
+
+ [127, 136] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    130        	puts &quot;abstract_store env session before call = #{env[ENV_SESSION_KEY]}&quot;
+    131          response = @app.call(env)
+ =&gt; 132        	puts &quot;abstract_store env session after call = #{env[ENV_SESSION_KEY]}&quot;
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:132
+ puts &quot;abstract_store env session after call = #{env[ENV_SESSION_KEY]}&quot;
+ 
+ (rdb:1) p env['rack.session.options']
+ {:path=&gt;&quot;/&quot;, :httponly=&gt;true, :domain=&gt;nil, :expire_after=&gt;nil, :cookie_only=&gt;true, :key=&gt;&quot;_session_id&quot;, :secret=&gt;&quot;35be19722d70e3549c1707b87baf40f341585c32bd2c9c63cfb19902675647d6b94f07fdcc2b1dc77a5a62a03851bb1e2ccdff7722e6718b367a064a034ade01&quot;, :secure=&gt;false}
+
+There is no saved session ID in `rack.session.options` at this point...
+
+ [135, 144] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    135          options = env[ENV_SESSION_OPTIONS_KEY]
+    136  
+    137          if !session_data.is_a?(AbstractStore::SessionHash) || session_data.send(:loaded?) || options[:expire_after]
+    138            session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) &amp;&amp; !session_data.send(:loaded?)
+    139  
+ =&gt; 140            sid = options[:id] || generate_sid
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:140
+ sid = options[:id] || generate_sid
+ 
+ (rdb:1) p options[:id]
+ nil
+
+So we generate a new session ID here, and save it in the database, then generate a new cookie:
+
+ [141, 150] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+    145  
+ =&gt; 146            cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+    147            cookie &lt;&lt; &quot;; domain=#{options[:domain]}&quot; if options[:domain]
+    148            cookie &lt;&lt; &quot;; path=#{options[:path]}&quot; if options[:path]
+    149            if options[:expire_after]
+    150              expiry = Time.now + options[:expire_after]
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:146 
+ cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+ 
+ (rdb:1) p @key
+ &quot;_session_id&quot;
+ 
+ (rdb:1) p sid
+ &quot;fca9862ce0015820072e85ae40262159&quot;
+
+Stepped through the rest of the cookie creation to the header setting:
+
+ [153, 162] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    153            cookie &lt;&lt; &quot;; Secure&quot; if options[:secure]
+    154            cookie &lt;&lt; &quot;; HttpOnly&quot; if options[:httponly]
+    155  
+    156            headers = response[1]
+    157            unless headers[SET_COOKIE].blank?
+ =&gt; 158              headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:158
+ headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ [&quot;auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;]
+ 
+Whoops, it's an Array, not a String, but we're about to append a new element:
+ 
+ [159, 168] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+    163  
+ =&gt; 164          response
+    165        end
+    166  
+    167        private
+    168          def generate_sid
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164
+ response
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ [&quot;auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;, &quot;\n_session_id=fca9862ce0015820072e85ae40262159; path=/; HttpOnly&quot;]
+ 
+Boom, this is not a good cookie. Note the newline before _session_id, which will prevent it being used as the actual session ID, so the next request resumes the old session rather than starting a new one, meaning that reset_session had no effect.
+
+We are now here:
+ 
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/query_cache.rb:34:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:9:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:28:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb:361:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/failsafe.rb:26:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `synchronize'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/dispatcher.rb:110:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:47:in `_call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:35:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:316:in `process'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:197:in `get'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `get'
+ - test/functional/about_controller_test.rb:329:in `test_about_page'
+ - test/functional/about_controller_test.rb:284:in `each'
+ - test/functional/about_controller_test.rb:284:in `test_about_page'
+ - test/functional/about_controller_test.rb:281:in `each'
+ - test/functional/about_controller_test.rb:281:in `test_about_page'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `run'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:661:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnermediator.rb:46:in `run_suite'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:67:in `start_mediator'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:41:in `start'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnerutilities.rb:29:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:216:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:12:in `run'
+ - /usr/lib/ruby/1.8/test/unit.rb:278
+ - test/functional/about_controller_test.rb:280
+
+I think this is the same problem as #4743, but was not resolved along with #4743 because AbstractStore contains a (still broken) copy of the old header code that CookieStore used to have, which assumed that headers were Strings. It seems from #4743 that Rack recently changed headers to be Arrays instead of Strings, and all the duplicated copies of this header handling code in Rails need to be updated.
+
+I think you could demonstrate this bug by applying the same tests written for #4743 (from [85b6d79d8a17fdef667770e31b44ac6647f8b584]) with an ActiveRecordStore session store instead of CookieStore, but I don't know how to run these tests or how to switch session store on the fly.
+
+I was able to resolve the problem with the following patch:
+
+ --- /usr/lib/ruby/gems/1.8/gems/actionpack-2.3.8/lib/action_controller/session/abstract_store.rb	2010-07-11 15:55:36.000000000 +0200
+ +++ vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb	2010-07-11 16:04:43.000000000 +0200
+ @@ -150,11 +154,8 @@
+            cookie &lt;&lt; &quot;; HttpOnly&quot; if options[:httponly]
+  
+            headers = response[1]
+ -          unless headers[SET_COOKIE].blank?
+ -            headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+ -          else
+ -            headers[SET_COOKIE] = cookie
+ -          end
+ +					headers[SET_COOKIE] = [] if headers[SET_COOKIE].blank?
+ +					headers[SET_COOKIE] &lt;&lt; cookie
+          end
+  
+          response</latest-body>
+  <original-body-html>&lt;div&gt;&lt;p&gt;reset_session doesn't work properly when using
+ActiveRecordStore, or probably other derivatives of
+ActionController::Session::AbstractStore.&lt;/p&gt;
+&lt;p&gt;After a reset_session, when
+ActionController::Session::AbstractStore generates a new session ID
+and tries to set the session cookie, it creates an invalid header
+instead.&lt;/p&gt;
+&lt;p&gt;Here are the relevant extracts from a debugging session with
+rails 2.3.8 and rack 1.1.0, although the problem was not fixed by
+upgrading rack to 1.2.1.&lt;/p&gt;
+&lt;p&gt;[127, 136] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;130         puts &quot;abstract_store env session before call = #{env[ENV_SESSION_KEY]}&quot;
+131          response = @app.call(env)&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 132 puts &quot;abstract_store env session after call =
+#{env[ENV_SESSION_KEY]}&quot;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:132
+puts &quot;abstract_store env session after call =
+#{env[ENV_SESSION_KEY]}&quot;&lt;/p&gt;
+&lt;p&gt;(rdb:1) p env['rack.session.options'] {:path=&amp;gt;&quot;/&quot;,
+:httponly=&amp;gt;true, :domain=&amp;gt;nil, :expire_after=&amp;gt;nil,
+:cookie_only=&amp;gt;true, :key=&amp;gt;&quot;_session_id&quot;,
+:secret=&amp;gt;&quot;35be19722d70e3549c1707b87baf40f341585c32bd2c9c63cfb19902675647d6b94f07fdcc2b1dc77a5a62a03851bb1e2ccdff7722e6718b367a064a034ade01&quot;,
+:secure=&amp;gt;false}&lt;/p&gt;
+&lt;p&gt;There is no saved session ID in
+&lt;code&gt;rack.session.options&lt;/code&gt; at this point...&lt;/p&gt;
+&lt;p&gt;[135, 144] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;135          options = env[ENV_SESSION_OPTIONS_KEY]
+136  
+137          if !session_data.is_a?(AbstractStore::SessionHash) || session_data.send(:loaded?) || options[:expire_after]
+138            session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) &amp;amp;&amp;amp; !session_data.send(:loaded?)
+139&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 140 sid = options[:id] || generate_sid&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;141
+142            unless set_session(env, sid, session_data.to_hash)
+143              return response
+144            end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:140
+sid = options[:id] || generate_sid&lt;/p&gt;
+&lt;p&gt;(rdb:1) p options[:id] nil&lt;/p&gt;
+&lt;p&gt;So we generate a new session ID here, and save it in the
+database, then generate a new cookie:&lt;/p&gt;
+&lt;p&gt;[141, 150] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;141
+142            unless set_session(env, sid, session_data.to_hash)
+143              return response
+144            end
+145&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 146 cookie = Rack::Utils.escape(@key) + '=' +
+Rack::Utils.escape(sid)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;147            cookie &amp;lt;&amp;lt; &quot;; domain=#{options[:domain]}&quot; if options[:domain]
+148            cookie &amp;lt;&amp;lt; &quot;; path=#{options[:path]}&quot; if options[:path]
+149            if options[:expire_after]
+150              expiry = Time.now + options[:expire_after]&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:146
+cookie = Rack::Utils.escape(@key) + '=' +
+Rack::Utils.escape(sid)&lt;/p&gt;
+&lt;p&gt;(rdb:1) p @key &quot;_session_id&quot;&lt;/p&gt;
+&lt;p&gt;(rdb:1) p sid &quot;fca9862ce0015820072e85ae40262159&quot;&lt;/p&gt;
+&lt;p&gt;Stepped through the rest of the cookie creation to the header
+setting:&lt;/p&gt;
+&lt;p&gt;[153, 162] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;153            cookie &amp;lt;&amp;lt; &quot;; Secure&quot; if options[:secure]
+154            cookie &amp;lt;&amp;lt; &quot;; HttpOnly&quot; if options[:httponly]
+155  
+156            headers = response[1]
+157            unless headers[SET_COOKIE].blank?&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 158 headers[SET_COOKIE] &amp;lt;&amp;lt; &quot;\n#{cookie}&quot;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;159            else
+160              headers[SET_COOKIE] = cookie
+161            end
+162          end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:158
+headers[SET_COOKIE] &amp;lt;&amp;lt; &quot;\n#{cookie}&quot;&lt;/p&gt;
+&lt;p&gt;(rdb:1) p headers[SET_COOKIE] [&quot;auth_token=; path=/;
+expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;]&lt;/p&gt;
+&lt;p&gt;Whoops, it's an Array, not a String, but we're about to append a
+new element:&lt;br&gt;&lt;/p&gt;
+&lt;p&gt;[159, 168] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;159            else
+160              headers[SET_COOKIE] = cookie
+161            end
+162          end
+163&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 164 response&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;165        end
+166  
+167        private
+168          def generate_sid&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164
+response&lt;/p&gt;
+&lt;p&gt;(rdb:1) p headers[SET_COOKIE] [&quot;auth_token=; path=/;
+expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;,
+&quot;\n_session_id=fca9862ce0015820072e85ae40262159; path=/;
+HttpOnly&quot;]&lt;/p&gt;
+&lt;p&gt;Boom, this is not a good cookie. Note the newline before
+_session_id, which will prevent it being used as the actual session
+ID, so the next request resumes the old session rather than
+starting a new one, meaning that reset_session had no effect.&lt;/p&gt;
+&lt;p&gt;We are now here:&lt;br&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/query_cache.rb:34:in
+&lt;code&gt;cache'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:9:in
+&lt;code&gt;cache'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:28:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb:361:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/failsafe.rb:26:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in
+&lt;code&gt;synchronize'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/dispatcher.rb:110:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:47:in
+&lt;code&gt;_call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:35:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:316:in
+&lt;code&gt;process'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:197:in
+&lt;code&gt;get'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in
+&lt;code&gt;__send__'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in
+&lt;code&gt;get'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:329:in
+&lt;code&gt;test_about_page'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:284:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:284:in
+&lt;code&gt;test_about_page'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:281:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:281:in
+&lt;code&gt;test_about_page'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in
+&lt;code&gt;__send__'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:661:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/testrunnermediator.rb:46:in
+&lt;code&gt;run_suite'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:67:in
+&lt;code&gt;start_mediator'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:41:in
+&lt;code&gt;start'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/testrunnerutilities.rb:29:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/autorunner.rb:216:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/autorunner.rb:12:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit.rb:278&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:280&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;I think this is the same problem as &lt;a href=
+&quot;/projects/8994/tickets/4743&quot; title=&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt;, but
+was not resolved along with &lt;a href=&quot;/projects/8994/tickets/4743&quot;
+title=&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt; because AbstractStore contains a
+(still broken) copy of the old header code that CookieStore used to
+have, which assumed that headers were Strings. It seems from
+&lt;a href=&quot;/projects/8994/tickets/4743&quot; title=
+&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt; that Rack recently changed headers to be
+Arrays instead of Strings, and all the duplicated copies of this
+header handling code in Rails need to be updated.&lt;/p&gt;
+&lt;p&gt;I think you could demonstrate this bug by applying the same
+tests written for &lt;a href=&quot;/projects/8994/tickets/4743&quot; title=
+&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt; (from &lt;a href=
+&quot;/projects/8994/changesets/85b6d79d8a17fdef667770e31b44ac6647f8b584&quot;
+title=
+&quot;Changeset [85b6d79d8a17fdef667770e31b44ac6647f8b584]&quot;&gt;[85b6d79d8a17fdef667770e31b44ac6647f8b584]&lt;/a&gt;)
+with an ActiveRecordStore session store instead of CookieStore, but
+I don't know how to run these tests or how to switch session store
+on the fly.&lt;/p&gt;
+&lt;p&gt;I was able to resolve the problem with the following patch:&lt;/p&gt;
+&lt;p&gt;---
+/usr/lib/ruby/gems/1.8/gems/actionpack-2.3.8/lib/action_controller/session/abstract_store.rb
+2010-07-11 15:55:36.000000000 +0200 +++
+vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+2010-07-11 16:04:43.000000000 +0200 @@ -150,11 +154,8 @@&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;        cookie &amp;lt;&amp;lt; &quot;; HttpOnly&quot; if options[:httponly]
+
+        headers = response[1]&lt;/code&gt;
+&lt;/pre&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;    unless headers[SET_COOKIE].blank?&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;      headers[SET_COOKIE] &amp;lt;&amp;lt; &quot;\n#{cookie}&quot;&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;    else&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;      headers[SET_COOKIE] = cookie&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;    end&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;            headers[SET_COOKIE] = [] if headers[SET_COOKIE].blank?&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;            headers[SET_COOKIE] &amp;lt;&amp;lt; cookie
+  end
+
+  response&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;/ul&gt;&lt;/div&gt;</original-body-html>
+  <versions type="array">
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>reset_session doesn't work properly when using ActiveRecordStore, or probably other derivatives of ActionController::Session::AbstractStore.
+
+After a reset_session, when ActionController::Session::AbstractStore generates a new session ID and tries to set the session cookie, it creates an invalid header instead.
+
+Here are the relevant extracts from a debugging session with rails 2.3.8 and rack 1.1.0, although the problem was not fixed by upgrading rack to 1.2.1.
+
+ [127, 136] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    130        	puts &quot;abstract_store env session before call = #{env[ENV_SESSION_KEY]}&quot;
+    131          response = @app.call(env)
+ =&gt; 132        	puts &quot;abstract_store env session after call = #{env[ENV_SESSION_KEY]}&quot;
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:132
+ puts &quot;abstract_store env session after call = #{env[ENV_SESSION_KEY]}&quot;
+ 
+ (rdb:1) p env['rack.session.options']
+ {:path=&gt;&quot;/&quot;, :httponly=&gt;true, :domain=&gt;nil, :expire_after=&gt;nil, :cookie_only=&gt;true, :key=&gt;&quot;_session_id&quot;, :secret=&gt;&quot;35be19722d70e3549c1707b87baf40f341585c32bd2c9c63cfb19902675647d6b94f07fdcc2b1dc77a5a62a03851bb1e2ccdff7722e6718b367a064a034ade01&quot;, :secure=&gt;false}
+
+There is no saved session ID in `rack.session.options` at this point...
+
+ [135, 144] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    135          options = env[ENV_SESSION_OPTIONS_KEY]
+    136  
+    137          if !session_data.is_a?(AbstractStore::SessionHash) || session_data.send(:loaded?) || options[:expire_after]
+    138            session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) &amp;&amp; !session_data.send(:loaded?)
+    139  
+ =&gt; 140            sid = options[:id] || generate_sid
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:140
+ sid = options[:id] || generate_sid
+ 
+ (rdb:1) p options[:id]
+ nil
+
+So we generate a new session ID here, and save it in the database, then generate a new cookie:
+
+ [141, 150] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+    145  
+ =&gt; 146            cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+    147            cookie &lt;&lt; &quot;; domain=#{options[:domain]}&quot; if options[:domain]
+    148            cookie &lt;&lt; &quot;; path=#{options[:path]}&quot; if options[:path]
+    149            if options[:expire_after]
+    150              expiry = Time.now + options[:expire_after]
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:146 
+ cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+ 
+ (rdb:1) p @key
+ &quot;_session_id&quot;
+ 
+ (rdb:1) p sid
+ &quot;fca9862ce0015820072e85ae40262159&quot;
+
+Stepped through the rest of the cookie creation to the header setting:
+
+ [153, 162] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    153            cookie &lt;&lt; &quot;; Secure&quot; if options[:secure]
+    154            cookie &lt;&lt; &quot;; HttpOnly&quot; if options[:httponly]
+    155  
+    156            headers = response[1]
+    157            unless headers[SET_COOKIE].blank?
+ =&gt; 158              headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:158
+ headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ [&quot;auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;]
+ 
+Whoops, it's an Array, not a String, but we're about to append a new element:
+ 
+ [159, 168] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+    163  
+ =&gt; 164          response
+    165        end
+    166  
+    167        private
+    168          def generate_sid
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164
+ response
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ [&quot;auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;, &quot;\n_session_id=fca9862ce0015820072e85ae40262159; path=/; HttpOnly&quot;]
+ 
+Boom, this is not a good cookie. Note the newline before _session_id, which will prevent it being used as the actual session ID, so the next request resumes the old session rather than starting a new one, meaning that reset_session had no effect.
+
+We are now here:
+ 
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/query_cache.rb:34:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:9:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:28:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb:361:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/failsafe.rb:26:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `synchronize'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/dispatcher.rb:110:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:47:in `_call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:35:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:316:in `process'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:197:in `get'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `get'
+ - test/functional/about_controller_test.rb:329:in `test_about_page'
+ - test/functional/about_controller_test.rb:284:in `each'
+ - test/functional/about_controller_test.rb:284:in `test_about_page'
+ - test/functional/about_controller_test.rb:281:in `each'
+ - test/functional/about_controller_test.rb:281:in `test_about_page'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `run'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:661:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnermediator.rb:46:in `run_suite'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:67:in `start_mediator'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:41:in `start'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnerutilities.rb:29:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:216:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:12:in `run'
+ - /usr/lib/ruby/1.8/test/unit.rb:278
+ - test/functional/about_controller_test.rb:280
+
+I think this is the same problem as #4743, but was not resolved along with #4743 because AbstractStore contains a (still broken) copy of the old header code that CookieStore used to have, which assumed that headers were Strings. It seems from #4743 that Rack recently changed headers to be Arrays instead of Strings, and all the duplicated copies of this header handling code in Rails need to be updated.
+
+I think you could demonstrate this bug by applying the same tests written for #4743 (from [85b6d79d8a17fdef667770e31b44ac6647f8b584]) with an ActiveRecordStore session store instead of CookieStore, but I don't know how to run these tests or how to switch session store on the fly.
+
+I was able to resolve the problem with the following patch:
+
+ --- /usr/lib/ruby/gems/1.8/gems/actionpack-2.3.8/lib/action_controller/session/abstract_store.rb	2010-07-11 15:55:36.000000000 +0200
+ +++ vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb	2010-07-11 16:04:43.000000000 +0200
+ @@ -150,11 +154,8 @@
+            cookie &lt;&lt; &quot;; HttpOnly&quot; if options[:httponly]
+  
+            headers = response[1]
+ -          unless headers[SET_COOKIE].blank?
+ -            headers[SET_COOKIE] &lt;&lt; &quot;\n#{cookie}&quot;
+ -          else
+ -            headers[SET_COOKIE] = cookie
+ -          end
+ +					headers[SET_COOKIE] = [] if headers[SET_COOKIE].blank?
+ +					headers[SET_COOKIE] &lt;&lt; cookie
+          end
+  
+          response</body>
+      <body-html>&lt;div&gt;&lt;p&gt;reset_session doesn't work properly when using
+ActiveRecordStore, or probably other derivatives of
+ActionController::Session::AbstractStore.&lt;/p&gt;
+&lt;p&gt;After a reset_session, when
+ActionController::Session::AbstractStore generates a new session ID
+and tries to set the session cookie, it creates an invalid header
+instead.&lt;/p&gt;
+&lt;p&gt;Here are the relevant extracts from a debugging session with
+rails 2.3.8 and rack 1.1.0, although the problem was not fixed by
+upgrading rack to 1.2.1.&lt;/p&gt;
+&lt;p&gt;[127, 136] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;130         puts &quot;abstract_store env session before call = #{env[ENV_SESSION_KEY]}&quot;
+131          response = @app.call(env)&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 132 puts &quot;abstract_store env session after call =
+#{env[ENV_SESSION_KEY]}&quot;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:132
+puts &quot;abstract_store env session after call =
+#{env[ENV_SESSION_KEY]}&quot;&lt;/p&gt;
+&lt;p&gt;(rdb:1) p env['rack.session.options'] {:path=&amp;gt;&quot;/&quot;,
+:httponly=&amp;gt;true, :domain=&amp;gt;nil, :expire_after=&amp;gt;nil,
+:cookie_only=&amp;gt;true, :key=&amp;gt;&quot;_session_id&quot;,
+:secret=&amp;gt;&quot;35be19722d70e3549c1707b87baf40f341585c32bd2c9c63cfb19902675647d6b94f07fdcc2b1dc77a5a62a03851bb1e2ccdff7722e6718b367a064a034ade01&quot;,
+:secure=&amp;gt;false}&lt;/p&gt;
+&lt;p&gt;There is no saved session ID in
+&lt;code&gt;rack.session.options&lt;/code&gt; at this point...&lt;/p&gt;
+&lt;p&gt;[135, 144] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;135          options = env[ENV_SESSION_OPTIONS_KEY]
+136  
+137          if !session_data.is_a?(AbstractStore::SessionHash) || session_data.send(:loaded?) || options[:expire_after]
+138            session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) &amp;amp;&amp;amp; !session_data.send(:loaded?)
+139&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 140 sid = options[:id] || generate_sid&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;141
+142            unless set_session(env, sid, session_data.to_hash)
+143              return response
+144            end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:140
+sid = options[:id] || generate_sid&lt;/p&gt;
+&lt;p&gt;(rdb:1) p options[:id] nil&lt;/p&gt;
+&lt;p&gt;So we generate a new session ID here, and save it in the
+database, then generate a new cookie:&lt;/p&gt;
+&lt;p&gt;[141, 150] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;141
+142            unless set_session(env, sid, session_data.to_hash)
+143              return response
+144            end
+145&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 146 cookie = Rack::Utils.escape(@key) + '=' +
+Rack::Utils.escape(sid)&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;147            cookie &amp;lt;&amp;lt; &quot;; domain=#{options[:domain]}&quot; if options[:domain]
+148            cookie &amp;lt;&amp;lt; &quot;; path=#{options[:path]}&quot; if options[:path]
+149            if options[:expire_after]
+150              expiry = Time.now + options[:expire_after]&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:146
+cookie = Rack::Utils.escape(@key) + '=' +
+Rack::Utils.escape(sid)&lt;/p&gt;
+&lt;p&gt;(rdb:1) p @key &quot;_session_id&quot;&lt;/p&gt;
+&lt;p&gt;(rdb:1) p sid &quot;fca9862ce0015820072e85ae40262159&quot;&lt;/p&gt;
+&lt;p&gt;Stepped through the rest of the cookie creation to the header
+setting:&lt;/p&gt;
+&lt;p&gt;[153, 162] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;153            cookie &amp;lt;&amp;lt; &quot;; Secure&quot; if options[:secure]
+154            cookie &amp;lt;&amp;lt; &quot;; HttpOnly&quot; if options[:httponly]
+155  
+156            headers = response[1]
+157            unless headers[SET_COOKIE].blank?&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 158 headers[SET_COOKIE] &amp;lt;&amp;lt; &quot;\n#{cookie}&quot;&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;159            else
+160              headers[SET_COOKIE] = cookie
+161            end
+162          end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:158
+headers[SET_COOKIE] &amp;lt;&amp;lt; &quot;\n#{cookie}&quot;&lt;/p&gt;
+&lt;p&gt;(rdb:1) p headers[SET_COOKIE] [&quot;auth_token=; path=/;
+expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;]&lt;/p&gt;
+&lt;p&gt;Whoops, it's an Array, not a String, but we're about to append a
+new element:&lt;br&gt;&lt;/p&gt;
+&lt;p&gt;[159, 168] in
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;159            else
+160              headers[SET_COOKIE] = cookie
+161            end
+162          end
+163&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;=&amp;gt; 164 response&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;165        end
+166  
+167        private
+168          def generate_sid&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164
+response&lt;/p&gt;
+&lt;p&gt;(rdb:1) p headers[SET_COOKIE] [&quot;auth_token=; path=/;
+expires=Thu, 01-Jan-1970 00:00:00 GMT&quot;,
+&quot;\n_session_id=fca9862ce0015820072e85ae40262159; path=/;
+HttpOnly&quot;]&lt;/p&gt;
+&lt;p&gt;Boom, this is not a good cookie. Note the newline before
+_session_id, which will prevent it being used as the actual session
+ID, so the next request resumes the old session rather than
+starting a new one, meaning that reset_session had no effect.&lt;/p&gt;
+&lt;p&gt;We are now here:&lt;br&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/query_cache.rb:34:in
+&lt;code&gt;cache'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:9:in
+&lt;code&gt;cache'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:28:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb:361:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/failsafe.rb:26:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in
+&lt;code&gt;synchronize'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/dispatcher.rb:110:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:47:in
+&lt;code&gt;_call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:35:in
+&lt;code&gt;call'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:316:in
+&lt;code&gt;process'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:197:in
+&lt;code&gt;get'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in
+&lt;code&gt;__send__'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in
+&lt;code&gt;get'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:329:in
+&lt;code&gt;test_about_page'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:284:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:284:in
+&lt;code&gt;test_about_page'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:281:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:281:in
+&lt;code&gt;test_about_page'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in
+&lt;code&gt;__send__'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;
+/home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:661:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;each'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/testrunnermediator.rb:46:in
+&lt;code&gt;run_suite'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:67:in
+&lt;code&gt;start_mediator'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:41:in
+&lt;code&gt;start'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/ui/testrunnerutilities.rb:29:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/autorunner.rb:216:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit/autorunner.rb:12:in
+&lt;code&gt;run'&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;/usr/lib/ruby/1.8/test/unit.rb:278&lt;/li&gt;
+&lt;li&gt;test/functional/about_controller_test.rb:280&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;I think this is the same problem as &lt;a href=
+&quot;/projects/8994/tickets/4743&quot; title=&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt;, but
+was not resolved along with &lt;a href=&quot;/projects/8994/tickets/4743&quot;
+title=&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt; because AbstractStore contains a
+(still broken) copy of the old header code that CookieStore used to
+have, which assumed that headers were Strings. It seems from
+&lt;a href=&quot;/projects/8994/tickets/4743&quot; title=
+&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt; that Rack recently changed headers to be
+Arrays instead of Strings, and all the duplicated copies of this
+header handling code in Rails need to be updated.&lt;/p&gt;
+&lt;p&gt;I think you could demonstrate this bug by applying the same
+tests written for &lt;a href=&quot;/projects/8994/tickets/4743&quot; title=
+&quot;Ticket #4743&quot;&gt;#4743&lt;/a&gt; (from &lt;a href=
+&quot;/projects/8994/changesets/85b6d79d8a17fdef667770e31b44ac6647f8b584&quot;
+title=
+&quot;Changeset [85b6d79d8a17fdef667770e31b44ac6647f8b584]&quot;&gt;[85b6d79d8a17fdef667770e31b44ac6647f8b584]&lt;/a&gt;)
+with an ActiveRecordStore session store instead of CookieStore, but
+I don't know how to run these tests or how to switch session store
+on the fly.&lt;/p&gt;
+&lt;p&gt;I was able to resolve the problem with the following patch:&lt;/p&gt;
+&lt;p&gt;---
+/usr/lib/ruby/gems/1.8/gems/actionpack-2.3.8/lib/action_controller/session/abstract_store.rb
+2010-07-11 15:55:36.000000000 +0200 +++
+vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+2010-07-11 16:04:43.000000000 +0200 @@ -150,11 +154,8 @@&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;        cookie &amp;lt;&amp;lt; &quot;; HttpOnly&quot; if options[:httponly]
+
+        headers = response[1]&lt;/code&gt;
+&lt;/pre&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;    unless headers[SET_COOKIE].blank?&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;      headers[SET_COOKIE] &amp;lt;&amp;lt; &quot;\n#{cookie}&quot;&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;    else&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;      headers[SET_COOKIE] = cookie&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;    end&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;            headers[SET_COOKIE] = [] if headers[SET_COOKIE].blank?&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;li&gt;
+&lt;pre&gt;
+&lt;code&gt;            headers[SET_COOKIE] &amp;lt;&amp;lt; cookie
+  end
+
+  response&lt;/code&gt;
+&lt;/pre&gt;&lt;/li&gt;
+&lt;/ul&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-11T15:41:10+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in raisl 2.3.8 when using ActiveRecordStore for cookies</title>
+      <updated-at type="datetime">2010-07-11T15:41:14+01:00</updated-at>
+      <user-id type="integer">53891</user-id>
+      <version type="integer">1</version>
+      <user-name>Chris Wilson</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body></body>
+      <body-html></body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-11T15:42:38+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- 
+:title: reset_session broken in raisl 2.3.8 when using ActiveRecordStore for cookies
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-07-11T15:42:42+01:00</updated-at>
+      <user-id type="integer">53891</user-id>
+      <version type="integer">2</version>
+      <user-name>Chris Wilson</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body></body>
+      <body-html></body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-11T17:02:00+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-07-11T17:02:02+01:00</updated-at>
+      <user-id type="integer">53891</user-id>
+      <version type="integer">3</version>
+      <user-name>Chris Wilson</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">1</attachments-count>
+      <body>Please note https://rails.lighthouseapp.com/projects/8994/tickets/1957#ticket-1957-16:
+
+&quot;there is a crapload of duplicated code (almost all of the session cookie store and the abstract session store are duplicated code).
+
+I'll look into searching for all of the places where a cookie may be built into an array, which is the real issue.&quot;
+
+But I don't think this was done, and #1957 was closed without it.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;Please note &lt;a href=
+&quot;https://rails.lighthouseapp.com/projects/8994/tickets/1957#ticket-1957-16&quot;&gt;
+https://rails.lighthouseapp.com/projects/8994/tickets/1957#ticket-1...&lt;/a&gt;:&lt;/p&gt;
+&lt;p&gt;&quot;there is a crapload of duplicated code (almost all of the
+session cookie store and the abstract session store are duplicated
+code).&lt;/p&gt;
+&lt;p&gt;I'll look into searching for all of the places where a cookie
+may be built into an array, which is the real issue.&quot;&lt;/p&gt;
+&lt;p&gt;But I don't think this was done, and &lt;a href=
+&quot;/projects/8994/tickets/1957&quot; title=&quot;Ticket #1957&quot;&gt;#1957&lt;/a&gt; was
+closed without it.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-11T17:23:01+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-07-11T17:23:03+01:00</updated-at>
+      <user-id type="integer">53891</user-id>
+      <version type="integer">4</version>
+      <user-name>Chris Wilson</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">1</attachments-count>
+      <body>+1
+
+I'm seeing this same bug, and Chris's patch to abstract_store.rb fixes the issue for me as well.
+
+Sean</body>
+      <body-html>&lt;div&gt;&lt;p&gt;+1&lt;/p&gt;
+&lt;p&gt;I'm seeing this same bug, and Chris's patch to abstract_store.rb
+fixes the issue for me as well.&lt;/p&gt;
+&lt;p&gt;Sean&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-07-30T22:04:47+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-07-30T22:04:51+01:00</updated-at>
+      <user-id type="integer">109676</user-id>
+      <version type="integer">5</version>
+      <user-name>Sean Rhea</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name nil="true"></assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">85</assigned-user-id>
+      <attachments-count type="integer">1</attachments-count>
+      <body>On further inspection, Chris's patch is not quite right.  Attached is an alternate patch using code from Rack 1.1.0.  It's working for me.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;On further inspection, Chris's patch is not quite right.
+Attached is an alternate patch using code from Rack 1.1.0. It's
+working for me.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-08-11T01:15:26+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- 
+:assigned_user: 
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-08-11T01:15:29+01:00</updated-at>
+      <user-id type="integer">109676</user-id>
+      <version type="integer">6</version>
+      <user-name>Sean Rhea</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name>Jeremy Kemper</assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">85</assigned-user-id>
+      <attachments-count type="integer">2</attachments-count>
+      <body>&lt;p&gt;Women in summer would like to become beautiful. Everything can grab other's eyes is their best friends.Products make them beauty and confident is their favourite. Look in the street,you can see many different types of make up to show women's personality.&lt;/p&gt;
+
+&lt;p&gt;Welcome to the shop, the following is our products, free shipping.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Soccer Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Cheap Soccer Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Nike Soccer Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Adidas Soccer Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Nike Soccer Shoes sale&lt;/a&gt;  &lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Adidas Soccer Shoes sale&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;UGG&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;UGGs&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;UGG Boot&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;UGG Boots&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;UGG Boots Sale&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;Cheap UGG Boots&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;UGG Boots Cheap&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;Women UGG boots&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;ugg boots cardy&lt;/a&gt;  &lt;a href=&quot;http://www.uggam.com/&quot;&gt;ugg cardy boots&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Air&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Air Max&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Air Max Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike SB&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Dunk&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Dunk SB&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Dunk SB Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Shox &lt;/a&gt;  &lt;a href=&quot;http://www.nikeca.com/&quot;&gt;Nike Shox Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandou.com/&quot;&gt;Timberland&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandou.com/&quot;&gt;Timberland sale&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandou.com/&quot;&gt;Timberland boots&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandou.com/&quot;&gt;Timberland boots online&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandou.com/&quot;&gt;Timberland on sale&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandou.com/&quot;&gt;New timberland boots&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/&quot;&gt;Women Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/&quot;&gt;Women Bags Sale&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/&quot;&gt;Women Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/&quot;&gt;Women Handbags Sale&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/&quot;&gt;Women New Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/&quot;&gt;Cheap Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/&quot;&gt;Cheap Bags On Sale&lt;/a&gt;  &lt;a href=&quot;http://www.ladysugg.com/&quot;&gt;UGG&lt;/a&gt;  &lt;a href=&quot;http://www.ladysugg.com/&quot;&gt;UGG boots&lt;/a&gt;  &lt;a href=&quot;http://www.ladysugg.com/&quot;&gt;UGG boots sale&lt;/a&gt;  &lt;a href=&quot;http://www.ladysugg.com/&quot;&gt;UGG boots short&lt;/a&gt;  &lt;a href=&quot;http://www.ladysugg.com/&quot;&gt;Short ugg&lt;/a&gt;  &lt;a href=&quot;http://www.ladysugg.com/&quot;&gt;Short ugg boots&lt;/a&gt;  &lt;a href=&quot;http://www.ladysugg.com/&quot;&gt;Ugg boots tall&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/&quot;&gt;New women bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/&quot;&gt;New women bags sale&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/&quot;&gt;New women bags sale online&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/&quot;&gt;Louis Vuitton Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/&quot;&gt;Gucci bags&lt;/a&gt;  &lt;a href=&quot;http://www.nikeou.com/&quot;&gt;Nike&lt;/a&gt;  &lt;a href=&quot;http://www.nikeou.com/&quot;&gt;Nike Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nikeou.com/&quot;&gt;Nike Shoes Sale&lt;/a&gt;  &lt;a href=&quot;http://www.nikeou.com/&quot;&gt;Nike running&lt;/a&gt;  &lt;a href=&quot;http://www.nikeou.com/&quot;&gt;Nike running shoes&lt;/a&gt;  &lt;a href=&quot;http://www.nikeou.com/&quot;&gt;Nike trainers&lt;/a&gt;  &lt;a href=&quot;http://www.nikeou.com/&quot;&gt;Nike trainers shoes&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandca.com/&quot;&gt;Timberland&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandca.com/&quot;&gt;Timberland boots&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandca.com/&quot;&gt;Timberland boots sale&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandca.com/&quot;&gt;Timberland boot&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandca.com/&quot;&gt;Timberland boot sale&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandca.com/&quot;&gt;Timberland boots cheap&lt;/a&gt;  &lt;a href=&quot;http://www.timberlandca.com/&quot;&gt;Men timberlands&lt;/a&gt;  &lt;a href=&quot;http://www.mbt-boot.com/&quot;&gt;MBT&lt;/a&gt;  &lt;a href=&quot;http://www.mbt-boot.com/&quot;&gt;MBT Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.mbt-boot.com/&quot;&gt;MBT Chapa GTX&lt;/a&gt;  &lt;a href=&quot;http://www.mbt-boot.com/&quot;&gt;MBT Men Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.mbt-boot.com/&quot;&gt;MBT Women Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.mbt-boot.com/&quot;&gt;Discount MBT Shoes&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/lv-handbags-c-18.html&quot;&gt;LV Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/gucci-handbags-c-8.html&quot;&gt;Gucci Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/chanel-handbags-c-3.html&quot;&gt;Chanel Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/chloe-handbags-c-4.html&quot;&gt;Chloe Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/dg-handbags-c-5.html&quot;&gt;D&amp;G Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/dior-handbags-c-6.html&quot;&gt;Dior Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/fendi-handbags-c-7.html&quot;&gt;Fendi Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/hermes-handbags-c-9.html&quot;&gt;Hermes Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/jimmy-choo-bags-c-10.html&quot;&gt;Jimmy Choo Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/marc-jacobs-bags-c-11.html&quot;&gt;Marc Jacobs Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/miu-miu-handbags-c-12.html&quot;&gt;Miu Miu Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/mulberry-bags-c-15.html&quot;&gt;Mulberry Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/prada-handbags-c-13.html&quot;&gt;Prada Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/versace-handbags-c-17.html&quot;&gt;Versace Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/yves-saint-laurent-c-14.html&quot;&gt;Yves Saint Laurent&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/balenciaga-bags-c-1.html&quot;&gt;Balenciaga Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagsca.com/burberry-handbags-c-2.html&quot;&gt;Burberry Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/lv-handbags-c-18.html&quot;&gt;LV Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/gucci-handbags-c-8.html&quot;&gt;Gucci Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/chanel-handbags-c-3.html&quot;&gt;Chanel Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/chloe-handbags-c-4.html&quot;&gt;Chloe Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/dg-handbags-c-5.html&quot;&gt;D&amp;G Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/dior-handbags-c-6.html&quot;&gt;Dior Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/fendi-handbags-c-7.html&quot;&gt;Fendi Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/hermes-handbags-c-9.html&quot;&gt;Hermes Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/jimmy-choo-bags-c-10.html&quot;&gt;Jimmy Choo Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/marc-jacobs-bags-c-11.html&quot;&gt;Marc Jacobs Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/miu-miu-handbags-c-12.html&quot;&gt;Miu Miu Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/mulberry-bags-c-15.html&quot;&gt;Mulberry Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/prada-handbags-c-13.html&quot;&gt;Prada Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/versace-handbags-c-17.html&quot;&gt;Versace Handbags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/yves-saint-laurent-c-14.html&quot;&gt;Yves Saint Laurent&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/balenciaga-bags-c-1.html&quot;&gt;Balenciaga Bags&lt;/a&gt;  &lt;a href=&quot;http://www.bagca.com/burberry-handbags-c-2.html&quot;&gt;Burberry Handbags&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;Those who want to become most beautiful in the world should try them. Just ones can make you different. Girls who want to grab your boyfriends's heart is necessary to use them.&lt;/p&gt;</body>
+      <body-html>&lt;div&gt;&lt;p&gt;Women in summer would like to become beautiful. Everything can
+grab other's eyes is their best friends.Products make them beauty
+and confident is their favourite. Look in the street,you can see
+many different types of make up to show women's personality.&lt;/p&gt;
+&lt;p&gt;Welcome to the shop, the following is our products, free
+shipping.&lt;/p&gt;
+&lt;p&gt;&lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Soccer Shoes&lt;/a&gt;
+&lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Cheap Soccer Shoes&lt;/a&gt;
+&lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Nike Soccer Shoes&lt;/a&gt;
+&lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Adidas Soccer Shoes&lt;/a&gt;
+&lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Nike Soccer Shoes
+sale&lt;/a&gt; &lt;a href=&quot;http://www.nike-soccer-shoes.net/&quot;&gt;Adidas Soccer
+Shoes sale&lt;/a&gt; &lt;a href=&quot;http://www.uggam.com/&quot;&gt;UGG&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;UGGs&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;UGG Boot&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;UGG Boots&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;UGG Boots Sale&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;Cheap UGG Boots&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;UGG Boots Cheap&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;Women UGG boots&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;ugg boots cardy&lt;/a&gt; &lt;a href=
+&quot;http://www.uggam.com/&quot;&gt;ugg cardy boots&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Air&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Air Max&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Air Max Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike SB&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Dunk&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Dunk SB&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Dunk SB Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Shox&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeca.com/&quot;&gt;Nike Shox Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandou.com/&quot;&gt;Timberland&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandou.com/&quot;&gt;Timberland sale&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandou.com/&quot;&gt;Timberland boots&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandou.com/&quot;&gt;Timberland boots online&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandou.com/&quot;&gt;Timberland on sale&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandou.com/&quot;&gt;New timberland boots&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/&quot;&gt;Women Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/&quot;&gt;Women Bags Sale&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/&quot;&gt;Women Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/&quot;&gt;Women Handbags Sale&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/&quot;&gt;Women New Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/&quot;&gt;Cheap Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/&quot;&gt;Cheap Bags On Sale&lt;/a&gt; &lt;a href=
+&quot;http://www.ladysugg.com/&quot;&gt;UGG&lt;/a&gt; &lt;a href=
+&quot;http://www.ladysugg.com/&quot;&gt;UGG boots&lt;/a&gt; &lt;a href=
+&quot;http://www.ladysugg.com/&quot;&gt;UGG boots sale&lt;/a&gt; &lt;a href=
+&quot;http://www.ladysugg.com/&quot;&gt;UGG boots short&lt;/a&gt; &lt;a href=
+&quot;http://www.ladysugg.com/&quot;&gt;Short ugg&lt;/a&gt; &lt;a href=
+&quot;http://www.ladysugg.com/&quot;&gt;Short ugg boots&lt;/a&gt; &lt;a href=
+&quot;http://www.ladysugg.com/&quot;&gt;Ugg boots tall&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/&quot;&gt;New women bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/&quot;&gt;New women bags sale&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/&quot;&gt;New women bags sale online&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/&quot;&gt;Louis Vuitton Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/&quot;&gt;Gucci bags&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeou.com/&quot;&gt;Nike&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeou.com/&quot;&gt;Nike Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeou.com/&quot;&gt;Nike Shoes Sale&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeou.com/&quot;&gt;Nike running&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeou.com/&quot;&gt;Nike running shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeou.com/&quot;&gt;Nike trainers&lt;/a&gt; &lt;a href=
+&quot;http://www.nikeou.com/&quot;&gt;Nike trainers shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandca.com/&quot;&gt;Timberland&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandca.com/&quot;&gt;Timberland boots&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandca.com/&quot;&gt;Timberland boots sale&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandca.com/&quot;&gt;Timberland boot&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandca.com/&quot;&gt;Timberland boot sale&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandca.com/&quot;&gt;Timberland boots cheap&lt;/a&gt; &lt;a href=
+&quot;http://www.timberlandca.com/&quot;&gt;Men timberlands&lt;/a&gt; &lt;a href=
+&quot;http://www.mbt-boot.com/&quot;&gt;MBT&lt;/a&gt; &lt;a href=
+&quot;http://www.mbt-boot.com/&quot;&gt;MBT Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.mbt-boot.com/&quot;&gt;MBT Chapa GTX&lt;/a&gt; &lt;a href=
+&quot;http://www.mbt-boot.com/&quot;&gt;MBT Men Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.mbt-boot.com/&quot;&gt;MBT Women Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.mbt-boot.com/&quot;&gt;Discount MBT Shoes&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/lv-handbags-c-18.html&quot;&gt;LV Handbags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagsca.com/gucci-handbags-c-8.html&quot;&gt;Gucci
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/chanel-handbags-c-3.html&quot;&gt;Chanel
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/chloe-handbags-c-4.html&quot;&gt;Chloe Handbags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagsca.com/dg-handbags-c-5.html&quot;&gt;D&amp;amp;G
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/dior-handbags-c-6.html&quot;&gt;Dior Handbags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagsca.com/fendi-handbags-c-7.html&quot;&gt;Fendi
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/hermes-handbags-c-9.html&quot;&gt;Hermes
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/jimmy-choo-bags-c-10.html&quot;&gt;Jimmy Choo
+Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/marc-jacobs-bags-c-11.html&quot;&gt;Marc Jacobs
+Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/miu-miu-handbags-c-12.html&quot;&gt;Miu Miu
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/mulberry-bags-c-15.html&quot;&gt;Mulberry Bags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagsca.com/prada-handbags-c-13.html&quot;&gt;Prada
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/versace-handbags-c-17.html&quot;&gt;Versace
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/yves-saint-laurent-c-14.html&quot;&gt;Yves Saint
+Laurent&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/balenciaga-bags-c-1.html&quot;&gt;Balenciaga
+Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagsca.com/burberry-handbags-c-2.html&quot;&gt;Burberry
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/lv-handbags-c-18.html&quot;&gt;LV Handbags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagca.com/gucci-handbags-c-8.html&quot;&gt;Gucci
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/chanel-handbags-c-3.html&quot;&gt;Chanel Handbags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagca.com/chloe-handbags-c-4.html&quot;&gt;Chloe
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/dg-handbags-c-5.html&quot;&gt;D&amp;amp;G Handbags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagca.com/dior-handbags-c-6.html&quot;&gt;Dior
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/fendi-handbags-c-7.html&quot;&gt;Fendi Handbags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagca.com/hermes-handbags-c-9.html&quot;&gt;Hermes
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/jimmy-choo-bags-c-10.html&quot;&gt;Jimmy Choo
+Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/marc-jacobs-bags-c-11.html&quot;&gt;Marc Jacobs
+Bags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/miu-miu-handbags-c-12.html&quot;&gt;Miu Miu
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/mulberry-bags-c-15.html&quot;&gt;Mulberry Bags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagca.com/prada-handbags-c-13.html&quot;&gt;Prada
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/versace-handbags-c-17.html&quot;&gt;Versace
+Handbags&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/yves-saint-laurent-c-14.html&quot;&gt;Yves Saint
+Laurent&lt;/a&gt; &lt;a href=
+&quot;http://www.bagca.com/balenciaga-bags-c-1.html&quot;&gt;Balenciaga Bags&lt;/a&gt;
+&lt;a href=&quot;http://www.bagca.com/burberry-handbags-c-2.html&quot;&gt;Burberry
+Handbags&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;Those who want to become most beautiful in the world should try
+them. Just ones can make you different. Girls who want to grab your
+boyfriends's heart is necessary to use them.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-08-17T03:30:18+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-08-17T16:21:49+01:00</updated-at>
+      <user-id type="integer">111887</user-id>
+      <version type="integer">7</version>
+      <user-name>quentina</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name>Jeremy Kemper</assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">85</assigned-user-id>
+      <attachments-count type="integer">2</attachments-count>
+      <body>Hello! We had some new MBT shoes in our shop! Such as &lt;a href=&quot;http://www.comfortoes.com/mbt-beach&quot;&gt;mbt-beach&lt;/a&gt; which can help you cool and comfortable; &lt;a href=&quot;http://www.comfortoes.com/mbt-changa&quot;&gt;mbt-changa&lt;/a&gt; is aid you Swiss Masai revolutionary fitness; &lt;a href=&quot;http://www.comfortoes.com/mbt-tunisha &quot;&gt;mbt-tunisha&lt;/a&gt; can help you lose weight, &lt;a href=&quot;http://www.comfortoes.com/mbt-tariki&quot;&gt;mbt-tariki&lt;/a&gt; unique design is good for your health; and the design of &lt;a href=&quot;http://www.comfortoes.com/mbt-shuguli&quot;&gt;mbt-shuguli&lt;/a&gt; is also good for your health etc. You can choose what you like here with you need, our MBT shoes salting very good, so you can rest assured purchase. We look forward to your arrival.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;Hello! We had some new MBT shoes in our shop! Such as &lt;a href=
+&quot;http://www.comfortoes.com/mbt-beach&quot;&gt;mbt-beach&lt;/a&gt; which can help
+you cool and comfortable; &lt;a href=
+&quot;http://www.comfortoes.com/mbt-changa&quot;&gt;mbt-changa&lt;/a&gt; is aid you
+Swiss Masai revolutionary fitness; &lt;a href=
+&quot;http://www.comfortoes.com/mbt-tunisha&quot;&gt;mbt-tunisha&lt;/a&gt; can help
+you lose weight, &lt;a href=
+&quot;http://www.comfortoes.com/mbt-tariki&quot;&gt;mbt-tariki&lt;/a&gt; unique design
+is good for your health; and the design of &lt;a href=
+&quot;http://www.comfortoes.com/mbt-shuguli&quot;&gt;mbt-shuguli&lt;/a&gt; is also
+good for your health etc. You can choose what you like here with
+you need, our MBT shoes salting very good, so you can rest assured
+purchase. We look forward to your arrival.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-08-17T08:31:07+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-08-17T16:22:24+01:00</updated-at>
+      <user-id type="integer">111899</user-id>
+      <version type="integer">8</version>
+      <user-name>vivian</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name>Jeremy Kemper</assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">85</assigned-user-id>
+      <attachments-count type="integer">2</attachments-count>
+      <body>I've also provided a fix for that at https://rails.lighthouseapp.com/projects/8994/tickets/4941-session-is-not-preserved-between-requests-in-integration-tests#ticket-4941-10
+
+that patch utilizes Rack::Utils directly instead of duplicating the code</body>
+      <body-html>&lt;div&gt;&lt;p&gt;I've also provided a fix for that at &lt;a href=
+&quot;https://rails.lighthouseapp.com/projects/8994/tickets/4941-session-is-not-preserved-between-requests-in-integration-tests#ticket-4941-10&quot;&gt;
+https://rails.lighthouseapp.com/projects/8994/tickets/4941-session-...&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;that patch utilizes Rack::Utils directly instead of duplicating
+the code&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-08-26T11:45:02+01:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>abstract_store.rb activerecord active_record_store.rb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2010-08-26T11:45:07+01:00</updated-at>
+      <user-id type="integer">9779</user-id>
+      <version type="integer">9</version>
+      <user-name>Pascal Friederich</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name>Jeremy Kemper</assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">85</assigned-user-id>
+      <attachments-count type="integer">2</attachments-count>
+      <body>This issue has been automatically marked as stale because it has not been commented on for at least three months.
+
+The resources of the Rails core team are limited, and so we are asking for your help. If you can still reproduce this error on the 3-0-stable branch or on master, please reply with all of the information you have about it and add &quot;[state:open]&quot; to your comment. This will reopen the ticket for review. Likewise, if you feel that this is a very important feature for Rails to include, please reply with your explanation so we can consider it.
+
+Thank you for all your contributions, and we hope you will understand this step to focus our efforts where they are most helpful.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;This issue has been automatically marked as stale because it has
+not been commented on for at least three months.&lt;/p&gt;
+&lt;p&gt;The resources of the Rails core team are limited, and so we are
+asking for your help. If you can still reproduce this error on the
+3-0-stable branch or on master, please reply with all of the
+information you have about it and add &quot;[state:open]&quot; to your
+comment. This will reopen the ticket for review. Likewise, if you
+feel that this is a very important feature for Rails to include,
+please reply with your explanation so we can consider it.&lt;/p&gt;
+&lt;p&gt;Thank you for all your contributions, and we hope you will
+understand this step to focus our efforts where they are most
+helpful.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2011-02-02T16:33:28+00:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: new
+:tag: abstract_store.rb activerecord active_record_store.rb cookie session
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>open</state>
+      <tag>abstract_storerb activerecord active_record_storerb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2011-02-02T17:01:44+00:00</updated-at>
+      <user-id type="integer">40272</user-id>
+      <version type="integer">10</version>
+      <user-name>Santiago Pastorino</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name>Jeremy Kemper</assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer">85</assigned-user-id>
+      <attachments-count type="integer">2</attachments-count>
+      <body nil="true"></body>
+      <body-html nil="true"></body-html>
+      <closed type="boolean">true</closed>
+      <created-at type="datetime">2011-02-02T16:33:31+00:00</created-at>
+      <creator-id type="integer">53891</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: open
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5086</number>
+      <permalink>reset_session-broken-in-raisl-238-when-using-activerecordstore-for-cookies</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>stale</state>
+      <tag>abstract_storerb activerecord active_record_storerb cookie session</tag>
+      <title>reset_session broken in rails 2.3.8 when using ActiveRecordStore for sessions</title>
+      <updated-at type="datetime">2011-02-02T17:02:21+00:00</updated-at>
+      <user-id type="integer">40272</user-id>
+      <version type="integer">11</version>
+      <user-name>Santiago Pastorino</user-name>
+      <creator-name>Chris Wilson</creator-name>
+      <assigned-user-name>Jeremy Kemper</assigned-user-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5086</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+  </versions>
+  <attachments type="array">
+    <attachment type="Attachment">
+      <code>f9516b48e311888dc2f1f31b124e99163febbb14</code>
+      <content-type>text/plain</content-type>
+      <created-at type="datetime">2010-07-11T17:02:00+01:00</created-at>
+      <filename>bug-report-5086.txt</filename>
+      <height type="integer" nil="true"></height>
+      <id type="integer">590576</id>
+      <size type="integer">9532</size>
+      <uploader-id type="integer">53891</uploader-id>
+      <width type="integer" nil="true"></width>
+      <url>http://rails.lighthouseapp.com/attachments/590576/bug-report-5086.txt</url>
+    </attachment>
+    <attachment type="Attachment">
+      <code>70b49fd594fedd4f9d4903cc207ad0a65c2377db</code>
+      <content-type>text/plain</content-type>
+      <created-at type="datetime">2010-08-11T01:15:26+01:00</created-at>
+      <filename>0001-fix-set-cookie-for-multiple-cookies.patch</filename>
+      <height type="integer" nil="true"></height>
+      <id type="integer">623111</id>
+      <size type="integer">1419</size>
+      <uploader-id type="integer">109676</uploader-id>
+      <width type="integer" nil="true"></width>
+      <url>http://rails.lighthouseapp.com/attachments/623111/0001-fix-set-cookie-for-multiple-cookies.patch</url>
+    </attachment>
+  </attachments>
+</ticket>

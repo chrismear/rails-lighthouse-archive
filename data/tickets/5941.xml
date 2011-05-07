@@ -1,0 +1,744 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ticket>
+  <assigned-user-id type="integer" nil="true"></assigned-user-id>
+  <attachments-count type="integer">0</attachments-count>
+  <closed type="boolean">true</closed>
+  <created-at type="datetime">2011-02-17T06:48:10+00:00</created-at>
+  <creator-id type="integer">34159</creator-id>
+  <milestone-due-on type="datetime" nil="true"></milestone-due-on>
+  <milestone-id type="integer" nil="true"></milestone-id>
+  <number type="integer">5941</number>
+  <permalink>sqlite3busyexceptions-are-raised-immediately-in-some-cases-despite-setting-sqlite3_busy_timeout</permalink>
+  <priority type="integer">0</priority>
+  <project-id type="integer">8994</project-id>
+  <raw-data type="binary" nil="true" encoding="base64"></raw-data>
+  <state>stale</state>
+  <tag>&quot;active record&quot; sqlite3 sqlite3_adapter transactions</tag>
+  <title> SQLite3::BusyExceptions are raised immediately in some cases, despite setting sqlite3_busy_timeout()</title>
+  <updated-at type="datetime">2011-02-17T06:48:10+00:00</updated-at>
+  <user-id type="integer">40272</user-id>
+  <version type="integer">4</version>
+  <user-name>Santiago Pastorino</user-name>
+  <creator-name>The Doctor What</creator-name>
+  <url>http://rails.lighthouseapp.com/projects/8994/tickets/5941</url>
+  <priority-name nil="true"></priority-name>
+  <original-body>This is complicated, so bear with me.
+
+We had a setup using multiple thin servers using SQLite3 as the
+backend. We were getting occasional `SQLite3::BusyExceptions`. We found
+a possible solution on StackOverflow[1]: set the timeout in
+`database.yaml`, which calls `sqlite3_busy_timeout()`.
+
+This solution doesn't work if you use
+`ActiveRecord::Base.transaction()` to group your writes into a single
+transaction. You still get immediate `SQLite3::BusyExceptions`.
+
+Spending way to much time reading about how SQLite works, we
+discovered that this is the correct behavior[2][3].  This is what we
+figured out was happening:
+
+    SQL&gt; begin transaction;
+    # The transaction has begun. We have acquired a SHARED lock.
+    SQL&gt; select * from sometable;
+    # We are still using the SHARED lock.
+    # Meanwhile, another process acquires the RESERVED lock.
+    # and starts writing to the DB.
+    SQL&gt; update sometable set value=2 where id = 3;
+    # We are now trying to request the RESERVED lock. SQLite
+    # raises the SQLITE_BUSY exception immediately because
+    # your previous selects may no longer be accurate[4]
+    # by the time it can get the RESERVED lock.
+
+According to &quot;Using SQlite&quot; by Jay A. Kreibich[5], if you know you're
+going to do writing in the transaction, you should use &quot;begin
+immediate transaction&quot;[2].  This gets a `RESERVED` lock
+immediately. If someone else holds the RESERVED lock, then it'll
+return `SQLITE_BUSY` (aka `SQLite::BusyException`) immediately (or
+after the `sqlite_busy_timeout()`).  The great thing is none of the
+statements in the transaction have run yet so you don't have to
+rollback the ActiveRecord objects at all.
+
+The quick fix is to modify `begin_db_transaction`
+in
+`activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb`
+to send `:immediate` to `@connection.transaction()`:
+
+    def begin_db_transaction #:nodoc:
+        @connection.transaction(:immediate)
+    end
+
+While this is sufficent for our application, since we only use
+transactions for `UPDATE`s and `INSERT`s, this would be a bad change
+for people who use `SELECT` statements inside a transaction.  They
+will lose a lot of concurrency, since there is only one `RESERVED`
+lock per database.
+
+I suspect that to fix this correctly, we will need to modify
+`ConnectionAdapters::DatabaseStatements#transaction` to accept another
+named argument to `ActiveRecord::Base.transaction()`.
+
+We can add an additional `option` (`:write_timeout`) which forces the
+transaction to use `:immediate` instead of the default `:deferred` and
+loops until the timeout hits.  Here is my example code for
+`begin_db_transaction` in
+`activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb`:
+
+    # write_timeout is in milliseconds.
+    def begin_db_transaction(write_timeout =&gt; nil) #:nodoc:
+      if write_timeout.nil?
+        @connection.transaction(:deferred) # Deferred is the default.
+      else
+        deadline = Time.new + (write_timeout.to_f / 1000)
+        success = false
+        while (!success and Time.new() &lt; deadline) do
+          begin
+            @connection.transaction(:immediate)
+            success = true
+          rescue SQLite3::BusyException
+            sleep 0.001
+          end
+        end
+        raise SQLite3::BusyException unless success
+      end
+    end
+
+Either way, I happily volunteer to submit patches for rails 2.x and
+rails 3.x to implement either solution (or a third, if someone comes
+up with a different approach).
+
+Ciao!
+
+BTW: I suspect that this is the cause behind the old ticket 8811[6].
+
+References:
+
+* [1] http://stackoverflow.com/questions/78801/sqlite3busyexception
+* [2] http://www.sqlite.org/lang_transaction.html
+* [3] http://www.sqlite.org/lockingv3.html#reserved_lock
+* [4] http://www.sqlite.org/lockingv3.html#hot_journals
+* [5] http://oreilly.com/catalog/9780596521196
+* [6] http://dev.rubyonrails.org/ticket/8811</original-body>
+  <latest-body>This is complicated, so bear with me.
+
+We had a setup using multiple thin servers using SQLite3 as the
+backend. We were getting occasional `SQLite3::BusyExceptions`. We found
+a possible solution on StackOverflow[1]: set the timeout in
+`database.yaml`, which calls `sqlite3_busy_timeout()`.
+
+This solution doesn't work if you use
+`ActiveRecord::Base.transaction()` to group your writes into a single
+transaction. You still get immediate `SQLite3::BusyExceptions`.
+
+Spending way to much time reading about how SQLite works, we
+discovered that this is the correct behavior[2][3].  This is what we
+figured out was happening:
+
+    SQL&gt; begin transaction;
+    # The transaction has begun. We have acquired a SHARED lock.
+    SQL&gt; select * from sometable;
+    # We are still using the SHARED lock.
+    # Meanwhile, another process acquires the RESERVED lock.
+    # and starts writing to the DB.
+    SQL&gt; update sometable set value=2 where id = 3;
+    # We are now trying to request the RESERVED lock. SQLite
+    # raises the SQLITE_BUSY exception immediately because
+    # your previous selects may no longer be accurate[4]
+    # by the time it can get the RESERVED lock.
+
+According to &quot;Using SQlite&quot; by Jay A. Kreibich[5], if you know you're
+going to do writing in the transaction, you should use &quot;begin
+immediate transaction&quot;[2].  This gets a `RESERVED` lock
+immediately. If someone else holds the RESERVED lock, then it'll
+return `SQLITE_BUSY` (aka `SQLite::BusyException`) immediately (or
+after the `sqlite_busy_timeout()`).  The great thing is none of the
+statements in the transaction have run yet so you don't have to
+rollback the ActiveRecord objects at all.
+
+The quick fix is to modify `begin_db_transaction`
+in
+`activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb`
+to send `:immediate` to `@connection.transaction()`:
+
+    def begin_db_transaction #:nodoc:
+        @connection.transaction(:immediate)
+    end
+
+While this is sufficent for our application, since we only use
+transactions for `UPDATE`s and `INSERT`s, this would be a bad change
+for people who use `SELECT` statements inside a transaction.  They
+will lose a lot of concurrency, since there is only one `RESERVED`
+lock per database.
+
+I suspect that to fix this correctly, we will need to modify
+`ConnectionAdapters::DatabaseStatements#transaction` to accept another
+named argument to `ActiveRecord::Base.transaction()`.
+
+We can add an additional `option` (`:write_timeout`) which forces the
+transaction to use `:immediate` instead of the default `:deferred` and
+loops until the timeout hits.  Here is my example code for
+`begin_db_transaction` in
+`activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb`:
+
+    # write_timeout is in milliseconds.
+    def begin_db_transaction(write_timeout =&gt; nil) #:nodoc:
+      if write_timeout.nil?
+        @connection.transaction(:deferred) # Deferred is the default.
+      else
+        deadline = Time.new + (write_timeout.to_f / 1000)
+        success = false
+        while (!success and Time.new() &lt; deadline) do
+          begin
+            @connection.transaction(:immediate)
+            success = true
+          rescue SQLite3::BusyException
+            sleep 0.001
+          end
+        end
+        raise SQLite3::BusyException unless success
+      end
+    end
+
+Either way, I happily volunteer to submit patches for rails 2.x and
+rails 3.x to implement either solution (or a third, if someone comes
+up with a different approach).
+
+Ciao!
+
+BTW: I suspect that this is the cause behind the old ticket 8811[6].
+
+References:
+
+* [1] http://stackoverflow.com/questions/78801/sqlite3busyexception
+* [2] http://www.sqlite.org/lang_transaction.html
+* [3] http://www.sqlite.org/lockingv3.html#reserved_lock
+* [4] http://www.sqlite.org/lockingv3.html#hot_journals
+* [5] http://oreilly.com/catalog/9780596521196
+* [6] http://dev.rubyonrails.org/ticket/8811</latest-body>
+  <original-body-html>&lt;div&gt;&lt;p&gt;This is complicated, so bear with me.&lt;/p&gt;
+&lt;p&gt;We had a setup using multiple thin servers using SQLite3 as
+the&lt;br&gt;
+backend. We were getting occasional
+&lt;code&gt;SQLite3::BusyExceptions&lt;/code&gt;. We found&lt;br&gt;
+a possible solution on StackOverflow[1]: set the timeout in&lt;br&gt;
+&lt;code&gt;database.yaml&lt;/code&gt;, which calls
+&lt;code&gt;sqlite3_busy_timeout()&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;This solution doesn't work if you use&lt;br&gt;
+&lt;code&gt;ActiveRecord::Base.transaction()&lt;/code&gt; to group your writes
+into a single transaction. You still get immediate
+&lt;code&gt;SQLite3::BusyExceptions&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;Spending way to much time reading about how SQLite works, we&lt;br&gt;
+discovered that this is the correct behavior[2][3]. This is what
+we&lt;br&gt;
+figured out was happening:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;SQL&amp;gt; begin transaction;
+# The transaction has begun. We have acquired a SHARED lock.
+SQL&amp;gt; select * from sometable;
+# We are still using the SHARED lock.
+# Meanwhile, another process acquires the RESERVED lock.
+# and starts writing to the DB.
+SQL&amp;gt; update sometable set value=2 where id = 3;
+# We are now trying to request the RESERVED lock. SQLite
+# raises the SQLITE_BUSY exception immediately because
+# your previous selects may no longer be accurate[4]
+# by the time it can get the RESERVED lock.&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;According to &quot;Using SQlite&quot; by Jay A. Kreibich[5], if you know
+you're&lt;br&gt;
+going to do writing in the transaction, you should use &quot;begin&lt;br&gt;
+immediate transaction&quot;[2]. This gets a &lt;code&gt;RESERVED&lt;/code&gt;
+lock&lt;br&gt;
+immediately. If someone else holds the RESERVED lock, then
+it'll&lt;br&gt;
+return &lt;code&gt;SQLITE_BUSY&lt;/code&gt; (aka
+&lt;code&gt;SQLite::BusyException&lt;/code&gt;) immediately (or&lt;br&gt;
+after the &lt;code&gt;sqlite_busy_timeout()&lt;/code&gt;). The great thing is
+none of the&lt;br&gt;
+statements in the transaction have run yet so you don't have to&lt;br&gt;
+rollback the ActiveRecord objects at all.&lt;/p&gt;
+&lt;p&gt;The quick fix is to modify &lt;code&gt;begin_db_transaction&lt;/code&gt;&lt;br&gt;
+in&lt;br&gt;
+&lt;code&gt;activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb&lt;/code&gt;
+to send &lt;code&gt;:immediate&lt;/code&gt; to
+&lt;code&gt;@connection.transaction()&lt;/code&gt;:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def begin_db_transaction #:nodoc:
+    @connection.transaction(:immediate)
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;While this is sufficent for our application, since we only
+use&lt;br&gt;
+transactions for &lt;code&gt;UPDATE&lt;/code&gt;s and &lt;code&gt;INSERT&lt;/code&gt;s,
+this would be a bad change&lt;br&gt;
+for people who use &lt;code&gt;SELECT&lt;/code&gt; statements inside a
+transaction. They&lt;br&gt;
+will lose a lot of concurrency, since there is only one
+&lt;code&gt;RESERVED&lt;/code&gt;&lt;br&gt;
+lock per database.&lt;/p&gt;
+&lt;p&gt;I suspect that to fix this correctly, we will need to modify&lt;br&gt;
+&lt;code&gt;ConnectionAdapters::DatabaseStatements#transaction&lt;/code&gt; to
+accept another named argument to
+&lt;code&gt;ActiveRecord::Base.transaction()&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;We can add an additional &lt;code&gt;option&lt;/code&gt;
+(&lt;code&gt;:write_timeout&lt;/code&gt;) which forces the&lt;br&gt;
+transaction to use &lt;code&gt;:immediate&lt;/code&gt; instead of the default
+&lt;code&gt;:deferred&lt;/code&gt; and&lt;br&gt;
+loops until the timeout hits. Here is my example code for&lt;br&gt;
+&lt;code&gt;begin_db_transaction&lt;/code&gt; in
+&lt;code&gt;activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb&lt;/code&gt;:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;# write_timeout is in milliseconds.
+def begin_db_transaction(write_timeout =&amp;gt; nil) #:nodoc:
+  if write_timeout.nil?
+    @connection.transaction(:deferred) # Deferred is the default.
+  else
+    deadline = Time.new + (write_timeout.to_f / 1000)
+    success = false
+    while (!success and Time.new() &amp;lt; deadline) do
+      begin
+        @connection.transaction(:immediate)
+        success = true
+      rescue SQLite3::BusyException
+        sleep 0.001
+      end
+    end
+    raise SQLite3::BusyException unless success
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Either way, I happily volunteer to submit patches for rails 2.x
+and&lt;br&gt;
+rails 3.x to implement either solution (or a third, if someone
+comes&lt;br&gt;
+up with a different approach).&lt;/p&gt;
+&lt;p&gt;Ciao!&lt;/p&gt;
+&lt;p&gt;BTW: I suspect that this is the cause behind the old ticket
+8811[6].&lt;/p&gt;
+&lt;p&gt;References:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/1&quot; title=
+&quot;Changeset [1]&quot;&gt;[1]&lt;/a&gt; &lt;a href=
+&quot;http://stackoverflow.com/questions/78801/sqlite3busyexception&quot;&gt;http://stackoverflow.com/questions/78801/sqlite3busyexception&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/2&quot; title=
+&quot;Changeset [2]&quot;&gt;[2]&lt;/a&gt; &lt;a href=
+&quot;http://www.sqlite.org/lang_transaction.html&quot;&gt;http://www.sqlite.org/lang_transaction.html&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/3&quot; title=
+&quot;Changeset [3]&quot;&gt;[3]&lt;/a&gt; &lt;a href=
+&quot;http://www.sqlite.org/lockingv3.html#reserved_lock&quot;&gt;http://www.sqlite.org/lockingv3.html#reserved_lock&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/4&quot; title=
+&quot;Changeset [4]&quot;&gt;[4]&lt;/a&gt; &lt;a href=
+&quot;http://www.sqlite.org/lockingv3.html#hot_journals&quot;&gt;http://www.sqlite.org/lockingv3.html#hot_journals&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/5&quot; title=
+&quot;Changeset [5]&quot;&gt;[5]&lt;/a&gt; &lt;a href=
+&quot;http://oreilly.com/catalog/9780596521196&quot;&gt;http://oreilly.com/catalog/9780596521196&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/6&quot; title=
+&quot;Changeset [6]&quot;&gt;[6]&lt;/a&gt; &lt;a href=
+&quot;http://dev.rubyonrails.org/ticket/8811&quot;&gt;http://dev.rubyonrails.org/ticket/8811&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;&lt;/div&gt;</original-body-html>
+  <versions type="array">
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>This is complicated, so bear with me.
+
+We had a setup using multiple thin servers using SQLite3 as the
+backend. We were getting occasional `SQLite3::BusyExceptions`. We found
+a possible solution on StackOverflow[1]: set the timeout in
+`database.yaml`, which calls `sqlite3_busy_timeout()`.
+
+This solution doesn't work if you use
+`ActiveRecord::Base.transaction()` to group your writes into a single
+transaction. You still get immediate `SQLite3::BusyExceptions`.
+
+Spending way to much time reading about how SQLite works, we
+discovered that this is the correct behavior[2][3].  This is what we
+figured out was happening:
+
+    SQL&gt; begin transaction;
+    # The transaction has begun. We have acquired a SHARED lock.
+    SQL&gt; select * from sometable;
+    # We are still using the SHARED lock.
+    # Meanwhile, another process acquires the RESERVED lock.
+    # and starts writing to the DB.
+    SQL&gt; update sometable set value=2 where id = 3;
+    # We are now trying to request the RESERVED lock. SQLite
+    # raises the SQLITE_BUSY exception immediately because
+    # your previous selects may no longer be accurate[4]
+    # by the time it can get the RESERVED lock.
+
+According to &quot;Using SQlite&quot; by Jay A. Kreibich[5], if you know you're
+going to do writing in the transaction, you should use &quot;begin
+immediate transaction&quot;[2].  This gets a `RESERVED` lock
+immediately. If someone else holds the RESERVED lock, then it'll
+return `SQLITE_BUSY` (aka `SQLite::BusyException`) immediately (or
+after the `sqlite_busy_timeout()`).  The great thing is none of the
+statements in the transaction have run yet so you don't have to
+rollback the ActiveRecord objects at all.
+
+The quick fix is to modify `begin_db_transaction`
+in
+`activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb`
+to send `:immediate` to `@connection.transaction()`:
+
+    def begin_db_transaction #:nodoc:
+        @connection.transaction(:immediate)
+    end
+
+While this is sufficent for our application, since we only use
+transactions for `UPDATE`s and `INSERT`s, this would be a bad change
+for people who use `SELECT` statements inside a transaction.  They
+will lose a lot of concurrency, since there is only one `RESERVED`
+lock per database.
+
+I suspect that to fix this correctly, we will need to modify
+`ConnectionAdapters::DatabaseStatements#transaction` to accept another
+named argument to `ActiveRecord::Base.transaction()`.
+
+We can add an additional `option` (`:write_timeout`) which forces the
+transaction to use `:immediate` instead of the default `:deferred` and
+loops until the timeout hits.  Here is my example code for
+`begin_db_transaction` in
+`activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb`:
+
+    # write_timeout is in milliseconds.
+    def begin_db_transaction(write_timeout =&gt; nil) #:nodoc:
+      if write_timeout.nil?
+        @connection.transaction(:deferred) # Deferred is the default.
+      else
+        deadline = Time.new + (write_timeout.to_f / 1000)
+        success = false
+        while (!success and Time.new() &lt; deadline) do
+          begin
+            @connection.transaction(:immediate)
+            success = true
+          rescue SQLite3::BusyException
+            sleep 0.001
+          end
+        end
+        raise SQLite3::BusyException unless success
+      end
+    end
+
+Either way, I happily volunteer to submit patches for rails 2.x and
+rails 3.x to implement either solution (or a third, if someone comes
+up with a different approach).
+
+Ciao!
+
+BTW: I suspect that this is the cause behind the old ticket 8811[6].
+
+References:
+
+* [1] http://stackoverflow.com/questions/78801/sqlite3busyexception
+* [2] http://www.sqlite.org/lang_transaction.html
+* [3] http://www.sqlite.org/lockingv3.html#reserved_lock
+* [4] http://www.sqlite.org/lockingv3.html#hot_journals
+* [5] http://oreilly.com/catalog/9780596521196
+* [6] http://dev.rubyonrails.org/ticket/8811</body>
+      <body-html>&lt;div&gt;&lt;p&gt;This is complicated, so bear with me.&lt;/p&gt;
+&lt;p&gt;We had a setup using multiple thin servers using SQLite3 as
+the&lt;br&gt;
+backend. We were getting occasional
+&lt;code&gt;SQLite3::BusyExceptions&lt;/code&gt;. We found&lt;br&gt;
+a possible solution on StackOverflow[1]: set the timeout in&lt;br&gt;
+&lt;code&gt;database.yaml&lt;/code&gt;, which calls
+&lt;code&gt;sqlite3_busy_timeout()&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;This solution doesn't work if you use&lt;br&gt;
+&lt;code&gt;ActiveRecord::Base.transaction()&lt;/code&gt; to group your writes
+into a single transaction. You still get immediate
+&lt;code&gt;SQLite3::BusyExceptions&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;Spending way to much time reading about how SQLite works, we&lt;br&gt;
+discovered that this is the correct behavior[2][3]. This is what
+we&lt;br&gt;
+figured out was happening:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;SQL&amp;gt; begin transaction;
+# The transaction has begun. We have acquired a SHARED lock.
+SQL&amp;gt; select * from sometable;
+# We are still using the SHARED lock.
+# Meanwhile, another process acquires the RESERVED lock.
+# and starts writing to the DB.
+SQL&amp;gt; update sometable set value=2 where id = 3;
+# We are now trying to request the RESERVED lock. SQLite
+# raises the SQLITE_BUSY exception immediately because
+# your previous selects may no longer be accurate[4]
+# by the time it can get the RESERVED lock.&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;According to &quot;Using SQlite&quot; by Jay A. Kreibich[5], if you know
+you're&lt;br&gt;
+going to do writing in the transaction, you should use &quot;begin&lt;br&gt;
+immediate transaction&quot;[2]. This gets a &lt;code&gt;RESERVED&lt;/code&gt;
+lock&lt;br&gt;
+immediately. If someone else holds the RESERVED lock, then
+it'll&lt;br&gt;
+return &lt;code&gt;SQLITE_BUSY&lt;/code&gt; (aka
+&lt;code&gt;SQLite::BusyException&lt;/code&gt;) immediately (or&lt;br&gt;
+after the &lt;code&gt;sqlite_busy_timeout()&lt;/code&gt;). The great thing is
+none of the&lt;br&gt;
+statements in the transaction have run yet so you don't have to&lt;br&gt;
+rollback the ActiveRecord objects at all.&lt;/p&gt;
+&lt;p&gt;The quick fix is to modify &lt;code&gt;begin_db_transaction&lt;/code&gt;&lt;br&gt;
+in&lt;br&gt;
+&lt;code&gt;activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb&lt;/code&gt;
+to send &lt;code&gt;:immediate&lt;/code&gt; to
+&lt;code&gt;@connection.transaction()&lt;/code&gt;:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;def begin_db_transaction #:nodoc:
+    @connection.transaction(:immediate)
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;While this is sufficent for our application, since we only
+use&lt;br&gt;
+transactions for &lt;code&gt;UPDATE&lt;/code&gt;s and &lt;code&gt;INSERT&lt;/code&gt;s,
+this would be a bad change&lt;br&gt;
+for people who use &lt;code&gt;SELECT&lt;/code&gt; statements inside a
+transaction. They&lt;br&gt;
+will lose a lot of concurrency, since there is only one
+&lt;code&gt;RESERVED&lt;/code&gt;&lt;br&gt;
+lock per database.&lt;/p&gt;
+&lt;p&gt;I suspect that to fix this correctly, we will need to modify&lt;br&gt;
+&lt;code&gt;ConnectionAdapters::DatabaseStatements#transaction&lt;/code&gt; to
+accept another named argument to
+&lt;code&gt;ActiveRecord::Base.transaction()&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;We can add an additional &lt;code&gt;option&lt;/code&gt;
+(&lt;code&gt;:write_timeout&lt;/code&gt;) which forces the&lt;br&gt;
+transaction to use &lt;code&gt;:immediate&lt;/code&gt; instead of the default
+&lt;code&gt;:deferred&lt;/code&gt; and&lt;br&gt;
+loops until the timeout hits. Here is my example code for&lt;br&gt;
+&lt;code&gt;begin_db_transaction&lt;/code&gt; in
+&lt;code&gt;activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb&lt;/code&gt;:&lt;/p&gt;
+&lt;pre&gt;
+&lt;code&gt;# write_timeout is in milliseconds.
+def begin_db_transaction(write_timeout =&amp;gt; nil) #:nodoc:
+  if write_timeout.nil?
+    @connection.transaction(:deferred) # Deferred is the default.
+  else
+    deadline = Time.new + (write_timeout.to_f / 1000)
+    success = false
+    while (!success and Time.new() &amp;lt; deadline) do
+      begin
+        @connection.transaction(:immediate)
+        success = true
+      rescue SQLite3::BusyException
+        sleep 0.001
+      end
+    end
+    raise SQLite3::BusyException unless success
+  end
+end&lt;/code&gt;
+&lt;/pre&gt;
+&lt;p&gt;Either way, I happily volunteer to submit patches for rails 2.x
+and&lt;br&gt;
+rails 3.x to implement either solution (or a third, if someone
+comes&lt;br&gt;
+up with a different approach).&lt;/p&gt;
+&lt;p&gt;Ciao!&lt;/p&gt;
+&lt;p&gt;BTW: I suspect that this is the cause behind the old ticket
+8811[6].&lt;/p&gt;
+&lt;p&gt;References:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/1&quot; title=
+&quot;Changeset [1]&quot;&gt;[1]&lt;/a&gt; &lt;a href=
+&quot;http://stackoverflow.com/questions/78801/sqlite3busyexception&quot;&gt;http://stackoverflow.com/questions/78801/sqlite3busyexception&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/2&quot; title=
+&quot;Changeset [2]&quot;&gt;[2]&lt;/a&gt; &lt;a href=
+&quot;http://www.sqlite.org/lang_transaction.html&quot;&gt;http://www.sqlite.org/lang_transaction.html&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/3&quot; title=
+&quot;Changeset [3]&quot;&gt;[3]&lt;/a&gt; &lt;a href=
+&quot;http://www.sqlite.org/lockingv3.html#reserved_lock&quot;&gt;http://www.sqlite.org/lockingv3.html#reserved_lock&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/4&quot; title=
+&quot;Changeset [4]&quot;&gt;[4]&lt;/a&gt; &lt;a href=
+&quot;http://www.sqlite.org/lockingv3.html#hot_journals&quot;&gt;http://www.sqlite.org/lockingv3.html#hot_journals&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/5&quot; title=
+&quot;Changeset [5]&quot;&gt;[5]&lt;/a&gt; &lt;a href=
+&quot;http://oreilly.com/catalog/9780596521196&quot;&gt;http://oreilly.com/catalog/9780596521196&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;/projects/8994/changesets/6&quot; title=
+&quot;Changeset [6]&quot;&gt;[6]&lt;/a&gt; &lt;a href=
+&quot;http://dev.rubyonrails.org/ticket/8811&quot;&gt;http://dev.rubyonrails.org/ticket/8811&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-11-09T21:01:22+00:00</created-at>
+      <creator-id type="integer">34159</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5941</number>
+      <permalink>sqlite3busyexceptions-are-raised-immediately-in-some-cases-despite-setting-sqlite3_busy_timeout</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>&quot;active record&quot; sqlite3 sqlite3_adapter transactions</tag>
+      <title> SQLite3::BusyExceptions are raised immediately in some cases, despite setting sqlite3_busy_timeout()</title>
+      <updated-at type="datetime">2010-11-09T21:01:24+00:00</updated-at>
+      <user-id type="integer">34159</user-id>
+      <version type="integer">1</version>
+      <user-name>The Doctor What</user-name>
+      <creator-name>The Doctor What</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5941</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>Another solution may be found in the Python Sqlite interface. Python defines a common interface to all databases (DBAPI2) that specifies that database connections are by default NOT in autocommit mode. This may be different from Ruby (I'm completely ignorant here) but possibly the Python solution for SQLite brings a new idea. The Python interface needs to turn off the autocommit mode which is achieved by a simple BEGIN statement. But this is not issued rigth away but only when the first UPDATE (or other dml) statement is encountered. The interface scans each SQL statement to determine this. This way the RESERVED lock will be acquired when the connection does not yet have a SHARED lock and then the busy timeout will be neatly observed. The idea for Ruby would be to do something similar within the ActiveRecord transaction method (only for SQLite). 
+
+Excuse me if this is not to the point. Also note that the idea is of no use if a connection already has a shared lock (by some unfinished cursor) before the transaction is started.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;Another solution may be found in the Python Sqlite interface.
+Python defines a common interface to all databases (DBAPI2) that
+specifies that database connections are by default NOT in
+autocommit mode. This may be different from Ruby (I'm completely
+ignorant here) but possibly the Python solution for SQLite brings a
+new idea. The Python interface needs to turn off the autocommit
+mode which is achieved by a simple BEGIN statement. But this is not
+issued rigth away but only when the first UPDATE (or other dml)
+statement is encountered. The interface scans each SQL statement to
+determine this. This way the RESERVED lock will be acquired when
+the connection does not yet have a SHARED lock and then the busy
+timeout will be neatly observed. The idea for Ruby would be to do
+something similar within the ActiveRecord transaction method (only
+for SQLite).&lt;/p&gt;
+&lt;p&gt;Excuse me if this is not to the point. Also note that the idea
+is of no use if a connection already has a shared lock (by some
+unfinished cursor) before the transaction is started.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2010-11-12T13:06:26+00:00</created-at>
+      <creator-id type="integer">34159</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5941</number>
+      <permalink>sqlite3busyexceptions-are-raised-immediately-in-some-cases-despite-setting-sqlite3_busy_timeout</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>new</state>
+      <tag>&quot;active record&quot; sqlite3 sqlite3_adapter transactions</tag>
+      <title> SQLite3::BusyExceptions are raised immediately in some cases, despite setting sqlite3_busy_timeout()</title>
+      <updated-at type="datetime">2010-11-12T13:06:30+00:00</updated-at>
+      <user-id type="integer">124695</user-id>
+      <version type="integer">2</version>
+      <user-name>Edzard Pasma</user-name>
+      <creator-name>The Doctor What</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5941</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>This issue has been automatically marked as stale because it has not been commented on for at least three months.
+
+The resources of the Rails core team are limited, and so we are asking for your help. If you can still reproduce this error on the 3-0-stable branch or on master, please reply with all of the information you have about it and add &quot;[state:open]&quot; to your comment. This will reopen the ticket for review. Likewise, if you feel that this is a very important feature for Rails to include, please reply with your explanation so we can consider it.
+
+Thank you for all your contributions, and we hope you will understand this step to focus our efforts where they are most helpful.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;This issue has been automatically marked as stale because it has
+not been commented on for at least three months.&lt;/p&gt;
+&lt;p&gt;The resources of the Rails core team are limited, and so we are
+asking for your help. If you can still reproduce this error on the
+3-0-stable branch or on master, please reply with all of the
+information you have about it and add &quot;[state:open]&quot; to your
+comment. This will reopen the ticket for review. Likewise, if you
+feel that this is a very important feature for Rails to include,
+please reply with your explanation so we can consider it.&lt;/p&gt;
+&lt;p&gt;Thank you for all your contributions, and we hope you will
+understand this step to focus our efforts where they are most
+helpful.&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">false</closed>
+      <created-at type="datetime">2011-02-12T19:18:05+00:00</created-at>
+      <creator-id type="integer">34159</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: new
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5941</number>
+      <permalink>sqlite3busyexceptions-are-raised-immediately-in-some-cases-despite-setting-sqlite3_busy_timeout</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>open</state>
+      <tag>&quot;active record&quot; sqlite3 sqlite3_adapter transactions</tag>
+      <title> SQLite3::BusyExceptions are raised immediately in some cases, despite setting sqlite3_busy_timeout()</title>
+      <updated-at type="datetime">2011-02-12T19:19:06+00:00</updated-at>
+      <user-id type="integer">40272</user-id>
+      <version type="integer">3</version>
+      <user-name>Santiago Pastorino</user-name>
+      <creator-name>The Doctor What</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5941</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body nil="true"></body>
+      <body-html nil="true"></body-html>
+      <closed type="boolean">true</closed>
+      <created-at type="datetime">2011-02-12T19:18:05+00:00</created-at>
+      <creator-id type="integer">34159</creator-id>
+      <diffable-attributes type="yaml">--- 
+:state: open
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5941</number>
+      <permalink>sqlite3busyexceptions-are-raised-immediately-in-some-cases-despite-setting-sqlite3_busy_timeout</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>stale</state>
+      <tag>&quot;active record&quot; sqlite3 sqlite3_adapter transactions</tag>
+      <title> SQLite3::BusyExceptions are raised immediately in some cases, despite setting sqlite3_busy_timeout()</title>
+      <updated-at type="datetime">2011-02-12T19:18:34+00:00</updated-at>
+      <user-id type="integer">40272</user-id>
+      <version type="integer">4</version>
+      <user-name>Santiago Pastorino</user-name>
+      <creator-name>The Doctor What</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5941</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+    <version type="Ticket::Version">
+      <assigned-user-id type="integer" nil="true"></assigned-user-id>
+      <attachments-count type="integer">0</attachments-count>
+      <body>Good &lt;a href=http://www.sale-puma.com&gt;Puma shoes sale&lt;/a&gt; information for &lt;a href=http://www.sale-puma.com&gt;Puma shoes&lt;/a&gt; fans: Yesterday, German sportswear maker Cheap Running Shoes purchased effectively lot of money Brands. The transaction entails the Cobra brand, too as linked inventory, intellectual house and endorsement contracts. It also helps make &lt;a href=http://www.sale-puma.com&gt;puma speed cat&lt;/a&gt; Shoes . They provide you with the utmost game and support all through the feet.You can happen around several types of basketball sneakers such as high-top,low-top and mid-top.The &lt;a href=http://www.sale-puma.com&gt;Puma shoes online&lt;/a&gt; and boots give you best ankle support will support want you to obtain steadiness.
+As we konw,Trail &lt;a href=http://www.sale-puma.com&gt;Puma Drift Cat&lt;/a&gt; Shoes black, Trail &lt;a href=http://www.sale-puma.com&gt;Puma future cat&lt;/a&gt; ShoesWhite Black? 50 many years backshore are actually released within a great accomplishment. Trail Running Shoes speed cat shoes?go in add-on to King Pele into planet tournament finals, bottom tennis discs matchrs within pasture inhabit an vital area in hold out in Wimbledon Dun; Its working firms have premier manufacturers and major marketplace positions in distilled spirits, residence and security, and golf products. The reply go all through the &lt;a href=http://www.sale-puma.com&gt;Cheap puma shoes&lt;/a&gt; on sale-here you are able to happen around several distcoun.&lt;a href=http://www.sale-puma.com&gt;puma shoes on sale &lt;/a&gt;.</body>
+      <body-html>&lt;div&gt;&lt;p&gt;Good &lt;a href=&quot;http:&quot;&gt;Puma shoes sale information for &lt;a href=
+&quot;http:&quot;&gt;Puma shoes fans: Yesterday, German sportswear maker Cheap
+Running Shoes purchased effectively lot of money Brands. The
+transaction entails the Cobra brand, too as linked inventory,
+intellectual house and endorsement contracts. It also helps make
+&lt;a href=&quot;http:&quot;&gt;puma speed cat Shoes . They provide you with the
+utmost game and support all through the feet.You can happen around
+several types of basketball sneakers such as high-top,low-top and
+mid-top.The &lt;a href=&quot;http:&quot;&gt;Puma shoes online and boots give you
+best ankle support will support want you to obtain steadiness.&lt;br&gt;
+As we konw,Trail &lt;a href=&quot;http:&quot;&gt;Puma Drift Cat Shoes black, Trail
+&lt;a href=&quot;http:&quot;&gt;Puma future cat ShoesWhite Black? 50 many years
+backshore are actually released within a great accomplishment.
+Trail Running Shoes speed cat shoes?go in add-on to King Pele into
+planet tournament finals, bottom tennis discs matchrs within
+pasture inhabit an vital area in hold out in Wimbledon Dun; Its
+working firms have premier manufacturers and major marketplace
+positions in distilled spirits, residence and security, and golf
+products. The reply go all through the &lt;a href=&quot;http:&quot;&gt;Cheap puma
+shoes on sale-here you are able to happen around several
+distcoun.&lt;a href=&quot;http:&quot;&gt;puma shoes on sale .&lt;/p&gt;&lt;/div&gt;</body-html>
+      <closed type="boolean">true</closed>
+      <created-at type="datetime">2011-02-17T06:03:33+00:00</created-at>
+      <creator-id type="integer">34159</creator-id>
+      <diffable-attributes type="yaml">--- {}
+
+</diffable-attributes>
+      <milestone-id type="integer" nil="true"></milestone-id>
+      <number type="integer">5941</number>
+      <permalink>sqlite3busyexceptions-are-raised-immediately-in-some-cases-despite-setting-sqlite3_busy_timeout</permalink>
+      <priority type="integer">0</priority>
+      <project-id type="integer">8994</project-id>
+      <state>stale</state>
+      <tag>&quot;active record&quot; sqlite3 sqlite3_adapter transactions</tag>
+      <title> SQLite3::BusyExceptions are raised immediately in some cases, despite setting sqlite3_busy_timeout()</title>
+      <updated-at type="datetime">2011-02-17T06:48:10+00:00</updated-at>
+      <user-id type="integer">137442</user-id>
+      <version type="integer">5</version>
+      <user-name>gfh</user-name>
+      <creator-name>The Doctor What</creator-name>
+      <url>http://rails.lighthouseapp.com/projects/8994/tickets/5941</url>
+      <priority-name nil="true"></priority-name>
+    </version>
+  </versions>
+</ticket>
