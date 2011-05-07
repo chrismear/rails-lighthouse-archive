@@ -1,0 +1,66 @@
+From 3cf9e40e07ab4bfb372b8ce06951148125846ed7 Mon Sep 17 00:00:00 2001
+From: Jacob Burkhart <jacob@brontes3d.com>
+Date: Wed, 28 Jul 2010 15:42:10 -0400
+Subject: [PATCH] fix dependent destroy counter cache avoidance for models that use STI [#3073 state:resolved]
+
+---
+ activerecord/lib/active_record/associations.rb |   12 +++++++-----
+ activerecord/test/cases/locking_test.rb        |   19 +++++++++++++++++++
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 1b9b725..9ad0d94 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1524,11 +1524,13 @@ module ActiveRecord
+                 define_method(method_name) do
+                   send(reflection.name).each do |o|
+                     # No point in executing the counter update since we're going to destroy the parent anyway
+-                    counter_method = ('belongs_to_counter_cache_before_destroy_for_' + self.class.name.downcase).to_sym
+-                    if(o.respond_to? counter_method) then
+-                      class << o
+-                        self
+-                      end.send(:define_method, counter_method, Proc.new {})
++                    o.class.reflect_on_all_associations.select{ |a| self.class.ancestors.include?(a.klass) }.each do |a|
++                      counter_method = ("belongs_to_counter_cache_before_destroy_for_#{a.name}").to_sym                    
++                      if(o.respond_to? counter_method) then
++                        class << o
++                          self
++                        end.send(:define_method, counter_method, Proc.new {})
++                      end
+                     end
+                     o.destroy
+                   end
+diff --git a/activerecord/test/cases/locking_test.rb b/activerecord/test/cases/locking_test.rb
+index e712696..b12a43d 100644
+--- a/activerecord/test/cases/locking_test.rb
++++ b/activerecord/test/cases/locking_test.rb
+@@ -195,6 +195,25 @@ class OptimisticLockingTest < ActiveRecord::TestCase
+     assert_equal true, p1.frozen?
+     assert_raises(ActiveRecord::RecordNotFound) { Person.find(p1.id) }
+     assert_raises(ActiveRecord::RecordNotFound) { LegacyThing.find(t.id) }
++    
++    Person.connection.add_column Person.table_name, 'person_type', :string    
++    Person.reset_column_information
++    eval(%Q{
++      class SuperPerson < Person
++      end
++    })
++
++    # See Lighthouse ticket #3073
++    p1 = SuperPerson.new(:first_name => 'fjord')
++    p1.save!
++    t = LegacyThing.new(:person => p1)
++    t.save!
++    p1.reload
++    assert_equal 1, p1.legacy_things_count
++    assert p1.destroy
++    assert_equal true, p1.frozen?
++    assert_raises(ActiveRecord::RecordNotFound) { Person.find(p1.id) }
++    assert_raises(ActiveRecord::RecordNotFound) { LegacyThing.find(t.id) }    
+   end
+ 
+   def test_quote_table_name
+-- 
+1.6.4.2
+

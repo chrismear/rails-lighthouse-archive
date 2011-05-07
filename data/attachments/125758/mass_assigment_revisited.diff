@@ -1,0 +1,1383 @@
+From 425390319e2d88b6eab74eb0f8d5ccddc0fdfa20 Mon Sep 17 00:00:00 2001
+From: Lance Ivy <lance@cainlevy.net>
+Date: Sat, 23 May 2009 19:16:35 -0700
+Subject: [PATCH] use ActiveRecord::Base#assign(hash) instead of #attributes=(hash), and let any mass assignment accept an array of assignable attributes
+
+---
+ activerecord/lib/active_record/associations.rb     |  107 ++++++++++---------
+ .../associations/association_collection.rb         |   24 ++--
+ .../associations/belongs_to_association.rb         |    8 +-
+ .../has_and_belongs_to_many_association.rb         |   12 +-
+ .../associations/has_many_through_association.rb   |    8 +-
+ .../associations/has_one_association.rb            |   12 +-
+ .../lib/active_record/attribute_methods.rb         |    2 +-
+ activerecord/lib/active_record/base.rb             |  115 ++++++++++++--------
+ .../lib/active_record/nested_attributes.rb         |    8 +-
+ .../active_record/serializers/json_serializer.rb   |    2 +-
+ .../active_record/serializers/xml_serializer.rb    |    2 +-
+ activerecord/lib/active_record/validations.rb      |    8 +-
+ .../associations/belongs_to_associations_test.rb   |   16 +++-
+ .../has_and_belongs_to_many_associations_test.rb   |   30 +++++
+ .../associations/has_many_associations_test.rb     |   21 ++++
+ .../has_many_through_associations_test.rb          |   18 +++-
+ .../associations/has_one_associations_test.rb      |   24 ++++-
+ activerecord/test/cases/associations_test.rb       |    2 +-
+ activerecord/test/cases/attribute_methods_test.rb  |    2 +-
+ activerecord/test/cases/base_test.rb               |   80 +++++++++-----
+ activerecord/test/cases/dirty_test.rb              |    2 +-
+ activerecord/test/cases/nested_attributes_test.rb  |   20 ++--
+ activerecord/test/schema/schema.rb                 |    1 +
+ 23 files changed, 336 insertions(+), 188 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 76726b7..5072f59 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -142,43 +142,43 @@ module ActiveRecord
+     # == Auto-generated methods
+     #
+     # === Singular associations (one-to-one)
+-    #                                     |            |  belongs_to  |
+-    #   generated methods                 | belongs_to | :polymorphic | has_one
+-    #   ----------------------------------+------------+--------------+---------
+-    #   other                             |     X      |      X       |    X
+-    #   other=(other)                     |     X      |      X       |    X
+-    #   build_other(attributes={})        |     X      |              |    X
+-    #   create_other(attributes={})       |     X      |              |    X
+-    #   other.create!(attributes={})      |            |              |    X
++    #                                                            |            |  belongs_to  |
++    #   generated methods                                        | belongs_to | :polymorphic | has_one
++    #   ---------------------------------------------------------+------------+--------------+---------
++    #   other                                                    |     X      |      X       |    X
++    #   other=(other)                                            |     X      |      X       |    X
++    #   build_other(attributes={}, allowed_attributes=[])        |     X      |              |    X
++    #   create_other(attributes={}, allowed_attributes=[])       |     X      |              |    X
++    #   other.create!(attributes={}, allowed_attributes=[])      |            |              |    X
+     #
+     # ===Collection associations (one-to-many / many-to-many)
+-    #                                     |       |          | has_many
+-    #   generated methods                 | habtm | has_many | :through
+-    #   ----------------------------------+-------+----------+----------
+-    #   others                            |   X   |    X     |    X
+-    #   others=(other,other,...)          |   X   |    X     |    X
+-    #   other_ids                         |   X   |    X     |    X
+-    #   other_ids=(id,id,...)             |   X   |    X     |    X
+-    #   others<<                          |   X   |    X     |    X
+-    #   others.push                       |   X   |    X     |    X
+-    #   others.concat                     |   X   |    X     |    X
+-    #   others.build(attributes={})       |   X   |    X     |    X
+-    #   others.create(attributes={})      |   X   |    X     |    X
+-    #   others.create!(attributes={})     |   X   |    X     |    X
+-    #   others.size                       |   X   |    X     |    X
+-    #   others.length                     |   X   |    X     |    X
+-    #   others.count                      |   X   |    X     |    X
+-    #   others.sum(args*,&block)          |   X   |    X     |    X
+-    #   others.empty?                     |   X   |    X     |    X
+-    #   others.clear                      |   X   |    X     |    X
+-    #   others.delete(other,other,...)    |   X   |    X     |    X
+-    #   others.delete_all                 |   X   |    X     |
+-    #   others.destroy_all                |   X   |    X     |    X
+-    #   others.find(*args)                |   X   |    X     |    X
+-    #   others.find_first                 |   X   |          |
+-    #   others.exists?                    |   X   |    X     |    X
+-    #   others.uniq                       |   X   |    X     |    X
+-    #   others.reset                      |   X   |    X     |    X
++    #                                                            |       |          | has_many
++    #   generated methods                                        | habtm | has_many | :through
++    #   ---------------------------------------------------------+-------+----------+----------
++    #   others                                                   |   X   |    X     |    X
++    #   others=(other,other,...)                                 |   X   |    X     |    X
++    #   other_ids                                                |   X   |    X     |    X
++    #   other_ids=(id,id,...)                                    |   X   |    X     |    X
++    #   others<<                                                 |   X   |    X     |    X
++    #   others.push                                              |   X   |    X     |    X
++    #   others.concat                                            |   X   |    X     |    X
++    #   others.build(attributes={}, allowed_attributes=[])       |   X   |    X     |    X
++    #   others.create(attributes={}, allowed_attributes=[])      |   X   |    X     |    X
++    #   others.create!(attributes={}, allowed_attributes=[])     |   X   |    X     |    X
++    #   others.size                                              |   X   |    X     |    X
++    #   others.length                                            |   X   |    X     |    X
++    #   others.count                                             |   X   |    X     |    X
++    #   others.sum(args*,&block)                                 |   X   |    X     |    X
++    #   others.empty?                                            |   X   |    X     |    X
++    #   others.clear                                             |   X   |    X     |    X
++    #   others.delete(other,other,...)                           |   X   |    X     |    X
++    #   others.delete_all                                        |   X   |    X     |
++    #   others.destroy_all                                       |   X   |    X     |    X
++    #   others.find(*args)                                       |   X   |    X     |    X
++    #   others.find_first                                        |   X   |          |
++    #   others.exists?                                           |   X   |    X     |    X
++    #   others.uniq                                              |   X   |    X     |    X
++    #   others.reset                                             |   X   |    X     |    X
+     #
+     # == Cardinality and associations
+     #
+@@ -682,12 +682,14 @@ module ActiveRecord
+       # [collection.exists?(...)]
+       #   Checks whether an associated object with the given conditions exists.
+       #   Uses the same rules as ActiveRecord::Base.exists?.
+-      # [collection.build(attributes = {}, ...)]
+-      #   Returns one or more new objects of the collection type that have been instantiated
+-      #   with +attributes+ and linked to this object through a foreign key, but have not yet
+-      #   been saved. <b>Note:</b> This only works if an associated object already exists, not if
+-      #   it's +nil+!
+-      # [collection.create(attributes = {})]
++      # [collection.build(attributes = {}, allowed_attributes = [])]
++      #   Returns a new object of the collection type that has been instantiated with +attributes+
++      #   and linked to this object through a foreign key, but has not yet been saved. <b>Note:</b>
++      #   This only works if an associated object already exists, not if it's +nil+!
++      # [collection.build([attributes = {}, attributes = {}, ...], allowed_attributes = [])]
++      #   Like build except it returns multiple objects of the collection type, one for each set
++      #   of supplied +attributes+.
++      # [collection.create(attributes = {}, allowed_attributes = [])]
+       #   Returns a new object of the collection type that has been instantiated
+       #   with +attributes+, linked to this object through a foreign key, and that has already
+       #   been saved (if it passed the validation). <b>Note:</b> This only works if an associated
+@@ -820,12 +822,12 @@ module ActiveRecord
+       # [association=(associate)]
+       #   Assigns the associate object, extracts the primary key, sets it as the foreign key,
+       #   and saves the associate object.
+-      # [build_association(attributes = {})]
++      # [build_association(attributes = {}, allowed_attributes = [])]
+       #   Returns a new object of the associated type that has been instantiated
+       #   with +attributes+ and linked to this object through a foreign key, but has not
+       #   yet been saved. <b>Note:</b> This ONLY works if an association already exists.
+       #   It will NOT work if the association is +nil+.
+-      # [create_association(attributes = {})]
++      # [create_association(attributes = {}, allowed_attributes = [])]
+       #   Returns a new object of the associated type that has been instantiated
+       #   with +attributes+, linked to this object through a foreign key, and that
+       #   has already been saved (if it passed the validation).
+@@ -925,10 +927,10 @@ module ActiveRecord
+       #   Returns the associated object. +nil+ is returned if none is found.
+       # [association=(associate)]
+       #   Assigns the associate object, extracts the primary key, and sets it as the foreign key.
+-      # [build_association(attributes = {})]
++      # [build_association(attributes = {}, allowed_attributes = [])]
+       #   Returns a new object of the associated type that has been instantiated
+       #   with +attributes+ and linked to this object through a foreign key, but has not yet been saved.
+-      # [create_association(attributes = {})]
++      # [create_association(attributes = {}, allowed_attributes = [])]
+       #   Returns a new object of the associated type that has been instantiated
+       #   with +attributes+, linked to this object through a foreign key, and that
+       #   has already been saved (if it passed the validation).
+@@ -1080,10 +1082,10 @@ module ActiveRecord
+       # [collection.exists?(...)]
+       #   Checks whether an associated object with the given conditions exists.
+       #   Uses the same rules as ActiveRecord::Base.exists?.
+-      # [collection.build(attributes = {})]
++      # [collection.build(attributes = {}, allowed_attributes = [])]
+       #   Returns a new object of the collection type that has been instantiated
+       #   with +attributes+ and linked to this object through the join table, but has not yet been saved.
+-      # [collection.create(attributes = {})]
++      # [collection.create(attributes = {}, allowed_attributes = [])]
+       #   Returns a new object of the collection type that has been instantiated
+       #   with +attributes+, linked to this object through the join table, and that has already been saved (if it passed the validation).
+       #
+@@ -1303,9 +1305,10 @@ module ActiveRecord
+ 
+         def association_constructor_method(constructor, reflection, association_proxy_class)
+           define_method("#{constructor}_#{reflection.name}") do |*params|
+-            attributees      = params.first unless params.empty?
+-            replace_existing = params[1].nil? ? true : params[1]
+-            association      = association_instance_get(reflection.name)
++            attributes         = params.first unless params.empty?
++            allowed_attributes = params.second unless params.empty?
++            replace_existing   = params[2].nil? ? true : params[2] # TODO
++            association        = association_instance_get(reflection.name)
+ 
+             unless association
+               association = association_proxy_class.new(self, reflection)
+@@ -1313,9 +1316,9 @@ module ActiveRecord
+             end
+ 
+             if association_proxy_class == HasOneAssociation
+-              association.send(constructor, attributees, replace_existing)
++              association.send(constructor, attributes, allowed_attributes, replace_existing)
+             else
+-              association.send(constructor, attributees)
++              association.send(constructor, attributes, allowed_attributes)
+             end
+           end
+         end
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index e12f6be..1665a33 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -95,11 +95,11 @@ module ActiveRecord
+         @loaded = false
+       end
+ 
+-      def build(attributes = {}, &block)
++      def build(attributes = {}, allowed_attributes = nil, &block) # TODO
+         if attributes.is_a?(Array)
+-          attributes.collect { |attr| build(attr, &block) }
++          attributes.collect { |attr| build(attr, allowed_attributes, &block) }
+         else
+-          build_record(attributes) do |record|
++          build_record(attributes, allowed_attributes) do |record|
+             block.call(record) if block_given?
+             set_belongs_to_association_for(record)
+           end
+@@ -237,19 +237,19 @@ module ActiveRecord
+         reset_target!
+       end
+ 
+-      def create(attrs = {})
++      def create(attrs = {}, allowed_attributes = nil)
+         if attrs.is_a?(Array)
+-          attrs.collect { |attr| create(attr) }
++          attrs.collect { |attr| create(attr, allowed_attributes) }
+         else
+-          create_record(attrs) do |record|
++          create_record(attrs, allowed_attributes) do |record|
+             yield(record) if block_given?
+             record.save
+           end
+         end
+       end
+ 
+-      def create!(attrs = {})
+-        create_record(attrs) do |record|
++      def create!(attrs = {}, allowed_attributes = nil)
++        create_record(attrs, allowed_attributes) do |record|
+           yield(record) if block_given?
+           record.save!
+         end
+@@ -416,11 +416,11 @@ module ActiveRecord
+         end
+ 
+       private
+-        def create_record(attrs)
++        def create_record(attrs, allowed_attributes = nil)
+           attrs.update(@reflection.options[:conditions]) if @reflection.options[:conditions].is_a?(Hash)
+           ensure_owner_is_not_new
+           record = @reflection.klass.send(:with_scope, :create => construct_scope[:create]) do
+-            @reflection.build_association(attrs)
++            @reflection.build_association(attrs, allowed_attributes)
+           end
+           if block_given?
+             add_record_to_target_with_callbacks(record) { |*block_args| yield(*block_args) }
+@@ -429,9 +429,9 @@ module ActiveRecord
+           end
+         end
+ 
+-        def build_record(attrs)
++        def build_record(attrs, allowed_attributes = nil)
+           attrs.update(@reflection.options[:conditions]) if @reflection.options[:conditions].is_a?(Hash)
+-          record = @reflection.build_association(attrs)
++          record = @reflection.build_association(attrs, allowed_attributes)
+           if block_given?
+             add_record_to_target_with_callbacks(record) { |*block_args| yield(*block_args) }
+           else
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index c885750..a44cb3c 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -1,12 +1,12 @@
+ module ActiveRecord
+   module Associations
+     class BelongsToAssociation < AssociationProxy #:nodoc:
+-      def create(attributes = {})
+-        replace(@reflection.create_association(attributes))
++      def create(attributes = {}, allowed_attributes = nil)
++        replace(@reflection.create_association(attributes, allowed_attributes))
+       end
+ 
+-      def build(attributes = {})
+-        replace(@reflection.build_association(attributes))
++      def build(attributes = {}, allowed_attributes = nil)
++        replace(@reflection.build_association(attributes, allowed_attributes))
+       end
+ 
+       def replace(record)
+diff --git a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+index af9ce3d..2d04630 100644
+--- a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+@@ -1,12 +1,12 @@
+ module ActiveRecord
+   module Associations
+     class HasAndBelongsToManyAssociation < AssociationCollection #:nodoc:
+-      def create(attributes = {})
+-        create_record(attributes) { |record| insert_record(record) }
++      def create(attributes = {}, allowed_attributes = nil)
++        create_record(attributes, allowed_attributes) { |record| insert_record(record) }
+       end
+ 
+-      def create!(attributes = {})
+-        create_record(attributes) { |record| insert_record(record, true) }
++      def create!(attributes = {}, allowed_attributes = nil)
++        create_record(attributes, allowed_attributes) { |record| insert_record(record, true) }
+       end
+ 
+       def columns
+@@ -113,13 +113,13 @@ module ActiveRecord
+         end
+ 
+       private
+-        def create_record(attributes, &block)
++        def create_record(attributes, allowed_attributes = nil, &block)
+           # Can't use Base.create because the foreign key may be a protected attribute.
+           ensure_owner_is_not_new
+           if attributes.is_a?(Array)
+             attributes.collect { |attr| create(attr) }
+           else
+-            build_record(attributes, &block)
++            build_record(attributes, allowed_attributes, &block)
+           end
+         end
+     end
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index e8dbae9..08a4a80 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -3,16 +3,16 @@ module ActiveRecord
+     class HasManyThroughAssociation < HasManyAssociation #:nodoc:
+       alias_method :new, :build
+ 
+-      def create!(attrs = nil)
++      def create!(attrs = nil, allowed_attributes = nil)
+         transaction do
+-          self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.create_association! } : @reflection.create_association!)
++          self << object = @reflection.create_association!(attrs, allowed_attributes)
+           object
+         end
+       end
+ 
+-      def create(attrs = nil)
++      def create(attrs = nil, allowed_attributes = nil)
+         transaction do
+-          self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.create_association } : @reflection.create_association)
++          self << object = @reflection.create_association(attrs, allowed_attributes)
+           object
+         end
+       end
+diff --git a/activerecord/lib/active_record/associations/has_one_association.rb b/activerecord/lib/active_record/associations/has_one_association.rb
+index b72b843..005dd25 100644
+--- a/activerecord/lib/active_record/associations/has_one_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_association.rb
+@@ -6,21 +6,21 @@ module ActiveRecord
+         construct_sql
+       end
+ 
+-      def create(attrs = {}, replace_existing = true)
++      def create(attrs = {}, allowed_attributes = nil, replace_existing = true)
+         new_record(replace_existing) do |reflection|
+-          reflection.create_association(attrs)
++          reflection.create_association(attrs, allowed_attributes)
+         end
+       end
+ 
+-      def create!(attrs = {}, replace_existing = true)
++      def create!(attrs = {}, allowed_attributes = nil, replace_existing = true)
+         new_record(replace_existing) do |reflection|
+-          reflection.create_association!(attrs)
++          reflection.create_association!(attrs, allowed_attributes)
+         end
+       end
+ 
+-      def build(attrs = {}, replace_existing = true)
++      def build(attrs = {}, allowed_attributes = nil, replace_existing = true)
+         new_record(replace_existing) do |reflection|
+-          reflection.build_association(attrs)
++          reflection.build_association(attrs, allowed_attributes)
+         end
+       end
+ 
+diff --git a/activerecord/lib/active_record/attribute_methods.rb b/activerecord/lib/active_record/attribute_methods.rb
+index d5e215a..614e0c5 100644
+--- a/activerecord/lib/active_record/attribute_methods.rb
++++ b/activerecord/lib/active_record/attribute_methods.rb
+@@ -230,7 +230,7 @@ module ActiveRecord
+     # Allows access to the object attributes, which are held in the <tt>@attributes</tt> hash, as though they
+     # were first-class methods. So a Person class with a name attribute can use Person#name and
+     # Person#name= and never directly use the attributes hash -- except for multiple assigns with
+-    # ActiveRecord#attributes=. A Milestone class can also ask Milestone#completed? to test that
++    # ActiveRecord#assign. A Milestone class can also ask Milestone#completed? to test that
+     # the completed attribute is not +nil+ or 0.
+     #
+     # It's also possible to instantiate related objects, so a Client class belonging to the clients
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index ec49d40..b459079 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -138,7 +138,7 @@ module ActiveRecord #:nodoc:
+   end
+ 
+   # Raised when an error occurred while doing a mass assignment to an attribute through the
+-  # <tt>attributes=</tt> method. The exception has an +attribute+ property that is the name of the
++  # <tt>assign()</tt> method. The exception has an +attribute+ property that is the name of the
+   # offending attribute.
+   class AttributeAssignmentError < ActiveRecordError
+     attr_reader :exception, :attribute
+@@ -391,9 +391,9 @@ module ActiveRecord #:nodoc:
+   #   nothing was found, please check its documentation for further details.
+   # * StatementInvalid - The database server rejected the SQL statement. The precise error is added in the message.
+   # * MultiparameterAssignmentErrors - Collection of errors that occurred during a mass assignment using the
+-  #   <tt>attributes=</tt> method. The +errors+ property of this exception contains an array of AttributeAssignmentError
++  #   <tt>assign()</tt> method. The +errors+ property of this exception contains an array of AttributeAssignmentError
+   #   objects that should be inspected to determine which attributes triggered the errors.
+-  # * AttributeAssignmentError - An error occurred while doing a mass assignment through the <tt>attributes=</tt> method.
++  # * AttributeAssignmentError - An error occurred while doing a mass assignment through the <tt>assign()</tt> method.
+   #   You can inspect the +attribute+ property of the exception object to determine which attribute triggered the error.
+   #
+   # *Note*: The attributes listed are class-level attributes (accessible from both the class and instance level).
+@@ -725,11 +725,11 @@ module ActiveRecord #:nodoc:
+       #   User.create([{ :first_name => 'Jamie' }, { :first_name => 'Jeremy' }]) do |u|
+       #     u.is_admin = false
+       #   end
+-      def create(attributes = nil, &block)
++      def create(attributes = nil, allowed_attributes = nil, &block)
+         if attributes.is_a?(Array)
+-          attributes.collect { |attr| create(attr, &block) }
++          attributes.collect { |attr| create(attr, allowed_attributes, &block) }
+         else
+-          object = new(attributes)
++          object = new(attributes, allowed_attributes)
+           yield(object) if block_given?
+           object.save
+           object
+@@ -1011,13 +1011,14 @@ module ActiveRecord #:nodoc:
+         update_counters(id, counter_name => -1)
+       end
+ 
+-      # Attributes named in this macro are protected from mass-assignment,
++      # Attributes named in this macro are by default protected from mass-assignment,
+       # such as <tt>new(attributes)</tt>,
+       # <tt>update_attributes(attributes)</tt>, or
+-      # <tt>attributes=(attributes)</tt>.
++      # <tt>assign(attributes)</tt>.
+       #
+-      # Mass-assignment to these attributes will simply be ignored, to assign
+-      # to them you can use direct writer methods. This is meant to protect
++      # Mass-assignment to these attributes will simply be ignored. To assign to
++      # these attributes you can use direct write methods, or override the default by
++      # passing explicitly allowed attributes. This is meant to protect
+       # sensitive attributes from being overwritten by malicious users
+       # tampering with URLs or forms.
+       #
+@@ -1027,9 +1028,12 @@ module ActiveRecord #:nodoc:
+       #
+       #   customer = Customer.new("name" => David, "credit_rating" => "Excellent")
+       #   customer.credit_rating # => nil
+-      #   customer.attributes = { "description" => "Jolly fellow", "credit_rating" => "Superb" }
++      #   customer.assign({"description" => "Jolly fellow", "credit_rating" => "Superb"})
+       #   customer.credit_rating # => nil
+       #
++      #   customer.assign({"description" => "Jolly fellow", "credit_rating" => "Superb"}, ["description", "credit_rating"])
++      #   customer.credit_rating # => "Superb"
++      #
+       #   customer.credit_rating = "Average"
+       #   customer.credit_rating # => "Average"
+       #
+@@ -1047,14 +1051,14 @@ module ActiveRecord #:nodoc:
+       # Specifies a white list of model attributes that can be set via
+       # mass-assignment, such as <tt>new(attributes)</tt>,
+       # <tt>update_attributes(attributes)</tt>, or
+-      # <tt>attributes=(attributes)</tt>
++      # <tt>assign(attributes)</tt>
+       #
+       # This is the opposite of the +attr_protected+ macro: Mass-assignment
+       # will only set attributes in this list, to assign to the rest of
+-      # attributes you can use direct writer methods. This is meant to protect
+-      # sensitive attributes from being overwritten by malicious users
+-      # tampering with URLs or forms. If you'd rather start from an all-open
+-      # default and restrict attributes as needed, have a look at
++      # attributes you can use direct writer methods or pass a set of explicitly
++      # allowed attributes. This is meant to protect sensitive attributes from being
++      # overwritten by malicious users tampering with URLs or forms. If you'd rather start
++      # from an all-open default and restrict attributes as needed, have a look at
+       # +attr_protected+.
+       #
+       #   class Customer < ActiveRecord::Base
+@@ -1063,9 +1067,12 @@ module ActiveRecord #:nodoc:
+       #
+       #   customer = Customer.new(:name => "David", :nickname => "Dave", :credit_rating => "Excellent")
+       #   customer.credit_rating # => nil
+-      #   customer.attributes = { :name => "Jolly fellow", :credit_rating => "Superb" }
++      #   customer.assign({ :name => "Jolly fellow", :credit_rating => "Superb" })
+       #   customer.credit_rating # => nil
+       #
++      #   customer.assign({ :name => "Jolly fellow", :credit_rating => "Superb" }, [:name, :credit_rating])
++      #   customer.credit_rating # => "Superb"
++      #
+       #   customer.credit_rating = "Average"
+       #   customer.credit_rating # => "Average"
+       def attr_accessible(*attributes)
+@@ -1900,14 +1907,15 @@ module ActiveRecord #:nodoc:
+             elsif match.instantiator?
+               instantiator = match.instantiator
+               # def self.find_or_create_by_user_id(*args)
+-              #   guard_protected_attributes = false
++              #   attribute_names = [:user_id]
++              #   allowed_attributes = attribute_names
+               #
+               #   if args[0].is_a?(Hash)
+-              #     guard_protected_attributes = true
+               #     attributes = args[0].with_indifferent_access
+-              #     find_attributes = attributes.slice(*[:user_id])
++              #     allowed_attributes = nil
++              #     find_attributes = attributes.slice(*attribute_names)
+               #   else
+-              #     find_attributes = attributes = construct_attributes_from_arguments([:user_id], args)
++              #     find_attributes = attributes = construct_attributes_from_arguments(attribute_names, args)
+               #   end
+               #
+               #   options = { :conditions => find_attributes }
+@@ -1916,7 +1924,7 @@ module ActiveRecord #:nodoc:
+               #   record = find(:first, options)
+               #
+               #   if record.nil?
+-              #     record = self.new { |r| r.send(:attributes=, attributes, guard_protected_attributes) }
++              #     record = self.new(attributes, allowed_attributes)
+               #     yield(record) if block_given?
+               #     record.save
+               #     record
+@@ -1926,14 +1934,15 @@ module ActiveRecord #:nodoc:
+               # end
+               self.class_eval %{
+                 def self.#{method_id}(*args)
+-                  guard_protected_attributes = false
++                  attribute_names = [:#{attribute_names.join(',:')}]
++                  allowed_attributes = attribute_names
+ 
+                   if args[0].is_a?(Hash)
+-                    guard_protected_attributes = true
+                     attributes = args[0].with_indifferent_access
+-                    find_attributes = attributes.slice(*[:#{attribute_names.join(',:')}])
++                    allowed_attributes = nil
++                    find_attributes = attributes.slice(*attribute_names)
+                   else
+-                    find_attributes = attributes = construct_attributes_from_arguments([:#{attribute_names.join(',:')}], args)
++                    find_attributes = attributes = construct_attributes_from_arguments(attribute_names, args)
+                   end
+ 
+                   options = { :conditions => find_attributes }
+@@ -1942,7 +1951,7 @@ module ActiveRecord #:nodoc:
+                   record = find(:first, options)
+ 
+                   if record.nil?
+-                    record = self.new { |r| r.send(:attributes=, attributes, guard_protected_attributes) }
++                    record = self.new(attributes, allowed_attributes)
+                     #{'yield(record) if block_given?'}
+                     #{'record.save' if instantiator == :create}
+                     record
+@@ -2440,12 +2449,12 @@ module ActiveRecord #:nodoc:
+       # attributes but not yet saved (pass a hash with key names matching the associated table column names).
+       # In both instances, valid attribute keys are determined by the column names of the associated table --
+       # hence you can't have attributes that aren't part of the table columns.
+-      def initialize(attributes = nil)
++      def initialize(attributes = nil, allowed_attributes = nil)
+         @attributes = attributes_from_column_definition
+         @attributes_cache = {}
+         @new_record = true
+         ensure_proper_type
+-        self.attributes = attributes unless attributes.nil?
++        self.assign(attributes, allowed_attributes) unless attributes.nil?
+         self.class.send(:scope, :create).each { |att,value| self.send("#{att}=", value) } if self.class.send(:scoped?, :create)
+         result = yield self if block_given?
+         callback(:after_initialize) if respond_to_without_attributes?(:after_initialize)
+@@ -2633,13 +2642,13 @@ module ActiveRecord #:nodoc:
+       # Updates all the attributes from the passed-in Hash and saves the record. If the object is invalid, the saving will
+       # fail and false will be returned.
+       def update_attributes(attributes)
+-        self.attributes = attributes
++        self.assign attributes
+         save
+       end
+ 
+       # Updates an object just like Base.update_attributes but calls save! instead of save so an exception is raised if the record is invalid.
+       def update_attributes!(attributes)
+-        self.attributes = attributes
++        self.assign attributes
+         save!
+       end
+ 
+@@ -2718,34 +2727,34 @@ module ActiveRecord #:nodoc:
+       def []=(attr_name, value)
+         write_attribute(attr_name, value)
+       end
+-
+-      # Allows you to set all the attributes at once by passing in a hash with keys
++      
++      # Allows you to set multiple attributes at once by passing in a hash with keys
+       # matching the attribute names (which again matches the column names).
+       #
+-      # If +guard_protected_attributes+ is true (the default), then sensitive
+-      # attributes can be protected from this form of mass-assignment by using
+-      # the +attr_protected+ macro. Or you can alternatively specify which
+-      # attributes *can* be accessed with the +attr_accessible+ macro. Then all the
+-      # attributes not included in that won't be allowed to be mass-assigned.
++      # Only +allowed_attributes+ will be assigned in this fashion, all others will
++      # be ignored. If +allowed_attributes+ is not set, then it will default to the
++      # list of attributes defined by +attr_accessible+ and +attr_protected+.
+       #
+       #   class User < ActiveRecord::Base
+       #     attr_protected :is_admin
+       #   end
+-      #   
++      #
+       #   user = User.new
+-      #   user.attributes = { :username => 'Phusion', :is_admin => true }
++      #   user.assign(:username => 'Phusion', :is_admin => true)
+       #   user.username   # => "Phusion"
+       #   user.is_admin?  # => false
+       #   
+-      #   user.send(:attributes=, { :username => 'Phusion', :is_admin => true }, false)
++      #   user = User.new
++      #   user.assign({ :username => 'Phusion', :is_admin => true }, [:username, :is_admin])
++      #   user.username   # => "Phusion"
+       #   user.is_admin?  # => true
+-      def attributes=(new_attributes, guard_protected_attributes = true)
++      def assign(new_attributes, allowed_attributes = nil)
+         return if new_attributes.nil?
+         attributes = new_attributes.dup
+         attributes.stringify_keys!
+ 
+         multi_parameter_attributes = []
+-        attributes = remove_attributes_protected_from_mass_assignment(attributes) if guard_protected_attributes
++        attributes = remove_attributes_protected_from_mass_assignment(attributes, allowed_attributes)
+ 
+         attributes.each do |k, v|
+           if k.include?("(")
+@@ -2758,6 +2767,11 @@ module ActiveRecord #:nodoc:
+         assign_multiparameter_attributes(multi_parameter_attributes)
+       end
+ 
++      def attributes=(new_attributes, guard_protected_attributes = true)
++        allowed_attributes = guard_protected_attributes ? nil : new_attributes.keys
++        assign(new_attributes, allowed_attributes)
++      end
++
+       # Returns a hash of all the attributes with their names as keys and the values of the attributes as values.
+       def attributes
+         self.attribute_names.inject({}) do |attrs, name|
+@@ -2936,10 +2950,19 @@ module ActiveRecord #:nodoc:
+           value
+         end
+       end
+-
+-      def remove_attributes_protected_from_mass_assignment(attributes)
++      
++      # Removes attributes that may not be mass assigned.
++      # * If a list (Array) of allowed attributes is provided, only those attributes are allowed.
++      # * Otherwise, if neither +attr_protected+ nor +attr_accessible+ are defined, only the default attributes are allowed.
++      # * Otherwise, if +attr_protected+ is defined, only those attributes are rejected.
++      # * Otherwise, if +attr_accessible+ is defined, only those attributes are allowed.
++      def remove_attributes_protected_from_mass_assignment(attributes, allowed_attributes = nil)
++        allowed_attributes = allowed_attributes.map{ |i| i.to_s } if allowed_attributes
++      
+         safe_attributes =
+-          if self.class.accessible_attributes.nil? && self.class.protected_attributes.nil?
++          if allowed_attributes
++            attributes.reject { |key, value| !allowed_attributes.include?(key.gsub(/\(.+/, "")) }
++          elsif self.class.accessible_attributes.nil? && self.class.protected_attributes.nil?
+             attributes.reject { |key, value| attributes_protected_by_default.include?(key.gsub(/\(.+/, "")) }
+           elsif self.class.protected_attributes.nil?
+             attributes.reject { |key, value| !self.class.accessible_attributes.include?(key.gsub(/\(.+/, "")) || attributes_protected_by_default.include?(key.gsub(/\(.+/, "")) }
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index c532d3d..c6d72f2 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -130,13 +130,13 @@ module ActiveRecord
+     # If the hash contains an <tt>id</tt> key that matches an already
+     # associated record, the matching record will be modified:
+     #
+-    #   member.attributes = {
++    #   member.assign(
+     #     :name => 'Joe',
+     #     :posts_attributes => [
+     #       { :id => 1, :title => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!' },
+     #       { :id => 2, :title => '[UPDATED] other post' }
+     #     ]
+-    #   }
++    #   )
+     #
+     #   member.posts.first.title # => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!'
+     #   member.posts.second.title # => '[UPDATED] other post'
+@@ -156,7 +156,7 @@ module ActiveRecord
+     #     :posts_attributes => [{ :id => '2', :_delete => '1' }]
+     #   }}
+     #
+-    #   member.attributes = params['member']
++    #   member.assign params['member']
+     #   member.posts.detect { |p| p.id == 2 }.marked_for_destruction? # => true
+     #   member.posts.length #=> 2
+     #   member.save
+@@ -322,7 +322,7 @@ module ActiveRecord
+       if has_delete_flag?(attributes) && allow_destroy
+         record.mark_for_destruction
+       else
+-        record.attributes = attributes.except(*UNASSIGNABLE_KEYS)
++        record.assign attributes.except(*UNASSIGNABLE_KEYS)
+       end
+     end
+ 
+diff --git a/activerecord/lib/active_record/serializers/json_serializer.rb b/activerecord/lib/active_record/serializers/json_serializer.rb
+index d376fd5..54d60e1 100644
+--- a/activerecord/lib/active_record/serializers/json_serializer.rb
++++ b/activerecord/lib/active_record/serializers/json_serializer.rb
+@@ -84,7 +84,7 @@ module ActiveRecord #:nodoc:
+     end
+ 
+     def from_json(json)
+-      self.attributes = ActiveSupport::JSON.decode(json)
++      self.assign ActiveSupport::JSON.decode(json)
+       self
+     end
+ 
+diff --git a/activerecord/lib/active_record/serializers/xml_serializer.rb b/activerecord/lib/active_record/serializers/xml_serializer.rb
+index 4eaf953..1b16f48 100644
+--- a/activerecord/lib/active_record/serializers/xml_serializer.rb
++++ b/activerecord/lib/active_record/serializers/xml_serializer.rb
+@@ -159,7 +159,7 @@ module ActiveRecord #:nodoc:
+     end
+ 
+     def from_xml(xml)
+-      self.attributes = Hash.from_xml(xml).values.first
++      self.assign Hash.from_xml(xml).values.first
+       self
+     end
+   end
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index a18fb3f..de02ca5 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -297,7 +297,7 @@ module ActiveRecord
+   #                                       # => "Last name can't be empty\n" +
+   #                                       #    "Phone number has invalid format"
+   #
+-  #   person.attributes = { "last_name" => "Heinemeier", "phone_number" => "555-555" }
++  #   person.assign({ "last_name" => "Heinemeier", "phone_number" => "555-555" })
+   #   person.save # => true (and person is now saved in the database)
+   #
+   # An Errors object is automatically created for every Active Record.
+@@ -983,11 +983,11 @@ module ActiveRecord
+ 
+       # Creates an object just like Base.create but calls save! instead of save
+       # so an exception is raised if the record is invalid.
+-      def create!(attributes = nil, &block)
++      def create!(attributes = nil, allowed_attributes = nil, &block)
+         if attributes.is_a?(Array)
+-          attributes.collect { |attr| create!(attr, &block) }
++          attributes.collect { |attr| create!(attr, allowed_attributes, &block) }
+         else
+-          object = new(attributes)
++          object = new(attributes, allowed_attributes)
+           yield(object) if block_given?
+           object.save!
+           object
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 13a78a1..ec46277 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -68,13 +68,27 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     citibank.reload
+     assert_equal apple, citibank.firm
+   end
+-
++  
++  def test_creating_with_allowed_attributes
++    citibank = Account.create("credit_limit" => 10)
++    apple    = citibank.create_firm({"name" => "Apple", "rating" => 5}, [:name])
++    assert_equal "Apple", apple.name
++    assert_equal 1, apple.rating
++  end
++  
+   def test_building_the_belonging_object
+     citibank = Account.create("credit_limit" => 10)
+     apple    = citibank.build_firm("name" => "Apple")
+     citibank.save
+     assert_equal apple.id, citibank.firm_id
+   end
++  
++  def test_building_with_allowed_attributes
++    citibank = Account.create("credit_limit" => 10)
++    apple    = citibank.build_firm({"name" => "Apple", "rating" => 5}, [:name])
++    assert_equal "Apple", apple.name
++    assert_equal 1, apple.rating
++  end
+ 
+   def test_natural_assignment_to_nil
+     client = Client.find(3)
+diff --git a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+index 8dc9580..f08f138 100644
+--- a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+@@ -257,6 +257,21 @@ class HasAndBelongsToManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal devel.projects.last, proj2
+     assert_equal Developer.find_by_name("Marcel").projects.last, proj2  # prove join table is updated
+   end
++  
++  def test_build_many
++    devel = Developer.find(1)
++    projects = devel.projects.build([{"name" => "First"}, {"name" => "Second"}])
++    assert_equal 2, projects.size
++    assert projects.all?(&:new_record?)
++  end
++  
++  def test_build_with_allowed_attributes
++    devel = Developer.find(1)
++    normal  = devel.projects.build({:name => "Normal", :type => "Project"}, [:name])
++    assert_nil normal.type
++    special = devel.projects.build({:name => "Special", :type => "SpecialProject"}, [:name, :type])
++    assert_equal 'SpecialProject', special.type
++  end
+ 
+   def test_create
+     devel = Developer.find(1)
+@@ -283,6 +298,21 @@ class HasAndBelongsToManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal Developer.find_by_name("Marcel").projects.last, proj2  # prove join table is updated
+   end
+ 
++  def test_create_many
++    devel = Developer.find(1)
++    assert_difference "devel.projects.count", 2 do
++      devel.projects.create([{"name" => "First"}, {"name" => "Second"}])
++    end
++  end
++  
++  def test_create_with_allowed_attributes
++    devel = Developer.find(1)
++    normal  = devel.projects.create({:name => "Normal", :type => "Project"}, [:name])
++    assert_nil normal.type
++    special = devel.projects.create({:name => "Special", :type => "SpecialProject"}, [:name, :type])
++    assert_equal 'SpecialProject', special.type
++  end
++
+   def test_creation_respects_hash_condition
+     post = categories(:general).post_with_conditions.build(:body => '')
+ 
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index d99424f..c79b5fd 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -369,6 +369,20 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert new_client.new_record?
+     assert_equal new_client, company.clients_of_firm.last
+   end
++  
++  def test_build_many
++    company = companies(:first_firm)
++    new_clients = assert_no_queries { company.clients_of_firm.build([{"name" => "Another Client"}, {"name" => "Yet Another Client"}]) }
++    assert 2, new_clients.size
++    assert new_clients.all?(&:new_record?)
++  end
++  
++  def test_build_with_allowed_attributes
++    company = companies(:first_firm)
++    new_client = company.clients_of_firm.build({:name => "A", :firm_name => "B"}, [:name])
++    assert_equal "A", new_client.name
++    assert_nil new_client.firm_name
++  end
+ 
+   def test_collection_size_after_building
+     company = companies(:first_firm)  # company already has one client
+@@ -465,6 +479,13 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     companies(:first_firm).clients_of_firm.create([{"name" => "Another Client"}, {"name" => "Another Client II"}])
+     assert_equal 3, companies(:first_firm).clients_of_firm(true).size
+   end
++  
++  def test_create_with_allowed_attributes
++    company = companies(:first_firm)
++    new_client = company.clients_of_firm.create({:name => "A", :firm_name => "B"}, [:name])
++    assert_equal "A", new_client.name
++    assert_nil new_client.firm_name
++  end
+ 
+   def test_create_followed_by_save_does_not_load_target
+     new_client = companies(:first_firm).clients_of_firm.create("name" => "Another Client")
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index 4254bad..dcca622 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -77,7 +77,14 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     assert posts(:thinking).reload.people(true).collect(&:first_name).include?("Bob")
+     assert posts(:thinking).reload.people(true).collect(&:first_name).include?("Ted")
+   end
+-
++  
++  def test_associate_new_by_building_with_allowed_attributes
++    post = posts(:thinking)
++    person = post.people.build({:first_name => "Pat", :gender => "M"}, [:first_name])
++    assert_equal "Pat", person.first_name
++    assert_nil person.gender
++  end
++  
+   def test_delete_association
+     assert_queries(2){posts(:welcome);people(:michael); }
+ 
+@@ -150,7 +157,7 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+ 
+     assert posts(:thinking).reload.people(true).collect(&:first_name).include?("Jeb")
+   end
+-
++  
+   def test_associate_with_create_and_no_options
+     peeps = posts(:thinking).people.count
+     posts(:thinking).people.create(:first_name => 'foo')
+@@ -163,6 +170,13 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     assert_equal peeps + 1, posts(:thinking).people.count
+   end
+ 
++  def test_associate_with_create_and_allowed_attributes
++    post = posts(:thinking)
++    person = post.people.create({:first_name => "Pat", :gender => "M"}, [:first_name])
++    assert_equal "Pat", person.first_name
++    assert_nil person.gender
++  end
++
+   def test_clear_associations
+     assert_queries(2) { posts(:welcome);posts(:welcome).people(true) }
+ 
+diff --git a/activerecord/test/cases/associations/has_one_associations_test.rb b/activerecord/test/cases/associations/has_one_associations_test.rb
+index 1ddb3f4..0b5f704 100644
+--- a/activerecord/test/cases/associations/has_one_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_associations_test.rb
+@@ -113,12 +113,12 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     apple.account = citibank
+     assert_equal apple.id, citibank.firm_id
+ 
+-    hsbc = apple.build_account({ :credit_limit => 20}, false)
++    hsbc = apple.build_account({ :credit_limit => 20}, nil, false)
+     assert_equal apple.id, hsbc.firm_id
+     hsbc.save
+     assert_equal apple.id, citibank.firm_id
+ 
+-    nykredit = apple.create_account({ :credit_limit => 30}, false)
++    nykredit = apple.create_account({ :credit_limit => 30}, nil, false)
+     assert_equal apple.id, nykredit.firm_id
+     assert_equal apple.id, citibank.firm_id
+     assert_equal apple.id, hsbc.firm_id
+@@ -130,7 +130,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     apple.account = citibank
+     assert_equal apple.id, citibank.firm_id
+ 
+-    hsbc = apple.create_account({:credit_limit => 10}, false)
++    hsbc = apple.create_account({:credit_limit => 10}, nil, false)
+     assert_equal apple.id, hsbc.firm_id
+     hsbc.save
+     assert_equal apple.id, citibank.firm_id
+@@ -210,6 +210,15 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     assert account.save
+     assert_equal account, firm.account
+   end
++  
++  def test_build_with_allowed_attributes
++    firm = Firm.new("name" => "GlobalMegaCorp")
++    firm.save
++    
++    account = firm.build_account({"credit_limit" => 1000, "nickname" => "Pocket Change"}, [:credit_limit])
++    assert_equal 1000, account.credit_limit
++    assert_nil account.nickname
++  end
+ 
+   def test_failing_build_association
+     firm = Firm.new("name" => "GlobalMegaCorp")
+@@ -234,6 +243,15 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     firm.account = account = Account.create("credit_limit" => 1000)
+     assert_equal account, firm.account
+   end
++  
++  def test_create_with_allowed_attributes
++    firm = Firm.new("name" => "GlobalMegaCorp")
++    firm.save
++    
++    account = firm.create_account({"credit_limit" => 1000, "nickname" => "Pocket Change"}, [:credit_limit])
++    assert_equal 1000, account.credit_limit
++    assert_nil account.nickname
++  end
+ 
+   def test_dependence_with_missing_association
+     Account.destroy_all
+diff --git a/activerecord/test/cases/associations_test.rb b/activerecord/test/cases/associations_test.rb
+index 056a294..cb5196a 100644
+--- a/activerecord/test/cases/associations_test.rb
++++ b/activerecord/test/cases/associations_test.rb
+@@ -171,7 +171,7 @@ class AssociationProxyTest < ActiveRecord::TestCase
+     assert_equal post.title, "New on Edge"
+     assert_equal post.body, "More cool stuff!"
+   end
+-
++  
+   def test_failed_reload_returns_nil
+     p = setup_dangling_association
+     assert_nil p.author.reload
+diff --git a/activerecord/test/cases/attribute_methods_test.rb b/activerecord/test/cases/attribute_methods_test.rb
+index 17ed302..4282bba 100644
+--- a/activerecord/test/cases/attribute_methods_test.rb
++++ b/activerecord/test/cases/attribute_methods_test.rb
+@@ -274,7 +274,7 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     privatize("title=(value)")
+ 
+     assert_raise(ActiveRecord::UnknownAttributeError) { topic = @target.new(:title => "Rants about pants") }
+-    assert_raise(ActiveRecord::UnknownAttributeError) { @target.new.attributes = { :title => "Ants in pants" } }
++    assert_raise(ActiveRecord::UnknownAttributeError) { @target.new.assign({ :title => "Ants in pants" }) }
+   end
+ 
+   private
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 59aa695..7c84fd4 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -85,9 +85,9 @@ class BasicsTest < ActiveRecord::TestCase
+     assert Topic.table_exists?
+   end
+ 
+-  def test_set_attributes
++  def test_assigning_attributes
+     topic = Topic.find(1)
+-    topic.attributes = { "title" => "Budget", "author_name" => "Jason" }
++    topic.assign({ "title" => "Budget", "author_name" => "Jason" })
+     topic.save
+     assert_equal("Budget", topic.title)
+     assert_equal("Jason", topic.author_name)
+@@ -202,7 +202,7 @@ class BasicsTest < ActiveRecord::TestCase
+ 
+   def test_save_null_string_attributes
+     topic = Topic.find(1)
+-    topic.attributes = { "title" => "null", "author_name" => "null" }
++    topic.assign({ "title" => "null", "author_name" => "null" })
+     topic.save!
+     topic.reload
+     assert_equal("null", topic.title)
+@@ -233,7 +233,7 @@ class BasicsTest < ActiveRecord::TestCase
+     topic = Topic.new(new_topic)
+     assert_equal new_topic[:title], topic.title
+ 
+-    topic.attributes= new_topic_values
++    topic.assign(new_topic_values)
+     assert_equal new_topic_values[:title], topic.title
+   end
+ 
+@@ -789,7 +789,7 @@ class BasicsTest < ActiveRecord::TestCase
+       Topic.default_timezone = :utc
+       attributes = { "bonus_time" => "5:42:00AM" }
+       topic = Topic.find(1)
+-      topic.attributes = attributes
++      topic.assign(attributes)
+       assert_equal Time.utc(2000, 1, 1, 5, 42, 0), topic.bonus_time
+       Topic.default_timezone = :local
+     end
+@@ -911,16 +911,37 @@ class BasicsTest < ActiveRecord::TestCase
+ 
+   def test_mass_assignment_should_raise_exception_if_accessible_and_protected_attribute_writers_are_both_used
+     topic = TopicWithProtectedContentAndAccessibleAuthorName.new
+-    assert_raise(RuntimeError) { topic.attributes = { "author_name" => "me" } }
+-    assert_raise(RuntimeError) { topic.attributes = { "content" => "stuff" } }
++    assert_raise(RuntimeError) { topic.assign({ "author_name" => "me" }) }
++    assert_raise(RuntimeError) { topic.assign({ "content" => "stuff" }) }
+   end
+ 
+   def test_mass_assignment_protection
+     firm = Firm.new
+-    firm.attributes = { "name" => "Next Angle", "rating" => 5 }
++    firm.assign({ "name" => "Next Angle", "rating" => 5 })
++    assert_equal "Next Angle", firm.name
+     assert_equal 1, firm.rating
+   end
+-
++  
++  def test_mass_assignment_with_allowed_attributes
++    firm = Firm.new
++    firm.assign({ "name" => "Next Angle", "rating" => 5 }, ["name"])
++    assert_equal "Next Angle", firm.name
++    assert_equal 1, firm.rating
++  end
++  
++  def test_mass_assignment_with_allowed_attributes_ignores_attr_protected
++    firm = Firm.new
++    firm.assign({ "name" => "Next Angle", "rating" => 5 }, ["name", "rating"])
++    assert_equal "Next Angle", firm.name
++    assert_equal 5, firm.rating
++  end
++  
++  def test_mass_assignment_on_initialization_with_allowed_attributes
++    firm = Firm.new({ "name" => "Next Angle", "rating" => 5 }, ["name", "rating"])
++    assert_equal "Next Angle", firm.name
++    assert_equal 5,  firm.rating
++  end
++  
+   def test_mass_assignment_protection_against_class_attribute_writers
+     [:logger, :configurations, :primary_key_prefix_type, :table_name_prefix, :table_name_suffix, :pluralize_table_names, :colorize_logging,
+       :default_timezone, :schema_format, :lock_optimistically, :record_timestamps].each do |method|
+@@ -932,7 +953,8 @@ class BasicsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_customized_primary_key_remains_protected
+-    subscriber = Subscriber.new(:nick => 'webster123', :name => 'nice try')
++    subscriber = Subscriber.new
++    subscriber.assign(:nick => 'webster123', :name => 'nice try')
+     assert_nil subscriber.id
+ 
+     keyboard = Keyboard.new(:key_number => 9, :name => 'nice try')
+@@ -940,7 +962,8 @@ class BasicsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_customized_primary_key_remains_protected_when_referred_to_as_id
+-    subscriber = Subscriber.new(:id => 'webster123', :name => 'nice try')
++    subscriber = Subscriber.new
++    subscriber.assign(:id => 'webster123', :name => 'nice try')
+     assert_nil subscriber.id
+ 
+     keyboard = Keyboard.new(:id => 9, :name => 'nice try')
+@@ -951,19 +974,20 @@ class BasicsTest < ActiveRecord::TestCase
+     firm = Firm.new
+ 
+     assert_raise(ActiveRecord::UnknownAttributeError) do
+-      firm.attributes = { "id" => 5, "type" => "Client", "i_dont_even_exist" => 20 }
++      firm.assign({ "id" => 5, "type" => "Client", "i_dont_even_exist" => 20 })
+     end
+   end
+ 
+   def test_mass_assignment_protection_on_defaults
+     firm = Firm.new
+-    firm.attributes = { "id" => 5, "type" => "Client" }
++    firm.assign({ "id" => 5, "type" => "Client" })
+     assert_nil firm.id
+     assert_equal "Firm", firm[:type]
+   end
+ 
+   def test_mass_assignment_accessible
+-    reply = Reply.new("title" => "hello", "content" => "world", "approved" => true)
++    reply = Reply.new
++    reply.assign("title" => "hello", "content" => "world", "approved" => true)
+     reply.save
+ 
+     assert reply.approved?
+@@ -1007,7 +1031,7 @@ class BasicsTest < ActiveRecord::TestCase
+   def test_multiparameter_attributes_on_date
+     attributes = { "last_read(1i)" => "2004", "last_read(2i)" => "6", "last_read(3i)" => "24" }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     # note that extra #to_date call allows test to pass for Oracle, which
+     # treats dates/times the same
+     assert_date_from_db Date.new(2004, 6, 24), topic.last_read.to_date
+@@ -1016,7 +1040,7 @@ class BasicsTest < ActiveRecord::TestCase
+   def test_multiparameter_attributes_on_date_with_empty_date
+     attributes = { "last_read(1i)" => "2004", "last_read(2i)" => "6", "last_read(3i)" => "" }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     # note that extra #to_date call allows test to pass for Oracle, which
+     # treats dates/times the same
+     assert_date_from_db Date.new(2004, 6, 1), topic.last_read.to_date
+@@ -1025,7 +1049,7 @@ class BasicsTest < ActiveRecord::TestCase
+   def test_multiparameter_attributes_on_date_with_all_empty
+     attributes = { "last_read(1i)" => "", "last_read(2i)" => "", "last_read(3i)" => "" }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_nil topic.last_read
+   end
+ 
+@@ -1035,7 +1059,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "written_on(4i)" => "16", "written_on(5i)" => "24", "written_on(6i)" => "00"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.local(2004, 6, 24, 16, 24, 0), topic.written_on
+   end
+ 
+@@ -1045,7 +1069,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "written_on(4i)" => "16", "written_on(5i)" => "24", "written_on(6i)" => "00"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     # testing against to_s(:db) representation because either a Time or a DateTime might be returned, depending on platform
+     assert_equal "1850-06-24 16:24:00", topic.written_on.to_s(:db)
+   end
+@@ -1057,7 +1081,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "written_on(4i)" => "16", "written_on(5i)" => "24", "written_on(6i)" => "00"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.utc(2004, 6, 24, 16, 24, 0), topic.written_on
+   ensure
+     ActiveRecord::Base.default_timezone = :local
+@@ -1072,7 +1096,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "written_on(4i)" => "16", "written_on(5i)" => "24", "written_on(6i)" => "00"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.utc(2004, 6, 24, 23, 24, 0), topic.written_on
+     assert_equal Time.utc(2004, 6, 24, 16, 24, 0), topic.written_on.time
+     assert_equal Time.zone, topic.written_on.time_zone
+@@ -1090,7 +1114,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "written_on(4i)" => "16", "written_on(5i)" => "24", "written_on(6i)" => "00"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.local(2004, 6, 24, 16, 24, 0), topic.written_on
+     assert_equal false, topic.written_on.respond_to?(:time_zone)
+   ensure
+@@ -1107,7 +1131,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "written_on(4i)" => "16", "written_on(5i)" => "24", "written_on(6i)" => "00"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.utc(2004, 6, 24, 16, 24, 0), topic.written_on
+     assert_equal false, topic.written_on.respond_to?(:time_zone)
+   ensure
+@@ -1126,7 +1150,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "bonus_time(4i)" => "16", "bonus_time(5i)" => "24"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.utc(2000, 1, 1, 16, 24, 0), topic.bonus_time
+     assert topic.bonus_time.utc?
+   ensure
+@@ -1141,7 +1165,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "written_on(4i)" => "16", "written_on(5i)" => "24", "written_on(6i)" => ""
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.local(2004, 6, 24, 16, 24, 0), topic.written_on
+   end
+ 
+@@ -1150,7 +1174,7 @@ class BasicsTest < ActiveRecord::TestCase
+     time = Time.mktime(2000, 1, 1, 1)
+     task.starting = time
+     attributes = { "starting(1i)" => "2004", "starting(2i)" => "6", "starting(3i)" => "24" }
+-    task.attributes = attributes
++    task.assign(attributes)
+     assert_equal time, task.starting
+   end
+ 
+@@ -1158,7 +1182,7 @@ class BasicsTest < ActiveRecord::TestCase
+     customer = Customer.new
+     address = Address.new("The Street", "The City", "The Country")
+     attributes = { "address(1)" => address.street, "address(2)" => address.city, "address(3)" => address.country }
+-    customer.attributes = attributes
++    customer.assign(attributes)
+     assert_equal address, customer.address
+   end
+ 
+@@ -1170,7 +1194,7 @@ class BasicsTest < ActiveRecord::TestCase
+       "bonus_time" => "5:42:00AM"
+     }
+     topic = Topic.find(1)
+-    topic.attributes = attributes
++    topic.assign(attributes)
+     assert_equal Time.local(2000, 1, 1, 5, 42, 0), topic.bonus_time
+   end
+ 
+diff --git a/activerecord/test/cases/dirty_test.rb b/activerecord/test/cases/dirty_test.rb
+index ac95bac..fcb7b32 100644
+--- a/activerecord/test/cases/dirty_test.rb
++++ b/activerecord/test/cases/dirty_test.rb
+@@ -179,7 +179,7 @@ class DirtyTest < ActiveRecord::TestCase
+     # Coming from web form.
+     params = {:topic => {:approved => 1}}
+     # In the controller.
+-    topic.attributes = params[:topic]
++    topic.assign(params[:topic])
+     assert topic.approved?
+     assert !topic.approved_changed?
+   end
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index f312751..173bb00 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -191,7 +191,7 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+ 
+   def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
+     assert_no_difference('Ship.count') do
+-      @pirate.attributes = { :ship_attributes => { :id => @ship.id, :_delete => '1' } }
++      @pirate.assign({ :ship_attributes => { :id => @ship.id, :_delete => '1' } })
+     end
+     assert_difference('Ship.count', -1) do
+       @pirate.save
+@@ -310,7 +310,7 @@ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+ 
+   def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
+     assert_no_difference('Pirate.count') do
+-      @ship.attributes = { :pirate_attributes => { :id => @ship.pirate.id, '_delete' => true } }
++      @ship.assign({ :pirate_attributes => { :id => @ship.pirate.id, '_delete' => true } })
+     end
+     assert_difference('Pirate.count', -1) { @ship.save }
+   end
+@@ -346,7 +346,7 @@ module NestedAttributesOnACollectionAssociationTests
+   end
+ 
+   def test_should_take_a_hash_and_assign_the_attributes_to_the_associated_models
+-    @pirate.attributes = @alternate_params
++    @pirate.assign @alternate_params
+     assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
+     assert_equal 'Privateers Greed', @pirate.send(@association_name).last.name
+   end
+@@ -355,21 +355,21 @@ module NestedAttributesOnACollectionAssociationTests
+     @child_1.stubs(:id).returns('ABC1X')
+     @child_2.stubs(:id).returns('ABC2X')
+ 
+-    @pirate.attributes = {
++    @pirate.assign({
+       association_getter => [
+         { :id => @child_1.id, :name => 'Grace OMalley' },
+         { :id => @child_2.id, :name => 'Privateers Greed' }
+       ]
+-    }
++    })
+ 
+     assert_equal ['Grace OMalley', 'Privateers Greed'], [@child_1.name, @child_2.name]
+   end
+ 
+   def test_should_automatically_build_new_associated_models_for_each_entry_in_a_hash_where_the_id_is_missing
+     @pirate.send(@association_name).destroy_all
+-    @pirate.reload.attributes = {
++    @pirate.reload.assign({
+       association_getter => { 'foo' => { :name => 'Grace OMalley' }, 'bar' => { :name => 'Privateers Greed' }}
+-    }
++    })
+ 
+     assert @pirate.send(@association_name).first.new_record?
+     assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
+@@ -386,12 +386,12 @@ module NestedAttributesOnACollectionAssociationTests
+ 
+   def test_should_ignore_new_associated_records_with_truthy_delete_attribute
+     @pirate.send(@association_name).destroy_all
+-    @pirate.reload.attributes = {
++    @pirate.reload.assign({
+       association_getter => {
+         'foo' => { :name => 'Grace OMalley' },
+         'bar' => { :name => 'Privateers Greed', '_delete' => '1' }
+       }
+-    }
++    })
+ 
+     assert_equal 1, @pirate.send(@association_name).length
+     assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
+@@ -400,7 +400,7 @@ module NestedAttributesOnACollectionAssociationTests
+   def test_should_ignore_new_associated_records_if_a_reject_if_proc_returns_false
+     @alternate_params[association_getter]['baz'] = {}
+     assert_no_difference("@pirate.send(@association_name).length") do
+-      @pirate.attributes = @alternate_params
++      @pirate.assign @alternate_params
+     end
+   end
+ 
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 6e8813d..56e3534 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -22,6 +22,7 @@ ActiveRecord::Schema.define do
+   # unless the ordering matters.  In which case, define them below
+   create_table :accounts, :force => true do |t|
+     t.integer :firm_id
++    t.string  :nickname
+     t.integer :credit_limit
+   end
+ 
+-- 
+1.6.0.4
+

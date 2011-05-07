@@ -1,0 +1,253 @@
+From 5e4accbc6017b2ef44f8434be205f2d3e718ddc4 Mon Sep 17 00:00:00 2001
+From: Justin Bailey <jgbailey@gmail.com>
+Date: Sun, 13 Sep 2009 22:54:58 -0700
+Subject: [PATCH] Implemented connection flags for MySQL driver.
+
+Added the :flags configuration option, which allow connection flags to
+be specified.
+
+Appropriate unit tests also added.
+
+Thanks to llasram@gmail.com for inspiration. See for
+http://dev.rubyonrails.org/ticket/5260 for original.
+---
+ .../connection_adapters/mysql_adapter.rb           |   18 +++-
+ activerecord/test/cases/connection_test_mysql.rb   |  124 +++++++++++++++----
+ activerecord/test/schema/mysql_specific_schema.rb  |   12 ++
+ 3 files changed, 126 insertions(+), 28 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 1259278..8fe181e 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -63,12 +63,20 @@ module ActiveRecord
+           raise
+         end
+       end
++
++      # Thanks llasram@gmail.com for inspiration here (see http://dev.rubyonrails.org/ticket/5260)
++      # Allow single string, comma-separated list or array
++      flags    = (if config[:flags].is_a?(String) then config[:flags].split(",") else config[:flags] end || []).inject(0) do |total, flag|
++        total | Mysql.const_get(flag.to_s.strip)
++      end
++      
+       MysqlCompat.define_all_hashes_method!
+ 
+       mysql = Mysql.init
+       mysql.ssl_set(config[:sslkey], config[:sslcert], config[:sslca], config[:sslcapath], config[:sslcipher]) if config[:sslca] || config[:sslkey]
+ 
+-      ConnectionAdapters::MysqlAdapter.new(mysql, logger, [host, username, password, database, port, socket], config)
++      options = [host, username, password, database, port, socket, flags]
++      ConnectionAdapters::MysqlAdapter.new(mysql, logger, options, config)
+     end
+   end
+ 
+@@ -143,6 +151,7 @@ module ActiveRecord
+     # * <tt>:host</tt> - Defaults to "localhost".
+     # * <tt>:port</tt> - Defaults to 3306.
+     # * <tt>:socket</tt> - Defaults to "/tmp/mysql.sock".
++    # * <tt>:flags</tt> -- Specifies flags to pass to the MySQL adapter's "real_connect" function. Should be an array of strings naming constants from the Mysql module (e.g., [CLIENT_MULTI_RESULTS, CLIENT_COMPRESS]).  Flags and their behavior are documented at mysql.com (http://dev.mysql.com/doc/refman/5.1/en/mysql-real-connect.html).
+     # * <tt>:username</tt> - Defaults to "root"
+     # * <tt>:password</tt> - Defaults to nothing.
+     # * <tt>:database</tt> - The name of the database. No default, must be provided.
+@@ -167,6 +176,10 @@ module ActiveRecord
+       cattr_accessor :emulate_booleans
+       self.emulate_booleans = true
+ 
++      # Holds a bitwise OR of connection flags passed to
++      # real_connect. 
++      attr_reader :flags
++
+       ADAPTER_NAME = 'MySQL'.freeze
+ 
+       LOST_CONNECTION_ERROR_MESSAGES = [
+@@ -195,6 +208,7 @@ module ActiveRecord
+       def initialize(connection, logger, connection_options, config)
+         super(connection, logger)
+         @connection_options, @config = connection_options, config
++        @flags = @connection_options.last
+         @quoted_column_names, @quoted_table_names = {}, {}
+         connect
+       end
+@@ -284,7 +298,7 @@ module ActiveRecord
+       rescue Mysql::Error
+         false
+       end
+-
++      
+       def reconnect!
+         disconnect!
+         connect
+diff --git a/activerecord/test/cases/connection_test_mysql.rb b/activerecord/test/cases/connection_test_mysql.rb
+index f79ee2f..422854a 100644
+--- a/activerecord/test/cases/connection_test_mysql.rb
++++ b/activerecord/test/cases/connection_test_mysql.rb
+@@ -6,41 +6,101 @@ class MysqlConnectionTest < ActiveRecord::TestCase
+     @connection = ActiveRecord::Base.connection
+   end
+ 
+-  def test_mysql_reconnect_attribute_after_connection_with_reconnect_true
+-    run_without_connection do |orig_connection|
+-      ActiveRecord::Base.establish_connection(orig_connection.merge({:reconnect => true}))
+-      assert ActiveRecord::Base.connection.raw_connection.reconnect
++#   def test_mysql_reconnect_attribute_after_connection_with_reconnect_true
++#     run_without_connection do |orig_connection|
++#       ActiveRecord::Base.establish_connection(orig_connection.merge({:reconnect => true}))
++#       assert ActiveRecord::Base.connection.raw_connection.reconnect
++#     end
++#   end
++
++#   def test_mysql_reconnect_attribute_after_connection_with_reconnect_false
++#     run_without_connection do |orig_connection|
++#       ActiveRecord::Base.establish_connection(orig_connection.merge({:reconnect => false}))
++#       assert !ActiveRecord::Base.connection.raw_connection.reconnect
++#     end
++#   end
++
++#   def test_no_automatic_reconnection_after_timeout
++#     assert @connection.active?
++#     @connection.update('set @@wait_timeout=1')
++#     sleep 2
++#     assert !@connection.active?
++#   end
++
++#   def test_successful_reconnection_after_timeout_with_manual_reconnect
++#     assert @connection.active?
++#     @connection.update('set @@wait_timeout=1')
++#     sleep 2
++#     @connection.reconnect!
++#     assert @connection.active?
++#   end
++
++#   def test_successful_reconnection_after_timeout_with_verify
++#     assert @connection.active?
++#     @connection.update('set @@wait_timeout=1')
++#     sleep 2
++#     @connection.verify!
++#     assert @connection.active?
++#  end
++
++  def test_flag_syntax
++    # Test that flags can be specified as single string, comma-separated list,
++    # or as an array.
++    ["CLIENT_MULTI_STATEMENTS", 
++     ["CLIENT_MULTI_STATEMENTS", "CLIENT_COMPRESS"],
++     "CLIENT_MULTI_STATEMENTS, CLIENT_COMPRESS"].each do |f|
++      assert_nothing_raised "Flag #{f.inspect} caused exception" do
++        connect_with_options :flags => f
++      end
+     end
+   end
+ 
+-  def test_mysql_reconnect_attribute_after_connection_with_reconnect_false
+-    run_without_connection do |orig_connection|
+-      ActiveRecord::Base.establish_connection(orig_connection.merge({:reconnect => false}))
+-      assert !ActiveRecord::Base.connection.raw_connection.reconnect
++  def test_multi_statements
++    # Test that MySQL connection can be configured
++    # to allow multiple statements.
++    connect_with_options :flags => "CLIENT_MULTI_STATEMENTS" do |conn|
++      assert conn.active?, "Connection not established."
++      assert_nothing_raised "Unable to execute multiple statements at once." do
++        rows = conn.select_rows(<<-SQL)
++select 1;
++select 2;
++SQL
++        assert(rows[0][0].to_i == 1, "Multiple statements did not return 1 as expected: #{rows.inspect}")
++      end
+     end
+   end
+ 
+-  def test_no_automatic_reconnection_after_timeout
+-    assert @connection.active?
+-    @connection.update('set @@wait_timeout=1')
+-    sleep 2
+-    assert !@connection.active?
++  def test_multi_results
++    # Test that MySQL connection can be configured
++    # to allow multiple results (e.g., stored procedures).
++    connect_with_options :flags => "CLIENT_MULTI_RESULTS" do |conn|
++      assert conn.active?, "Connection not established."
++      assert_nothing_raised "Unable to retrieve multiple results." do
++        rows = conn.select_rows('CALL ten();')
++        assert(rows[0][0].to_i == 10, "ten() did not return 10 as expected: #{rows.inspect}")
++      end
++    end
+   end
++  
++  def test_flags
++    # Test that flags are recalled correctly
++    connect_with_options :flags => [ "CLIENT_MULTI_RESULTS", "CLIENT_COMPRESS" ] do |conn|
++      assert conn.flags & Mysql::CLIENT_MULTI_RESULTS == Mysql::CLIENT_MULTI_RESULTS, "CLIENT_MULTI_RESULTS flag not preserved: #{conn.flags}"
++      assert conn.flags & Mysql::CLIENT_COMPRESS == Mysql::CLIENT_COMPRESS, "CLIENT_MULTI_RESULTS flag not present: #{conn.flags}"
++      assert conn.flags & Mysql::CLIENT_IGNORE_SPACE == 0, "CLIENT_IGNORE_SPACE flag should not be present: #{conn.flags}"
++    end
+ 
+-  def test_successful_reconnection_after_timeout_with_manual_reconnect
+-    assert @connection.active?
+-    @connection.update('set @@wait_timeout=1')
+-    sleep 2
+-    @connection.reconnect!
+-    assert @connection.active?
+-  end
++    connect_with_options :flags => "CLIENT_MULTI_RESULTS, CLIENT_COMPRESS" do |conn|
++      assert conn.flags & Mysql::CLIENT_MULTI_RESULTS == Mysql::CLIENT_MULTI_RESULTS, "CLIENT_MULTI_RESULTS flag not preserved: #{conn.flags}"
++      assert conn.flags & Mysql::CLIENT_COMPRESS == Mysql::CLIENT_COMPRESS, "CLIENT_MULTI_RESULTS flag not present: #{conn.flags}"
++      assert conn.flags & Mysql::CLIENT_IGNORE_SPACE == 0, "CLIENT_IGNORE_SPACE flag should not be present: #{conn.flags}"
++    end
+ 
+-  def test_successful_reconnection_after_timeout_with_verify
+-    assert @connection.active?
+-    @connection.update('set @@wait_timeout=1')
+-    sleep 2
+-    @connection.verify!
+-    assert @connection.active?
++    connect_with_options :flags => "CLIENT_COMPRESS" do |conn|
++      assert conn.flags & Mysql::CLIENT_MULTI_RESULTS == 0, "CLIENT_MULTI_RESULTS should not be present: #{conn.flags}"
++      assert conn.flags & Mysql::CLIENT_COMPRESS == Mysql::CLIENT_COMPRESS, "CLIENT_MULTI_RESULTS flag not present: #{conn.flags}"
++      assert conn.flags & Mysql::CLIENT_IGNORE_SPACE == 0, "CLIENT_IGNORE_SPACE flag should not be present: #{conn.flags}"
++    end
+   end
+ 
+   private
+@@ -53,4 +113,16 @@ class MysqlConnectionTest < ActiveRecord::TestCase
+       ActiveRecord::Base.establish_connection(original_connection)
+     end
+   end
++
++  def connect_with_options(options)
++    config = ActiveRecord::Base.connection_pool.spec.config 
++    begin
++      ActiveRecord::Base.establish_connection(config.merge(options))
++      yield ActiveRecord::Base.connection if block_given?
++      ActiveRecord::Base.connection.disconnect!
++    ensure
++      ActiveRecord::Base.establish_connection(config)
++      @connection = ActiveRecord::Base.connection
++    end
++  end
+ end
+diff --git a/activerecord/test/schema/mysql_specific_schema.rb b/activerecord/test/schema/mysql_specific_schema.rb
+index f44c33a..c78d99f 100644
+--- a/activerecord/test/schema/mysql_specific_schema.rb
++++ b/activerecord/test/schema/mysql_specific_schema.rb
+@@ -9,4 +9,16 @@ ActiveRecord::Schema.define do
+     t.text   :medium_text, :limit => 16777215
+     t.text   :long_text,   :limit => 2147483647
+   end
++
++  ActiveRecord::Base.connection.execute <<-SQL
++DROP PROCEDURE IF EXISTS ten;
++SQL
++
++  ActiveRecord::Base.connection.execute <<-SQL
++CREATE PROCEDURE ten() SQL SECURITY INVOKER
++BEGIN
++	select 10;
++END
++SQL
++
+ end
+-- 
+1.6.2.msysgit.0.186.gf7512
+

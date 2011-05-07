@@ -1,0 +1,107 @@
+From a0ab976d2b96b6ddf20d412b73f2ab97122f85e6 Mon Sep 17 00:00:00 2001
+From: John F. Douthat <johndouthat@gmail.com>
+Date: Tue, 21 Apr 2009 13:35:54 -0500
+Subject: [PATCH] Fix action cached methods returning ActiveRecord::RecordNotFound returning 200 OK, blank body on every request after the first. Fixes #2533
+
+---
+ .../lib/action_controller/caching/actions.rb       |   10 +++++-
+ actionpack/test/controller/caching_test.rb         |   35 ++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 1 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/caching/actions.rb b/actionpack/lib/action_controller/caching/actions.rb
+index 87b5029..21ee9bd 100644
+--- a/actionpack/lib/action_controller/caching/actions.rb
++++ b/actionpack/lib/action_controller/caching/actions.rb
+@@ -61,7 +61,9 @@ module ActionController #:nodoc:
+           filter_options = { :only => actions, :if => options.delete(:if), :unless => options.delete(:unless) }
+ 
+           cache_filter = ActionCacheFilter.new(:layout => options.delete(:layout), :cache_path => options.delete(:cache_path), :store_options => options)
+-          around_filter(cache_filter, filter_options)
++          around_filter(filter_options) do |controller, action|
++            cache_filter.filter(controller, action)
++          end
+         end
+       end
+ 
+@@ -83,6 +85,12 @@ module ActionController #:nodoc:
+           @options = options
+         end
+ 
++        def filter(controller, action)
++          should_continue = before(controller)
++          action.call if should_continue
++          after(controller)
++        end
++
+         def before(controller)
+           cache_path = ActionCachePath.new(controller, path_options_for(controller, @options.slice(:cache_path)))
+           if cache = controller.read_fragment(cache_path.path, @options[:store_options])
+diff --git a/actionpack/test/controller/caching_test.rb b/actionpack/test/controller/caching_test.rb
+index 86dafd9..77897b2 100644
+--- a/actionpack/test/controller/caching_test.rb
++++ b/actionpack/test/controller/caching_test.rb
+@@ -1,5 +1,6 @@
+ require 'fileutils'
+ require 'abstract_unit'
++require 'active_record_unit'
+ 
+ CACHE_DIR = 'test_cache'
+ # Don't change '/../temp/' cavalierly or you might hose something you don't want hosed
+@@ -152,6 +153,7 @@ class ActionCachingTestController < ActionController::Base
+   caches_action :edit, :cache_path => Proc.new { |c| c.params[:id] ? "http://test.host/#{c.params[:id]};edit" : "http://test.host/edit" }
+   caches_action :with_layout
+   caches_action :layout_false, :layout => false
++  caches_action :record_not_found, :four_oh_four, :simple_runtime_error
+ 
+   layout 'talk_from_action.erb'
+ 
+@@ -174,6 +176,18 @@ class ActionCachingTestController < ActionController::Base
+     render :text => @cache_this, :layout => true
+   end
+ 
++  def record_not_found
++    raise ActiveRecord::RecordNotFound, "oops!"
++  end
++  
++  def four_oh_four
++    render :text => "404'd!", :status => 404
++  end
++  
++  def simple_runtime_error
++    raise "oops!"
++  end
++  
+   alias_method :show, :index
+   alias_method :edit, :index
+   alias_method :destroy, :index
+@@ -456,6 +470,27 @@ class ActionCacheTest < ActionController::TestCase
+     assert_response :success
+   end
+ 
++  def test_record_not_found_returns_404_for_multiple_requests
++    get :record_not_found
++    assert_response 404
++    get :record_not_found
++    assert_response 404
++  end
++  
++  def test_four_oh_four_returns_404_for_multiple_requests
++    get :four_oh_four
++    assert_response 404
++    get :four_oh_four
++    assert_response 404
++  end
++  
++  def test_simple_runtime_error_returns_500_for_multiple_requests
++    get :simple_runtime_error
++    assert_response 500
++    get :simple_runtime_error
++    assert_response 500    
++  end
++  
+   private
+     def content_to_cache
+       assigns(:cache_this)
+-- 
+1.6.1
+

@@ -1,0 +1,90 @@
+From eefa8b229a58906d7e05467d8212615f26490433 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Sun, 21 Sep 2008 23:51:02 +0200
+Subject: [PATCH] Add an 'extra_conditions' parameter to configure_dependency_for_has_many for
+ supporting certain plugins, and make the generated callbacks run inside
+ AssociationCollection#activate_context.
+
+---
+ activerecord/lib/active_record/associations.rb     |   28 +++++++++++++++++--
+ .../associations/association_collection.rb         |    9 ++++++
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 6f4be93..13e86ce 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1428,15 +1428,23 @@ module ActiveRecord
+           []
+         end
+ 
++        # Creates before_destroy callback methods that nullify, delete or destroy
++        # has_many associated objects, according to the defined :dependent rule.
++        #
+         # See HasManyAssociation#delete_records.  Dependent associations
+         # delete children, otherwise foreign key is set to NULL.
+-        def configure_dependency_for_has_many(reflection)
++        #
++        # The +extra_conditions+ parameter, which is not used within the main
++        # Active Record codebase, is meant to allow plugins to define extra
++        # finder conditions.
++        def configure_dependency_for_has_many(reflection, extra_conditions = nil)
+           if reflection.options.include?(:dependent)
+             # Add polymorphic type if the :as option is present
+             dependent_conditions = []
+             dependent_conditions << "#{reflection.primary_key_name} = \#{record.quoted_id}"
+             dependent_conditions << "#{reflection.options[:as]}_type = '#{base_class.name}'" if reflection.options[:as]
+             dependent_conditions << sanitize_sql(reflection.options[:conditions]) if reflection.options[:conditions]
++            dependent_conditions << extra_conditions if extra_conditions
+             dependent_conditions = dependent_conditions.collect {|where| "(#{where})" }.join(" AND ")
+ 
+             case reflection.options[:dependent]
+@@ -1447,9 +1455,23 @@ module ActiveRecord
+                 end
+                 before_destroy method_name
+               when :delete_all
+-                module_eval "before_destroy { |record| #{reflection.class_name}.delete_all(%(#{dependent_conditions})) }"
++                module_eval %Q{
++                  before_destroy do |record|
++                    record.#{reflection.name}.activate_context do
++                      #{reflection.class_name}.delete_all("#{dependent_conditions}")
++                    end
++                  end
++                }
+               when :nullify
+-                module_eval "before_destroy { |record| #{reflection.class_name}.update_all(%(#{reflection.primary_key_name} = NULL),  %(#{dependent_conditions})) }"
++                module_eval %Q{
++                  before_destroy do |record|
++                    record.#{reflection.name}.activate_context do
++                      #{reflection.class_name}.update_all(
++                          "#{reflection.primary_key_name} = NULL",
++                          "#{dependent_conditions}")
++                    end
++                  end
++                }
+               else
+                 raise ArgumentError, "The :dependent option expects either :destroy, :delete_all, or :nullify (#{reflection.options[:dependent].inspect})"
+             end
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 463de9d..d8829e2 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -123,6 +123,15 @@ module ActiveRecord
+       alias_method :push, :<<
+       alias_method :concat, :<<
+ 
++      # Activates this association's context and yields the given block.
++      #
++      # The default implementation does nothing, it only yields the block. This
++      # method is intended to be a hook which plugins can override to add
++      # behavior.
++      def activate_context
++        yield
++      end
++      
+       # Starts a transaction in the association class's database connection.
+       #
+       #   class Author < ActiveRecord::Base
+-- 
+1.6.0.2
+

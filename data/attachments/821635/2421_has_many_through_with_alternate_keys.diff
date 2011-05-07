@@ -1,0 +1,181 @@
+From 16d0dd31d4d2288469628c98bedc9f10435ae8a6 Mon Sep 17 00:00:00 2001
+From: Jon Leighton <j@jonathanleighton.com>
+Date: Wed, 15 Dec 2010 23:27:15 +0000
+Subject: [PATCH] Fix various issues with the :primary_key option in :through associations [#2421 state:resolved]
+
+---
+ .../associations/through_association_scope.rb      |   26 +++++++-------------
+ activerecord/lib/active_record/reflection.rb       |    6 ++++-
+ .../test/cases/associations/join_model_test.rb     |   16 ++++++++++++
+ activerecord/test/cases/reflection_test.rb         |    5 ++++
+ activerecord/test/models/categorization.rb         |    3 ++
+ activerecord/test/models/post.rb                   |   10 +++++++
+ 6 files changed, 48 insertions(+), 18 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/through_association_scope.rb b/activerecord/lib/active_record/associations/through_association_scope.rb
+index 2ecd0f0..5dc5b0c 100644
+--- a/activerecord/lib/active_record/associations/through_association_scope.rb
++++ b/activerecord/lib/active_record/associations/through_association_scope.rb
+@@ -39,22 +39,22 @@ module ActiveRecord
+       # Build SQL conditions from attributes, qualified by table name.
+       def construct_conditions
+         table = aliased_through_table
+-        conditions = construct_quoted_owner_attributes(@reflection.through_reflection).map do |attr, value|
++        conditions = construct_owner_attributes(@reflection.through_reflection).map do |attr, value|
+           table[attr].eq(value)
+         end
+         conditions << Arel.sql(sql_conditions) if sql_conditions
+         table.create_and(conditions)
+       end
+ 
+-      # Associate attributes pointing to owner, quoted.
+-      def construct_quoted_owner_attributes(reflection)
++      # Associate attributes pointing to owner
++      def construct_owner_attributes(reflection)
+         if as = reflection.options[:as]
+-          { "#{as}_id" => @owner.id,
++          { "#{as}_id"   => @owner[reflection.active_record_primary_key],
+             "#{as}_type" => @owner.class.base_class.name }
+         elsif reflection.macro == :belongs_to
+           { reflection.klass.primary_key => @owner[reflection.primary_key_name] }
+         else
+-          { reflection.primary_key_name => @owner.id }
++          { reflection.primary_key_name => @owner[reflection.active_record_primary_key] }
+         end
+       end
+ 
+@@ -74,7 +74,8 @@ module ActiveRecord
+         conditions = []
+ 
+         if @reflection.source_reflection.macro == :belongs_to
+-          reflection_primary_key = @reflection.klass.primary_key
++          reflection_primary_key = @reflection.source_reflection.options[:primary_key] ||
++                                   @reflection.klass.primary_key
+           source_primary_key     = @reflection.source_reflection.primary_key_name
+           if @reflection.options[:source_type]
+             column = @reflection.source_reflection.options[:foreign_type]
+@@ -83,7 +84,8 @@ module ActiveRecord
+           end
+         else
+           reflection_primary_key = @reflection.source_reflection.primary_key_name
+-          source_primary_key     = @reflection.through_reflection.klass.primary_key
++          source_primary_key     = @reflection.source_reflection.options[:primary_key] ||
++                                   @reflection.through_reflection.klass.primary_key
+           if @reflection.source_reflection.options[:as]
+             column = "#{@reflection.source_reflection.options[:as]}_type"
+             conditions <<
+@@ -99,16 +101,6 @@ module ActiveRecord
+           right.create_on(right.create_and(conditions)))
+       end
+ 
+-      # Construct attributes for associate pointing to owner.
+-      def construct_owner_attributes(reflection)
+-        if as = reflection.options[:as]
+-          { "#{as}_id" => @owner.id,
+-            "#{as}_type" => @owner.class.base_class.name }
+-        else
+-          { reflection.primary_key_name => @owner.id }
+-        end
+-      end
+-
+       # Construct attributes for :through pointing to owner and associate.
+       def construct_join_attributes(associate)
+         # TODO: revisit this to allow it for deletion, supposing dependent option is supported
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index fe4b518..b9caa64 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -205,7 +205,11 @@ module ActiveRecord
+       end
+ 
+       def association_foreign_key
+-        @association_foreign_key ||= @options[:association_foreign_key] || class_name.foreign_key
++        @association_foreign_key ||= options[:association_foreign_key] || class_name.foreign_key
++      end
++
++      def active_record_primary_key
++        @active_record_primary_key ||= options[:primary_key] || active_record.primary_key
+       end
+ 
+       def counter_cache_column
+diff --git a/activerecord/test/cases/associations/join_model_test.rb b/activerecord/test/cases/associations/join_model_test.rb
+index 4581cb1..0a57c78 100644
+--- a/activerecord/test/cases/associations/join_model_test.rb
++++ b/activerecord/test/cases/associations/join_model_test.rb
+@@ -298,6 +298,22 @@ class AssociationsJoinModelTest < ActiveRecord::TestCase
+     assert_equal [authors(:mary)], posts(:authorless).authors
+   end
+ 
++  def test_has_many_going_through_join_model_with_custom_primary_key
++    assert_equal [authors(:david)], posts(:thinking).authors_using_author_id
++  end
++
++  def test_has_many_going_through_polymorphic_join_model_with_custom_primary_key
++    assert_equal [tags(:general)], posts(:eager_other).tags_using_author_id
++  end
++
++  def test_has_many_through_with_custom_primary_key_on_belongs_to_source
++    assert_equal [authors(:david), authors(:david)], posts(:thinking).author_using_custom_pk
++  end
++
++  def test_has_many_through_with_custom_primary_key_on_has_many_source
++    assert_equal [authors(:david)], posts(:thinking).authors_using_custom_pk
++  end
++
+   def test_both_scoped_and_explicit_joins_should_be_respected
+     assert_nothing_raised do
+       Post.send(:with_scope, :find => {:joins => "left outer join comments on comments.id = posts.id"}) do
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 389ca9e..912e3c4 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -191,6 +191,11 @@ class ReflectionTest < ActiveRecord::TestCase
+     assert_kind_of ThroughReflection, Subscriber.reflect_on_association(:books)
+   end
+ 
++  def test_active_record_primary_key
++    assert_equal "nick", Subscriber.reflect_on_association(:subscriptions).active_record_primary_key.to_s
++    assert_equal "name", Author.reflect_on_association(:essay).active_record_primary_key.to_s
++  end
++
+   def test_collection_association
+     assert Pirate.reflect_on_association(:birds).collection?
+     assert Pirate.reflect_on_association(:parrots).collection?
+diff --git a/activerecord/test/models/categorization.rb b/activerecord/test/models/categorization.rb
+index b3fc29f..fdb0a11 100644
+--- a/activerecord/test/models/categorization.rb
++++ b/activerecord/test/models/categorization.rb
+@@ -2,6 +2,9 @@ class Categorization < ActiveRecord::Base
+   belongs_to :post
+   belongs_to :category
+   belongs_to :author
++
++  belongs_to :author_using_custom_pk,  :class_name => 'Author', :foreign_key => :author_id, :primary_key => :author_address_extra_id
++  has_many   :authors_using_custom_pk, :class_name => 'Author', :foreign_key => :id,        :primary_key => :category_id
+ end
+ 
+ class SpecialCategorization < ActiveRecord::Base
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index 164b499..974e87d 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -69,6 +69,16 @@ class Post < ActiveRecord::Base
+   has_many :categorizations, :foreign_key => :category_id
+   has_many :authors, :through => :categorizations
+ 
++  has_many :categorizations_using_author_id, :primary_key => :author_id, :foreign_key => :post_id, :class_name => 'Categorization'
++  has_many :authors_using_author_id, :through => :categorizations_using_author_id, :source => :author
++
++  has_many :taggings_using_author_id, :primary_key => :author_id, :as => :taggable, :class_name => 'Tagging'
++  has_many :tags_using_author_id, :through => :taggings_using_author_id, :source => :tag
++
++  has_many :standard_categorizations, :class_name => 'Categorization', :foreign_key => :post_id
++  has_many :author_using_custom_pk,  :through => :standard_categorizations
++  has_many :authors_using_custom_pk, :through => :standard_categorizations
++
+   has_many :readers
+   has_many :readers_with_person, :include => :person, :class_name => "Reader"
+   has_many :people, :through => :readers
+-- 
+1.7.1
+

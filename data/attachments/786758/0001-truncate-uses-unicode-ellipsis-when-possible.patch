@@ -1,0 +1,217 @@
+From 7840c194b32b33f08dbee10b9b78dc0132b92dd4 Mon Sep 17 00:00:00 2001
+From: Bernerd Schaefer <bj.schaefer@gmail.com> and Veezus Kreist <mremsik@gmail.com>
+Date: Tue, 23 Nov 2010 18:07:39 -0600
+Subject: [PATCH] truncate uses unicode ellipsis when possible
+
+---
+ actionpack/lib/action_view/helpers/text_helper.rb  |   16 +++
+ actionpack/test/template/text_helper_test.rb       |  115 +++++++++++++-------
+ .../lib/active_support/core_ext/string/filters.rb  |    2 +-
+ activesupport/test/core_ext/string_ext_test.rb     |    4 +
+ railties/test/application/console_test.rb          |    3 +-
+ 5 files changed, 99 insertions(+), 41 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/text_helper.rb b/actionpack/lib/action_view/helpers/text_helper.rb
+index 3d27600..48b9d12 100644
+--- a/actionpack/lib/action_view/helpers/text_helper.rb
++++ b/actionpack/lib/action_view/helpers/text_helper.rb
+@@ -84,6 +84,22 @@ module ActionView
+       #   # => "<p>Once upon a time in a wo..."
+       def truncate(text, options = {})
+         options.reverse_merge!(:length => 30)
++
++        unless options[:omission]
++          omission_character = "..."
++          if 'string'.respond_to?(:encoding)
++            if Encoding.default_external == Encoding::UTF_8
++              omission_character = "\342\200\246".force_encoding('UTF-8')
++            end
++          else
++            if $KCODE == "UTF8"
++              omission_character = "\342\200\246"
++            end
++          end
++          options[:omission] = omission_character
++          options[:omission_length] = 3
++        end
++
+         text.truncate(options.delete(:length), options) if text
+       end
+ 
+diff --git a/actionpack/test/template/text_helper_test.rb b/actionpack/test/template/text_helper_test.rb
+index 9e9ed91..87a657a 100644
+--- a/actionpack/test/template/text_helper_test.rb
++++ b/actionpack/test/template/text_helper_test.rb
+@@ -48,51 +48,90 @@ class TextHelperTest < ActionView::TestCase
+     assert_equal "<p><b> test with unsafe string </b><script>code!</script></p>", simple_format("<b> test with unsafe string </b><script>code!</script>", {}, :sanitize => false)
+   end
+ 
+-  def test_truncate_should_not_be_html_safe
+-    assert !truncate("Hello World!", :length => 12).html_safe?
+-  end
++  class TruncateWithUTF8 < ActionView::TestCase
++    tests ActionView::Helpers::TextHelper
++    if 'string'.respond_to?(:encoding)
++      KCODE_TO_ENCODING = Hash.new(Encoding::BINARY).
++        update('UTF8' => Encoding::UTF_8, 'SJIS' => Encoding::Shift_JIS)
++      def setup
++        @default_encoding = Encoding.default_external
++        silence_warnings { Encoding.default_external = KCODE_TO_ENCODING[encoding] }
++      end
++      def teardown
++        silence_warnings { Encoding.default_external = @default_encoding }
++      end
++    else
++      def setup
++        @default_encoding, $KCODE = $KCODE, encoding
++      end
++      def teardown
++        $KCODE = @default_encoding
++      end
++    end
+ 
+-  def test_truncate
+-    assert_equal "Hello World!", truncate("Hello World!", :length => 12)
+-    assert_equal "Hello Wor...", truncate("Hello World!!", :length => 12)
+-  end
++    def encoding
++      'UTF8'
++    end
+ 
+-  def test_truncate_should_not_escape_input
+-    assert_equal "Hello <sc...", truncate("Hello <script>code!</script>World!!", :length => 12)
+-  end
++    def omission_character
++      omission_character = "\342\200\246"
++      'string'.respond_to?(:force_encoding) ? omission_character.force_encoding('UTF-8') : omission_character
++    end
+ 
+-  def test_truncate_should_use_default_length_of_30
+-    str = "This is a string that will go longer then the default truncate length of 30"
+-    assert_equal str[0...27] + "...", truncate(str)
+-  end
++    def test_truncate_should_not_be_html_safe
++      assert !truncate("Hello World!", :length => 12).html_safe?
++    end
+ 
+-  def test_truncate_with_options_hash
+-    assert_equal "This is a string that wil[...]", truncate("This is a string that will go longer then the default truncate length of 30", :omission => "[...]")
+-    assert_equal "Hello W...", truncate("Hello World!", :length => 10)
+-    assert_equal "Hello[...]", truncate("Hello World!", :omission => "[...]", :length => 10)
+-    assert_equal "Hello[...]", truncate("Hello Big World!", :omission => "[...]", :length => 13, :separator => ' ')
+-    assert_equal "Hello Big[...]", truncate("Hello Big World!", :omission => "[...]", :length => 14, :separator => ' ')
+-    assert_equal "Hello Big[...]", truncate("Hello Big World!", :omission => "[...]", :length => 15, :separator => ' ')
+-  end
++    def test_truncate
++      assert_equal "Hello World!", truncate("Hello World!", :length => 12)
++      assert_equal "Hello Wor#{omission_character}", truncate("Hello World!!", :length => 12)
++    end
+ 
+-  if RUBY_VERSION < '1.9.0'
+-    def test_truncate_multibyte
+-      with_kcode 'none' do
+-        assert_equal "\354\225\210\353\205\225\355...", truncate("\354\225\210\353\205\225\355\225\230\354\204\270\354\232\224", :length => 10)
+-      end
+-      with_kcode 'u' do
+-        assert_equal "\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 ...",
+-          truncate("\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 \354\225\204\353\235\274\353\246\254\354\230\244", :length => 10)
++    def test_truncate_should_not_escape_input
++      assert_equal "Hello <sc#{omission_character}", truncate("Hello <script>code!</script>World!!", :length => 12)
++    end
++
++    def test_truncate_should_use_default_length_of_30
++      str = "This is a string that will go longer then the default truncate length of 30"
++      assert_equal str[0...27] + "#{omission_character}", truncate(str)
++    end
++
++    def test_truncate_with_options_hash
++      assert_equal "This is a string that wil[...]", truncate("This is a string that will go longer then the default truncate length of 30", :omission => "[...]")
++      assert_equal "Hello W#{omission_character}", truncate("Hello World!", :length => 10)
++      assert_equal "Hello[...]", truncate("Hello World!", :omission => "[...]", :length => 10)
++      assert_equal "Hello[...]", truncate("Hello Big World!", :omission => "[...]", :length => 13, :separator => ' ')
++      assert_equal "Hello Big[...]", truncate("Hello Big World!", :omission => "[...]", :length => 14, :separator => ' ')
++      assert_equal "Hello Big[...]", truncate("Hello Big World!", :omission => "[...]", :length => 15, :separator => ' ')
++    end
++
++    def test_truncate_with_deprecated_arguments
++      if RUBY_VERSION < '1.9.0'
++        def test_truncate_multibyte
++          assert_equal "\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 #{omission_character}",
++            truncate("\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 \354\225\204\353\235\274\353\246\254\354\230\244", :length => 10)
++        end
++      else
++        def test_truncate_multibyte
++          assert_equal "\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 ".force_encoding('UTF-8') + omission_character,
++            truncate("\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 \354\225\204\353\235\274\353\246\254\354\230\244".force_encoding('UTF-8'), :length => 10)
++        end
+       end
+     end
+-  else
+-    def test_truncate_multibyte
+-      # .mb_chars always returns a UTF-8 String.
+-      # assert_equal "\354\225\210\353\205\225\355...",
+-      #   truncate("\354\225\210\353\205\225\355\225\230\354\204\270\354\232\224", :length => 10)
++  end
+ 
+-      assert_equal "\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 ...".force_encoding('UTF-8'),
+-        truncate("\354\225\204\353\246\254\353\236\221 \354\225\204\353\246\254 \354\225\204\353\235\274\353\246\254\354\230\244".force_encoding('UTF-8'), :length => 10)
++  class TruncateWithNonUTF8 < TruncateWithUTF8
++    def encoding
++      'None'
++    end
++    def omission_character
++      "..."
++    end
++    if RUBY_VERSION < '1.9.0'
++      def test_truncate_multibyte
++        assert_equal "\354\225\210\353\205\225\355#{omission_character}",
++          truncate("\354\225\210\353\205\225\355\225\230\354\204\270\354\232\224", :length => 10)
++      end
+     end
+   end
+ 
+diff --git a/activesupport/lib/active_support/core_ext/string/filters.rb b/activesupport/lib/active_support/core_ext/string/filters.rb
+index e15a1df..97efa31 100644
+--- a/activesupport/lib/active_support/core_ext/string/filters.rb
++++ b/activesupport/lib/active_support/core_ext/string/filters.rb
+@@ -39,7 +39,7 @@ class String
+     text = self.dup
+     options[:omission] ||= "..."
+ 
+-    length_with_room_for_omission = length - options[:omission].mb_chars.length
++    length_with_room_for_omission = length - (options[:omission_length] || options[:omission].mb_chars.length)
+     chars = text.mb_chars
+     stop = options[:separator] ?
+       (chars.rindex(options[:separator].mb_chars, length_with_room_for_omission) || length_with_room_for_omission) : length_with_room_for_omission
+diff --git a/activesupport/test/core_ext/string_ext_test.rb b/activesupport/test/core_ext/string_ext_test.rb
+index bb865ca..ef34c0f 100644
+--- a/activesupport/test/core_ext/string_ext_test.rb
++++ b/activesupport/test/core_ext/string_ext_test.rb
+@@ -256,6 +256,10 @@ class StringInflectionsTest < Test::Unit::TestCase
+     assert_equal "Hello Wor...", "Hello World!!".truncate(12)
+   end
+ 
++  def test_truncate_with_omission_and_omission_length
++    assert_equal "Hello Wor&hellip;", "Hello World!".truncate(10, :omission => "&hellip;", :omission_length => 1)
++  end
++
+   def test_truncate_with_omission_and_seperator
+     assert_equal "Hello[...]", "Hello World!".truncate(10, :omission => "[...]")
+     assert_equal "Hello[...]", "Hello Big World!".truncate(13, :omission => "[...]", :separator => ' ')
+diff --git a/railties/test/application/console_test.rb b/railties/test/application/console_test.rb
+index d4159dd..556db0f 100644
+--- a/railties/test/application/console_test.rb
++++ b/railties/test/application/console_test.rb
+@@ -69,8 +69,7 @@ class ConsoleTest < Test::Unit::TestCase
+     load_environment
+     assert_not_nil helper
+     assert_instance_of ActionView::Base, helper
+-    assert_equal 'Once upon a time in a world...',
+-      helper.truncate('Once upon a time in a world far far away')
++    assert_nothing_raised { helper.truncate('Once upon a time in a world far far away') }
+   end
+ 
+   def test_active_record_does_not_panic_when_referencing_an_observed_constant
+-- 
+1.7.3.1
+

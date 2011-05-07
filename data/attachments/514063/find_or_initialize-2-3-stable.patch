@@ -1,0 +1,94 @@
+From 18d91cb35f84fd28f580caa0e526d8f713f5f3bd Mon Sep 17 00:00:00 2001
+From: Santiago Pastorino <santiago@wyeworks.com>
+Date: Fri, 7 May 2010 16:58:24 -0300
+Subject: [PATCH] =?UTF-8?q?Make=20find=5For=5Fcreate=20and=20find=5For=5Finitialize=20work=20mixing=20explicit=20parameters=20and=20a=20hash=20backport=20from=203.0=20ht:=20Marc-Andr=C3=A9=20Lafortune=20[#4457=20state:committed]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ activerecord/lib/active_record/base.rb |   23 ++++++++++++++---------
+ activerecord/test/cases/finder_test.rb |   18 +++++++++++++++++-
+ 2 files changed, 31 insertions(+), 10 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 32d2854..1067e36 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1942,23 +1942,28 @@ module ActiveRecord #:nodoc:
+               # end
+               self.class_eval <<-EOS, __FILE__, __LINE__ + 1
+                 def self.#{method_id}(*args)
+-                  guard_protected_attributes = false
+-
+-                  if args[0].is_a?(Hash)
+-                    guard_protected_attributes = true
+-                    attributes = args[0].with_indifferent_access
+-                    find_attributes = attributes.slice(*[:#{attribute_names.join(',:')}])
+-                  else
+-                    find_attributes = attributes = construct_attributes_from_arguments([:#{attribute_names.join(',:')}], args)
++                  attributes = [:#{attribute_names.join(',:')}]
++                  protected_attributes_for_create = unprotected_attributes_for_create = {}
++                  args.each_with_index do |arg, i|
++                    if arg.is_a?(Hash)
++                      protected_attributes_for_create = args[i].with_indifferent_access
++                    else
++                      unprotected_attributes_for_create[attributes[i]] = args[i]
++                    end
+                   end
+ 
++                  find_attributes = (protected_attributes_for_create.merge(unprotected_attributes_for_create)).slice(*attributes)
++
+                   options = { :conditions => find_attributes }
+                   set_readonly_option!(options)
+ 
+                   record = find(:first, options)
+ 
+                   if record.nil?
+-                    record = self.new { |r| r.send(:attributes=, attributes, guard_protected_attributes) }
++                    record = self.new do |r|
++                      r.send(:attributes=, protected_attributes_for_create, true) unless protected_attributes_for_create.empty?
++                      r.send(:attributes=, unprotected_attributes_for_create, false) unless unprotected_attributes_for_create.empty?
++                    end
+                     #{'yield(record) if block_given?'}
+                     #{'record.save' if instantiator == :create}
+                     record
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index 0959585..c779a69 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -838,7 +838,7 @@ class FinderTest < ActiveRecord::TestCase
+     assert c.new_record?
+   end
+ 
+-  def test_find_or_create_from_one_attribute_should_set_not_attribute_even_when_protected
++  def test_find_or_create_from_one_attribute_should_not_set_attribute_even_when_protected
+     c = Company.find_or_create_by_name({:name => "Fortune 1000", :rating => 1000})
+     assert_equal "Fortune 1000", c.name
+     assert_not_equal 1000, c.rating
+@@ -846,6 +846,22 @@ class FinderTest < ActiveRecord::TestCase
+     assert !c.new_record?
+   end
+ 
++  def test_find_or_initialize_from_one_attribute_should_set_attribute_even_when_protected_and_also_set_the_hash
++    c = Company.find_or_initialize_by_rating(1000, {:name => "Fortune 1000"})
++    assert_equal "Fortune 1000", c.name
++    assert_equal 1000, c.rating
++    assert c.valid?
++    assert c.new_record?
++  end
++
++  def test_find_or_create_from_one_attribute_should_set_attribute_even_when_protected_and_also_set_the_hash
++    c = Company.find_or_create_by_rating(1000, {:name => "Fortune 1000"})
++    assert_equal "Fortune 1000", c.name
++    assert_equal 1000, c.rating
++    assert c.valid?
++    assert !c.new_record?
++  end
++
+   def test_find_or_initialize_from_one_attribute_should_set_attribute_even_when_protected
+     c = Company.find_or_initialize_by_name_and_rating("Fortune 1000", 1000)
+     assert_equal "Fortune 1000", c.name
+-- 
+1.7.0
+

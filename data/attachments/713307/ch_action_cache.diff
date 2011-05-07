@@ -1,0 +1,219 @@
+From 3fcc2fa93d8afb5a2359181a431263118ae66935 Mon Sep 17 00:00:00 2001
+From: Chris Hapgood <cch1@hapgoods.com>
+Date: Mon, 11 Oct 2010 09:42:05 -0400
+Subject: [PATCH] Let respond_to do the heavy action cache lifting
+
+In determining the best content type for a response, let respond_to consider
+available content types using existing logic.  Work hard to ensure that
+cached content has an extension to indicate its content type.
+---
+ .../lib/action_controller/caching/actions.rb       |   73 ++++++++++----------
+ actionpack/test/controller/caching_test.rb         |   20 +++---
+ 2 files changed, 46 insertions(+), 47 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/caching/actions.rb b/actionpack/lib/action_controller/caching/actions.rb
+index 21ee9bd..e581731 100644
+--- a/actionpack/lib/action_controller/caching/actions.rb
++++ b/actionpack/lib/action_controller/caching/actions.rb
+@@ -70,13 +70,14 @@ module ActionController #:nodoc:
+       protected
+         def expire_action(options = {})
+           return unless cache_configured?
++          options = {:format => :all}.merge(options)
+ 
+           if options[:action].is_a?(Array)
+             options[:action].dup.each do |action|
+-              expire_fragment(ActionCachePath.path_for(self, options.merge({ :action => action }), false))
++              expire_fragment(ActionCachePath.path_for(self, options.merge({ :action => action })))
+             end
+           else
+-            expire_fragment(ActionCachePath.path_for(self, options, false))
++            expire_fragment(ActionCachePath.path_for(self, options))
+           end
+         end
+ 
+@@ -93,12 +94,23 @@ module ActionController #:nodoc:
+ 
+         def before(controller)
+           cache_path = ActionCachePath.new(controller, path_options_for(controller, @options.slice(:cache_path)))
+-          if cache = controller.read_fragment(cache_path.path, @options[:store_options])
+-            controller.rendered_action_cache = true
+-            set_content_type!(controller, cache_path.extension)
+-            options = { :text => cache }
+-            options.merge!(:layout => true) if cache_layout?
+-            controller.__send__(:render, options)
++          responder = MimeResponds::Responder.new(controller)
++          # To which types can we respond from cache?  Best Answer: query cache store.  Cheap Answer: use static config.
++          # OPTIMIZE: Query cache store to determine which types can be responded to from cache.
++          types = @options[:store_options][:cache_types] || [:any]
++          types.each do |type|
++            responder.send(type) do
++              path = cache_path.path(controller.response.template.template_format.to_sym)
++              if cache = controller.read_fragment(path, @options[:store_options])
++                controller.rendered_action_cache = true
++                options = { :text => cache }
++                options.merge!(:layout => true) if cache_layout?
++                controller.__send__(:render, options)
++              end
++            end
++          end
++          responder.respond
++          if controller.rendered_action_cache
+             false
+           else
+             controller.action_cache_path = cache_path
+@@ -108,14 +120,12 @@ module ActionController #:nodoc:
+         def after(controller)
+           return if controller.rendered_action_cache || !caching_allowed(controller)
+           action_content = cache_layout? ? content_for_layout(controller) : controller.response.body
+-          controller.write_fragment(controller.action_cache_path.path, action_content, @options[:store_options])
++          response_mime_type = Mime::Type.lookup(controller.response.content_type)
++          path = controller.action_cache_path.path(response_mime_type.to_sym)
++          controller.write_fragment(path, action_content, @options[:store_options])
+         end
+ 
+         private
+-          def set_content_type!(controller, extension)
+-            controller.response.content_type = Mime::Type.lookup_by_extension(extension).to_s if extension
+-          end
+-
+           def path_options_for(controller, options)
+             ((path_options = options[:cache_path]).respond_to?(:call) ? path_options.call(controller) : path_options) || {}
+           end
+@@ -134,26 +144,25 @@ module ActionController #:nodoc:
+       end
+ 
+       class ActionCachePath
+-        attr_reader :path, :extension
+-
+         class << self
+-          def path_for(controller, options, infer_extension = true)
+-            new(controller, options, infer_extension).path
++          def path_for(controller, options)
++            new(controller, options).path
+           end
+         end
+         
+-        # When true, infer_extension will look up the cache path extension from the request's path & format.
++        def initialize(controller, options = {})
++          @controller = controller
++          @options = options
++        end
++
++        # When present, mime_type cause the path to be specific to a given mime type..
+         # This is desirable when reading and writing the cache, but not when expiring the cache -
+         # expire_action should expire the same files regardless of the request format.
+-        def initialize(controller, options = {}, infer_extension = true)
+-          if infer_extension
+-            extract_extension(controller.request)
+-            options = options.reverse_merge(:format => @extension) if options.is_a?(Hash)
+-          end
+-
+-          path = controller.url_for(options).split('://').last
++        def path(format = nil)
++          options = @options.dup
++          options = options.reverse_merge(:format => format) if format && options.is_a?(Hash)
++          path = @controller.url_for(options).split('://').last
+           normalize!(path)
+-          add_extension!(path, @extension)
+           @path = URI.unescape(path)
+         end
+ 
+@@ -161,17 +170,7 @@ module ActionController #:nodoc:
+           def normalize!(path)
+             path << 'index' if path[-1] == ?/
+           end
+-
+-          def add_extension!(path, extension)
+-            path << ".#{extension}" if extension and !path.ends_with?(extension)
+-          end
+-          
+-          def extract_extension(request)
+-            # Don't want just what comes after the last '.' to accommodate multi part extensions
+-            # such as tar.gz.
+-            @extension = request.path[/^[^.]+\.(.+)$/, 1] || request.cache_format
+-          end
+       end
+     end
+   end
+-end
++end
+\ No newline at end of file
+diff --git a/actionpack/test/controller/caching_test.rb b/actionpack/test/controller/caching_test.rb
+index 223f5f7..809f880 100644
+--- a/actionpack/test/controller/caching_test.rb
++++ b/actionpack/test/controller/caching_test.rb
+@@ -254,7 +254,7 @@ class ActionCacheTest < ActionController::TestCase
+     get :index
+     cached_time = content_to_cache
+     assert_equal cached_time, @response.body
+-    assert fragment_exist?('hostname.com/action_caching_test')
++    assert fragment_exist?('hostname.com/action_caching_test?format=all')
+     reset!
+ 
+     get :index
+@@ -265,7 +265,7 @@ class ActionCacheTest < ActionController::TestCase
+     get :destroy
+     cached_time = content_to_cache
+     assert_equal cached_time, @response.body
+-    assert !fragment_exist?('hostname.com/action_caching_test/destroy')
++    assert !fragment_exist?('hostname.com/action_caching_test/destroy?format=all')
+     reset!
+ 
+     get :destroy
+@@ -276,26 +276,26 @@ class ActionCacheTest < ActionController::TestCase
+     get :with_layout
+     cached_time = content_to_cache
+     assert_not_equal cached_time, @response.body
+-    assert fragment_exist?('hostname.com/action_caching_test/with_layout')
++    assert fragment_exist?('hostname.com/action_caching_test/with_layout?format=all')
+     reset!
+ 
+     get :with_layout
+     assert_not_equal cached_time, @response.body
+ 
+-    assert_equal @response.body, read_fragment('hostname.com/action_caching_test/with_layout')
++    assert_equal @response.body, read_fragment('hostname.com/action_caching_test/with_layout?format=all')
+   end
+ 
+   def test_action_cache_with_layout_and_layout_cache_false
+     get :layout_false
+     cached_time = content_to_cache
+     assert_not_equal cached_time, @response.body
+-    assert fragment_exist?('hostname.com/action_caching_test/layout_false')
++    assert fragment_exist?('hostname.com/action_caching_test/layout_false?format=all')
+     reset!
+ 
+     get :layout_false
+     assert_not_equal cached_time, @response.body
+ 
+-    assert_equal cached_time, read_fragment('hostname.com/action_caching_test/layout_false')
++    assert_equal cached_time, read_fragment('hostname.com/action_caching_test/layout_false?format=all')
+   end
+ 
+   def test_action_cache_conditional_options
+@@ -309,8 +309,8 @@ class ActionCacheTest < ActionController::TestCase
+ 
+   def test_action_cache_with_store_options
+     MockTime.expects(:now).returns(12345).once
+-    @controller.expects(:read_fragment).with('hostname.com/action_caching_test', :expires_in => 1.hour).once
+-    @controller.expects(:write_fragment).with('hostname.com/action_caching_test', '12345.0', :expires_in => 1.hour).once
++    @controller.expects(:read_fragment).with('hostname.com/action_caching_test?format=all', :expires_in => 1.hour).once
++    @controller.expects(:write_fragment).with('hostname.com/action_caching_test?format=all', '12345.0', :expires_in => 1.hour).once
+     get :index
+   end
+ 
+@@ -441,8 +441,8 @@ class ActionCacheTest < ActionController::TestCase
+ 
+   def test_correct_content_type_is_returned_for_cache_hit
+     # run it twice to cache it the first time
+-    get :index, :id => 'content-type.xml'
+-    get :index, :id => 'content-type.xml'
++    get :index, :id => 'content-type.xml', :format => 'xml'
++    get :index, :id => 'content-type.xml', :format => 'xml'
+     assert_equal 'application/xml', @response.content_type
+   end
+ 
+-- 
+1.7.1
+

@@ -1,0 +1,486 @@
+From 5125edc694234d1d622f7417d9bf43e4b5fffb26 Mon Sep 17 00:00:00 2001
+From: thedarkone <nobody>
+Date: Tue, 10 Feb 2009 02:55:58 +0100
+Subject: [PATCH] Add reloadable templates.
+
+---
+ actionpack/lib/action_controller/dispatcher.rb    |    7 +-
+ actionpack/lib/action_controller/rescue.rb        |    2 +-
+ actionpack/lib/action_view.rb                     |    1 +
+ actionpack/lib/action_view/base.rb                |   11 ++-
+ actionpack/lib/action_view/paths.rb               |   17 ++--
+ actionpack/lib/action_view/reloadable_template.rb |  124 +++++++++++++++++++++
+ actionpack/lib/action_view/renderable.rb          |    4 +
+ actionpack/lib/action_view/template.rb            |   73 ++++---------
+ railties/environments/test.rb                     |    1 +
+ railties/lib/initializer.rb                       |   17 +---
+ 10 files changed, 177 insertions(+), 80 deletions(-)
+ create mode 100644 actionpack/lib/action_view/reloadable_template.rb
+
+diff --git a/actionpack/lib/action_controller/dispatcher.rb b/actionpack/lib/action_controller/dispatcher.rb
+index e91babd..91bb061 100644
+--- a/actionpack/lib/action_controller/dispatcher.rb
++++ b/actionpack/lib/action_controller/dispatcher.rb
+@@ -3,7 +3,7 @@ module ActionController
+   # reloading the app after each request when Dependencies.load? is true.
+   class Dispatcher
+     class << self
+-      def define_dispatcher_callbacks(cache_classes)
++      def define_dispatcher_callbacks(cache_classes, cache_templates = true)
+         unless cache_classes
+           # Development mode callbacks
+           before_dispatch :reload_application
+@@ -11,6 +11,11 @@ module ActionController
+           ActionView::Helpers::AssetTagHelper.cache_asset_timestamps = false
+         end
+ 
++        unless cache_templates
++          ActionView::ReloadableTemplate.register_new_request_callback!(ActionMailer::Base) if Rails.configuration.frameworks.include?(:action_mailer)
++          ActionView::ReloadableTemplate.register_new_request_callback!(ActionController::Base)
++        end
++
+         if defined?(ActiveRecord)
+           after_dispatch :checkin_connections
+           to_prepare(:activerecord_instantiate_observers) { ActiveRecord::Base.instantiate_observers }
+diff --git a/actionpack/lib/action_controller/rescue.rb b/actionpack/lib/action_controller/rescue.rb
+index 40aa7cd..ec61715 100644
+--- a/actionpack/lib/action_controller/rescue.rb
++++ b/actionpack/lib/action_controller/rescue.rb
+@@ -38,7 +38,7 @@ module ActionController #:nodoc:
+       'ActionView::TemplateError'         => 'template_error'
+     }
+ 
+-    RESCUES_TEMPLATE_PATH = ActionView::Template::Path.new(
++    RESCUES_TEMPLATE_PATH = ActionView::Template::EagerPath.new(
+       File.join(File.dirname(__FILE__), "templates"))
+ 
+     def self.included(base) #:nodoc:
+diff --git a/actionpack/lib/action_view.rb b/actionpack/lib/action_view.rb
+index 0b710bd..1f1ff9d 100644
+--- a/actionpack/lib/action_view.rb
++++ b/actionpack/lib/action_view.rb
+@@ -44,6 +44,7 @@ module ActionView
+   autoload :Renderable, 'action_view/renderable'
+   autoload :RenderablePartial, 'action_view/renderable_partial'
+   autoload :Template, 'action_view/template'
++  autoload :ReloadableTemplate, 'action_view/reloadable_template'
+   autoload :TemplateError, 'action_view/template_error'
+   autoload :TemplateHandler, 'action_view/template_handler'
+   autoload :TemplateHandlers, 'action_view/template_handlers'
+diff --git a/actionpack/lib/action_view/base.rb b/actionpack/lib/action_view/base.rb
+index 3134807..f83be72 100644
+--- a/actionpack/lib/action_view/base.rb
++++ b/actionpack/lib/action_view/base.rb
+@@ -182,10 +182,15 @@ module ActionView #:nodoc:
+     # that alert()s the caught exception (and then re-raises it).
+     cattr_accessor :debug_rjs
+ 
+-    # Specify whether to check whether modified templates are recompiled without a restart
++    # Specify whether templates should be cached. Otherwise the file we be read everytime it is accessed.
++    # Automaticaly reloading templates are not thread safe and should only be used in development mode.
+     @@cache_template_loading = false
+     cattr_accessor :cache_template_loading
+ 
++    def self.cache_template_loading?
++      ActionController::Base.allow_concurrency || cache_template_loading
++    end
++
+     attr_internal :request
+ 
+     delegate :request_forgery_protection_token, :template, :params, :session, :cookies, :response, :headers,
+@@ -247,8 +252,8 @@ module ActionView #:nodoc:
+         if options[:layout]
+           _render_with_layout(options, local_assigns, &block)
+         elsif options[:file]
+-          template = self.view_paths.find_template(options[:file], template_format)
+-          template.render_template(self, options[:locals])
++          tempalte = self.view_paths.find_template(options[:file], template_format)
++          tempalte.render_template(self, options[:locals])
+         elsif options[:partial]
+           render_partial(options)
+         elsif options[:inline]
+diff --git a/actionpack/lib/action_view/paths.rb b/actionpack/lib/action_view/paths.rb
+index e14b212..d15709b 100644
+--- a/actionpack/lib/action_view/paths.rb
++++ b/actionpack/lib/action_view/paths.rb
+@@ -2,7 +2,11 @@ module ActionView #:nodoc:
+   class PathSet < Array #:nodoc:
+     def self.type_cast(obj)
+       if obj.is_a?(String)
+-        Template::Path.new(obj)
++        if Base.cache_template_loading?
++          Template::EagerPath.new(obj)
++        else
++          ReloadableTemplate::ReloadablePath.new(obj)
++        end
+       else
+         obj
+       end
+@@ -32,8 +36,9 @@ module ActionView #:nodoc:
+       super(*objs.map { |obj| self.class.type_cast(obj) })
+     end
+ 
+-    def find_template(template_path, format = nil)
+-      return template_path if template_path.respond_to?(:render)
++    def find_template(original_template_path, format = nil)
++      return original_template_path if original_template_path.respond_to?(:render)
++      template_path = original_template_path.sub(/^\//, '')
+ 
+       each do |load_path|
+         if format && (template = load_path["#{template_path}.#{I18n.locale}.#{format}"])
+@@ -52,11 +57,7 @@ module ActionView #:nodoc:
+         end
+       end
+ 
+-      if File.exist?(template_path)
+-        return Template.new(template_path, template_path[0] == 47 ? "" : ".")
+-      end
+-
+-      raise MissingTemplate.new(self, template_path, format)
++      File.file?(template_path) ? Template.new(template_path, template_path =~ /\A\// ? "" : ".") : raise(MissingTemplate.new(self, template_path, format))
+     end
+   end
+ end
+diff --git a/actionpack/lib/action_view/reloadable_template.rb b/actionpack/lib/action_view/reloadable_template.rb
+new file mode 100644
+index 0000000..8b70727
+--- /dev/null
++++ b/actionpack/lib/action_view/reloadable_template.rb
+@@ -0,0 +1,124 @@
++module ActionView #:nodoc:
++  class ReloadableTemplate < Template
++    
++    class TemplateDeleted < ActionView::ActionViewError
++    end
++    
++    class ReloadablePath < Template::Path
++      
++      def initialize(path)
++        super
++        @paths = {}
++        new_request!
++      end
++      
++      def new_request!
++        @disk_cache = {}
++      end
++      
++      def [](path)
++        if found_template = @paths[path]
++          begin
++            found_template.reset_cache_if_stale!
++          rescue TemplateDeleted
++            unregister_template(found_template)
++            self[path]
++          end
++        else
++          load_all_templates_from_dir(templates_dir_from_path(path))
++          @paths[path]
++        end
++      end
++      
++      def register_template_from_file(template_file_path)
++        if !@paths[template_relative_path = template_file_path.split("#{@path}/").last] && File.file?(template_file_path)
++          register_template(ReloadableTemplate.new(template_relative_path, self))
++        end
++      end
++      
++      def register_template(template)
++        template.accessible_paths.each do |path|
++          @paths[path] = template
++        end
++      end
++      
++      # remove (probably deleted) template from cache
++      def unregister_template(template)
++        template.accessible_paths.each do |template_path|
++          @paths.delete(template_path) if @paths[template_path] == template
++        end
++        # fill in any newly created gaps
++        @paths.values.uniq.each do |template|
++          template.accessible_paths.each {|path| @paths[path] ||= template}
++        end
++      end
++      
++      # load all templates from the directory of the requested template
++      def load_all_templates_from_dir(dir)
++        # hit disk only once per template-dir/request
++        @disk_cache[dir] ||= template_files_from_dir(dir).each {|template_file| register_template_from_file(template_file)}
++      end
++      
++      def templates_dir_from_path(path)
++        File.join(@path, File.dirname(path))
++      end
++      
++      # get all the template filenames from the dir
++      def template_files_from_dir(dir)
++        Dir.glob("#{dir}/*")
++      end
++      
++    end
++    
++    module Unfreezable
++      def freeze; self; end
++    end
++
++    def initialize(*args)
++      super
++      @compiled_methods = []
++      
++      # we don't ever want to get frozen
++      extend Unfreezable
++    end
++    
++    def mtime
++      File.mtime(filename)
++    end
++    
++    attr_reader :previously_last_modified
++    
++    def stale?
++      previously_last_modified.nil? || previously_last_modified < mtime
++    rescue Errno::ENOENT => e
++      undef_my_compiled_methods!
++      raise TemplateDeleted
++    end
++
++    def reset_cache_if_stale!
++      if stale?
++        flush_cache 'source', 'compiled_source'
++        undef_my_compiled_methods!
++        @previously_last_modified = mtime
++      end
++      self
++    end
++    
++    def undef_my_compiled_methods!
++      @compiled_methods.each {|comp_method| ActionView::Base::CompiledTemplates.send :remove_method, comp_method}
++      @compiled_methods.clear
++    end
++
++    def compile!(render_symbol, local_assigns)
++      super
++      @compiled_methods << render_symbol
++    end
++    
++    def self.register_new_request_callback!(base)
++      ActionController::Dispatcher.to_prepare do
++        base.view_paths.each{|view_path| view_path.new_request! if view_path.respond_to?(:new_request!)}
++      end
++    end
++        
++  end
++end
+diff --git a/actionpack/lib/action_view/renderable.rb b/actionpack/lib/action_view/renderable.rb
+index c127bb2..41080ed 100644
+--- a/actionpack/lib/action_view/renderable.rb
++++ b/actionpack/lib/action_view/renderable.rb
+@@ -91,5 +91,9 @@ module ActionView
+           raise ActionView::TemplateError.new(self, {}, e)
+         end
+       end
++
++      def recompile?
++        false
++      end
+   end
+ end
+diff --git a/actionpack/lib/action_view/template.rb b/actionpack/lib/action_view/template.rb
+index ee1b9f2..090a2cd 100644
+--- a/actionpack/lib/action_view/template.rb
++++ b/actionpack/lib/action_view/template.rb
+@@ -7,11 +7,6 @@ module ActionView #:nodoc:
+       def initialize(path)
+         raise ArgumentError, "path already is a Path class" if path.is_a?(Path)
+         @path = path.freeze
+-
+-        @paths = {}
+-        templates_in_path do |template|
+-          load_template(template)
+-        end
+       end
+ 
+       def to_s
+@@ -44,42 +39,36 @@ module ActionView #:nodoc:
+       # etc. A format must be supplied to match a formated file. +hello/index+
+       # will never match +hello/index.html.erb+.
+       def [](path)
+-        @paths[path] || find_template(path)
+       end
++    end
+ 
+-      private
+-        def templates_in_path
+-          (Dir.glob("#{@path}/**/*/**") | Dir.glob("#{@path}/**")).each do |file|
+-            yield create_template(file) unless File.directory?(file)
+-          end
+-        end
+-
+-        def create_template(file)
+-          Template.new(file.split("#{self}/").last, self)
+-        end
++    class EagerPath < Path
++      def initialize(path)
++        super
+ 
+-        def load_template(template)
++        @paths = {}
++        templates_in_path do |template|
+           template.load!
+           template.accessible_paths.each do |path|
+             @paths[path] = template
+           end
+         end
++        @paths.freeze
++      end
+ 
+-        def matching_templates(template_path)
+-          Dir.glob("#{@path}/#{template_path}.*").each do |file|
++      def [](path)
++        @paths[path]
++      end
++      
++      private
++        def templates_in_path
++          (Dir.glob("#{@path}/**/*/**") | Dir.glob("#{@path}/**")).each do |file|
+             yield create_template(file) unless File.directory?(file)
+           end
+         end
+ 
+-        def find_template(path)
+-          return nil if Base.cache_template_loading || ActionController::Base.allow_concurrency
+-          matching_templates(path) do |template|
+-            if template.accessible_paths.include?(path)
+-              load_template(template)
+-              return template
+-            end
+-          end
+-          nil
++        def create_template(file)
++          Template.new(file.split("#{self}/").last, self)
+         end
+     end
+ 
+@@ -168,14 +157,10 @@ module ActionView #:nodoc:
+       @@exempt_from_layout.any? { |exempted| path =~ exempted }
+     end
+ 
+-    def mtime
+-      File.mtime(filename)
+-    end
+-    memoize :mtime
+-
+     def source
+       File.read(filename)
+     end
++    memoize :source
+ 
+     def method_segment
+       relative_path.to_s.gsub(/([^a-zA-Z0-9_])/) { $1.ord }
+@@ -189,34 +174,16 @@ module ActionView #:nodoc:
+       if TemplateError === e
+         e.sub_template_of(self)
+         raise e
+-      elsif Errno::ENOENT === e
+-        raise MissingTemplate.new(view.view_paths, filename.sub("#{RAILS_ROOT}/#{load_path}/", ""))
+       else
+         raise TemplateError.new(self, view.assigns, e)
+       end
+     end
+ 
+-    def stale?
+-      !frozen? && mtime < mtime(:reload)
+-    end
+-
+     def load!
+-      reloadable? ? memoize_all : freeze
++      freeze
+     end
+ 
+     private
+-      def cached?
+-        Base.cache_template_loading || ActionController::Base.allow_concurrency
+-      end
+-
+-      def reloadable?
+-        !cached?
+-      end
+-
+-      def recompile?
+-        reloadable? ? stale? : false
+-      end
+-
+       def valid_extension?(extension)
+         !Template.registered_template_handler(extension).nil?
+       end
+@@ -263,5 +230,5 @@ module ActionView #:nodoc:
+ 
+         [base_path, name, locale, format, extension]
+       end
+- end
++  end
+ end
+diff --git a/railties/environments/test.rb b/railties/environments/test.rb
+index 496eb95..d6f80a4 100644
+--- a/railties/environments/test.rb
++++ b/railties/environments/test.rb
+@@ -12,6 +12,7 @@ config.whiny_nils = true
+ # Show full error reports and disable caching
+ config.action_controller.consider_all_requests_local = true
+ config.action_controller.perform_caching             = false
++config.action_view.cache_template_loading            = true
+ 
+ # Disable request forgery protection in test environment
+ config.action_controller.allow_forgery_protection    = false
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 11aa8a5..52e072d 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -181,9 +181,6 @@ module Rails
+       # Observers are loaded after plugins in case Observers or observed models are modified by plugins.
+       load_observers
+ 
+-      # Load view path cache
+-      load_view_paths
+-
+       # Load application classes
+       load_application_classes
+ 
+@@ -367,15 +364,6 @@ Run `rake gems:install` to install the missing gems.
+       end
+     end
+ 
+-    def load_view_paths
+-      if configuration.frameworks.include?(:action_view)
+-        if configuration.cache_classes
+-          ActionController::Base.view_paths = configuration.view_path if configuration.frameworks.include?(:action_controller)
+-          ActionMailer::Base.template_root = view_path if configuration.frameworks.include?(:action_mailer)
+-        end
+-      end
+-    end
+-
+     # Eager load application classes
+     def load_application_classes
+       return if $rails_rake_task
+@@ -480,7 +468,7 @@ Run `rake gems:install` to install the missing gems.
+     # set to use Configuration#view_path.
+     def initialize_framework_views
+       if configuration.frameworks.include?(:action_view)
+-        view_path = ActionView::Template::Path.new(configuration.view_path)
++        view_path = ActionView::PathSet.type_cast(configuration.view_path)
+         ActionMailer::Base.template_root ||= view_path if configuration.frameworks.include?(:action_mailer)
+         ActionController::Base.view_paths = view_path if configuration.frameworks.include?(:action_controller) && ActionController::Base.view_paths.empty?
+       end
+@@ -584,7 +572,8 @@ Run `rake gems:install` to install the missing gems.
+     def prepare_dispatcher
+       return unless configuration.frameworks.include?(:action_controller)
+       require 'dispatcher' unless defined?(::Dispatcher)
+-      Dispatcher.define_dispatcher_callbacks(configuration.cache_classes)
++      cache_templates = configuration.frameworks.include?(:action_view) && ActionView::Base.cache_template_loading?
++      Dispatcher.define_dispatcher_callbacks(configuration.cache_classes, cache_templates)
+       Dispatcher.new(Rails.logger).send :run_callbacks, :prepare_dispatch
+     end
+ 
+-- 
+1.6.0.1
+

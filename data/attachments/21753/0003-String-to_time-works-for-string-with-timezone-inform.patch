@@ -1,0 +1,154 @@
+From 6ae323eb9613f3057fe6a00ac1f7a4a2aaf4b623 Mon Sep 17 00:00:00 2001
+From: Dan Barry <dan@bakineggs.com>
+Date: Mon, 5 May 2008 17:59:19 -0500
+Subject: [PATCH] String#to_time works for string with timezone information
+
+---
+ activerecord/test/cases/attribute_methods_test.rb  |   27 ++++++++++++++++++++
+ .../active_support/core_ext/string/conversions.rb  |   13 +++++++++-
+ .../lib/active_support/values/time_zone.rb         |    3 ++
+ activesupport/test/core_ext/string_ext_test.rb     |   27 ++++++++++++++++++++
+ activesupport/test/time_zone_test.rb               |    8 ++++++
+ 5 files changed, 77 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/test/cases/attribute_methods_test.rb b/activerecord/test/cases/attribute_methods_test.rb
+index 61a049a..ab9abf2 100755
+--- a/activerecord/test/cases/attribute_methods_test.rb
++++ b/activerecord/test/cases/attribute_methods_test.rb
+@@ -173,6 +173,33 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_setting_time_zone_aware_attribute_with_string
++    utc_time = Time.utc(2008, 1, 1)
++    (-11..13).each do |timezone_offset|
++      time_string = utc_time.in_time_zone(timezone_offset).to_s
++      in_time_zone "Pacific Time (US & Canada)" do
++        record   = @target.new
++        record.written_on = time_string
++        assert_equal Time.zone.parse(time_string), record.written_on
++        assert_equal TimeZone["Pacific Time (US & Canada)"], record.written_on.time_zone
++        assert_equal Time.utc(2007, 12, 31, 16), record.written_on.time
++      end
++    end
++  end
++
++  def test_setting_time_zone_aware_attribute_interprets_time_zone_unaware_string_in_time_zone
++    time_string = 'Tue Jan 01 00:00:00 2008'
++    (-11..13).each do |timezone_offset|
++      in_time_zone timezone_offset do
++        record   = @target.new
++        record.written_on = time_string
++        assert_equal Time.zone.parse(time_string), record.written_on
++        assert_equal TimeZone[timezone_offset], record.written_on.time_zone
++        assert_equal Time.utc(2008, 1, 1), record.written_on.time
++      end
++    end
++  end
++
+   def test_setting_time_zone_aware_attribute_in_current_time_zone
+     utc_time = Time.utc(2008, 1, 1)
+     in_time_zone "Pacific Time (US & Canada)" do
+diff --git a/activesupport/lib/active_support/core_ext/string/conversions.rb b/activesupport/lib/active_support/core_ext/string/conversions.rb
+index d4334dc..610fc72 100644
+--- a/activesupport/lib/active_support/core_ext/string/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/string/conversions.rb
+@@ -12,7 +12,18 @@ module ActiveSupport #:nodoc:
+ 
+         # Form can be either :utc (default) or :local.
+         def to_time(form = :utc)
+-          ::Time.send("#{form}_time", *::Date._parse(self, false).values_at(:year, :mon, :mday, :hour, :min, :sec).map { |arg| arg || 0 })
++          parsed = ::Date._parse(self, false)
++          result = ::Time.send("#{form}_time", *parsed.values_at(:year, :mon, :mday, :hour, :min, :sec).map { |arg| arg || 0 })
++
++          unless result.is_a?(::DateTime)
++            if !parsed[:offset].nil?
++              offset = parsed[:offset]
++            elsif !::Time.zone.nil?
++              offset = result.in_time_zone(::Time.zone).utc_offset
++            end
++          end
++
++          result - offset.to_i
+         end
+ 
+         def to_date
+diff --git a/activesupport/lib/active_support/values/time_zone.rb b/activesupport/lib/active_support/values/time_zone.rb
+index 9cdc2a7..2342cd1 100644
+--- a/activesupport/lib/active_support/values/time_zone.rb
++++ b/activesupport/lib/active_support/values/time_zone.rb
+@@ -214,6 +214,9 @@ class TimeZone
+   #   Time.zone.parse('22:30:00')   # => Fri, 31 Dec 1999 22:30:00 HST -10:00
+   def parse(str, now=now)
+     time = Time.parse(str, now) rescue DateTime.parse(str)
++    unless time.is_a?(DateTime) || Date._parse(str)[:offset].nil?
++      time += time.in_time_zone(self).utc_offset - time.utc_offset
++    end
+     ActiveSupport::TimeWithZone.new(nil, self, time)
+   end
+ 
+diff --git a/activesupport/test/core_ext/string_ext_test.rb b/activesupport/test/core_ext/string_ext_test.rb
+index 19a30f1..57d56ea 100644
+--- a/activesupport/test/core_ext/string_ext_test.rb
++++ b/activesupport/test/core_ext/string_ext_test.rb
+@@ -91,6 +91,24 @@ class StringInflectionsTest < Test::Unit::TestCase
+     assert_equal Time.local_time(2039, 2, 27, 23, 50), "2039-02-27 23:50".to_time(:local)
+   end
+   
++  def test_string_without_timezone_to_time_in_timezone
++    time_string = '2005-02-27 23:50'
++    datetime_string = '2039-02-27 23:50'
++    silence_warnings do # silence warnings raised by tzinfo gem
++      (-11..13).each do |timezone_offset|
++        in_time_zone timezone_offset do
++          assert_equal Time.zone.parse(time_string), time_string.to_time
++          assert_equal DateTime.civil(2039, 2, 27, 23, 50), datetime_string.to_time
++        end
++      end
++    end
++  end
++
++  def test_string_to_time_with_timezone
++    assert_equal Time.utc(2005, 2, 27, 23, 50), "2005-02-27 21:50 -0200".to_time
++    assert_equal DateTime.civil(2039, 2, 27, 23, 50), "2039-02-27 23:50 -0200".to_time
++  end
++
+   def test_string_to_datetime
+     assert_equal DateTime.civil(2039, 2, 27, 23, 50), "2039-02-27 23:50".to_datetime
+     assert_equal 0, "2039-02-27 23:50".to_datetime.offset # use UTC offset
+@@ -196,4 +214,13 @@ class StringInflectionsTest < Test::Unit::TestCase
+       $KCODE = old_kcode
+     end
+   end
++
++  private
++  def in_time_zone(zone)
++    old_zone  = Time.zone
++    Time.zone = zone ? TimeZone[zone] : nil
++    yield
++  ensure
++    Time.zone = old_zone
++  end
+ end
+diff --git a/activesupport/test/time_zone_test.rb b/activesupport/test/time_zone_test.rb
+index 2f06c34..dd70186 100644
+--- a/activesupport/test/time_zone_test.rb
++++ b/activesupport/test/time_zone_test.rb
+@@ -173,6 +173,14 @@ class TimeZoneTest < Test::Unit::TestCase
+     assert_equal zone, twz.time_zone
+   end
+ 
++  def test_parse_string_with_timezone
++    (-11..13).each do |timezone_offset|
++      zone = TimeZone[timezone_offset]
++      twz = zone.parse('1999-12-31 19:00:00')
++      assert_equal twz, zone.parse(twz.to_s)
++    end
++  end
++
+   def test_parse_with_old_date
+     silence_warnings do # silence warnings raised by tzinfo gem
+       zone = TimeZone['Eastern Time (US & Canada)']
+-- 
+1.5.4.2
+

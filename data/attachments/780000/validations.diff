@@ -1,0 +1,168 @@
+From 08bdba366986198043f208aa892c8e84611840bb Mon Sep 17 00:00:00 2001
+From: Thilo Utke <thilo@upstre.am>
+Date: Fri, 19 Nov 2010 15:53:40 +0100
+Subject: [PATCH] deserialize error messages directly from error hash instead of an array of messages. this will loose multiple errors on one attribute unless ticket #5615 is fixed
+
+---
+ activeresource/lib/active_resource/validations.rb |   23 +++++++---------
+ activeresource/test/cases/base_errors_test.rb     |   30 ++++++++++----------
+ 2 files changed, 25 insertions(+), 28 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/validations.rb b/activeresource/lib/active_resource/validations.rb
+index a373e53..2542828 100644
+--- a/activeresource/lib/active_resource/validations.rb
++++ b/activeresource/lib/active_resource/validations.rb
+@@ -8,33 +8,30 @@ module ActiveResource
+   # Active Resource validation is reported to and from this object, which is used by Base#save
+   # to determine whether the object in a valid state to be saved. See usage example in Validations.
+   class Errors < ActiveModel::Errors
+-    # Grabs errors from an array of messages (like ActiveRecord::Validations)
++    # Grabs errors from a hash of errors (like ActiveRecord::Validations)
+     # The second parameter directs the errors cache to be cleared (default)
+     # or not (by passing true)
+-    def from_array(messages, save_cache = false)
++    def from_hash(errors, save_cache = false)
+       clear unless save_cache
+-      humanized_attributes = Hash[@base.attributes.keys.map { |attr_name| [attr_name.humanize, attr_name] }]
+-      messages.each do |message|
+-        attr_message = humanized_attributes.keys.detect do |attr_name|
+-          if message[0, attr_name.size + 1] == "#{attr_name} "
+-            add humanized_attributes[attr_name], message[(attr_name.size + 1)..-1]
++      errors.each do |attr, messages|
++        if messages.is_a?(Array)
++          messages.each do |message|
++            add attr, message
+           end
++        else
++          add attr, messages
+         end
+-
+-        self[:base] << message if attr_message.nil?
+       end
+     end
+ 
+     # Grabs errors from a json response.
+     def from_json(json, save_cache = false)
+-      array = Array.wrap(ActiveSupport::JSON.decode(json)['errors']) rescue []
+-      from_array array, save_cache
++      from_hash (ActiveSupport::JSON.decode(json)['errors'] || {}), save_cache
+     end
+ 
+     # Grabs errors from an XML response.
+     def from_xml(xml, save_cache = false)
+-      array = Array.wrap(Hash.from_xml(xml)['errors']['error']) rescue []
+-      from_array array, save_cache
++      from_hash (Hash.from_xml(xml)['errors'] || {}), save_cache
+     end
+   end
+ 
+diff --git a/activeresource/test/cases/base_errors_test.rb b/activeresource/test/cases/base_errors_test.rb
+index 5063916..755375b 100644
+--- a/activeresource/test/cases/base_errors_test.rb
++++ b/activeresource/test/cases/base_errors_test.rb
+@@ -4,8 +4,8 @@ require "fixtures/person"
+ class BaseErrorsTest < Test::Unit::TestCase
+   def setup
+     ActiveResource::HttpMock.respond_to do |mock|
+-      mock.post "/people.xml", {}, %q(<?xml version="1.0" encoding="UTF-8"?><errors><error>Age can't be blank</error><error>Name can't be blank</error><error>Name must start with a letter</error><error>Person quota full for today.</error></errors>), 422, {'Content-Type' => 'application/xml; charset=utf-8'}
+-      mock.post "/people.json", {}, %q({"errors":["Age can't be blank","Name can't be blank","Name must start with a letter","Person quota full for today."]}), 422, {'Content-Type' => 'application/json; charset=utf-8'}
++      mock.post "/people.xml", {}, %q(<?xml version="1.0" encoding="UTF-8"?><errors><age type="array"><age>can't be blank</age></age><name type="array"><name>can't be blank</name><name>must start with a letter</name></name><base type="array"><base>Person quota full for today.</base></base></errors>), 422, {'Content-Type' => 'application/xml; charset=utf-8'}
++      mock.post "/people.json", {}, %q({"errors":{"age":"can't be blank","name":["can't be blank","must start with a letter"],"base":"Person quota full for today."}}), 422, {'Content-Type' => 'application/json; charset=utf-8'}
+     end
+   end
+ 
+@@ -16,7 +16,7 @@ class BaseErrorsTest < Test::Unit::TestCase
+       end
+     end
+   end
+-
++  
+   def test_should_parse_json_and_xml_errors
+     [ :json, :xml ].each do |format|
+       invalid_user_using_format(format) do
+@@ -25,18 +25,18 @@ class BaseErrorsTest < Test::Unit::TestCase
+       end
+     end
+   end
+-
++  
+   def test_should_parse_json_errors_when_no_errors_key
+     ActiveResource::HttpMock.respond_to do |mock|
+       mock.post "/people.json", {}, '{}', 422, {'Content-Type' => 'application/json; charset=utf-8'}
+     end
+-
++  
+     invalid_user_using_format(:json) do
+       assert_kind_of ActiveResource::Errors, @person.errors
+       assert_equal 0, @person.errors.size
+     end
+   end
+-
++  
+   def test_should_parse_errors_to_individual_attributes
+     [ :json, :xml ].each do |format|
+       invalid_user_using_format(format) do
+@@ -47,7 +47,7 @@ class BaseErrorsTest < Test::Unit::TestCase
+       end
+     end
+   end
+-
++  
+   def test_should_iterate_over_errors
+     [ :json, :xml ].each do |format|
+       invalid_user_using_format(format) do
+@@ -57,7 +57,7 @@ class BaseErrorsTest < Test::Unit::TestCase
+       end
+     end
+   end
+-
++  
+   def test_should_iterate_over_full_errors
+     [ :json, :xml ].each do |format|
+       invalid_user_using_format(format) do
+@@ -67,7 +67,7 @@ class BaseErrorsTest < Test::Unit::TestCase
+       end
+     end
+   end
+-
++  
+   def test_should_format_full_errors
+     [ :json, :xml ].each do |format|
+       invalid_user_using_format(format) do
+@@ -79,27 +79,27 @@ class BaseErrorsTest < Test::Unit::TestCase
+       end
+     end
+   end
+-
++  
+   def test_should_mark_as_invalid_when_content_type_is_unavailable_in_response_header
+     ActiveResource::HttpMock.respond_to do |mock|
+-      mock.post "/people.xml", {}, %q(<?xml version="1.0" encoding="UTF-8"?><errors><error>Age can't be blank</error><error>Name can't be blank</error><error>Name must start with a letter</error><error>Person quota full for today.</error></errors>), 422, {}
+-      mock.post "/people.json", {}, %q({"errors":["Age can't be blank","Name can't be blank","Name must start with a letter","Person quota full for today."]}), 422, {}
++      mock.post "/people.xml", {}, %q(<?xml version="1.0" encoding="UTF-8"?><errors><age type="array"><age>can't be blank</age></age><name type="array"><name>can't be blank</name><name>must start with a letter</name></name><base type="array"><base>Person quota full for today.</base></base></errors>), 422, {}
++      mock.post "/people.json", {}, %q({"errors":{"age":"can't be blank","name":"can't be blank","name":"must start with a letter","base":"Person quota full for today."}}), 422, {}
+     end
+-
++  
+     [ :json, :xml ].each do |format|
+       invalid_user_using_format(format) do
+         assert !@person.valid?
+       end
+     end
+   end
+-
++  
+   private
+   def invalid_user_using_format(mime_type_reference)
+     previous_format = Person.format
+     Person.format = mime_type_reference
+     @person = Person.new(:name => '', :age => '')
+     assert_equal false, @person.save
+-
++  
+     yield
+   ensure
+     Person.format = previous_format
+-- 
+1.7.3.1
+

@@ -1,0 +1,274 @@
+Index: vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+===================================================================
+--- vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb	(revision 119)
++++ vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb	(working copy)
+@@ -23,6 +23,10 @@
+       def table_exists?(table_name)
+         tables.include?(table_name.to_s)
+       end
++      
++      def function_definition_for(function_name)
++        Function.new(function_name)
++      end
+ 
+       # Returns an array of indexes for the given table.
+       # def indexes(table_name, name = nil) end
+Index: vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+===================================================================
+--- vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb	(revision 119)
++++ vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb	(working copy)
+@@ -470,6 +470,37 @@
+         end
+     end
+ 
++    # Defines what we need to know about an SQL function.
++    class Function
++      attr_reader :calling_sql, :arguments, :return_type, :result_cast_code, :returns_set
++      
++      def initialize(function_name, catalog_info)
++        @function_name, @catalog_info = function_name, catalog_info
++        @arguments = extract_arguments
++        @result_type, @result_cast_code = extract_result_type
++        @returns_set = extract_returns_set
++        @calling_sql = extract_calling_sql
++      end
++      
++      private
++      
++        def extract_calling_sql
++          raise NotImplementedError
++        end
++      
++        def extract_arguments
++          raise NotImplementedError
++        end
++        
++        def extract_result_type
++          raise NotImplementedError
++        end
++      
++        def extract_returns_set
++          raise NotImplementedError
++        end
++    end
++
+     # Represents a SQL table in an abstract way for updating a table.
+     # Also see TableDefinition and SchemaStatements#create_table
+     #
+Index: vendor/rails/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+===================================================================
+--- vendor/rails/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb	(revision 119)
++++ vendor/rails/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb	(working copy)
+@@ -70,6 +70,14 @@
+       def quote_table_name(name)
+         quote_column_name(name)
+       end
++      
++      def quote_function_name(function_name)
++        quote_table_name(function_name)
++      end
++      
++      def quote_schema_name(schema_name)
++        quote_table_name(schema_name)
++      end
+ 
+       # REFERENTIAL INTEGRITY ====================================
+ 
+Index: vendor/rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+===================================================================
+--- vendor/rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb	(revision 119)
++++ vendor/rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb	(working copy)
+@@ -39,6 +39,42 @@
+   end
+ 
+   module ConnectionAdapters
++    class PostgreSQLFunction < Function
++      private
++        def extract_calling_sql
++          if returns_set
++            "SELECT * FROM #{@function_name}(%s)"
++          else
++            "SELECT #{@function_name}(%s)"
++          end
++        end
++      
++        def extract_arguments
++          i = -1
++          @catalog_info['arguments'].map do |arg|
++            i += 1
++            column = PostgreSQLColumn.new(nil, nil, arg)
++            {:class => column.klass, :cast_code => column.type_cast_code("args[#{i}]")}
++          end
++        end
++        
++        def extract_result_type
++          column = PostgreSQLColumn.new(nil, nil, @catalog_info['type'])
++          [column.klass, column.type_cast_code('value')]
++        end
++        
++        def extract_returns_set
++          case @catalog_info['returns_set']
++          when 'f'
++            false
++          when 't'
++            true
++          else
++            raise ArgumentError
++          end
++        end
++    end
++    
+     # PostgreSQL-specific extensions to column definitions in a table.
+     class PostgreSQLColumn < Column #:nodoc:
+       # Instantiates a new PostgreSQL column definition in a table.
+@@ -527,6 +563,44 @@
+            WHERE schemaname IN (#{schemas})
+         SQL
+       end
++      
++      def self.relation_name_parts(relation_name)
++        parts = relation_name.split('.')
++        if parts.length == 1
++          relation = relation_name
++          schema = select_value('SHOW search_path').split(',').detect{|s| s =~ /^[a-z_\-]+$/i} rescue 'public'
++        elsif parts.length == 2
++          schema, relation = parts
++        else
++          raise ArgumentError
++        end
++        
++        [schema, relation]
++      end
++      
++      def function_definition_for(function_name)
++        schema, relation = self.class.relation_name_parts(function_name)
++        
++        catalog_info = select_one(%{
++          SELECT proc.proargtypes AS arguments, type.typname AS type, proc.proretset AS returns_set FROM pg_catalog.pg_proc AS proc
++            JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = proc.pronamespace
++            JOIN pg_catalog.pg_type AS type ON type.oid = proc.prorettype
++          WHERE proc.proname = '#{relation}' AND namespace.nspname = '#{schema}'
++        })
++        
++        unless catalog_info
++          raise Base::SQLFunctionNotFound, "SQL Function #{function_name} doesn't exist."
++        end
++        
++        catalog_info['arguments'] = catalog_info['arguments'].split.map do |argument|
++          select_value(%{
++            SELECT typname FROM pg_catalog.pg_type
++            WHERE oid = #{argument}
++          })
++        end
++        
++        PostgreSQLFunction.new(function_name, catalog_info)
++      end
+ 
+       # Returns the list of all indexes for a table.
+       def indexes(table_name, name = nil)
+Index: vendor/rails/activerecord/lib/active_record/sql_methods.rb
+===================================================================
+--- vendor/rails/activerecord/lib/active_record/sql_methods.rb	(revision 0)
++++ vendor/rails/activerecord/lib/active_record/sql_methods.rb	(revision 0)
+@@ -0,0 +1,80 @@
++module ActiveRecord
++  module SQLMethods
++    class SQLMethodError < ActiveRecordError #:nodoc:
++    end
++    
++    class SQLFunctionNotFound < SQLMethodError #:nodoc:
++    end
++    
++    def self.included(base) #:nodoc:
++      base.extend ClassMethods
++    end
++    
++    module ClassMethods
++      def build_argument_cast(var_name, argument) #:nodoc:
++        if argument[:cast_code] == nil
++          "#{var_name} = connection.quote(#{var_name})"
++        else
++          "#{var_name} = #{argument[:cast_code]}"
++        end
++      end
++      
++      def build_argument_casts(arguments) #:nodoc:
++        i = -1
++        arguments.collect do |argument|
++          i += 1
++          var_name = "args[#{i}]"
++          build_argument_cast(var_name, argument)
++        end
++      end
++      
++      def build_function_call(function) #:nodoc:
++        function.returns_set ? build_function_set_call(function) : build_function_scalar_call(function)
++      end
++      
++      def build_function_set_call(function) #:nodoc:
++        query = function.calling_sql
++        %{query = sprintf('#{query}', args.join(', '))
++          connection.select_values(query).map do |value|
++            #{function.result_cast_code}
++          end}
++      end
++      
++      def build_function_scalar_call(function) #:nodoc:
++        query = function.calling_sql
++        %{query = sprintf('#{query}', args.join(', ))
++          value = connection.select_value(query)
++          #{function.result_cast_code}}
++      end
++      
++      def sql_method(method_name)
++        function_name = "#{table_name}_#{method_name}"
++        function = connection.function_definition_for(function_name)
++        argument_casts = build_argument_casts(function.arguments)
++        call_code = build_function_call(function)
++
++        method_body = %{
++          def #{method_name}(*args)
++            unless args.length == #{function.arguments.length}
++              raise ArgumentError, sprintf('wrong number of arguments (%d for #{function.arguments.length})', args.length)
++            end
++            #{argument_casts.join("\n")}
++            #{call_code}
++          end}
++        
++        define_sql_method(method_name, method_body)
++      end
++      
++      def define_sql_method(method_name, method_code) #:nodoc:
++        begin
++          instance_eval(method_code, __FILE__, __LINE__)
++        rescue SyntaxError => err
++          if logger
++            logger.warn("An exception was raised during compilation of the sql method #{method_name}.")
++            logger.warn(err.message)
++          end
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file
+Index: vendor/rails/activerecord/lib/active_record.rb
+===================================================================
+--- vendor/rails/activerecord/lib/active_record.rb	(revision 119)
++++ vendor/rails/activerecord/lib/active_record.rb	(working copy)
+@@ -56,6 +56,7 @@
+ require 'active_record/serialization'
+ require 'active_record/attribute_methods'
+ require 'active_record/dirty'
++require 'active_record/sql_methods'
+ 
+ ActiveRecord::Base.class_eval do
+   extend ActiveRecord::QueryCache
+@@ -75,6 +76,7 @@
+   include ActiveRecord::Reflection
+   include ActiveRecord::Calculations
+   include ActiveRecord::Serialization
++  include ActiveRecord::SQLMethods
+ end
+ 
+ require 'active_record/connection_adapters/abstract_adapter'

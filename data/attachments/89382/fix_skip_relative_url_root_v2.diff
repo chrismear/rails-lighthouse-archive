@@ -1,0 +1,144 @@
+From 9bc654d3884875fb8765c952fc11334f51ce3687 Mon Sep 17 00:00:00 2001
+From: Xavier Noria <fxn@hashref.com>
+Date: Mon, 16 Feb 2009 23:18:10 +0100
+Subject: [PATCH] fix
+
+---
+ actionpack/lib/action_controller/url_rewriter.rb |   15 +++--
+ actionpack/test/controller/url_rewriter_test.rb  |   59 ++++++++++++++-------
+ 2 files changed, 48 insertions(+), 26 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/url_rewriter.rb b/actionpack/lib/action_controller/url_rewriter.rb
+index bb6cb43..74413ee 100644
+--- a/actionpack/lib/action_controller/url_rewriter.rb
++++ b/actionpack/lib/action_controller/url_rewriter.rb
+@@ -100,18 +100,18 @@ module ActionController
+       base.default_url_options ||= {}
+     end
+ 
+-    # Generate a url based on the options provided, default_url_options and the
+-    # routes defined in routes.rb.  The following options are supported:
++    # Generates a URL based on the +options+ provided, +default_url_options+ and
++    # the routes defined in <tt>routes.rb</tt>. The following options are supported:
+     #
+-    # * <tt>:only_path</tt> - If true, the relative url is returned. Defaults to +false+.
++    # * <tt>:only_path</tt> - If true, the default, a relative URL is returned.
+     # * <tt>:protocol</tt> - The protocol to connect to. Defaults to 'http'.
+     # * <tt>:host</tt> - Specifies the host the link should be targetted at.
+     #   If <tt>:only_path</tt> is false, this option must be
+     #   provided either explicitly, or via +default_url_options+.
+     # * <tt>:port</tt> - Optionally specify the port to connect to.
+     # * <tt>:anchor</tt> - An anchor name to be appended to the path.
+-    # * <tt>:skip_relative_url_root</tt> - If true, the url is not constructed using the
+-    #   +relative_url_root+ set in ActionController::Base.relative_url_root.
++    # * <tt>:skip_relative_url_root</tt> - If true, <tt>ActionController::Base.relative_url_root</tt>
++    #   is not taken into account.
+     # * <tt>:trailing_slash</tt> - If true, adds a trailing slash, as in "/archive/2009/"
+     #
+     # Any other key (<tt>:controller</tt>, <tt>:action</tt>, etc.) given to
+@@ -138,10 +138,13 @@ module ActionController
+         url << ":#{options.delete(:port)}" if options.key?(:port)
+       else
+         # Delete the unused options to prevent their appearance in the query string.
+-        [:protocol, :host, :port, :skip_relative_url_root].each { |k| options.delete(k) }
++        [:protocol, :host, :port].each { |k| options.delete(k) }
+       end
+       trailing_slash = options.delete(:trailing_slash) if options.key?(:trailing_slash)
++
+       url << ActionController::Base.relative_url_root.to_s unless options[:skip_relative_url_root]
++      options.delete(:skip_relative_url_root) # prevent its appearance in the query string
++
+       anchor = "##{CGI.escape options.delete(:anchor).to_param.to_s}" if options[:anchor]
+       generated = Routing::Routes.generate(options, {})
+       url << (trailing_slash ? generated.sub(/\?|\z/) { "/" + $& } : generated)
+diff --git a/actionpack/test/controller/url_rewriter_test.rb b/actionpack/test/controller/url_rewriter_test.rb
+index 09a8356..a189113 100644
+--- a/actionpack/test/controller/url_rewriter_test.rb
++++ b/actionpack/test/controller/url_rewriter_test.rb
+@@ -98,6 +98,13 @@ class UrlWriterTests < ActionController::TestCase
+     W.default_url_options[:host] = 'www.basecamphq.com'
+   end
+ 
++  def with_relative_url_root(str)
++    current = ActionController::Base.relative_url_root
++    ActionController::Base.relative_url_root = str
++    yield
++    ActionController::Base.relative_url_root = current
++  end
++
+   def test_exception_is_thrown_without_host
+     assert_raises RuntimeError do
+       W.new.url_for :controller => 'c', :action => 'a', :id => 'i'
+@@ -183,15 +190,12 @@ class UrlWriterTests < ActionController::TestCase
+   end
+ 
+   def test_relative_url_root_is_respected
+-    orig_relative_url_root = ActionController::Base.relative_url_root
+-    ActionController::Base.relative_url_root = '/subdir'
+-
+-    add_host!
+-    assert_equal('https://www.basecamphq.com/subdir/c/a/i',
+-      W.new.url_for(:controller => 'c', :action => 'a', :id => 'i', :protocol => 'https')
+-    )
+-  ensure
+-    ActionController::Base.relative_url_root = orig_relative_url_root
++    with_relative_url_root('/subdir') do
++      add_host!
++      assert_equal('https://www.basecamphq.com/subdir/c/a/i',
++        W.new.url_for(:controller => 'c', :action => 'a', :id => 'i', :protocol => 'https')
++      )
++    end
+   end
+ 
+   def test_named_routes
+@@ -216,21 +220,36 @@ class UrlWriterTests < ActionController::TestCase
+   end
+ 
+   def test_relative_url_root_is_respected_for_named_routes
+-    orig_relative_url_root = ActionController::Base.relative_url_root
+-    ActionController::Base.relative_url_root = '/subdir'
++    with_relative_url_root('/subdir') do
++      ActionController::Routing::Routes.draw do |map|
++        map.home '/home/sweet/home/:user', :controller => 'home', :action => 'index'
++      end
+ 
+-    ActionController::Routing::Routes.draw do |map|
+-      map.home '/home/sweet/home/:user', :controller => 'home', :action => 'index'
++      kls = Class.new { include ActionController::UrlWriter }
++      controller = kls.new
++
++      assert_equal 'http://www.basecamphq.com/subdir/home/sweet/home/again',
++        controller.send(:home_url, :host => 'www.basecamphq.com', :user => 'again')
++      ActionController::Routing::Routes.load!
+     end
++  end
+ 
+-    kls = Class.new { include ActionController::UrlWriter }
+-    controller = kls.new
++  def test_skip_relative_url_root_with_relative_url
++    with_relative_url_root('/subdir') do
++      add_host!
++      assert_equal('/c/a',
++        W.new.url_for(:controller => 'c', :action => 'a', :only_path => true, :skip_relative_url_root => true)
++      )
++    end
++  end
+ 
+-    assert_equal 'http://www.basecamphq.com/subdir/home/sweet/home/again',
+-      controller.send(:home_url, :host => 'www.basecamphq.com', :user => 'again')
+-  ensure
+-    ActionController::Routing::Routes.load!
+-    ActionController::Base.relative_url_root = orig_relative_url_root
++  def test_skip_relative_url_root_with_absolute_url
++    with_relative_url_root('/subdir') do
++      add_host!
++      assert_equal('http://www.basecamphq.com/c/a',
++        W.new.url_for(:controller => 'c', :action => 'a', :skip_relative_url_root => true)
++      )
++    end
+   end
+ 
+   def test_only_path
+-- 
+1.6.1.2
+

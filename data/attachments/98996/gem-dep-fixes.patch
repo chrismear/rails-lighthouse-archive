@@ -1,0 +1,225 @@
+From 54bfa22e3e8357204a4736b3b55c1645e4cbe25d Mon Sep 17 00:00:00 2001
+From: Matt Jones <al2o3cr@gmail.com>
+Date: Thu, 12 Mar 2009 05:11:00 -0400
+Subject: [PATCH] Fix a number of corner cases in gem dependencies. See #2195 for discussion.
+
+- gems:unpack:dependencies now only unpacks runtime dependencies. Use gems:unpack:all_dependencies to get the old behavior.
+
+- gems task now shows status of gems not currently loaded (using lowercase letters). Useful for inspecting dependencies of gems (ruport, for example) that don't load dependencies at startup.
+
+- hardened methods in Rails::GemDependency against Gem::Exception from mismatched versions. Install/unpack/etc. should complain and continue.
+
+- warn users when trying to unpack gems not installed on the system, rather than silently ignoring them.
+
+Thanks to David Dollar for raising many of these issues.
+---
+ railties/lib/rails/gem_dependency.rb |   25 ++++++++++++++--
+ railties/lib/tasks/gems.rake         |   53 +++++++++++++++++++++++-----------
+ railties/test/gem_dependency_test.rb |    5 ++-
+ 3 files changed, 61 insertions(+), 22 deletions(-)
+
+diff --git a/railties/lib/rails/gem_dependency.rb b/railties/lib/rails/gem_dependency.rb
+index 2dd6590..8660f98 100644
+--- a/railties/lib/rails/gem_dependency.rb
++++ b/railties/lib/rails/gem_dependency.rb
+@@ -38,7 +38,11 @@ module Rails
+     end
+ 
+     def vendor_gem?
+-      Gem.loaded_specs.has_key?(name) && Gem.loaded_specs[name].loaded_from.include?(self.class.unpacked_path)
++      if Gem.loaded_specs.has_key?(name)
++        Gem.loaded_specs[name].loaded_from.include?(self.class.unpacked_path)
++      else
++        specification && specification.loaded_from.include?(self.class.unpacked_path)
++      end
+     end
+ 
+     def initialize(name, options = {})
+@@ -75,12 +79,17 @@ module Rails
+     def dependencies(options = {})
+       return [] if framework_gem? || specification.nil?
+ 
+-      all_dependencies = specification.dependencies.map do |dependency|
++      deps = specification.dependencies.dup
++      deps.reject! { |d| d.type == :development } unless options[:development]
++
++      all_dependencies = deps.map do |dependency|
+         GemDependency.new(dependency.name, :requirement => dependency.version_requirements)
+       end
+ 
+       all_dependencies += all_dependencies.map { |d| d.dependencies(options) }.flatten if options[:flatten]
+       all_dependencies.uniq
++    rescue Gem::Exception
++      []
+     end
+ 
+     def gem_dir(base_directory)
+@@ -109,6 +118,12 @@ module Rails
+       (r == Gem::Requirement.default) ? nil : r
+     end
+ 
++    def installed?
++      !specification.nil?
++    rescue Gem::Exception
++      false
++    end
++
+     def frozen?
+       @frozen ||= vendor_rails? || vendor_gem?
+     end
+@@ -133,6 +148,8 @@ module Rails
+           # have been loaded
+           !(gem_lib_files & $").empty?
+         end
++      rescue Gem::Exception
++        false
+       end
+     end
+ 
+@@ -150,6 +167,7 @@ module Rails
+     end
+ 
+     def unpack_to(directory)
++      puts "Gem #{@dep} not found - skipping." if specification.nil?
+       return if specification.nil? || File.directory?(gem_dir(directory)) || framework_gem?
+ 
+       FileUtils.mkdir_p directory
+@@ -160,7 +178,8 @@ module Rails
+       # Gem.activate changes the spec - get the original
+       real_spec = Gem::Specification.load(specification.loaded_from)
+       write_spec(directory, real_spec)
+-
++    rescue Gem::Exception => e
++      puts "Skipping unpack of #{@dep} - gem error: #{e.message}"
+     end
+ 
+     def write_spec(directory, spec)
+diff --git a/railties/lib/tasks/gems.rake b/railties/lib/tasks/gems.rake
+index 0932ba7..ba06aa4 100644
+--- a/railties/lib/tasks/gems.rake
++++ b/railties/lib/tasks/gems.rake
+@@ -7,16 +7,37 @@ task :gems => 'gems:base' do
+   puts "I = Installed"
+   puts "F = Frozen"
+   puts "R = Framework (loaded before rails starts)"
++  puts "    Lowercase letters are not loaded"
+ end
+ 
+ def print_gem_status(gem, indent=1)
+-  code = gem.loaded? ? (gem.frozen? ? (gem.framework_gem? ? "R" : "F") : "I") : " "
++  if gem.loaded?
++    code = case
++           when gem.framework_gem? then 'R'
++           when gem.frozen?        then 'F'
++           else                         'I'
++           end
++  else
++    code = case
++           when gem.frozen?        then 'f'
++           when gem.installed?     then 'i'
++           else                         ' '
++           end
++  end
+   puts "   "*(indent-1)+" - [#{code}] #{gem.name} #{gem.requirement.to_s}"
+   gem.dependencies.each { |g| print_gem_status(g, indent+1)} if gem.loaded?
+ end
+ 
++def current_gems
++  gems = Rails.configuration.gems
++  gems.reject! { |g| g.name != ENV['GEM'] } unless ENV['GEM'].blank?
++  gems
++end
++
+ namespace :gems do
+   task :base do
++    require 'rubygems'
++    require 'rubygems/gem_runner'
+     $gems_rake_task = true
+     Rake::Task[:environment].invoke
+   end
+@@ -25,6 +46,7 @@ namespace :gems do
+   task :build do
+     $gems_rake_task = true
+     require 'rails/gem_builder'
++    # loading the environment here can cause missing native extensions to crash Rails
+     Dir[File.join(Rails::GemDependency.unpacked_path, '*')].each do |gem_dir|
+       spec_file = File.join(gem_dir, '.specification')
+       next unless File.exists?(spec_file)
+@@ -37,17 +59,12 @@ namespace :gems do
+ 
+   desc "Installs all required gems for this application."
+   task :install => :base do
+-    require 'rubygems'
+-    require 'rubygems/gem_runner'
+-    Rails.configuration.gems.each { |gem| gem.install unless gem.loaded? }
++    current_gems.each { |gem| gem.install unless gem.installed? }
+   end
+ 
+   desc "Unpacks the specified gem into vendor/gems."
+   task :unpack => :base do
+-    require 'rubygems'
+-    require 'rubygems/gem_runner'
+-    Rails.configuration.gems.each do |gem|
+-      next unless ENV['GEM'].blank? || ENV['GEM'] == gem.name
++    current_gems.each do |gem|
+       gem.unpack_to(Rails::GemDependency.unpacked_path)
+     end
+   end
+@@ -55,25 +72,27 @@ namespace :gems do
+   namespace :unpack do
+     desc "Unpacks the specified gems and its dependencies into vendor/gems"
+     task :dependencies => :unpack do
+-      require 'rubygems'
+-      require 'rubygems/gem_runner'
+-      Rails.configuration.gems.each do |gem|
+-        next unless ENV['GEM'].blank? || ENV['GEM'] == gem.name
++      current_gems.each do |gem|
+         gem.dependencies(:flatten => true).each do |dependency|
+           dependency.unpack_to(Rails::GemDependency.unpacked_path)
+         end
+       end
+     end
++    task :all_dependencies => :unpack do
++      current_gems.each do |gem|
++        gem.dependencies(:flatten => true, :development => true).each do |dependency|
++          dependency.unpack_to(Rails::GemDependency.unpacked_path)
++        end
++      end
++    end
+   end
+ 
+   desc "Regenerate gem specifications in correct format."
+   task :refresh_specs => :base do
+-    require 'rubygems'
+-    require 'rubygems/gem_runner'
+     Rails::VendorGemSourceIndex.silence_spec_warnings = true
+-    Rails.configuration.gems.each do |gem|
+-      next unless gem.frozen? && (ENV['GEM'].blank? || ENV['GEM'] == gem.name)
++    current_gems.each do |gem|
++      next unless gem.frozen?
+       gem.refresh_spec(Rails::GemDependency.unpacked_path) if gem.loaded?
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/railties/test/gem_dependency_test.rb b/railties/test/gem_dependency_test.rb
+index 8b761c4..c0b2160 100644
+--- a/railties/test/gem_dependency_test.rb
++++ b/railties/test/gem_dependency_test.rb
+@@ -133,9 +133,10 @@ class GemDependencyTest < Test::Unit::TestCase
+     dummy_gem.add_load_paths
+     dummy_gem.load
+     assert dummy_gem.loaded?
+-    assert_equal 2, dummy_gem.dependencies(:flatten => true).size
++    assert_equal 0, dummy_gem.dependencies(:flatten => true).size
++    assert_equal 2, dummy_gem.dependencies(:flatten => true, :development => true).size
+     assert_nothing_raised do
+-      dummy_gem.dependencies.each do |g|
++      dummy_gem.dependencies(:development => true).each do |g|
+         g.dependencies
+       end
+     end
+-- 
+1.5.3.1
+

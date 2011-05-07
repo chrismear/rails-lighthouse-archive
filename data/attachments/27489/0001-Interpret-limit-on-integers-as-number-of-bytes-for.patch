@@ -1,0 +1,194 @@
+From fc2aa590c8edf8cf569b17ca79959a20422c2a1d Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Tarmo=20T=C3=A4nav?= <tarmo@itech.ee>
+Date: Sun, 15 Jun 2008 05:55:56 +0300
+Subject: [PATCH] Interpret :limit on integers as number of bytes for mysql and postgresql
+
+---
+ .../connection_adapters/mysql_adapter.rb           |   21 +++++----
+ .../connection_adapters/postgresql_adapter.rb      |   16 ++++---
+ activerecord/test/cases/migration_test.rb          |    5 ++
+ activerecord/test/cases/schema_dumper_test.rb      |   46 ++++++++++++++++++++
+ activerecord/test/schema/schema.rb                 |    7 +++
+ 5 files changed, 79 insertions(+), 16 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 93aafaa..d07558a 100755
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -99,7 +99,8 @@ module ActiveRecord
+         end
+ 
+         def extract_limit(sql_type)
+-          if sql_type =~ /blob|text/i
++          case sql_type
++          when /blob|text/i
+             case sql_type
+             when /tiny/i
+               255
+@@ -110,6 +111,10 @@ module ActiveRecord
+             else
+               super # we could return 65535 here, but we leave it undecorated by default
+             end
++          when /^int/i;       4
++          when /^bigint/i;    8
++          when /^smallint/i;  2
++          when /^mediumint/i; 3
+           else
+             super
+           end
+@@ -168,7 +173,7 @@ module ActiveRecord
+         :primary_key => "int(11) DEFAULT NULL auto_increment PRIMARY KEY".freeze,
+         :string      => { :name => "varchar", :limit => 255 },
+         :text        => { :name => "text" },
+-        :integer     => { :name => "int"},
++        :integer     => { :name => "int", :limit => 4 },
+         :float       => { :name => "float" },
+         :decimal     => { :name => "decimal" },
+         :datetime    => { :name => "datetime" },
+@@ -459,14 +464,10 @@ module ActiveRecord
+         return super unless type.to_s == 'integer'
+ 
+         case limit
+-        when 0..3
+-          "smallint(#{limit})"
+-        when 4..8
+-          "int(#{limit})"
+-        when 9..20
+-          "bigint(#{limit})"
+-        else
+-          'int(11)'
++        when 1..2;   'smallint'
++        when 3;      'mediumint'
++        when 4, nil; 'int(11)'
++        when 5..8;   'bigint'
+         end
+       end
+ 
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 294f4c1..78bf921 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -47,6 +47,12 @@ module ActiveRecord
+       end
+ 
+       private
++        def extract_limit(sql_type)
++          return 8 if sql_type =~ /^bigint/i
++          return 2 if sql_type =~ /^smallint/i
++          super
++        end
++
+         # Extracts the scale from PostgreSQL-specific data types.
+         def extract_scale(sql_type)
+           # Money type has a fixed scale of 2.
+@@ -782,12 +788,10 @@ module ActiveRecord
+       def type_to_sql(type, limit = nil, precision = nil, scale = nil)
+         return super unless type.to_s == 'integer'
+ 
+-        if limit.nil? || limit == 4
+-          'integer'
+-        elsif limit < 4
+-          'smallint'
+-        else
+-          'bigint'
++        case limit
++          when 1..2;      'smallint'
++          when 3..4, nil; 'integer'
++          when 5..8;      'bigint'
+         end
+       end
+       
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index f36255e..89f5166 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -173,6 +173,11 @@ if ActiveRecord::Base.connection.supports_migrations?
+         assert_equal 'smallint', one.sql_type
+         assert_equal 'integer', four.sql_type
+         assert_equal 'bigint', eight.sql_type
++      elsif current_adapter?(:MysqlAdapter)
++        assert_match /^int\(\d+\)/, default.sql_type
++        assert_match /^smallint\(\d+\)/, one.sql_type
++        assert_match /^int\(\d+\)/, four.sql_type
++        assert_match /^bigint\(\d+\)/, eight.sql_type
+       elsif current_adapter?(:OracleAdapter)
+         assert_equal 'NUMBER(38)', default.sql_type
+         assert_equal 'NUMBER(1)', one.sql_type
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index c42b0ef..942d686 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -72,6 +72,52 @@ class SchemaDumperTest < ActiveRecord::TestCase
+     assert_match %r{:null => false}, output
+   end
+ 
++  def test_schema_dump_includes_limit_constraint_for_integer_columns
++    stream = StringIO.new
++
++    ActiveRecord::SchemaDumper.ignore_tables = [/^(?!integer_limits)/]
++    ActiveRecord::SchemaDumper.dump(ActiveRecord::Base.connection, stream)
++    output = stream.string
++
++    if current_adapter?(:PostgreSQLAdapter)
++      assert_match %r{c_int_1.*:limit => 2}, output
++      assert_match %r{c_int_2.*:limit => 2}, output
++
++      # int 3 is 4 bytes in postgresql
++      assert_match %r{c_int_3.*}, output
++      assert_no_match %r{c_int_3.*:limit}, output
++
++      assert_match %r{c_int_4.*}, output
++      assert_no_match %r{c_int_4.*:limit}, output
++    elsif current_adapter?(:MysqlAdapter)
++      assert_match %r{c_int_1.*:limit => 2}, output
++      assert_match %r{c_int_2.*:limit => 2}, output
++      assert_match %r{c_int_3.*:limit => 3}, output
++
++      assert_match %r{c_int_4.*}, output
++      assert_no_match %r{c_int_4.*:limit}, output
++    elsif current_adapter?(:SQLiteAdapter)
++      assert_match %r{c_int_1.*:limit => 1}, output
++      assert_match %r{c_int_2.*:limit => 2}, output
++      assert_match %r{c_int_3.*:limit => 3}, output
++      assert_match %r{c_int_4.*:limit => 4}, output
++    end
++    assert_match %r{c_int_without_limit.*}, output
++    assert_no_match %r{c_int_without_limit.*:limit}, output
++
++    if current_adapter?(:SQLiteAdapter)
++      assert_match %r{c_int_5.*:limit => 5}, output
++      assert_match %r{c_int_6.*:limit => 6}, output
++      assert_match %r{c_int_7.*:limit => 7}, output
++      assert_match %r{c_int_8.*:limit => 8}, output
++    else
++      assert_match %r{c_int_5.*:limit => 8}, output
++      assert_match %r{c_int_6.*:limit => 8}, output
++      assert_match %r{c_int_7.*:limit => 8}, output
++      assert_match %r{c_int_8.*:limit => 8}, output
++    end
++  end
++
+   def test_schema_dump_with_string_ignored_table
+     stream = StringIO.new
+ 
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 423929f..234c434 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -407,6 +407,13 @@ ActiveRecord::Schema.define do
+     t.column :key, :string
+   end
+ 
++  create_table :integer_limits, :force => true do |t|
++    t.integer :"c_int_without_limit"
++    (1..8).each do |i|
++      t.integer :"c_int_#{i}", :limit => i
++    end
++  end
++
+   except 'SQLite' do
+     # fk_test_has_fk should be before fk_test_has_pk
+     create_table :fk_test_has_fk, :force => true do |t|
+-- 
+1.5.5.4
+

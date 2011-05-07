@@ -1,0 +1,151 @@
+From b2441b8028fc0f02babee2d10416d070e1d88e42 Mon Sep 17 00:00:00 2001
+From: Harri Kauhanen <harri.kauhanen@gmail.com>
+Date: Tue, 9 Sep 2008 17:11:10 +0300
+Subject: [PATCH] Made fixtures work with namespaced models
+
+---
+ activerecord/lib/active_record/fixtures.rb |   38 ++++++++++++++++++++++------
+ railties/lib/tasks/databases.rake          |    5 ++-
+ 2 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/activerecord/lib/active_record/fixtures.rb b/activerecord/lib/active_record/fixtures.rb
+index 114141a..b064d7d 100644
+--- a/activerecord/lib/active_record/fixtures.rb
++++ b/activerecord/lib/active_record/fixtures.rb
+@@ -510,7 +510,8 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+           fixtures_map = {}
+ 
+           fixtures = table_names_to_fetch.map do |table_name|
+-            fixtures_map[table_name] = Fixtures.new(connection, File.split(table_name.to_s).last, class_names[table_name.to_sym], File.join(fixtures_directory, table_name.to_s))
++            fixtures_file = locate_fixtures_file(fixtures_directory, table_name)
++            fixtures_map[table_name] = Fixtures.new(connection, File.split(table_name.to_s).last, class_names[table_name.to_sym], fixtures_file)
+           end
+ 
+           all_loaded_fixtures.update(fixtures_map)
+@@ -547,10 +548,11 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+     @connection, @table_name, @fixture_path, @file_filter = connection, table_name, fixture_path, file_filter
+     @name = table_name # preserve fixture base name
+     @class_name = class_name ||
+-                  (ActiveRecord::Base.pluralize_table_names ? @table_name.singularize.camelize : @table_name.camelize)
+-    @table_name = "#{ActiveRecord::Base.table_name_prefix}#{@table_name}#{ActiveRecord::Base.table_name_suffix}"
+-    @table_name = class_name.table_name if class_name.respond_to?(:table_name)
++                  (ActiveRecord::Base.class_name(table_name = table_name))
++    # @table_name = "#{ActiveRecord::Base.table_name_prefix}#{@table_name}#{ActiveRecord::Base.table_name_suffix}"
++    # @table_name = class_name.table_name if class_name.respond_to?(:table_name)
+     @connection = class_name.connection if class_name.respond_to?(:connection)
++
+     read_fixture_files
+   end
+ 
+@@ -602,7 +604,7 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+           else
+             model_class
+           end
+-
++          
+         reflection_class.reflect_on_all_associations.each do |association|
+           case association.macro
+           when :belongs_to
+@@ -647,6 +649,17 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+     end
+   end
+ 
++  def self.locate_fixtures_file(fixtures_directory, table_name)
++    fixture_file_candidates = Dir.glob(File.join(fixtures_directory, '**', '*.{yml,csv}'))
++    fixture_file_candidates.map! { |f| f[fixtures_directory.length..f.length-5]}
++    fixture_file_candidates.each do |candidate|
++      if table_name == candidate.sub(/\/*/, '').gsub(File::Separator, '__')
++        return fixtures_directory + candidate
++      end
++    end
++    nil
++  end
++
+   private
+     class HabtmFixtures < ::Fixtures #:nodoc:
+       def read_fixture_files; end
+@@ -713,12 +726,13 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+           end
+ 
+         yaml_value.each do |fixture|
++
+           raise Fixture::FormatError, "Bad data for #{@class_name} fixture named #{fixture}" unless fixture.respond_to?(:each)
+ 	  fixture.each do |name, data|
+             unless data
+               raise Fixture::FormatError, "Bad data for #{@class_name} fixture named #{name} (nil)"
+             end
+-
++            
+             self[name] = Fixture.new(data, model_class)
+           end
+         end
+@@ -841,8 +855,16 @@ module Test #:nodoc:
+ 
+         def fixtures(*table_names)
+           if table_names.first == :all
+-            table_names = Dir["#{fixture_path}/*.yml"] + Dir["#{fixture_path}/*.csv"]
+-            table_names.map! { |f| File.basename(f).split('.')[0..-2].join('.') }
++            fixture_files = Dir[File.join("#{fixture_path}", "**", "*.{yml,csv}")]
++            fixture_files_stripped = fixture_files.map { |f| f.sub(fixture_path, '').split('.')[0..-2].join('.').sub(/\/*/, '') }
++            table_names = fixture_files_stripped.map { |f| f.gsub(File::SEPARATOR, '__') }
++            # There propably is a neater 'Ruby way' to do this..
++            for i in 0..(table_names.size - 1)
++              class_portions = table_names[i].split('__')
++              class_portions.map! { |c| c.classify }
++              class_name = class_portions.join('::')
++              fixture_class_names[table_names[i].to_sym] = class_name
++            end
+           else
+             table_names = table_names.flatten.map { |n| n.to_s }
+           end
+diff --git a/railties/lib/tasks/databases.rake b/railties/lib/tasks/databases.rake
+index 21c81b3..151a9f0 100644
+--- a/railties/lib/tasks/databases.rake
++++ b/railties/lib/tasks/databases.rake
+@@ -189,8 +189,9 @@ namespace :db do
+       base_dir = ENV['FIXTURES_PATH'] ? File.join(Rails.root, ENV['FIXTURES_PATH']) : File.join(Rails.root, 'test', 'fixtures')
+       fixtures_dir = ENV['FIXTURES_DIR'] ? File.join(base_dir, ENV['FIXTURES_DIR']) : base_dir
+ 
+-      (ENV['FIXTURES'] ? ENV['FIXTURES'].split(/,/).map {|f| File.join(fixtures_dir, f) } : Dir.glob(File.join(fixtures_dir, '*.{yml,csv}'))).each do |fixture_file|
+-        Fixtures.create_fixtures(File.dirname(fixture_file), File.basename(fixture_file, '.*'))
++      (ENV['FIXTURES'] ? ENV['FIXTURES'].split(/,/).map {|f| File.join(fixtures_dir, f) } : Dir.glob(File.join(fixtures_dir, '**', '*.{yml,csv}'))).each do |fixture_file|
++        fixture_file = fixture_file[fixtures_dir.length+1..fixture_file.length-5].gsub(File::Separator, '__')
++        Fixtures.create_fixtures(fixtures_dir, fixture_file)
+       end
+     end
+ 
+-- 
+1.5.5.1
+
+
+From cd093f86bff183b1eee9f354e441e36ad0edb205 Mon Sep 17 00:00:00 2001
+From: Harri Kauhanen <harri.kauhanen@gmail.com>
+Date: Wed, 10 Sep 2008 10:35:53 +0300
+Subject: [PATCH] Broke a test with tablename prefix/suffix. Now fixed.
+
+---
+ activerecord/lib/active_record/fixtures.rb |    6 +++---
+ 1 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/fixtures.rb b/activerecord/lib/active_record/fixtures.rb
+index b064d7d..46dd982 100644
+--- a/activerecord/lib/active_record/fixtures.rb
++++ b/activerecord/lib/active_record/fixtures.rb
+@@ -547,10 +547,10 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+   def initialize(connection, table_name, class_name, fixture_path, file_filter = DEFAULT_FILTER_RE)
+     @connection, @table_name, @fixture_path, @file_filter = connection, table_name, fixture_path, file_filter
+     @name = table_name # preserve fixture base name
++    @table_name = "#{ActiveRecord::Base.table_name_prefix}#{@table_name}#{ActiveRecord::Base.table_name_suffix}"
++    @table_name = class_name.table_name if class_name.respond_to?(:table_name)
+     @class_name = class_name ||
+-                  (ActiveRecord::Base.class_name(table_name = table_name))
+-    # @table_name = "#{ActiveRecord::Base.table_name_prefix}#{@table_name}#{ActiveRecord::Base.table_name_suffix}"
+-    # @table_name = class_name.table_name if class_name.respond_to?(:table_name)
++                  (ActiveRecord::Base.class_name(table_name = @table_name))
+     @connection = class_name.connection if class_name.respond_to?(:connection)
+ 
+     read_fixture_files
+-- 
+1.5.5.1
+
+

@@ -1,0 +1,229 @@
+From 61b68702748ff7da4fbc97a2bdf00c39a71e63ab Mon Sep 17 00:00:00 2001
+From: moro <moronatural@gmail.com>
+Date: Thu, 1 Oct 2009 20:58:39 +0900
+Subject: [PATCH] impl. rack middleware to block invalid chars.
+
+block invalid chars, which is redundant UTF-8 chars for example,
+to come into Rails app world.
+---
+ actionpack/lib/action_controller.rb                |    1 +
+ .../lib/action_controller/invalid_char_blocker.rb  |   49 +++++++++
+ actionpack/lib/action_controller/middlewares.rb    |    1 +
+ .../test/controller/invalid_char_blocker_test.rb   |  106 ++++++++++++++++++++
+ .../test/fixtures/multipart/invalid_char_text_file |   11 ++
+ 5 files changed, 168 insertions(+), 0 deletions(-)
+ create mode 100644 actionpack/lib/action_controller/invalid_char_blocker.rb
+ create mode 100644 actionpack/test/controller/invalid_char_blocker_test.rb
+ create mode 100644 actionpack/test/fixtures/multipart/invalid_char_text_file
+
+diff --git a/actionpack/lib/action_controller.rb b/actionpack/lib/action_controller.rb
+index f53ba27..7ee995c 100644
+--- a/actionpack/lib/action_controller.rb
++++ b/actionpack/lib/action_controller.rb
+@@ -53,6 +53,7 @@ module ActionController
+   autoload :HttpAuthentication, 'action_controller/http_authentication'
+   autoload :Integration, 'action_controller/integration'
+   autoload :IntegrationTest, 'action_controller/integration'
++  autoload :InvalidCharBlocker, 'action_controller/invalid_char_blocker'
+   autoload :Layout, 'action_controller/layout'
+   autoload :MiddlewareStack, 'action_controller/middleware_stack'
+   autoload :MimeResponds, 'action_controller/mime_responds'
+diff --git a/actionpack/lib/action_controller/invalid_char_blocker.rb b/actionpack/lib/action_controller/invalid_char_blocker.rb
+new file mode 100644
+index 0000000..eb421bd
+--- /dev/null
++++ b/actionpack/lib/action_controller/invalid_char_blocker.rb
+@@ -0,0 +1,49 @@
++require 'rack'
++
++module ActionController
++  class InvalidCharBlocker
++    def initialize(app, engine = :activesupport)
++      @app = app
++
++      @verifier = case engine
++                  when :activesupport
++                    require 'active_support/multibyte/utils'
++                    ActiveSupport::Multibyte
++                  end
++    end
++
++    def call(env)
++      req = Rack::Request.new(env)
++      if [req.GET, req.POST].any?{|param| param && include_invalid_char?(param) }
++        return Rack::Response.new(['Bad Request'], 400).finish
++      else
++        @app.call(env)
++      end
++    end
++
++    private
++    def include_invalid_char?(param)
++      param.any?{|k,v| !validate(k, v) }
++    end
++
++    def validate(*vars)
++      vars.all? do |var|
++        case var
++        when Hash
++          var[:tempfile].respond_to?(:read) ? true : !include_invalid_char?(var)
++        when Array
++          validate(*var)
++        else
++          str = if 'ruby19'.respond_to?(:force_encoding)
++                  var.dup.to_s.force_encoding(Encoding.default_external)
++                else
++                  var.to_s
++                end
++          @verifier.verify(str)
++        end
++      end
++    end
++  end
++end
++
++
+diff --git a/actionpack/lib/action_controller/middlewares.rb b/actionpack/lib/action_controller/middlewares.rb
+index dda25fc..57eb3d9 100644
+--- a/actionpack/lib/action_controller/middlewares.rb
++++ b/actionpack/lib/action_controller/middlewares.rb
+@@ -7,6 +7,7 @@ use "ActionController::Failsafe"
+ use lambda { ActionController::Base.session_store },
+     lambda { ActionController::Base.session_options }
+ 
++use "ActionController::InvalidCharBlocker"
+ use "ActionController::ParamsParser"
+ use "Rack::MethodOverride"
+ use "Rack::Head"
+diff --git a/actionpack/test/controller/invalid_char_blocker_test.rb b/actionpack/test/controller/invalid_char_blocker_test.rb
+new file mode 100644
+index 0000000..c46de00
+--- /dev/null
++++ b/actionpack/test/controller/invalid_char_blocker_test.rb
+@@ -0,0 +1,106 @@
++require 'abstract_unit'
++require 'action_controller/invalid_char_blocker'
++
++class InvalidCharBlockerTest < ActiveSupport::TestCase
++  ACCEPTABLE_QUERIES = [
++    "q=value",
++    "q[]=ruby",
++    "q[i]=ruby",
++    "q[i][j]=ruby",
++    "q1[i]=ruby&&q1[j]=%E3%82%8B%E3%81%B3%E3%83%BC",
++    "q1=value&q2=%E3%82%8B%E3%81%B3%E3%83%BC", # q2: valid japanese
++  ].freeze
++
++  BAD_QUERIES = [
++    "q=%C0%AF",
++    "q[]=%C0%AF",
++    "q[i]=%C0%AF",
++    "q[i][j]=%C0%AF",
++    "q1[i]=ruby&&q1[j]=%C0%AF",
++    "%C0%AF=value",
++    "q1=value&q2=%E3%82%8B%E3%81%B3%E3%83%BC&q3=%C0%AF", # q2:valid japanese, q3:invalid chars
++  ].freeze
++
++  def setup
++    if RUBY_VERSION < "1.9"
++      @orig_kcode = $KCODE
++      $KCODE = "u"
++    else
++      @orig_ext_enc = Encoding.default_external
++      Encoding.default_external = "UTF-8"
++    end
++
++    @app = lambda{|env| [200, {}, "valid chars"] }
++    @blocker = ActionController::InvalidCharBlocker.new(@app)
++  end
++
++  def teardown
++    if RUBY_VERSION < "1.9"
++      $KCODE = @orig_kcode
++    else
++      Encoding.default_external = @orig_ext_enc
++    end
++  end
++
++  def test_valid_query_param_should_be_passed
++    ACCEPTABLE_QUERIES.each do |query|
++      status, header, body = @blocker.call("QUERY_STRING" => query,
++                                           "rack.input" => StringIO.new(''))
++      assert_equal 200, status
++    end
++  end
++
++  def test_valid_form_urlencoded_should_be_passed
++    ACCEPTABLE_QUERIES.each do |query|
++      status, header, body = @blocker.call("CONTENT_TYPE" => 'application/x-www-form-urlencoded',
++                                           "rack.input" => StringIO.new(query))
++      assert_equal 200, status
++    end
++  end
++
++  def test_valid_multipart_formdata_should_be_passed
++    %w[text_file large_text_file binary_file].each do |fixture|
++      request_multipart(fixture) do |status, header, body|
++        assert_equal 200, status
++      end
++    end
++  end
++
++  def test_invalid_multipart_formdata_should_be_blocked
++    request_multipart("invalid_char_text_file") do |status, header, body|
++      assert_equal 400, status
++    end
++  end
++
++  def test_invalid_query_param_should_be_blocked
++    BAD_QUERIES.each do |query|
++      status, header, body = @blocker.call("QUERY_STRING" => query,
++                                           "rack.input" => StringIO.new(''))
++      assert_equal 400, status, "Failed to detect invalid char '#{query}'"
++    end
++  end
++
++  def test_invalid_form_urlencoded_should_be_blocked
++    BAD_QUERIES.each do |query|
++      status, header, body = @blocker.call("CONTENT_TYPE" => 'application/x-www-form-urlencoded',
++                                           "rack.input" => StringIO.new(query))
++      assert_equal 400, status, "Failed to detect invalid char '#{query}'"
++    end
++  end
++
++  private
++  def request_multipart(fname)
++    path = File.expand_path("../fixtures/multipart/#{fname}", File.dirname(__FILE__))
++    fixture = (RUBY_VERSION < "1.9" ) ? File.open(path, "r") : File.open(path, "r:ASCII-8BIT")
++
++    begin
++      res = @blocker.call("CONTENT_TYPE" => 'multipart/form-data; boundary="AaB03x"',
++                          "CONTENT_LENGTH" => fixture.stat.size.to_s,
++                          "rack.input" => StringIO.new(fixture.read))
++      yield res
++    ensure
++      fixture.close unless fixture.closed?
++    end
++  end
++end
++
+diff --git a/actionpack/test/fixtures/multipart/invalid_char_text_file b/actionpack/test/fixtures/multipart/invalid_char_text_file
+new file mode 100644
+index 0000000..8025ed2
+--- /dev/null
++++ b/actionpack/test/fixtures/multipart/invalid_char_text_file
+@@ -0,0 +1,11 @@
++--AaB03x
++Content-Disposition: form-data; name="foo"
++
++bar¿Ø
++--AaB03x
++Content-Disposition: form-data; name="file"; filename="file.txt"
++Content-Type: text/plain
++
++contents
++--AaB03x--
++
+-- 
+1.6.3.3
+

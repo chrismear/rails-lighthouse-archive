@@ -1,0 +1,342 @@
+From 5064a2d6512527193d3d2562b2949a7e4bf7c8e4 Mon Sep 17 00:00:00 2001
+From: Stephen Bannasch <stephen.bannasch@gmail.com>
+Date: Sun, 15 Mar 2009 06:32:29 -0400
+Subject: [PATCH] add JRuby-JDOM backend for XmlMini
+
+---
+ activesupport/lib/active_support/xml_mini/jdom.rb |  162 +++++++++++++++++++++
+ activesupport/test/xml_mini/jdom_engine_test.rb   |  153 +++++++++++++++++++
+ 2 files changed, 315 insertions(+), 0 deletions(-)
+ create mode 100644 activesupport/lib/active_support/xml_mini/jdom.rb
+ create mode 100644 activesupport/test/xml_mini/jdom_engine_test.rb
+
+diff --git a/activesupport/lib/active_support/xml_mini/jdom.rb b/activesupport/lib/active_support/xml_mini/jdom.rb
+new file mode 100644
+index 0000000..18e259d
+--- /dev/null
++++ b/activesupport/lib/active_support/xml_mini/jdom.rb
+@@ -0,0 +1,162 @@
++raise "JRuby is required to use the JDOM backend for XmlMini" unless RUBY_PLATFORM =~ /java/
++
++require 'jruby'
++include Java 
++
++import javax.xml.parsers.DocumentBuilder unless defined? DocumentBuilder
++import javax.xml.parsers.DocumentBuilderFactory unless defined? DocumentBuilderFactory
++import java.io.StringReader unless defined? StringReader
++import org.xml.sax.InputSource unless defined? InputSource
++import org.xml.sax.Attributes unless defined? Attributes
++import org.w3c.dom.Node unless defined? Node
++
++# = XmlMini JRuby JDOM implementation
++module ActiveSupport
++  module XmlMini_JDOM #:nodoc:
++    extend self
++
++    CONTENT_KEY = '__content__'.freeze
++
++    NODE_TYPE_NAMES = %w{ATTRIBUTE_NODE CDATA_SECTION_NODE COMMENT_NODE DOCUMENT_FRAGMENT_NODE 
++    DOCUMENT_NODE DOCUMENT_TYPE_NODE ELEMENT_NODE ENTITY_NODE ENTITY_REFERENCE_NODE NOTATION_NODE 
++    PROCESSING_INSTRUCTION_NODE TEXT_NODE}
++
++    node_type_map = {}
++    NODE_TYPE_NAMES.each { |type| node_type_map[Node.send(type)] = type }
++
++    # Parse an XML Document string into a simple hash using Java's jdom.
++    # string::
++    #   XML Document string to parse
++    def parse(string)
++      if string.blank?
++        {}
++      else
++        @dbf = DocumentBuilderFactory.new_instance
++        xml_string_reader = StringReader.new(string)
++        xml_input_source = InputSource.new(xml_string_reader)
++        doc = @dbf.new_document_builder.parse(xml_input_source) 
++        merge_element!({}, doc.document_element)
++      end
++    end
++
++    private
++
++    # Convert an XML element and merge into the hash
++    #
++    # hash::
++    #   Hash to merge the converted element into.
++    # element::
++    #   XML element to merge into hash
++    def merge_element!(hash, element)
++      merge!(hash, element.tag_name, collapse(element))
++    end
++
++    # Actually converts an XML document element into a data structure.
++    #
++    # element::
++    #   The document element to be collapsed.
++    def collapse(element)
++      hash = get_attributes(element)
++      
++      child_nodes = element.child_nodes
++      if child_nodes.length > 0
++        for i in 0...child_nodes.length
++          child = child_nodes.item(i)
++          merge_element!(hash, child) unless child.node_type == Node.TEXT_NODE
++        end
++        merge_texts!(hash, element) unless empty_content?(element)
++        hash
++      else
++        merge_texts!(hash, element)
++      end
++    end
++
++    # Merge all the texts of an element into the hash
++    #
++    # hash::
++    #   Hash to add the converted emement to.
++    # element::
++    #   XML element whose texts are to me merged into the hash
++    def merge_texts!(hash, element)
++      text_children = texts(element)
++      if text_children.join.empty?
++        hash
++      else
++        # must use value to prevent double-escaping
++        merge!(hash, CONTENT_KEY, text_children.join)
++      end
++    end
++
++    # Adds a new key/value pair to an existing Hash. If the key to be added
++    # already exists and the existing value associated with key is not
++    # an Array, it will be wrapped in an Array. Then the new value is
++    # appended to that Array.
++    #
++    # hash::
++    #   Hash to add key/value pair to.
++    # key::
++    #   Key to be added.
++    # value::
++    #   Value to be associated with key.
++    def merge!(hash, key, value)
++      if hash.has_key?(key)
++        if hash[key].instance_of?(Array)
++          hash[key] << value
++        else
++          hash[key] = [hash[key], value]
++        end
++      elsif value.instance_of?(Array)
++        hash[key] = [value]
++      else
++        hash[key] = value
++      end
++      hash
++    end
++
++    # Converts the attributes array of an XML element into a hash.
++    # Returns an empty Hash if node has no attributes.
++    #
++    # element::
++    #   XML element to extract attributes from.
++    def get_attributes(element)
++      attribute_hash = {}
++      attributes = element.attributes
++      for i in 0...attributes.length
++         attribute_hash[attributes.item(i).name] =  attributes.item(i).value
++       end
++      attribute_hash
++    end
++
++    # Determines if a document element has text content
++    #
++    # element::
++    #   XML element to be checked.
++    def texts(element)
++      texts = []
++      child_nodes = element.child_nodes
++      for i in 0...child_nodes.length
++        item = child_nodes.item(i)
++        if item.node_type == Node.TEXT_NODE
++          texts << item.get_data
++        end
++      end
++      texts
++    end
++
++    # Determines if a document element has text content
++    #
++    # element::
++    #   XML element to be checked.
++    def empty_content?(element)
++      text = ''
++      child_nodes = element.child_nodes
++      for i in 0...child_nodes.length
++        item = child_nodes.item(i)
++        if item.node_type == Node.TEXT_NODE
++          text << item.get_data.strip
++        end
++      end
++      text.strip.length == 0
++    end
++  end
++end
+diff --git a/activesupport/test/xml_mini/jdom_engine_test.rb b/activesupport/test/xml_mini/jdom_engine_test.rb
+new file mode 100644
+index 0000000..96a265d
+--- /dev/null
++++ b/activesupport/test/xml_mini/jdom_engine_test.rb
+@@ -0,0 +1,153 @@
++require 'abstract_unit'
++require 'active_support/xml_mini'
++
++if RUBY_PLATFORM =~ /java/
++
++class JDOMEngineTest < Test::Unit::TestCase
++  include ActiveSupport
++
++  def setup
++    @default_backend = XmlMini.backend
++    XmlMini.backend = 'JDOM'
++  end
++
++  def teardown
++    XmlMini.backend = @default_backend
++  end
++
++  # def test_file_from_xml
++  #   hash = Hash.from_xml(<<-eoxml)
++  #     <blog>
++  #       <logo type="file" name="logo.png" content_type="image/png">
++  #       </logo>
++  #     </blog>
++  #   eoxml
++  #   assert hash.has_key?('blog')
++  #   assert hash['blog'].has_key?('logo')
++  # 
++  #   file = hash['blog']['logo']
++  #   assert_equal 'logo.png', file.original_filename
++  #   assert_equal 'image/png', file.content_type
++  # end
++  
++  def test_exception_thrown_on_expansion_attack
++    assert_raise NativeException do
++      attack_xml = <<-EOT
++      <?xml version="1.0" encoding="UTF-8"?>
++      <!DOCTYPE member [
++        <!ENTITY a "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
++        <!ENTITY b "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
++        <!ENTITY c "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">
++        <!ENTITY d "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;">
++        <!ENTITY e "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">
++        <!ENTITY f "&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;">
++        <!ENTITY g "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
++      ]>
++      <member>
++      &a;
++      </member>
++      EOT
++      Hash.from_xml(attack_xml)
++    end
++  end
++  
++  def test_setting_JDOM_as_backend
++    XmlMini.backend = 'JDOM'
++    assert_equal XmlMini_JDOM, XmlMini.backend
++  end
++  
++  def test_blank_returns_empty_hash
++    assert_equal({}, XmlMini.parse(nil))
++    assert_equal({}, XmlMini.parse(''))
++  end
++  
++  def test_array_type_makes_an_array
++    assert_equal_rexml(<<-eoxml)
++      <blog>
++        <posts type="array">
++          <post>a post</post>
++          <post>another post</post>
++        </posts>
++      </blog>
++    eoxml
++  end
++  
++  def test_one_node_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products/>
++    eoxml
++  end
++  
++  def test_one_node_with_attributes_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products foo="bar"/>
++    eoxml
++  end
++  
++  def test_products_node_with_book_node_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++    </products>
++    eoxml
++  end
++  
++  def test_products_node_with_two_book_nodes_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++      <book name="america" id="67890" />
++    </products>
++    eoxml
++  end
++  
++  def test_single_node_with_content_as_hash
++    assert_equal_rexml(<<-eoxml)
++      <products>
++        hello world
++      </products>
++    eoxml
++  end
++  
++  def test_children_with_children
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        <book name="america" id="67890" />
++      </products>
++    </root>
++    eoxml
++  end
++  
++  def test_children_with_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello everyone
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_non_adjacent_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++  end
++
++  private
++  def assert_equal_rexml(xml)
++    hash = XmlMini.with_backend('REXML') { XmlMini.parse(xml) }
++    assert_equal(hash, XmlMini.parse(xml))
++  end
++end
++
++else 
++  # don't run these test because we aren't running in JRuby
++end
+-- 
+1.6.1.2
+

@@ -1,0 +1,143 @@
+From b2e3675683b18ae50ad6659f77868f19cc62b86a Mon Sep 17 00:00:00 2001
+From: Neeraj Singh <neerajdotname@gmail.com>
+Date: Tue, 20 Jul 2010 23:52:24 -0400
+Subject: [PATCH] Timestamp columns of HABTM join table should record timestamps
+
+[#5161 state:resolved]
+---
+ .../has_and_belongs_to_many_association.rb         |    6 +++-
+ activerecord/lib/active_record/timestamp.rb        |   19 +++++++++--
+ .../has_and_belongs_to_many_associations_test.rb   |   35 +++++++++++++++++++-
+ activerecord/test/schema/schema.rb                 |    2 +
+ 4 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+index 9ec63e3..177d790 100644
+--- a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+@@ -53,7 +53,11 @@ module ActiveRecord
+                 when @reflection.association_foreign_key.to_s
+                   attrs[relation[column.name]] = record.id
+                 else
+-                  if record.has_attribute?(column.name)
++                  if record.send(:all_timestamp_attributes).include?(column.name.to_sym)
++                    if record.record_timestamps
++                      attrs[relation[column.name]] = record.send(:current_time_from_proper_timezone)
++                    end
++                  elsif record.has_attribute?(column.name)
+                     value = @owner.send(:quote_value, record[column.name], column)
+                     attrs[relation[column.name]] = value unless value.nil?
+                   end
+diff --git a/activerecord/lib/active_record/timestamp.rb b/activerecord/lib/active_record/timestamp.rb
+index 341cc87..6c1e376 100644
+--- a/activerecord/lib/active_record/timestamp.rb
++++ b/activerecord/lib/active_record/timestamp.rb
+@@ -39,8 +39,9 @@ module ActiveRecord
+       if record_timestamps
+         current_time = current_time_from_proper_timezone
+ 
+-        write_attribute('created_at', current_time) if respond_to?(:created_at) && created_at.nil?
+-        write_attribute('created_on', current_time) if respond_to?(:created_on) && created_on.nil?
++        timestamp_attributes_for_create.each do |column|
++          write_attribute(column.to_s, current_time) if respond_to?(column) && self.send(column).nil?
++        end
+ 
+         timestamp_attributes_for_update_in_model.each do |column|
+           write_attribute(column.to_s, current_time) if self.send(column).nil?
+@@ -65,7 +66,19 @@ module ActiveRecord
+     end
+ 
+     def timestamp_attributes_for_update_in_model #:nodoc:
+-      [:updated_at, :updated_on].select { |elem| respond_to?(elem) }
++      timestamp_attributes_for_update.select { |elem| respond_to?(elem) }
++    end
++
++    def timestamp_attributes_for_update #:nodoc:
++      [:updated_at, :updated_on]
++    end
++
++    def timestamp_attributes_for_create #:nodoc:
++      [:created_at, :created_on]
++    end
++
++    def all_timestamp_attributes #:nodoc:
++      timestamp_attributes_for_update + timestamp_attributes_for_create
+     end
+     
+     def current_time_from_proper_timezone #:nodoc:
+diff --git a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+index d4d3d8e..d7e9ca0 100644
+--- a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+@@ -85,7 +85,9 @@ class HasAndBelongsToManyAssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :companies, :categories, :posts, :categories_posts, :developers, :projects, :developers_projects,
+            :parrots, :pirates, :treasures, :price_estimates, :tags, :taggings
+ 
+-  def test_should_property_quote_string_primary_keys
++  def setup_data_for_habtm_case
++    ActiveRecord::Base.connection.execute('delete from countries_treaties')
++
+     country = Country.new(:name => 'India')
+     country.country_id = 'c1'
+     country.save!
+@@ -93,6 +95,10 @@ class HasAndBelongsToManyAssociationsTest < ActiveRecord::TestCase
+     treaty = Treaty.new(:name => 'peace')
+     treaty.treaty_id = 't1'
+     country.treaties << treaty
++  end
++
++  def test_should_property_quote_string_primary_keys
++    setup_data_for_habtm_case
+ 
+     con = ActiveRecord::Base.connection
+     sql = 'select * from countries_treaties'
+@@ -101,6 +107,33 @@ class HasAndBelongsToManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal 't1', record[1]
+   end
+ 
++  def test_should_record_timestamp_for_join_table
++    setup_data_for_habtm_case
++
++    con = ActiveRecord::Base.connection
++    sql = 'select * from countries_treaties'
++    record = con.select_rows(sql).last
++    assert_not_nil record[2]
++    assert_not_nil record[3]
++    assert_match %r{\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}}, record[2]
++    assert_match %r{\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}}, record[3]
++  end
++
++  def test_should_record_timestamp_for_join_table_only_if_timestamp_should_be_recorded
++    begin
++      Treaty.record_timestamps = false
++      setup_data_for_habtm_case
++
++      con = ActiveRecord::Base.connection
++      sql = 'select * from countries_treaties'
++      record = con.select_rows(sql).last
++      assert_nil record[2]
++      assert_nil record[3]
++    ensure
++      Treaty.record_timestamps = true
++    end
++  end
++
+   def test_has_and_belongs_to_many
+     david = Developer.find(1)
+ 
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index c4eed25..a69e38f 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -611,6 +611,8 @@ ActiveRecord::Schema.define do
+   create_table :countries_treaties, :force => true, :id => false do |t|
+     t.string :country_id, :null => false
+     t.string :treaty_id, :null => false
++    t.datetime :created_at
++    t.datetime :updated_at
+   end
+ 
+   except 'SQLite' do
+-- 
+1.6.5.2
+

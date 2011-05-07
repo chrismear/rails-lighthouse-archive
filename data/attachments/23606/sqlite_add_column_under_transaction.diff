@@ -1,0 +1,58 @@
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 8abbc6d..987287f 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -214,6 +214,8 @@ module ActiveRecord
+       end
+ 
+       def add_column(table_name, column_name, type, options = {}) #:nodoc:
++        raise StatementInvalid, 'Cannot add columns to a SQLite database while inside a transaction' if 
++          ActiveRecord::Base.connection.instance_variable_get(:@connection).transaction_active?
+         super(table_name, column_name, type, options)
+         # See last paragraph on http://www.sqlite.org/lang_altertable.html
+         execute "VACUUM"
+diff --git a/activerecord/test/cases/transactions_test.rb b/activerecord/test/cases/transactions_test.rb
+index 63f04e3..b52a65a 100644
+--- a/activerecord/test/cases/transactions_test.rb
++++ b/activerecord/test/cases/transactions_test.rb
+@@ -179,6 +179,40 @@ class TransactionTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_sqlite_add_column_in_transaction_raises_statement_invalid
++    return true unless current_adapter?(:SQLite3Adapter, :SQLiteAdapter)
++
++    # Test first if column creation/deletion works correctly when no
++    # transaction is in place.
++    #
++    # We go back to the connection for the column queries because
++    # Topic.columns is cached and won't report changes to the DB
++    begin
++      Topic.connection.add_column('topics', 'stuff', :string)
++    rescue ActiveRecord::StatementInvalid => msg
++      raise msg unless msg =~ /duplicate column name/
++    end
++    assert(Topic.connection.columns('topics').map {|c| c.name}.include?('stuff'), 
++           "Column creation under SQLite (no transactions) not successful")
++
++    Topic.connection.remove_column('topics', 'stuff')
++    assert(! Topic.connection.columns('topics').map {|c| c.name}.include?('stuff'), 
++           "Column deletion under SQLite (no transactions) not successful")
++
++    # Test now inside a transaction: add_column should raise a StatementInvalid
++    Topic.transaction do
++      begin
++        Topic.connection.add_column('topics', 'stuff', :string)
++        raised = false
++      rescue ActiveRecord::StatementInvalid
++        raised = true
++      end
++      assert raised, "StatementInvalid was _NOT_ raised when adding a " <<
++        "column on SQLite under a transaction"
++      raise ActiveRecord::Rollback
++    end
++  end
++
+   private
+     def add_exception_raising_after_save_callback_to_topic
+       Topic.class_eval { def after_save() raise "Make the transaction rollback" end }

@@ -1,0 +1,203 @@
+From 22170045ce48597010a9b861025f0a3247a37f05 Mon Sep 17 00:00:00 2001
+From: Josh Sharpe <josh.m.sharpe@gmail.com>
+Date: Tue, 1 Sep 2009 10:11:28 -0400
+Subject: [PATCH] Added support for ActiveModel#strip_attributes and ActiveRecord::Base.strip_attributes!
+
+ActiveModel#strip_attributes removes leading and trailing
+white spaces from all applicable attributes.
+
+ActiveRecord::Base.strip_attributes! adds a before_validation
+filter to your class which calls ActiveModel#strip_attributes.
+---
+ activemodel/lib/active_model.rb                    |    1 +
+ activemodel/lib/active_model/strip_attributes.rb   |   39 ++++
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/base.rb             |    1 +
+ activerecord/lib/active_record/strip_attributes.rb |   30 +++
+ activerecord/test/cases/strip_attributes_test.rb   |   51 +++++
+ 7 files changed, 323 insertions(+), 0 deletions(-)
+ create mode 100644 activemodel/lib/active_model/strip_attributes.rb
+ create mode 100644 activerecord/lib/active_record/strip_attributes.rb
+ create mode 100644 activerecord/test/cases/strip_attributes_test.rb
+ create mode 100644 strip_attributes.patch
+
+diff --git a/activemodel/lib/active_model.rb b/activemodel/lib/active_model.rb
+index 6eab00c..9b1e011 100644
+--- a/activemodel/lib/active_model.rb
++++ b/activemodel/lib/active_model.rb
+@@ -44,6 +44,7 @@ module ActiveModel
+   autoload :Observing
+   autoload :Serialization
+   autoload :StateMachine
++  autoload :StripAttributes
+   autoload :TestCase
+   autoload :Translation
+   autoload :VERSION
+diff --git a/activemodel/lib/active_model/strip_attributes.rb b/activemodel/lib/active_model/strip_attributes.rb
+new file mode 100644
+index 0000000..3cc7d70
+--- /dev/null
++++ b/activemodel/lib/active_model/strip_attributes.rb
+@@ -0,0 +1,39 @@
++module ActiveModel
++  # Removes leading and trailing whitespaces from all applicable 
++  # attributes. If the attribute is blank it will be converted to nil.
++  
++  # Examples:
++  #
++  # p = Person.new
++  # p.first_name = " Josh "
++  # p.strip_attributes
++  # p.first_name            # => "Josh"
++  #
++  # Options:
++  # 
++  # :only => :first_name    #=> Only strip first_name
++  # :except => [:email]     #=> Strip everything except email
++  module StripAttributes
++    extend ActiveSupport::Concern
++    def strip_attributes(options = {})
++      only = Array(options[:only]).map(&:to_s)
++      except = Array(options[:except]).map(&:to_s)
++
++      attributes_to_strip = self.attributes.keys
++
++      unless only.empty?
++        attributes_to_strip = attributes_to_strip.select{|k| only.include?(k)}
++      end
++
++      unless except.blank?
++        attributes_to_strip = attributes_to_strip.reject{|k| except.include?(k)}
++      end
++
++      attributes_to_strip.each do |attr|
++        if self.send(attr).respond_to?(:strip)
++          self.send "#{attr}=", self.send(attr).blank? ? nil : self.send(attr).strip
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 58673ab..6d35319 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -75,6 +75,7 @@ module ActiveRecord
+     autoload :Serialization
+     autoload :SessionStore
+     autoload :StateMachine
++    autoload :StripAttributes
+     autoload :Timestamp
+     autoload :Transactions
+     autoload :Types
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 6063c97..53638c6 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -2613,6 +2613,7 @@ module ActiveRecord #:nodoc:
+     include Callbacks, ActiveModel::Observing, Timestamp
+     include Associations, AssociationPreload, NamedScope
+     include ActiveModel::Conversion
++    include StripAttributes
+ 
+     # AutosaveAssociation needs to be included before Transactions, because we want
+     # #save_with_autosave_associations to be wrapped inside a transaction.
+diff --git a/activerecord/lib/active_record/strip_attributes.rb b/activerecord/lib/active_record/strip_attributes.rb
+new file mode 100644
+index 0000000..f17655b
+--- /dev/null
++++ b/activerecord/lib/active_record/strip_attributes.rb
+@@ -0,0 +1,30 @@
++module ActiveRecord
++  module StripAttributes
++    extend ActiveSupport::Concern
++    include ActiveModel::StripAttributes
++
++    # Adds a before_validation callback that will remove leading and trailing 
++    # whitespaces from all applicable attributes. If the attribute is blank it 
++    # will be converted to nil.  This is useful for form attributes and keeping 
++    # blank strings out of your database.
++    
++    # Examples:
++    #
++    # p = Person.new
++    # p.first_name = " Josh "
++    # p.first_name            # => Josh
++    # p.last_name             # => nil
++    #
++    # Options:
++    # 
++    # :only => :first_name    #=> Only strip first_name
++    # :except => [:email]     #=> Strip everything except email
++    module ClassMethods
++      def strip_attributes!(options = {})
++        before_validation do |record|          
++          record.strip_attributes(options)
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/strip_attributes_test.rb b/activerecord/test/cases/strip_attributes_test.rb
+new file mode 100644
+index 0000000..422519f
+--- /dev/null
++++ b/activerecord/test/cases/strip_attributes_test.rb
+@@ -0,0 +1,51 @@
++require 'cases/helper'
++require 'models/post'
++require 'models/topic'
++require 'models/item'
++
++class StripAttributesTest < ActiveRecord::TestCase
++  def test_stripping_ending_and_trailing_spaces
++    Post.strip_attributes!
++
++    post = Post.new(:title => 'nob blank', :body => 'not blank')
++    assert post.update_attributes(:title => " strip attributes ")
++    assert_equal "strip attributes", post.title
++    assert post.update_attributes(:body => " does cool things ")
++    assert_equal "does cool things", post.body
++  end
++  
++  def test_except_option
++    Post.strip_attributes!(:except => :body)
++
++    post = Post.new(:title => 'nob blank', :body => 'not blank')
++    assert post.update_attributes(:title => " strip attributes ")
++    assert_equal "strip attributes", post.title
++    assert post.update_attributes(:body => " does cool things ")
++    assert_equal " does cool things ", post.body
++  end
++
++  def test_only_option
++    Topic.strip_attributes!(:only => [:title])
++    topic = Topic.new
++    assert topic.update_attributes(:title => " strip attributes ")
++    assert_equal "strip attributes", topic.title
++    assert topic.update_attributes(:content => " does cool things ")
++    assert_equal " does cool things ", topic.content
++  end
++  
++  def test_only_and_except
++    Topic.strip_attributes!(:only => :title, :except => [:author_email_address])
++    topic = Topic.new
++    assert topic.update_attributes(:title => " strip me ")
++    assert_equal "strip me", topic.title
++    assert topic.update_attributes(:author_email_address => " foo@bar.com ")
++    assert_equal " foo@bar.com ", topic.author_email_address
++  end
++
++  def test_converting_blank_to_nil
++    Item.strip_attributes!
++    item = Item.new
++    assert item.update_attributes(:name => "")
++    assert_nil item.name
++  end
++end
+\ No newline at end of file
+-- 
+1.6.4.2
+

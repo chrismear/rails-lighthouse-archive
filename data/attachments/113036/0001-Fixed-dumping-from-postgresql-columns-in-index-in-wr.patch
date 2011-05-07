@@ -1,0 +1,100 @@
+From a3348130fe1549d94b43ada59aef2a39ccefdbaa Mon Sep 17 00:00:00 2001
+From: Max Lapshin <max@maxidoors.ru>
+Date: Mon, 20 Apr 2009 19:47:31 +0400
+Subject: [PATCH] Fixed dumping from postgresql columns in index in wrong order. Now it's ok.
+
+---
+ .../connection_adapters/postgresql_adapter.rb      |   35 +++++++++++---------
+ activerecord/test/cases/schema_dumper_test.rb      |    5 +++
+ activerecord/test/schema/schema.rb                 |    2 +
+ 3 files changed, 26 insertions(+), 16 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index ec204d0..05c804a 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -640,33 +640,36 @@ module ActiveRecord
+       def indexes(table_name, name = nil)
+          schemas = schema_search_path.split(/,/).map { |p| quote(p) }.join(',')
+          result = query(<<-SQL, name)
+-           SELECT distinct i.relname, d.indisunique, a.attname
+-             FROM pg_class t, pg_class i, pg_index d, pg_attribute a
++           SELECT distinct i.relname, d.indisunique, d.indkey, t.oid
++             FROM pg_class t, pg_class i, pg_index d
+            WHERE i.relkind = 'i'
+              AND d.indexrelid = i.oid
+              AND d.indisprimary = 'f'
+              AND t.oid = d.indrelid
+              AND t.relname = '#{table_name}'
+              AND i.relnamespace IN (SELECT oid FROM pg_namespace WHERE nspname IN (#{schemas}) )
+-             AND a.attrelid = t.oid
+-             AND ( d.indkey[0]=a.attnum OR d.indkey[1]=a.attnum
+-                OR d.indkey[2]=a.attnum OR d.indkey[3]=a.attnum
+-                OR d.indkey[4]=a.attnum OR d.indkey[5]=a.attnum
+-                OR d.indkey[6]=a.attnum OR d.indkey[7]=a.attnum
+-                OR d.indkey[8]=a.attnum OR d.indkey[9]=a.attnum )
+           ORDER BY i.relname
+         SQL
++        
+ 
+-        current_index = nil
+         indexes = []
+ 
+-        result.each do |row|
+-          if current_index != row[0]
+-            indexes << IndexDefinition.new(table_name, row[0], row[1] == "t", [])
+-            current_index = row[0]
+-          end
+-
+-          indexes.last.columns << row[2]
++        indexes = result.map do |row|
++          index_name = row[0]
++          unique = row[1] == 't'
++          indkey = row[2].split(" ")
++          oid = row[3]
++          
++          columns = query(<<-SQL, "Columns for index #{row[0]} on #{table_name}").inject({}) {|attlist, r| attlist[r[1]] = r[0]; attlist}
++          SELECT a.attname, a.attnum
++          FROM pg_attribute a
++          WHERE a.attrelid = #{oid}
++          AND a.attnum IN (#{indkey.join(",")})
++          SQL
++          
++          column_names = indkey.map {|attnum| columns[attnum] }
++          IndexDefinition.new(table_name, index_name, unique, column_names)
++          
+         end
+ 
+         indexes
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index 17e4c75..6063742 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -146,6 +146,11 @@ class SchemaDumperTest < ActiveRecord::TestCase
+       ActiveRecord::SchemaDumper.dump(ActiveRecord::Base.connection, stream)
+     end
+   end
++  
++  def test_schema_dumps_index_columns_in_right_order
++    index_definition = standard_dump.split(/\n/).grep(/add_index.*companies/).first.strip
++    assert_equal 'add_index "companies", ["firm_id", "type", "rating", "ruby_type"], :name => "company_index"', index_definition
++  end
+ 
+   if current_adapter?(:MysqlAdapter)
+     def test_schema_dump_should_not_add_default_value_for_mysql_text_field
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 5640510..3288abb 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -113,6 +113,8 @@ ActiveRecord::Schema.define do
+     t.integer :client_of
+     t.integer :rating, :default => 1
+   end
++  
++  add_index :companies, [:firm_id, :type, :rating, :ruby_type], :name => "company_index"
+ 
+   create_table :computers, :force => true do |t|
+     t.integer :developer, :null => false
+-- 
+1.5.4.3
+

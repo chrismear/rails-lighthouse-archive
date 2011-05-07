@@ -1,0 +1,398 @@
+From 3d8df39dcf610598134cfac7f70e848a67855891 Mon Sep 17 00:00:00 2001
+From: Bart ten Brinke <info@retrosync.com>
+Date: Thu, 26 Feb 2009 00:24:42 +0100
+Subject: [PATCH] xml mini libxml support
+
+---
+ activesupport/lib/active_support/xml_mini.rb       |  116 ++----------------
+ .../lib/active_support/xml_mini/libxml.rb          |  131 ++++++++++++++++++++
+ activesupport/lib/active_support/xml_mini/rexml.rb |  106 ++++++++++++++++
+ 3 files changed, 249 insertions(+), 104 deletions(-)
+ create mode 100644 activesupport/lib/active_support/xml_mini/libxml.rb
+ create mode 100644 activesupport/lib/active_support/xml_mini/rexml.rb
+
+diff --git a/activesupport/lib/active_support/xml_mini.rb b/activesupport/lib/active_support/xml_mini.rb
+index ce3f506..f10facc 100644
+--- a/activesupport/lib/active_support/xml_mini.rb
++++ b/activesupport/lib/active_support/xml_mini.rb
+@@ -1,113 +1,21 @@
+ # = XmlMini
+-# This is a derivitive work of XmlSimple 1.0.11
+-# Author::    Joseph Holsten <joseph@josephholsten.com>
+-# Copyright:: Copyright (c) 2008 Joseph Holsten
+-# Copyright:: Copyright (c) 2003-2006 Maik Schmidt <contact@maik-schmidt.de>
+-# License::   Distributes under the same terms as Ruby.
+ module ActiveSupport
+   module XmlMini
+     extend self
+-
++    
+     CONTENT_KEY = '__content__'.freeze
+-
+-    # Parse an XML Document string into a simple hash
+-    #
+-    # Same as XmlSimple::xml_in but doesn't shoot itself in the foot,
+-    # and uses the defaults from ActiveSupport
+-    #
+-    # string::
+-    #   XML Document string to parse
+-    def parse(string)
+-      require 'rexml/document' unless defined?(REXML::Document)
+-      doc = REXML::Document.new(string)
+-      merge_element!({}, doc.root)
+-    end
+-
+-    private
+-      # Convert an XML element and merge into the hash
+-      #
+-      # hash::
+-      #   Hash to merge the converted element into.
+-      # element::
+-      #   XML element to merge into hash
+-      def merge_element!(hash, element)
+-        merge!(hash, element.name, collapse(element))
+-      end
+-
+-      # Actually converts an XML document element into a data structure.
+-      #
+-      # element::
+-      #   The document element to be collapsed.
+-      def collapse(element)
+-        hash = get_attributes(element)
+-
+-        if element.has_elements?
+-          element.each_element {|child| merge_element!(hash, child) }
+-          merge_texts!(hash, element) unless empty_content?(element)
+-          hash
+-        else
+-          merge_texts!(hash, element)
+-        end
+-      end
+-
+-      # Merge all the texts of an element into the hash
+-      #
+-      # hash::
+-      #   Hash to add the converted emement to.
+-      # element::
+-      #   XML element whose texts are to me merged into the hash
+-      def merge_texts!(hash, element)
+-        unless element.has_text?
+-          hash
+-        else
+-          # must use value to prevent double-escaping
+-          merge!(hash, CONTENT_KEY, element.texts.sum(&:value))
+-        end
+-      end
+-
+-      # Adds a new key/value pair to an existing Hash. If the key to be added
+-      # already exists and the existing value associated with key is not
+-      # an Array, it will be wrapped in an Array. Then the new value is
+-      # appended to that Array.
+-      #
+-      # hash::
+-      #   Hash to add key/value pair to.
+-      # key::
+-      #   Key to be added.
+-      # value::
+-      #   Value to be associated with key.
+-      def merge!(hash, key, value)
+-        if hash.has_key?(key)
+-          if hash[key].instance_of?(Array)
+-            hash[key] << value
+-          else
+-            hash[key] = [hash[key], value]
+-          end
+-        elsif value.instance_of?(Array)
+-          hash[key] = [value]
+-        else
+-          hash[key] = value
+-        end
+-        hash
+-      end
+-
+-      # Converts the attributes array of an XML element into a hash.
+-      # Returns an empty Hash if node has no attributes.
+-      #
+-      # element::
+-      #   XML element to extract attributes from.
+-      def get_attributes(element)
+-        attributes = {}
+-        element.attributes.each { |n,v| attributes[n] = v }
+-        attributes
++    
++    # Hook the correct parser into XmlMini
++    def hook_parser
++      begin
++        require 'xml/libxml' unless defined? LibXML
++        require "active_support/xml_mini/libxml.rb"
++      rescue MissingSourceFile => e
++        require "active_support/xml_mini/rexml.rb"
+       end
++    end
++    
++    hook_parser
+ 
+-      # Determines if a document element has text content
+-      #
+-      # element::
+-      #   XML element to be checked.
+-      def empty_content?(element)
+-        element.texts.join.blank?
+-      end
+   end
+ end
+\ No newline at end of file
+diff --git a/activesupport/lib/active_support/xml_mini/libxml.rb b/activesupport/lib/active_support/xml_mini/libxml.rb
+new file mode 100644
+index 0000000..8d10848
+--- /dev/null
++++ b/activesupport/lib/active_support/xml_mini/libxml.rb
+@@ -0,0 +1,131 @@
++# = XML Mini Libxml implementation
++module ActiveSupport
++  module XmlMini
++    extend self
++    
++    # Parse an XML Document string into a simple hash using libxml.
++    # string::
++    #   XML Document string to parse
++    def parse(string)
++      require 'xml/libxml' unless defined? LibXML
++
++      string.strip!
++      XML.default_keep_blanks = false
++
++      return {} if string.blank?
++      return XML::Parser.string(string).parse.to_hash
++    end
++
++  end
++end
++
++module XML
++  module Conversions
++    module Document
++      def to_hash
++        root.to_hash
++      end
++    end
++
++    module Node
++      CONTENT_ROOT = '__content__'
++      LIB_XML_LIMIT = 30000000 # Hardcoded LibXML limit
++      
++      # Convert XML document to hash
++      #
++      # hash::
++      #   Hash to merge the converted element into.
++      def to_hash(hash={})
++        if text?
++          raise RuntimeError if content.length >= LIB_XML_LIMIT
++          hash[CONTENT_ROOT] = content
++        else
++          sub_hash = insert_name_into_hash(hash, name)            
++          attributes_to_hash(sub_hash)
++          if array?
++            children_array_to_hash(sub_hash)
++          elsif yaml?
++            children_yaml_to_hash(sub_hash)
++          else
++            children_to_hash(sub_hash)
++          end
++        end
++        hash
++      end
++
++      protected
++
++        # Insert name into hash
++        #
++        # hash::
++        #   Hash to merge the converted element into.
++        # name::
++        #   name to to merge into hash
++        def insert_name_into_hash(hash, name)
++          sub_hash = {}
++          if hash[name]                        
++            if !hash[name].kind_of? Array 
++              hash[name] = [hash[name]]              
++            end
++            hash[name] << sub_hash
++          else
++            hash[name] = sub_hash
++          end   
++          sub_hash
++        end
++
++        # Insert children into hash
++        #
++        # hash::
++        #   Hash to merge the children into.
++        def children_to_hash(hash={})
++          each { |child| child.to_hash(hash) }
++          attributes_to_hash(hash)
++          hash
++        end
++
++        # Convert xml attributes to hash
++        #
++        # hash::
++        #   Hash to merge the attributes into
++        def attributes_to_hash(hash={})
++          each_attr { |attr| hash[attr.name] = attr.value }
++          hash
++        end
++
++        # Convert array into hash
++        #
++        # hash::
++        #   Hash to merge the array into
++        def children_array_to_hash(hash={})
++          hash[child.name] = map do |child|
++            returning({}) { |sub_hash| child.children_to_hash(sub_hash) }
++          end
++          hash
++        end
++      
++        # Convert yaml into hash
++        #
++        # hash::
++        #   Hash to merge the yaml into
++        def children_yaml_to_hash(hash = {})
++          hash[CONTENT_ROOT] = content unless content.blank?
++          hash
++        end
++      
++        # Check if child is of type array
++        def array?
++          child? && child.next? && child.name == child.next.name
++        end
++      
++        # Check if child is of type yaml
++        def yaml?
++          attributes.collect{|x| x.value}.include?('yaml')
++        end
++      
++    end
++  end
++end
++
++XML::Document.send(:include, XML::Conversions::Document)
++XML::Node.send(:include, XML::Conversions::Node)
+\ No newline at end of file
+diff --git a/activesupport/lib/active_support/xml_mini/rexml.rb b/activesupport/lib/active_support/xml_mini/rexml.rb
+new file mode 100644
+index 0000000..7d365aa
+--- /dev/null
++++ b/activesupport/lib/active_support/xml_mini/rexml.rb
+@@ -0,0 +1,106 @@
++# = XmlMini ReXML implementation
++module ActiveSupport
++  module XmlMini
++    extend self
++    
++    # Parse an XML Document string into a simple hash
++    #
++    # Same as XmlSimple::xml_in but doesn't shoot itself in the foot,
++    # and uses the defaults from ActiveSupport
++    #
++    # string::
++    #   XML Document string to parse
++    def parse(string)
++      require 'rexml/document' unless defined?(REXML::Document)
++      doc = REXML::Document.new(string)
++      merge_element!({}, doc.root)
++    end
++
++    private
++      # Convert an XML element and merge into the hash
++      #
++      # hash::
++      #   Hash to merge the converted element into.
++      # element::
++      #   XML element to merge into hash
++      def merge_element!(hash, element)
++        merge!(hash, element.name, collapse(element))
++      end
++
++      # Actually converts an XML document element into a data structure.
++      #
++      # element::
++      #   The document element to be collapsed.
++      def collapse(element)
++        hash = get_attributes(element)
++
++        if element.has_elements?
++          element.each_element {|child| merge_element!(hash, child) }
++          merge_texts!(hash, element) unless empty_content?(element)
++          hash
++        else
++          merge_texts!(hash, element)
++        end
++      end
++
++      # Merge all the texts of an element into the hash
++      #
++      # hash::
++      #   Hash to add the converted emement to.
++      # element::
++      #   XML element whose texts are to me merged into the hash
++      def merge_texts!(hash, element)
++        unless element.has_text?
++          hash
++        else
++          # must use value to prevent double-escaping
++          merge!(hash, CONTENT_KEY, element.texts.sum(&:value))
++        end
++      end
++
++      # Adds a new key/value pair to an existing Hash. If the key to be added
++      # already exists and the existing value associated with key is not
++      # an Array, it will be wrapped in an Array. Then the new value is
++      # appended to that Array.
++      #
++      # hash::
++      #   Hash to add key/value pair to.
++      # key::
++      #   Key to be added.
++      # value::
++      #   Value to be associated with key.
++      def merge!(hash, key, value)
++        if hash.has_key?(key)
++          if hash[key].instance_of?(Array)
++            hash[key] << value
++          else
++            hash[key] = [hash[key], value]
++          end
++        elsif value.instance_of?(Array)
++          hash[key] = [value]
++        else
++          hash[key] = value
++        end
++        hash
++      end
++
++      # Converts the attributes array of an XML element into a hash.
++      # Returns an empty Hash if node has no attributes.
++      #
++      # element::
++      #   XML element to extract attributes from.
++      def get_attributes(element)
++        attributes = {}
++        element.attributes.each { |n,v| attributes[n] = v }
++        attributes
++      end
++
++      # Determines if a document element has text content
++      #
++      # element::
++      #   XML element to be checked.
++      def empty_content?(element)
++        element.texts.join.blank?
++      end
++  end
++end
+\ No newline at end of file
+-- 
+1.6.0.6
+

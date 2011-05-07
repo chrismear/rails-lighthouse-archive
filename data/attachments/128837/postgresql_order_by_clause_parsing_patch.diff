@@ -1,0 +1,179 @@
+From 81083e5725e2986f91b89d6207f24bfe1510485f Mon Sep 17 00:00:00 2001
+From: John Weathers <johnweathers@gmail.com>
+Date: Tue, 2 Jun 2009 15:20:00 -0400
+Subject: [PATCH] Updated postgresql adapter so that it properly parses columns from 'order by' clauses
+
+---
+ .../connection_adapters/postgresql_adapter.rb      |   65 ++++++++++++++++++--
+ activerecord/test/cases/associations/eager_test.rb |    5 ++
+ .../order_by_clause_parsing_test_postgresql.rb     |   52 ++++++++++++++++
+ 3 files changed, 116 insertions(+), 6 deletions(-)
+ create mode 100644 activerecord/test/cases/order_by_clause_parsing_test_postgresql.rb
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 002696d..37bd2a7 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -887,10 +887,9 @@ module ActiveRecord
+         return "DISTINCT #{columns}" if order_by.blank?
+ 
+         # Construct a clean list of column names from the ORDER BY clause, removing
+-        # any ASC/DESC modifiers
+-        order_columns = order_by.split(',').collect { |s| s.split.first }
+-        order_columns.delete_if &:blank?
+-        order_columns = order_columns.zip((0...order_columns.size).to_a).map { |s,i| "#{s} AS alias_#{i}" }
++        # any ASC/DESC modifiers and adding enumerated aliases
++        order_columns = parse_columns(order_by)
++        order_columns = order_columns.zip((0...order_columns.size).to_a).map { |c,i| "#{c.sub(/\b(?:asc|desc)$/i, '')} AS alias_#{i}" }
+ 
+         # Return a DISTINCT ON() clause that's distinct on the columns we want but includes
+         # all the required columns for the ORDER BY to work properly.
+@@ -905,8 +904,7 @@ module ActiveRecord
+       def add_order_by_for_association_limiting!(sql, options) #:nodoc:
+         return sql if options[:order].blank?
+         
+-        order = options[:order].split(',').collect { |s| s.strip }.reject(&:blank?)
+-        order.map! { |s| 'DESC' if s =~ /\bdesc$/i }
++        order = parse_columns(options[:order]).map { |s| m = s.match(/(?:\b(?:asc|desc))?$/i)[0]; (m=='') ? ' ASC' : m.upcase }
+         order = order.zip((0...order.size).to_a).map { |s,i| "id_list.alias_#{i} #{s}" }.join(', ')
+         
+         sql.replace "SELECT * FROM (#{sql}) AS id_list ORDER BY #{order}"
+@@ -1078,6 +1076,61 @@ module ActiveRecord
+             [match_data[1], (rest.length > 0 ? rest : nil)]
+           end
+         end
++
++        # Parses column expressions out of an "order by" clause
++        def parse_columns(order_by)
++          columns = []
++          token = ''
++          stack = []
++          last_char = nil
++
++          escape_always_enabled = (quoted_string_prefix != 'E')
++          escape_enabled = escape_always_enabled
++          
++          within_quotes = {:single => false, :double => false}
++
++          order_by.each_byte do |byte|
++            char = byte.chr
++
++            case char
++            when '('
++              stack.push('(') unless within_quotes[:single] || within_quotes[:double]
++            when ')'
++              (stack.pop if stack.last == '(') unless within_quotes[:single] || within_quotes[:double]
++            when '['
++              stack.push('[') unless within_quotes[:single] || within_quotes[:double]
++            when ']'
++              (stack.pop if stack.last == '[') unless within_quotes[:single] || within_quotes[:double]
++            when "'", '"'
++              escaped = last_char == '\\' && escape_enabled && within_quotes[:single]
++              kind, other_kind = (char == "'") ? [:single, :double] : [:double, :single]
++
++              unless escaped || within_quotes[other_kind]
++                if stack.last == char
++                  stack.pop
++                  within_quotes[kind] = false
++                  escape_enabled = escape_always_enabled if char == "'"
++                elsif !within_quotes[kind]
++                  within_quotes[kind] = true
++                  escape_enabled = escape_always_enabled || (last_char == 'E') if char == "'"
++                  stack.push(char)
++                end
++              end
++            when ','
++              if stack.empty?
++                columns << token.strip
++                token = ''
++                last_char = char
++                next
++              end
++            end
++            
++            token << char
++            last_char = char
++          end
++          columns << token.strip
++        end
++
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 4cf49be..fc56423 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -588,6 +588,11 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_equal posts(:thinking, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => 'UPPER(posts.title), posts.id', :limit => 2, :offset => 1)
+     assert_equal posts(:sti_post_and_comments, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => 'UPPER(posts.title) DESC, posts.id', :limit => 2, :offset => 1)
+   end
++  
++  def test_limited_eager_with_complex_multiple_order_columns
++    assert_equal posts(:thinking, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => 'COALESCE(UPPER(posts.title), \'Untitled\'), posts.id', :limit => 2, :offset => 1)
++    assert_equal posts(:sti_post_and_comments, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => 'COALESCE(UPPER(posts.title), \'Untitled\') DESC, posts.id', :limit => 2, :offset => 1)
++  end
+ 
+   def test_limited_eager_with_numeric_in_association
+     assert_equal people(:david, :susan), Person.find(:all, :include => [:readers, :primary_contact, :number1_fan], :conditions => "number1_fans_people.first_name like 'M%'", :order => 'people.id', :limit => 2, :offset => 0)
+diff --git a/activerecord/test/cases/order_by_clause_parsing_test_postgresql.rb b/activerecord/test/cases/order_by_clause_parsing_test_postgresql.rb
+new file mode 100644
+index 0000000..4d7839a
+--- /dev/null
++++ b/activerecord/test/cases/order_by_clause_parsing_test_postgresql.rb
+@@ -0,0 +1,52 @@
++require "cases/helper"
++require "models/parrot"
++
++class PostgresqlOrderByClauseParsingTest < ActiveRecord::TestCase
++  def setup
++    @connection = ActiveRecord::Base.connection
++  end
++
++  def test_escaping_with_backslashes
++    columns = @connection.send(:parse_columns, "E'Doe\\',John', 'Voltaire'")
++    assert_equal ["E'Doe\\',John'", "'Voltaire'"], columns
++
++    if @connection.supports_standard_conforming_strings?
++      columns = @connection.send(:parse_columns, "'Doe\\',John', 'Voltaire'")
++      assert_equal ["'Doe\\'", "John', 'Voltaire'"], columns
++    else
++      columns = @connection.send(:parse_columns, "'Doe\\',John', 'Voltaire'")
++      assert_equal ["'Doe\\',John'", "'Voltaire'"], columns
++    end
++  end
++
++  def test_escaping_with_repeated_single_quotes
++    columns = @connection.send(:parse_columns, "'Doe''','John', 'Voltaire'")
++    assert_equal ["'Doe'''","'John'", "'Voltaire'"], columns
++  end
++
++  def test_parsing_with_identifiers
++    columns = @connection.send(:parse_columns, '"Last Name" DESC, "First Name" ASC')
++    assert_equal ['"Last Name" DESC', '"First Name" ASC'], columns 
++    
++    columns = @connection.send(:parse_columns, '"\'Special\' Name" DESC, "First Name" ASC')
++    assert_equal ['"\'Special\' Name" DESC', '"First Name" ASC'], columns 
++  end
++
++  def test_parsing_with_multi_argument_functions
++    columns = @connection.send(:parse_columns, "COALESCE(name, 'Unknown') DESC, age")
++    assert_equal ["COALESCE(name, 'Unknown') DESC", "age"], columns
++    
++    columns = @connection.send(:parse_columns, "GREATEST(created_at, updated_at, completed_at) DESC, last_name, first_name")
++    assert_equal ["GREATEST(created_at, updated_at, completed_at) DESC", "last_name", "first_name"], columns
++  end
++
++  def test_parsing_with_nested_functions
++    columns = @connection.send(:parse_columns, "GREATEST(COALESCE(voting_age, 18), COALESCE(driving_age, 15), COALESCE(military_age, 18)), full_name")
++    assert_equal ["GREATEST(COALESCE(voting_age, 18), COALESCE(driving_age, 15), COALESCE(military_age, 18))", "full_name"], columns
++  end
++
++  def test_parsing_with_arrays
++    columns = @connection.send(:parse_columns, "ARRAY[1,2,3+4], created_at")
++    assert_equal ["ARRAY[1,2,3+4]", "created_at"], columns 
++  end
++end
+-- 
+1.6.0.4
+

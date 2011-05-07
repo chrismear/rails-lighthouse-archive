@@ -1,0 +1,141 @@
+From 36dfcc0c4eae8eb6d02221e277e4b4f90aa753f9 Mon Sep 17 00:00:00 2001
+From: Akira Matsuda <ronnie@dio.jp>
+Date: Thu, 27 Jan 2011 08:14:10 +0900
+Subject: [PATCH 1/2] create_table doesn't need the |t| block parameter now!
+
+---
+ .../abstract/schema_statements.rb                  |    4 ++--
+ .../connection_adapters/sqlite_adapter.rb          |   18 ++++++++++--------
+ activerecord/lib/active_record/session_store.rb    |    7 ++++---
+ 3 files changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+index 5b9c48b..ee22ced 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+@@ -150,11 +150,11 @@ module ActiveRecord
+       #  )
+       #
+       # See also TableDefinition#column for details on how to create columns.
+-      def create_table(table_name, options = {})
++      def create_table(table_name, options = {}, &blk)
+         td = table_definition
+         td.primary_key(options[:primary_key] || Base.get_primary_key(table_name.to_s.singularize)) unless options[:id] == false
+ 
+-        yield td if block_given?
++        td.instance_eval(&blk) if blk
+ 
+         if options[:force] && table_exists?(table_name)
+           drop_table(table_name, options)
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index b04383d..f71cc60 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -355,27 +355,29 @@ module ActiveRecord
+           drop_table(from)
+         end
+ 
+-        def copy_table(from, to, options = {}) #:nodoc:
+-          options = options.merge(:id => (!columns(from).detect{|c| c.name == 'id'}.nil? && 'id' == primary_key(from).to_s))
++        def copy_table(from, to, options = {}, &block) #:nodoc:
++          from_columns, from_primary_key = columns(from), primary_key(from)
++          options = options.merge(:id => (!from_columns.detect {|c| c.name == 'id'}.nil? && 'id' == primary_key(from).to_s))
++          table_definition = nil
+           create_table(to, options) do |definition|
+-            @definition = definition
+-            columns(from).each do |column|
++            table_definition = definition
++            from_columns.each do |column|
+               column_name = options[:rename] ?
+                 (options[:rename][column.name] ||
+                  options[:rename][column.name.to_sym] ||
+                  column.name) : column.name
+ 
+-              @definition.column(column_name, column.type,
++              table_definition.column(column_name, column.type,
+                 :limit => column.limit, :default => column.default,
+                 :null => column.null)
+             end
+-            @definition.primary_key(primary_key(from)) if primary_key(from)
+-            yield @definition if block_given?
++            table_definition.primary_key from_primary_key if from_primary_key
++            table_definition.instance_eval(&block) if block
+           end
+ 
+           copy_table_indexes(from, to, options[:rename] || {})
+           copy_table_contents(from, to,
+-            @definition.columns.map {|column| column.name},
++            table_definition.columns.map {|column| column.name},
+             options[:rename] || {})
+         end
+ 
+diff --git a/activerecord/lib/active_record/session_store.rb b/activerecord/lib/active_record/session_store.rb
+index 3400fd6..09c7922 100644
+--- a/activerecord/lib/active_record/session_store.rb
++++ b/activerecord/lib/active_record/session_store.rb
+@@ -63,11 +63,12 @@ module ActiveRecord
+       end
+ 
+       def create_table!
++        id_col_name, data_col_name = session_id_column, data_column_name
+         connection.create_table(table_name) do |t|
+-          t.string session_id_column, :limit => 255
+-          t.text data_column_name
++          t.string id_col_name, :limit => 255
++          t.text data_col_name
+         end
+-        connection.add_index table_name, session_id_column, :unique => true
++        connection.add_index table_name, id_col_name, :unique => true
+       end
+     end
+ 
+-- 
+1.7.3.5
+
+
+From 7b71e9e7eb9037c4b7ac68b37e2ad6b78a7bf89d Mon Sep 17 00:00:00 2001
+From: Akira Matsuda <ronnie@dio.jp>
+Date: Thu, 27 Jan 2011 08:20:48 +0900
+Subject: [PATCH 2/2] Tests for new create_table DSL
+
+---
+ activerecord/test/cases/migration_test.rb |   21 ++++++++++++++++++++-
+ 1 files changed, 20 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index a5a9965..b4bf1a4 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -1650,9 +1650,28 @@ if ActiveRecord::Base.connection.supports_migrations?
+     ensure
+       Person.connection.drop_table :delete_me rescue nil
+     end
+-
+   end # SexyMigrationsTest
+ 
++  class SexierMigrationsTest < ActiveRecord::TestCase
++    def test_create_table_with_column_without_block_parameter
++      Person.connection.create_table :testings, :force => true do
++        column :foo, :string
++      end
++      assert Person.connection.column_exists?(:testings, :foo, :string)
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
++    def test_create_table_with_sexy_column_without_block_parameter
++      Person.connection.create_table :testings, :force => true do
++        integer :bar
++      end
++      assert Person.connection.column_exists?(:testings, :bar, :integer)
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++  end # SexierMigrationsTest
++
+   class MigrationLoggerTest < ActiveRecord::TestCase
+     def test_migration_should_be_run_without_logger
+       previous_logger = ActiveRecord::Base.logger
+-- 
+1.7.3.5
+

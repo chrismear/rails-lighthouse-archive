@@ -1,0 +1,169 @@
+From ab85f756b35b8e770b7ed11eb52ddca418cd74d2 Mon Sep 17 00:00:00 2001
+From: Stephen Celis <stephen@stephencelis.com>
+Date: Sat, 12 Dec 2009 10:08:41 -0600
+Subject: [PATCH] Add limit functionality to first and last
+
+If a :limit option exists in a find for :first or :last, return the
+first or last number of records specified. The limit can be directly
+specified as an argument in the convenience methods
+ActiveRecord::Base.first and last. Behavior approximates that of
+Array#first and #last.
+---
+ .../associations/association_collection.rb         |   10 ++++++----
+ activerecord/lib/active_record/base.rb             |   19 ++++++++++++-------
+ activerecord/lib/active_record/named_scope.rb      |    8 ++++----
+ activerecord/test/cases/finder_test.rb             |   20 ++++++++++++++++++++
+ 4 files changed, 42 insertions(+), 15 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 25e329c..618d376 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -64,7 +64,8 @@ module ActiveRecord
+       # Fetches the first one using SQL if possible.
+       def first(*args)
+         if fetch_first_or_last_using_find?(args)
+-          find(:first, *args)
++          options, limit = args.extract_options!, args.shift
++          find(:first, *(args << options.merge(:limit => limit || options[:limit])))
+         else
+           load_target unless loaded?
+           @target.first(*args)
+@@ -74,7 +75,8 @@ module ActiveRecord
+       # Fetches the last one using SQL if possible.
+       def last(*args)
+         if fetch_first_or_last_using_find?(args)
+-          find(:last, *args)
++          options, limit = args.extract_options!, args.shift
++          find(:last, *(args << options.merge(:limit => limit || options[:limit])))
+         else
+           load_target unless loaded?
+           @target.last(*args)
+@@ -492,8 +494,8 @@ module ActiveRecord
+         end
+ 
+         def fetch_first_or_last_using_find?(args)
+-          args.first.kind_of?(Hash) || !(loaded? || @owner.new_record? || @reflection.options[:finder_sql] ||
+-                                         @target.any? { |record| record.new_record? } || args.first.kind_of?(Integer))
++          !(loaded? || @owner.new_record? || @reflection.options[:finder_sql] ||
++             @target.any? { |record| record.new_record? })
+         end
+     end
+   end
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 321bba4..7d05f75 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -651,15 +651,19 @@ module ActiveRecord #:nodoc:
+       end
+ 
+       # A convenience wrapper for <tt>find(:first, *args)</tt>. You can pass in all the
+-      # same arguments to this method as you can to <tt>find(:first)</tt>.
++      # same arguments to this method as you can to <tt>find(:first)</tt>. The limit
++      # can be passed in directly as the first argument.
+       def first(*args)
+-        find(:first, *args)
++        options, limit = args.extract_options!, args.shift
++        find(:first, *(args << options.merge(:limit => limit || options[:limit])))
+       end
+ 
+       # A convenience wrapper for <tt>find(:last, *args)</tt>. You can pass in all the
+-      # same arguments to this method as you can to <tt>find(:last)</tt>.
++      # same arguments to this method as you can to <tt>find(:last)</tt>. The limit
++      # can be passed in directly as the first argument.
+       def last(*args)
+-        find(:last, *args)
++        options, limit = args.extract_options!, args.shift
++        find(:last, *(args << options.merge(:limit => limit || options[:limit])))
+       end
+ 
+       # Returns an ActiveRecord::Relation object. You can pass in all the same arguments to this method as you can
+@@ -1525,8 +1529,8 @@ module ActiveRecord #:nodoc:
+ 
+       private
+         def find_initial(options)
+-          options.update(:limit => 1)
+-          find_every(options).first
++          every = find_every(options.merge(:limit => options[:limit] || 1))
++          options[:limit] ? every : every.first
+         end
+ 
+         def find_last(options)
+@@ -1545,7 +1549,8 @@ module ActiveRecord #:nodoc:
+           end
+ 
+           begin
+-            find_initial(options.merge({ :order => order }))
++            last = find_initial(options.merge(:order => order))
++            options[:limit] ? last.reverse : last
+           ensure
+             scope[:order] = original_scoped_order if original_scoped_order
+           end
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index bbe2d1f..f738c7e 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -129,18 +129,18 @@ module ActiveRecord
+       end
+ 
+       def first(*args)
+-        if args.first.kind_of?(Integer) || (@found && !args.first.kind_of?(Hash))
++        if @found
+           proxy_found.first(*args)
+         else
+-          find(:first, *args)
++          super
+         end
+       end
+ 
+       def last(*args)
+-        if args.first.kind_of?(Integer) || (@found && !args.first.kind_of?(Hash))
++        if @found
+           proxy_found.last(*args)
+         else
+-          find(:last, *args)
++          super
+         end
+       end
+ 
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index 3de0779..db25156 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -232,6 +232,13 @@ class FinderTest < ActiveRecord::TestCase
+     assert_nil(first)
+   end
+ 
++  def test_find_first_with_limit
++    first_two = Topic.find(:first, :limit => 2)
++    assert_equal(Topic.find(:all, :limit => 2), first_two)
++    first_one = Topic.find(:first, :limit => 1)
++    assert_kind_of(Array, first_one)
++  end
++
+   def test_first
+     assert_equal topics(:second).title, Topic.first(:conditions => "title = 'The Second Topic of the day'").title
+   end
+@@ -240,6 +247,19 @@ class FinderTest < ActiveRecord::TestCase
+     assert_nil Topic.first(:conditions => "title = 'The Second Topic of the day!'")
+   end
+ 
++  def test_first_with_limit
++    assert_equal Topic.find(:first, :limit => 2), Topic.first(2)
++  end
++
++  def test_find_last_with_limit
++    last_two = Topic.find(:last, :limit => 2)
++    assert_equal Topic.find(:all, :limit => 2, :order => "id DESC").reverse, last_two
++  end
++
++  def test_last_with_limit
++    assert_equal Topic.find(:last, :limit => 2), Topic.last(2)
++  end
++
+   def test_unexisting_record_exception_handling
+     assert_raise(ActiveRecord::RecordNotFound) {
+       Topic.find(1).parent
+-- 
+1.6.5.5
+

@@ -1,0 +1,127 @@
+From 0c71f79ce8f076216909bfc90bbf47b239bbed7d Mon Sep 17 00:00:00 2001
+From: James Le Cuirot <chewi@aura-online.co.uk>
+Date: Mon, 13 Sep 2010 15:44:38 +0100
+Subject: [PATCH] Prevent tables from being joined twice when giving the same association in both :include and :join while some other association requires eager loading. Fixes #3339.
+
+---
+ activerecord/lib/active_record/associations.rb     |   25 ++++++++++++++++----
+ activerecord/lib/active_record/base.rb             |    7 +++--
+ activerecord/test/cases/associations/eager_test.rb |    7 +++++
+ 3 files changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 3a32581..06343fa 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1628,9 +1628,11 @@ module ActiveRecord
+         def construct_finder_sql_with_included_associations(options, join_dependency)
+           scope = scope(:find)
+           sql = "SELECT #{column_aliases(join_dependency)} FROM #{(scope && scope[:from]) || options[:from] || quoted_table_name} "
+-          sql << join_dependency.join_associations.collect{|join| join.association_join }.join
+ 
+-          add_joins!(sql, options[:joins], scope)
++          ja = join_dependency.join_associations
++          sql << ja.map(&:association_join).join
++
++          add_joins!(sql, options[:joins], scope, ja.map(&:table_names_and_aliases).flatten)
+           add_conditions!(sql, options[:conditions], scope)
+           add_limited_ids_condition!(sql, options, join_dependency) if !using_limitable_reflections?(join_dependency.reflections) && ((scope && scope[:limit]) || options[:limit])
+ 
+@@ -1686,7 +1688,7 @@ module ActiveRecord
+ 
+           if is_distinct
+             sql << distinct_join_associations.collect { |assoc| assoc.association_join }.join
+-            add_joins!(sql, options[:joins], scope)
++            add_joins!(sql, options[:joins], scope, distinct_join_associations.map(&:table_names_and_aliases).flatten)
+           end
+ 
+           add_conditions!(sql, options[:conditions], scope)
+@@ -2064,7 +2066,7 @@ module ActiveRecord
+               join = case reflection.macro
+                 when :has_and_belongs_to_many
+                   " #{join_type} %s ON %s.%s = %s.%s " % [
+-                     table_alias_for(options[:join_table], aliased_join_table_name),
++                     join_table_name_and_alias,
+                      connection.quote_table_name(aliased_join_table_name),
+                      options[:foreign_key] || reflection.active_record.to_s.foreign_key,
+                      connection.quote_table_name(parent.aliased_table_name),
+@@ -2131,7 +2133,7 @@ module ActiveRecord
+                       end
+ 
+                       " #{join_type} %s ON (%s.%s = %s.%s%s%s%s) " % [
+-                        table_alias_for(through_reflection.klass.table_name, aliased_join_table_name),
++                        join_table_name_and_alias,
+                         connection.quote_table_name(parent.aliased_table_name),
+                         connection.quote_column_name(parent.primary_key),
+                         connection.quote_table_name(aliased_join_table_name),
+@@ -2189,6 +2191,10 @@ module ActiveRecord
+               join
+             end
+ 
++            def table_names_and_aliases
++              [ table_name_and_alias, join_table_name_and_alias ].compact
++            end
++
+             protected
+ 
+               def aliased_table_name_for(name, suffix = nil)
+@@ -2221,6 +2227,15 @@ module ActiveRecord
+                 table_alias_for table_name, @aliased_table_name
+               end
+ 
++              def join_table_name_and_alias
++                case reflection.macro
++                  when :has_and_belongs_to_many
++                    table_alias_for options[:join_table], aliased_join_table_name
++                  when :has_many, :has_one
++                    table_alias_for through_reflection.klass.table_name, aliased_join_table_name if reflection.options[:through]
++                end
++              end
++
+               def interpolate_sql(sql)
+                 instance_eval("%@#{sql.gsub('@', '\@')}@")
+               end
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index ac82cc1..713cec8 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1812,7 +1812,7 @@ module ActiveRecord #:nodoc:
+         end
+ 
+         # The optional scope argument is for the current <tt>:find</tt> scope.
+-        def add_joins!(sql, joins, scope = :auto)
++        def add_joins!(sql, joins, scope = :auto, exclude = nil)
+           scope = scope(:find) if :auto == scope
+           merged_joins = scope && scope[:joins] && joins ? merge_joins(scope[:joins], joins) : (joins || scope && scope[:joins])
+           case merged_joins
+@@ -1820,8 +1820,9 @@ module ActiveRecord #:nodoc:
+             if array_of_strings?(merged_joins)
+               sql << merged_joins.join(' ') + " "
+             else
+-              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, merged_joins, nil)
+-              sql << " #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} "
++              ja = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, merged_joins, nil).join_associations
++              ja.reject! { |a| a.table_names_and_aliases.any? { |t| exclude.include?(t) } } if exclude
++              sql << " #{ja.map(&:association_join).join} "
+             end
+           when String
+             sql << " #{merged_joins} "
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 1870f97..54a3e03 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -844,4 +844,11 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_queries(2) { @tagging = Tagging.find(t.id, :include => :taggable) }
+     assert_no_queries { assert ! @tagging.taggable }
+   end
++
++  def test_association_in_include_and_join_not_joined_twice
++    options = { :include => [ :author, :comments ], :joins => :author, :conditions => "comments.id IS NOT NULL" }
++
++    assert_nothing_raised { Post.find(:all, options) }
++    assert_nothing_raised { Post.find(:all, options.merge(:limit => 10, :order => 'authors.id ASC')) }
++  end
+ end
+-- 
+1.7.2
+

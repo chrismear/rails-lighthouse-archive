@@ -1,0 +1,183 @@
+From 1c6acbeca3eab2b2301d7a5251ba899a486a5181 Mon Sep 17 00:00:00 2001
+From: Doug Barth <dougbarth@gmail.com>
+Date: Tue, 7 Oct 2008 10:58:54 -0500
+Subject: [PATCH] Made semantics for counters across cache stores consistent.
+
+---
+ .../cache/compressed_mem_cache_store.rb            |    9 ++-
+ .../lib/active_support/cache/file_store.rb         |    1 +
+ .../lib/active_support/cache/mem_cache_store.rb    |    1 +
+ activesupport/test/caching_test.rb                 |   86 +++++++++++++++-----
+ 4 files changed, 73 insertions(+), 24 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb b/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
+index 0bff6cf..d87eb17 100644
+--- a/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
+@@ -3,12 +3,17 @@ module ActiveSupport
+     class CompressedMemCacheStore < MemCacheStore
+       def read(name, options = nil)
+         if value = super(name, (options || {}).merge(:raw => true))
+-          Marshal.load(ActiveSupport::Gzip.decompress(value))
++          if raw?(options)
++            value
++          else
++            Marshal.load(ActiveSupport::Gzip.decompress(value))
++          end
+         end
+       end
+ 
+       def write(name, value, options = nil)
+-        super(name, ActiveSupport::Gzip.compress(Marshal.dump(value)), (options || {}).merge(:raw => true))
++        value = ActiveSupport::Gzip.compress(Marshal.dump(value)) unless raw?(options)
++        super(name, value, (options || {}).merge(:raw => true))
+       end
+     end
+   end
+diff --git a/activesupport/lib/active_support/cache/file_store.rb b/activesupport/lib/active_support/cache/file_store.rb
+index ef53363..ffe0bab 100644
+--- a/activesupport/lib/active_support/cache/file_store.rb
++++ b/activesupport/lib/active_support/cache/file_store.rb
+@@ -16,6 +16,7 @@ module ActiveSupport
+         super
+         ensure_cache_path(File.dirname(real_file_path(name)))
+         File.atomic_write(real_file_path(name), cache_path) { |f| Marshal.dump(value, f) }
++        value
+       rescue => e
+         logger.error "Couldn't create cache directory: #{name} (#{e.message})" if logger
+       end
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index 58958dc..ae468a6 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -34,6 +34,7 @@ module ActiveSupport
+       def write(key, value, options = nil)
+         super
+         method = options && options[:unless_exist] ? :add : :set
++        value = value.to_s if raw?(options)
+         response = @data.send(method, key, value, expires_in(options), raw?(options))
+         response == Response::STORED
+       rescue MemCache::MemCacheError => e
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index 9ea9389..88c6d6c 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -71,41 +71,21 @@ uses_mocha 'high-level cache store tests' do
+   end
+ end
+ 
+-class FileStoreTest < Test::Unit::TestCase
+-  def setup
+-    @cache = ActiveSupport::Cache.lookup_store(:file_store, Dir.pwd)
+-  end
+-
++# Tests the base functionality that should be identical across all cache stores.
++module CacheStoreBehavior
+   def test_should_read_and_write_strings
+     @cache.write('foo', 'bar')
+     assert_equal 'bar', @cache.read('foo')
+-  ensure
+-    File.delete("foo.cache")
+   end
+ 
+   def test_should_read_and_write_hash
+     @cache.write('foo', {:a => "b"})
+     assert_equal({:a => "b"}, @cache.read('foo'))
+-  ensure
+-    File.delete("foo.cache")
+   end
+ 
+   def test_should_read_and_write_nil
+     @cache.write('foo', nil)
+     assert_equal nil, @cache.read('foo')
+-  ensure
+-    File.delete("foo.cache")
+-  end
+-end
+-
+-class MemoryStoreTest < Test::Unit::TestCase
+-  def setup
+-    @cache = ActiveSupport::Cache.lookup_store(:memory_store)
+-  end
+-
+-  def test_should_read_and_write
+-    @cache.write('foo', 'bar')
+-    assert_equal 'bar', @cache.read('foo')
+   end
+ 
+   def test_fetch_without_cache_miss
+@@ -121,9 +101,71 @@ class MemoryStoreTest < Test::Unit::TestCase
+     @cache.fetch('foo', :force => true) { 'bar' }
+   end
+ 
++  def test_increment
++    @cache.write('foo', 1, :raw => true)
++    assert_equal 1, @cache.read('foo', :raw => true).to_i
++    assert_equal 2, @cache.increment('foo')
++    assert_equal 2, @cache.read('foo', :raw => true).to_i
++    assert_equal 3, @cache.increment('foo')
++    assert_equal 3, @cache.read('foo', :raw => true).to_i
++  end
++
++  def test_decrement
++    @cache.write('foo', 3, :raw => true)
++    assert_equal 3, @cache.read('foo', :raw => true).to_i
++    assert_equal 2, @cache.decrement('foo')
++    assert_equal 2, @cache.read('foo', :raw => true).to_i
++    assert_equal 1, @cache.decrement('foo')
++    assert_equal 1, @cache.read('foo', :raw => true).to_i
++  end
++end
++
++class FileStoreTest < Test::Unit::TestCase
++  def setup
++    @cache = ActiveSupport::Cache.lookup_store(:file_store, Dir.pwd)
++  end
++
++  def teardown
++    File.delete("foo.cache")
++  end
++
++  include CacheStoreBehavior
++end
++
++class MemoryStoreTest < Test::Unit::TestCase
++  def setup
++    @cache = ActiveSupport::Cache.lookup_store(:memory_store)
++  end
++
++  include CacheStoreBehavior
++
+   def test_store_objects_should_be_immutable
+     @cache.write('foo', 'bar')
+     assert_raise(ActiveSupport::FrozenObjectError) { @cache.read('foo').gsub!(/.*/, 'baz') }
+     assert_equal 'bar', @cache.read('foo')
+   end
+ end
++
++class MemCacheStoreTest < Test::Unit::TestCase
++  def setup
++    @cache = ActiveSupport::Cache.lookup_store(:mem_cache_store)
++    @cache.clear
++  end
++
++  include CacheStoreBehavior
++
++  def test_store_objects_should_be_immutable
++    @cache.write('foo', 'bar')
++    @cache.read('foo').gsub!(/.*/, 'baz')
++    assert_equal 'bar', @cache.read('foo')
++  end
++end
++
++class CompressedMemCacheStore < Test::Unit::TestCase
++  def setup
++    @cache = ActiveSupport::Cache.lookup_store(:compressed_mem_cache_store)
++    @cache.clear
++  end
++
++  include CacheStoreBehavior
++end
+-- 
+1.5.6.1
+

@@ -1,0 +1,227 @@
+commit 66ba15425f6b0e026475536ec1a7f156a71034e9
+Author: Eloy Duran <eloy.de.enige@gmail.com>
+Date:   Wed Dec 30 16:39:22 2009 +0100
+
+    Add NestedAttributes :destroy_missing option.
+    
+    The #mark_missing_records_for_destruction method is available on
+    AssociationCollection, because not everyone uses NestedAttributes, but might
+    use AutosaveAssociation.
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index e5ed769..ebdd822 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -372,5 +372,42 @@ module ActiveRecord
+         end
+       end
+     end
++
++    module AssociationCollectionExtension
++      # Iterates over the association collection and marks the records for
++      # destruction which _not_ included in the +records_or_ids+ array. Instead
++      # of the records themselves, you can also pass the IDs of the records to
++      # keep.
++      #
++      # Note that this will always load the association target.
++      #
++      #   member.posts.map(&:id) # => [1, 2, 3, 4]
++      #   member.posts.mark_missing_records_for_destruction([2, 3])
++      #   member.posts[0].marked_for_destruction? # => true
++      #   member.posts[1].marked_for_destruction? # => false
++      #   member.posts[2].marked_for_destruction? # => false
++      #   member.posts[3].marked_for_destruction? # => true
++      #
++      # Or with an array of records instead of their ids:
++      #
++      #   member.posts.mark_missing_records_for_destruction([member.posts[1], member.posts[2]])
++      #   member.posts[0].marked_for_destruction? # => true
++      #   member.posts[1].marked_for_destruction? # => false
++      #   member.posts[2].marked_for_destruction? # => false
++      #   member.posts[3].marked_for_destruction? # => true
++      def mark_missing_records_for_destruction(records_or_ids)
++        ids = if records_or_ids.first.respond_to?(:new_record?)
++                records_or_ids.map(&:id)
++              else
++                records_or_ids.map(&:to_i)
++              end
++
++        each do |record|
++          record.mark_for_destruction unless record.new_record? || ids.include?(record.id)
++        end
++      end
++    end
+   end
+ end
++
++ActiveRecord::Associations::AssociationCollection.send(:include, ActiveRecord::AutosaveAssociation::AssociationCollectionExtension)
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index 5290113..01cbf3a 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -193,36 +193,43 @@ module ActiveRecord
+       #   If true, destroys any members from the attributes hash with a
+       #   <tt>_destroy</tt> key and a value that evaluates to +true+
+       #   (eg. 1, '1', true, or 'true'). This option is off by default.
++      # [:destroy_missing]
++      #   If true, destroys any members from the association collection for
++      #   which _no_ +ID+ is available in the attributes hash. Note that this
++      #   option is only applicable to collection associations. This option is
++      #   off by default.
+       # [:reject_if]
+-      #   Allows you to specify a Proc or a Symbol pointing to a method
+-      #   that checks whether a record should be built for a certain attribute
+-      #   hash. The hash is passed to the supplied Proc or the method
+-      #   and it should return either +true+ or +false+. When no :reject_if
+-      #   is specified, a record will be built for all attribute hashes that
+-      #   do not have a <tt>_destroy</tt> value that evaluates to true.
+-      #   Passing <tt>:all_blank</tt> instead of a Proc will create a proc
+-      #   that will reject a record where all the attributes are blank.
++      #   Allows you to specify a Proc or a Symbol pointing to a method that
++      #   checks whether a record should be built for a certain attribute hash.
++      #   The hash is passed to the supplied Proc or the method and it should
++      #   return either +true+ or +false+. When no :reject_if is specified, a
++      #   record will be built for all attribute hashes that do not have a
++      #   <tt>_destroy</tt> value that evaluates to true. Passing
++      #   <tt>:all_blank</tt> instead of a Proc will create a proc that will
++      #   reject a record where all the attributes are blank.
+       # [:limit]
+-      #   Allows you to specify the maximum number of the associated records that
+-      #   can be processes with the nested attributes. If the size of the
+-      #   nested attributes array exceeds the specified limit, NestedAttributes::TooManyRecords
+-      #   exception is raised. If omitted, any number associations can be processed.
+-      #   Note that the :limit option is only applicable to one-to-many associations.
++      #   Allows you to specify the maximum number of the associated records
++      #   that can be processes with the nested attributes. If the size of the
++      #   nested attributes array exceeds the specified limit,
++      #   NestedAttributes::TooManyRecords exception is raised. If omitted, any
++      #   number of members can be processed. Note that this option is only
++      #   applicable to collection associations.
+       # [:update_only]
+-      #   Allows you to specify that an existing record may only be updated.
+-      #   A new record may only be created when there is no existing record.
+-      #   This option only works for one-to-one associations and is ignored for
+-      #   collection associations. This option is off by default.
++      #   Allows you to specify that an existing record may only be updated. A
++      #   new record may only be created when there is no existing record. Note
++      #   that this option is only applicable to one-to-one associations. This
++      #   option is off by default.
+       #
+       # Examples:
+       #   # creates avatar_attributes=
+       #   accepts_nested_attributes_for :avatar, :reject_if => proc { |attributes| attributes['name'].blank? }
+       #   # creates avatar_attributes= and posts_attributes=
+-      #   accepts_nested_attributes_for :avatar, :posts, :allow_destroy => true
++      #   accepts_nested_attributes_for :avatar, :allow_destroy => true
++      #   accepts_nested_attributes_for :posts, :destroy_missing => true
+       def accepts_nested_attributes_for(*attr_names)
+         options = { :allow_destroy => false, :update_only => false }
+         options.update(attr_names.extract_options!)
+-        options.assert_valid_keys(:allow_destroy, :reject_if, :limit, :update_only)
++        options.assert_valid_keys(:allow_destroy, :destroy_missing, :reject_if, :limit, :update_only)
+ 
+         attr_names.each do |association_name|
+           if reflection = reflect_on_association(association_name)
+@@ -347,6 +354,9 @@ module ActiveRecord
+         attributes_collection = attributes_collection.sort_by { |index, _| index.to_i }.map { |_, attributes| attributes }
+       end
+ 
++      # This list is to keep track of the records which are _not_ missing from the attributes.
++      records_to_keep = []
++
+       attributes_collection.each do |attributes|
+         attributes = attributes.with_indifferent_access
+ 
+@@ -355,9 +365,12 @@ module ActiveRecord
+             send(association_name).build(attributes.except(*UNASSIGNABLE_KEYS))
+           end
+         elsif existing_record = send(association_name).detect { |record| record.id.to_s == attributes['id'].to_s }
++          records_to_keep << existing_record
+           assign_to_or_mark_for_destruction(existing_record, attributes, options[:allow_destroy])
+         end
+       end
++
++      send(association_name).mark_missing_records_for_destruction(records_to_keep) if options[:destroy_missing]
+     end
+ 
+     # Updates a record with the +attributes+ or marks it for destruction if
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 0c1d7be..52e709c 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -638,6 +638,29 @@ class TestDestroyAsPartOfAutosaveAssociation < ActiveRecord::TestCase
+ 
+   # has_many & has_and_belongs_to
+   %w{ parrots birds }.each do |association_name|
++    define_method("test_should_mark_existing_records_in_a_collection_for_destruction_for_which_their_ids_are_missing") do
++      2.times { |i| @pirate.send(association_name).create!(:name => "#{association_name}_#{i}") }
++      child_1 = @pirate.send(association_name).first
++
++      [child_1, child_1.id, child_1.id.to_s].each do |keep|
++        child_1, child_2 = @pirate.reload.send(association_name)
++        child_3 = @pirate.send(association_name).build
++
++        @pirate.send(association_name).mark_missing_records_for_destruction([keep])
++        assert !child_1.marked_for_destruction?
++        assert child_2.marked_for_destruction?
++        assert !child_3.marked_for_destruction?
++      end
++
++      child_1, child_2 = @pirate.reload.send(association_name)
++      child_3 = @pirate.send(association_name).build
++      @pirate.send(association_name).mark_missing_records_for_destruction([])
++
++      assert child_1.marked_for_destruction?
++      assert child_2.marked_for_destruction?
++      assert !child_3.marked_for_destruction?
++    end
++
+     define_method("test_should_destroy_#{association_name}_as_part_of_the_save_transaction_if_they_were_marked_for_destroyal") do
+       2.times { |i| @pirate.send(association_name).create!(:name => "#{association_name}_#{i}") }
+ 
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index b26ba84..57acd59 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -544,6 +544,27 @@ module NestedAttributesOnACollectionAssociationTests
+     assert_difference('@pirate.send(@association_name).count', -1) { @pirate.save }
+   end
+ 
++  def test_should_not_destroy_missing_records_by_default
++    assert_no_difference('@pirate.send(@association_name).count') do
++      @pirate.update_attribute(association_getter, 'foo' => { :id => @child_1.id, :name => 'Changed' })
++    end
++  end
++
++  def test_should_destroy_missing_records
++    options = Pirate.nested_attributes_options[@association_name]
++    options[:destroy_missing] = true
++
++    assert_difference('@pirate.send(@association_name).count', -1) do
++      @pirate.update_attribute(association_getter, 'foo' => { :id => @child_1.id, :name => 'Changed' })
++    end
++
++    remaining_child = @pirate.reload.send(@association_name).last
++    assert_equal @child_1.id, remaining_child.id
++    assert_equal 'Changed', remaining_child.name
++  ensure
++    options[:destroy_missing] = nil
++  end
++
+   def test_should_automatically_enable_autosave_on_the_association
+     assert Pirate.reflect_on_association(@association_name).options[:autosave]
+   end
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 86ad121..415886b 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -17,7 +17,7 @@ class Pirate < ActiveRecord::Base
+   has_many :treasures, :as => :looter
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
+-  # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
++  # These have :autosave enabled because accepts_nested_attributes_for is used on them.
+   has_one :ship
+   has_one :update_only_ship, :class_name => 'Ship'
+   has_one :non_validated_ship, :class_name => 'Ship'

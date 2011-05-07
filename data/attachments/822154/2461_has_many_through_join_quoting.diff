@@ -1,0 +1,117 @@
+From 69b0aae6b8b714d4c22c6188b5ade24fc41e6dcf Mon Sep 17 00:00:00 2001
+From: Jon Leighton <j@jonathanleighton.com>
+Date: Thu, 16 Dec 2010 10:29:13 +0000
+Subject: [PATCH] Fix problem where wrong keys are used in JoinAssociation when an association goes :through a belongs_to [#2801 state:resolved]
+
+---
+ .../join_dependency/join_association.rb            |   21 +++++++++++--------
+ activerecord/lib/active_record/reflection.rb       |    4 +++
+ .../has_many_through_associations_test.rb          |    7 ++++++
+ activerecord/test/cases/reflection_test.rb         |    5 ++++
+ activerecord/test/models/post.rb                   |    1 +
+ 5 files changed, 29 insertions(+), 9 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/class_methods/join_dependency/join_association.rb b/activerecord/lib/active_record/associations/class_methods/join_dependency/join_association.rb
+index 6947780..02707df 100644
+--- a/activerecord/lib/active_record/associations/class_methods/join_dependency/join_association.rb
++++ b/activerecord/lib/active_record/associations/class_methods/join_dependency/join_association.rb
+@@ -190,17 +190,20 @@ module ActiveRecord
+             ).alias @aliased_join_table_name
+ 
+             jt_conditions = []
+-            jt_foreign_key = first_key = second_key = nil
++            first_key = second_key = nil
+ 
+-            if through_reflection.options[:as] # has_many :through against a polymorphic join
+-              as_key         = through_reflection.options[:as].to_s
+-              jt_foreign_key = as_key + '_id'
+-
+-              jt_conditions <<
+-              join_table[as_key + '_type'].
+-                eq(parent.active_record.base_class.name)
++            if through_reflection.macro == :belongs_to
++              jt_primary_key = through_reflection.primary_key_name
++              jt_foreign_key = through_reflection.association_primary_key
+             else
++              jt_primary_key = through_reflection.active_record_primary_key
+               jt_foreign_key = through_reflection.primary_key_name
++
++              if through_reflection.options[:as] # has_many :through against a polymorphic join
++                jt_conditions <<
++                join_table["#{through_reflection.options[:as]}_type"].
++                  eq(parent.active_record.base_class.name)
++              end
+             end
+ 
+             case source_reflection.macro
+@@ -233,7 +236,7 @@ module ActiveRecord
+             end
+ 
+             jt_conditions <<
+-            parent_table[parent.primary_key].
++            parent_table[jt_primary_key].
+               eq(join_table[jt_foreign_key])
+ 
+             if through_reflection.options[:conditions]
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index b9caa64..70165c6 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -208,6 +208,10 @@ module ActiveRecord
+         @association_foreign_key ||= options[:association_foreign_key] || class_name.foreign_key
+       end
+ 
++      def association_primary_key
++        @association_primary_key ||= options[:primary_key] || klass.primary_key
++      end
++
+       def active_record_primary_key
+         @active_record_primary_key ||= options[:primary_key] || active_record.primary_key
+       end
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index 77bc369..cf0eedb 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -479,4 +479,11 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     assert_equal 1, mary.unique_categorized_posts.length
+     assert_equal 1, mary.unique_categorized_post_ids.length
+   end
++
++  def test_joining_has_many_through_belongs_to
++    posts = Post.joins(:author_categorizations).
++                 where('categorizations.id' => categorizations(:mary_thinking_sti).id)
++
++    assert_equal [posts(:eager_other)], posts
++  end
+ end
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 912e3c4..1e20571 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -191,6 +191,11 @@ class ReflectionTest < ActiveRecord::TestCase
+     assert_kind_of ThroughReflection, Subscriber.reflect_on_association(:books)
+   end
+ 
++  def test_association_primary_key
++    assert_equal "id", Author.reflect_on_association(:posts).association_primary_key.to_s
++    assert_equal "name", Author.reflect_on_association(:essay).association_primary_key.to_s
++  end
++
+   def test_active_record_primary_key
+     assert_equal "nick", Subscriber.reflect_on_association(:subscriptions).active_record_primary_key.to_s
+     assert_equal "name", Author.reflect_on_association(:essay).active_record_primary_key.to_s
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index 974e87d..34ea49f 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -38,6 +38,7 @@ class Post < ActiveRecord::Base
+   end
+ 
+   has_many :author_favorites, :through => :author
++  has_many :author_categorizations, :through => :author, :source => :categorizations
+ 
+   has_many :comments_with_interpolated_conditions, :class_name => 'Comment',
+       :conditions => ['#{"#{aliased_table_name}." rescue ""}body = ?', 'Thank you for the welcome']
+-- 
+1.7.1
+

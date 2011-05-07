@@ -1,0 +1,97 @@
+commit 1319ef9ce608fcb9a2a82377964eee4c91ad313e
+Author: Rich Cavanaugh <cavanaugh@fatjam.com>
+Date:   Sun May 11 20:20:48 2008 -0400
+
+    fixup the cookie store double escape issue
+
+diff --git a/actionpack/lib/action_controller/cgi_ext/cookie.rb b/actionpack/lib/action_controller/cgi_ext/cookie.rb
+index 3dd374f..e35bab5 100644
+--- a/actionpack/lib/action_controller/cgi_ext/cookie.rb
++++ b/actionpack/lib/action_controller/cgi_ext/cookie.rb
+@@ -37,7 +37,7 @@ class CGI #:nodoc:
+         @path = nil
+       else
+         @name = name['name']
+-        @value = Array(name['value'])
++        @value = name['value'].kind_of?(String) ? [name['value']] : Array(name['value'])
+         @domain = name['domain']
+         @expires = name['expires']
+         @secure = name['secure'] || false
+diff --git a/actionpack/lib/action_controller/session/cookie_store.rb b/actionpack/lib/action_controller/session/cookie_store.rb
+index 560491f..cc8cf8a 100644
+--- a/actionpack/lib/action_controller/session/cookie_store.rb
++++ b/actionpack/lib/action_controller/session/cookie_store.rb
+@@ -130,14 +130,16 @@ class CGI::Session::CookieStore
+     # Marshal a session hash into safe cookie data. Include an integrity hash.
+     def marshal(session)
+       data = ActiveSupport::Base64.encode64(Marshal.dump(session)).chop
+-      CGI.escape "#{data}--#{generate_digest(data)}"
++      "#{data}--#{generate_digest(data)}"
+     end
+ 
+     # Unmarshal cookie data to a hash and verify its integrity.
+     def unmarshal(cookie)
+       if cookie
+-        data, digest = CGI.unescape(cookie).split('--')
+-        unless digest == generate_digest(data)
++        data, digest = cookie.split('--')
++        # using shortcircuited logic here to avoid doing extra work for 
++        # most sessions. The extra work here being the second unescape.
++        unless digest == generate_digest(data) || digest == generate_digest(data = CGI.unescape(data))
+           delete
+           raise TamperedWithCookie
+         end
+diff --git a/actionpack/test/controller/cookie_test.rb b/actionpack/test/controller/cookie_test.rb
+index 42f3bd2..b3c1a85 100644
+--- a/actionpack/test/controller/cookie_test.rb
++++ b/actionpack/test/controller/cookie_test.rb
+@@ -137,4 +137,9 @@ class CookieTest < Test::Unit::TestCase
+     cookies = CGI::Cookie.parse('return_to=http://rubyonrails.org/search?term=api&scope=all&global=true')
+     assert_equal({"return_to" => ["http://rubyonrails.org/search?term=api&scope=all&global=true"]}, cookies)
+   end
++  
++  def test_cookies_should_not_be_split_on_values_with_newlines
++    cookies = CGI::Cookie.new("name" => "val", "value" => "this\nis\na\ntest")
++    assert cookies.size == 1
++  end
+ end
+diff --git a/actionpack/test/controller/session/cookie_store_test.rb b/actionpack/test/controller/session/cookie_store_test.rb
+index d308f2a..c5189d8 100755
+--- a/actionpack/test/controller/session/cookie_store_test.rb
++++ b/actionpack/test/controller/session/cookie_store_test.rb
+@@ -43,7 +43,9 @@ class CookieStoreTest < Test::Unit::TestCase
+     { :empty => ['BAgw--0686dcaccc01040f4bd4f35fe160afe9bc04c330', {}],
+       :a_one => ['BAh7BiIGYWkG--5689059497d7f122a7119f171aef81dcfd807fec', { 'a' => 1 }],
+       :typical => ['BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7BiILbm90aWNlIgxIZXkgbm93--9d20154623b9eeea05c62ab819be0e2483238759', { 'user_id' => 123, 'flash' => { 'notice' => 'Hey now' }}],
+-      :flashed => ['BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7AA%3D%3D--bf9785a666d3c4ac09f7fe3353496b437546cfbf', { 'user_id' => 123, 'flash' => {} }] }
++      :flashed => ['BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7AA==--bf9785a666d3c4ac09f7fe3353496b437546cfbf', { 'user_id' => 123, 'flash' => {} }],
++      :double_escaped => [CGI.escape('BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7AA%3D%3D--bf9785a666d3c4ac09f7fe3353496b437546cfbf'), { 'user_id' => 123, 'flash' => {} }] }
++      
+   end
+ 
+   def setup
+@@ -101,6 +103,15 @@ class CookieStoreTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_restores_double_encoded_cookies
++    set_cookie! cookie_value(:double_escaped)
++    new_session do |session|      
++      session.dbman.restore
++      assert_equal session["user_id"], 123
++      assert_equal session["flash"], {}
++    end
++  end
++
+   def test_close_doesnt_write_cookie_if_data_is_blank
+     new_session do |session|
+       assert_no_cookies session
+@@ -241,6 +252,7 @@ class CookieStoreWithMD5DigestTest < CookieStoreTest
+     { :empty => ['BAgw--0415cc0be9579b14afc22ee2d341aa21', {}],
+       :a_one => ['BAh7BiIGYWkG--5a0ed962089cc6600ff44168a5d59bc8', { 'a' => 1 }],
+       :typical => ['BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7BiILbm90aWNlIgxIZXkgbm93--f426763f6ef435b3738b493600db8d64', { 'user_id' => 123, 'flash' => { 'notice' => 'Hey now' }}],
+-      :flashed => ['BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7AA%3D%3D--0af9156650dab044a53a91a4ddec2c51', { 'user_id' => 123, 'flash' => {} }] }
++      :flashed => ['BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7AA==--0af9156650dab044a53a91a4ddec2c51', { 'user_id' => 123, 'flash' => {} }],
++      :double_escaped => [CGI.escape('BAh7ByIMdXNlcl9pZGkBeyIKZmxhc2h7AA%3D%3D--0af9156650dab044a53a91a4ddec2c51'), { 'user_id' => 123, 'flash' => {} }] }
+   end
+ end

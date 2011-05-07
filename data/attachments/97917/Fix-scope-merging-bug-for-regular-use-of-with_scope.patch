@@ -1,0 +1,281 @@
+From 05d0be8714bda3a1aacdfe726d8dd5df300a069b Mon Sep 17 00:00:00 2001
+From: Manfred Stienstra <manfred@fngtps.com>
+Date: Tue, 10 Mar 2009 11:54:10 +0100
+Subject: [PATCH] Fix scope merging bug for regular use of with_scope.
+
+Create scopes were merged reversed to make chained scopes work, this broke regular uses
+of with_scope. Explicitly perform a reverse merge in the case of resolving chained
+scopes. Adds test for untested uses of with_scope.
+---
+ activerecord/lib/active_record/base.rb         |   19 +++++-------
+ activerecord/lib/active_record/named_scope.rb  |    4 +-
+ activerecord/test/cases/method_scoping_test.rb |   38 ++++++++++++++++++++---
+ activerecord/test/cases/named_scope_test.rb    |   22 +++++++++-----
+ 4 files changed, 57 insertions(+), 26 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index edc1459..4f39761 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -416,7 +416,7 @@ module ActiveRecord #:nodoc:
+     end
+ 
+     @@subclasses = {}
+-    
++
+     ##
+     # :singleton-method:
+     # Contains the database configuration - as is typically stored in config/database.yml -
+@@ -661,7 +661,6 @@ module ActiveRecord #:nodoc:
+         connection.select_all(sanitize_sql(sql), "#{name} Load").collect! { |record| instantiate(record) }
+       end
+ 
+-
+       # Returns true if a record exists in the table that matches the +id+ or
+       # conditions given, or false otherwise. The argument can take five forms:
+       #
+@@ -1003,7 +1002,6 @@ module ActiveRecord #:nodoc:
+         update_counters(id, counter_name => -1)
+       end
+ 
+-
+       # Attributes named in this macro are protected from mass-assignment,
+       # such as <tt>new(attributes)</tt>,
+       # <tt>update_attributes(attributes)</tt>, or
+@@ -1104,7 +1102,6 @@ module ActiveRecord #:nodoc:
+         read_inheritable_attribute(:attr_serialized) or write_inheritable_attribute(:attr_serialized, {})
+       end
+ 
+-
+       # Guesses the table name (in forced lower-case) based on the name of the class in the inheritance hierarchy descending
+       # directly from ActiveRecord::Base. So if the hierarchy looks like: Reply < Message < ActiveRecord::Base, then Message is used
+       # to guess the table name even when called on Reply. The rules used to do the guess are handled by the Inflector class
+@@ -1417,7 +1414,6 @@ module ActiveRecord #:nodoc:
+         end
+       end
+ 
+-
+       def quote_value(value, column = nil) #:nodoc:
+         connection.quote(value,column)
+       end
+@@ -1486,7 +1482,7 @@ module ActiveRecord #:nodoc:
+         elsif match = DynamicScopeMatch.match(method_id)
+           return true if all_attributes_exists?(match.attribute_names)
+         end
+-        
++
+         super
+       end
+ 
+@@ -2014,7 +2010,6 @@ module ActiveRecord #:nodoc:
+           end
+         end
+ 
+-
+         # Defines an "attribute" method (like +inheritance_column+ or
+         # +table_name+). A new (class) method will be created with the
+         # given name. If a value is specified, the new method will
+@@ -2111,7 +2106,7 @@ module ActiveRecord #:nodoc:
+           end
+ 
+           # Merge scopings
+-          if action == :merge && current_scoped_methods
++          if [:merge, :reverse_merge].include?(action) && current_scoped_methods
+             method_scoping = current_scoped_methods.inject(method_scoping) do |hash, (method, params)|
+               case hash[method]
+                 when Hash
+@@ -2133,7 +2128,11 @@ module ActiveRecord #:nodoc:
+                       end
+                     end
+                   else
+-                    hash[method] = hash[method].merge(params)
++                    if action == :reverse_merge
++                      hash[method] = hash[method].merge(params)
++                    else
++                      hash[method] = params.merge(hash[method])
++                    end
+                   end
+                 else
+                   hash[method] = params
+@@ -2143,7 +2142,6 @@ module ActiveRecord #:nodoc:
+           end
+ 
+           self.scoped_methods << method_scoping
+-
+           begin
+             yield
+           ensure
+@@ -2749,7 +2747,6 @@ module ActiveRecord #:nodoc:
+         assign_multiparameter_attributes(multi_parameter_attributes)
+       end
+ 
+-
+       # Returns a hash of all the attributes with their names as keys and the values of the attributes as values.
+       def attributes
+         self.attribute_names.inject({}) do |attrs, name|
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 43411df..519941d 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -104,7 +104,7 @@ module ActiveRecord
+         end
+       end
+     end
+-    
++
+     class Scope
+       attr_reader :proxy_scope, :proxy_options, :current_scoped_methods_when_defined
+       NON_DELEGATE_METHODS = %w(nil? send object_id class extend find size count sum average maximum minimum paginate first last empty? any? respond_to?).to_set
+@@ -175,7 +175,7 @@ module ActiveRecord
+         if scopes.include?(method)
+           scopes[method].call(self, *args)
+         else
+-          with_scope :find => proxy_options, :create => proxy_options[:conditions].is_a?(Hash) ?  proxy_options[:conditions] : {} do
++          with_scope({:find => proxy_options, :create => proxy_options[:conditions].is_a?(Hash) ?  proxy_options[:conditions] : {}}, :reverse_merge) do
+             method = :new if method == :build
+             if current_scoped_methods_when_defined
+               with_scope current_scoped_methods_when_defined do
+diff --git a/activerecord/test/cases/method_scoping_test.rb b/activerecord/test/cases/method_scoping_test.rb
+index c676c1c..68a7017 100644
+--- a/activerecord/test/cases/method_scoping_test.rb
++++ b/activerecord/test/cases/method_scoping_test.rb
+@@ -262,6 +262,15 @@ class NestedScopingTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_merge_inner_scope_has_priority
++    Developer.with_scope(:find => { :limit => 5 }) do
++      Developer.with_scope(:find => { :limit => 10 }) do
++        merged_option = Developer.instance_eval('current_scoped_methods')[:find]
++        assert_equal({ :limit => 10 }, merged_option)
++      end
++    end
++  end
++
+   def test_replace_options
+     Developer.with_scope(:find => { :conditions => "name = 'David'" }) do
+       Developer.with_exclusive_scope(:find => { :conditions => "name = 'Jamis'" }) do
+@@ -400,6 +409,29 @@ class NestedScopingTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_nested_scoped_create
++    comment = nil
++    Comment.with_scope(:create => { :post_id => 1}) do
++      Comment.with_scope(:create => { :post_id => 2}) do
++        assert_equal({ :post_id => 2 }, Comment.send(:current_scoped_methods)[:create])
++        comment = Comment.create :body => "Hey guys, nested scopes are broken. Please fix!"
++      end
++    end
++    assert_equal 2, comment.post_id
++  end
++
++  def test_nested_exclusive_scope_for_create
++    comment = nil
++    Comment.with_scope(:create => { :body => "Hey guys, nested scopes are broken. Please fix!" }) do
++      Comment.with_exclusive_scope(:create => { :post_id => 1 }) do
++        assert_equal({ :post_id => 1 }, Comment.send(:current_scoped_methods)[:create])
++        comment = Comment.create :body => "Hey guys"
++      end
++    end
++    assert_equal 1, comment.post_id
++    assert_equal 'Hey guys', comment.body
++  end
++
+   def test_merged_scoped_find_on_blank_conditions
+     [nil, " ", [], {}].each do |blank|
+       Developer.with_scope(:find => {:conditions => blank}) do
+@@ -523,7 +555,6 @@ class HasManyScopingTest< ActiveRecord::TestCase
+   end
+ end
+ 
+-
+ class HasAndBelongsToManyScopingTest< ActiveRecord::TestCase
+   fixtures :posts, :categories, :categories_posts
+ 
+@@ -549,7 +580,6 @@ class HasAndBelongsToManyScopingTest< ActiveRecord::TestCase
+   end
+ end
+ 
+-
+ class DefaultScopingTest < ActiveRecord::TestCase
+   fixtures :developers
+ 
+@@ -577,7 +607,7 @@ class DefaultScopingTest < ActiveRecord::TestCase
+     # Scopes added on children should append to parent scope
+     expected_klass_scope = [{ :create => {}, :find => { :order => 'salary DESC' }}, { :create => {}, :find => {} }]
+     assert_equal expected_klass_scope, klass.send(:scoped_methods)
+-    
++
+     # Parent should still have the original scope
+     assert_equal scope, DeveloperOrderedBySalary.send(:scoped_methods)
+   end
+@@ -620,7 +650,6 @@ end
+ =begin
+ # We disabled the scoping for has_one and belongs_to as we can't think of a proper use case
+ 
+-
+ class BelongsToScopingTest< ActiveRecord::TestCase
+   fixtures :comments, :posts
+ 
+@@ -640,7 +669,6 @@ class BelongsToScopingTest< ActiveRecord::TestCase
+ 
+ end
+ 
+-
+ class HasOneScopingTest< ActiveRecord::TestCase
+   fixtures :comments, :posts
+ 
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index 9f3a384..4b2be09 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -247,7 +247,7 @@ class NamedScopeTest < ActiveRecord::TestCase
+     topic = Topic.approved.create!({})
+     assert topic.approved
+   end
+-  
++
+   def test_should_build_with_proxy_options_chained
+     topic = Topic.approved.by_lifo.build({})
+     assert topic.approved
+@@ -287,15 +287,21 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert_equal post.comments.size, Post.scoped(:joins => join).scoped(:joins => join, :conditions => "posts.id = #{post.id}").size
+   end
+ 
+-  def test_chanining_should_use_latest_conditions_when_creating
+-    post1 = Topic.rejected.approved.new
+-    assert post1.approved?
++  def test_chaining_should_use_latest_conditions_when_creating
++    post = Topic.rejected.new
++    assert !post.approved?
++
++    post = Topic.rejected.approved.new
++    assert post.approved?
+ 
+-    post2 = Topic.approved.rejected.new
+-    assert ! post2.approved?
++    post = Topic.approved.rejected.new
++    assert !post.approved?
++
++    post = Topic.approved.rejected.approved.new
++    assert post.approved?
+   end
+ 
+-  def test_chanining_should_use_latest_conditions_when_searching
++  def test_chaining_should_use_latest_conditions_when_searching
+     # Normal hash conditions
+     assert_equal Topic.all(:conditions => {:approved => true}), Topic.rejected.approved.all
+     assert_equal Topic.all(:conditions => {:approved => false}), Topic.approved.rejected.all
+@@ -306,7 +312,7 @@ class NamedScopeTest < ActiveRecord::TestCase
+     # Nested hash conditions with different keys
+     assert_equal [posts(:sti_comments)], Post.with_special_comments.with_post(4).all.uniq
+   end
+-  
++
+   def test_methods_invoked_within_scopes_should_respect_scope
+     assert_equal [], Topic.approved.by_rejected_ids.proxy_options[:conditions][:id]
+   end
+-- 
+1.6.1.3
+

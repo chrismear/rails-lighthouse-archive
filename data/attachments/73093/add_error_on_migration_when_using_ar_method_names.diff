@@ -1,0 +1,292 @@
+From fd8e909da2e1a92681122d4262d2ec961c218058 Mon Sep 17 00:00:00 2001
+From: Emilio Tagua <miloops@gmail.com>
+Date: Sat, 20 Dec 2008 18:18:55 -0300
+Subject: [PATCH] Raise error when naming a column in a migration with an Active Record instance method name.
+
+---
+ activerecord/lib/active_record/migration.rb        |   53 +++++++++++---------
+ activerecord/test/cases/migration_test.rb          |   32 +++++++++---
+ .../101_migration_with_invalid_column_name.rb      |    9 +++
+ ..._migration_renaming_column_with_invalid_name.rb |    9 +++
+ 4 files changed, 71 insertions(+), 32 deletions(-)
+ create mode 100644 activerecord/test/migrations/broken/101_migration_with_invalid_column_name.rb
+ create mode 100644 activerecord/test/migrations/broken/102_migration_renaming_column_with_invalid_name.rb
+
+diff --git a/activerecord/lib/active_record/migration.rb b/activerecord/lib/active_record/migration.rb
+index 15350cf..6646f78 100644
+--- a/activerecord/lib/active_record/migration.rb
++++ b/activerecord/lib/active_record/migration.rb
+@@ -103,7 +103,7 @@ module ActiveRecord
+   #
+   # The Rails package has several tools to help create and apply migrations.
+   #
+-  # To generate a new migration, you can use 
++  # To generate a new migration, you can use
+   #   script/generate migration MyNewMigration
+   #
+   # where MyNewMigration is the name of your migration. The generator will
+@@ -121,16 +121,16 @@ module ActiveRecord
+   #     def self.up
+   #       add_column :tablenames, :fieldname, :string
+   #     end
+-  # 
++  #
+   #     def self.down
+   #       remove_column :tablenames, :fieldname
+   #     end
+   #   end
+-  # 
++  #
+   # To run migrations against the currently configured database, use
+   # <tt>rake db:migrate</tt>. This will update the database by running all of the
+   # pending migrations, creating the <tt>schema_migrations</tt> table
+-  # (see "About the schema_migrations table" section below) if missing. It will also 
++  # (see "About the schema_migrations table" section below) if missing. It will also
+   # invoke the db:schema:dump task, which will update your db/schema.rb file
+   # to match the structure of your database.
+   #
+@@ -240,7 +240,7 @@ module ActiveRecord
+   # lower than the current schema version: when migrating up, those
+   # never-applied "interleaved" migrations will be automatically applied, and
+   # when migrating down, never-applied "interleaved" migrations will be skipped.
+-  # 
++  #
+   # == Timestamped Migrations
+   #
+   # By default, Rails generates migrations that look like:
+@@ -253,7 +253,7 @@ module ActiveRecord
+   # off by setting:
+   #
+   #    config.active_record.timestamped_migrations = false
+-  # 
++  #
+   # In environment.rb.
+   #
+   class Migration
+@@ -342,8 +342,15 @@ module ActiveRecord
+         arg_list = arguments.map(&:inspect) * ', '
+ 
+         say_with_time "#{method}(#{arg_list})" do
+-          unless arguments.empty? || method == :execute
++          if !arguments.empty? && method != :execute
+             arguments[0] = Migrator.proper_table_name(arguments.first)
++            column_name = case method
++              when :add_column
++                arguments[1]
++              when :rename_column
++                arguments[2]
++            end.to_s
++            ActiveRecord::Base.instance_method_already_implemented?(column_name) unless column_name.blank?
+           end
+           ActiveRecord::Base.connection.send(method, *arguments, &block)
+         end
+@@ -385,9 +392,9 @@ module ActiveRecord
+       def rollback(migrations_path, steps=1)
+         migrator = self.new(:down, migrations_path)
+         start_index = migrator.migrations.index(migrator.current_migration)
+-        
++
+         return unless start_index
+-        
++
+         finish = migrator.migrations[start_index + steps]
+         down(migrations_path, finish ? finish.version : 0)
+       end
+@@ -399,7 +406,7 @@ module ActiveRecord
+       def down(migrations_path, target_version = nil)
+         self.new(:down, migrations_path, target_version).migrate
+       end
+-      
++
+       def run(direction, migrations_path, target_version)
+         self.new(direction, migrations_path, target_version).run
+       end
+@@ -430,17 +437,17 @@ module ActiveRecord
+     def initialize(direction, migrations_path, target_version = nil)
+       raise StandardError.new("This database does not yet support migrations") unless Base.connection.supports_migrations?
+       Base.connection.initialize_schema_migrations_table
+-      @direction, @migrations_path, @target_version = direction, migrations_path, target_version      
++      @direction, @migrations_path, @target_version = direction, migrations_path, target_version
+     end
+ 
+     def current_version
+       migrated.last || 0
+     end
+-    
++
+     def current_migration
+       migrations.detect { |m| m.version == current_version }
+     end
+-    
++
+     def run
+       target = migrations.detect { |m| m.version == @target_version }
+       raise UnknownMigrationVersionError.new(@target_version) if target.nil?
+@@ -457,14 +464,14 @@ module ActiveRecord
+       if target.nil? && !@target_version.nil? && @target_version > 0
+         raise UnknownMigrationVersionError.new(@target_version)
+       end
+-      
++
+       start = up? ? 0 : (migrations.index(current) || 0)
+       finish = migrations.index(target) || migrations.size - 1
+       runnable = migrations[start..finish]
+-      
++
+       # skip the last migration if we're headed down, but not ALL the way down
+       runnable.pop if down? && !target.nil?
+-      
++
+       runnable.each do |migration|
+         Base.logger.info "Migrating to #{migration.name} (#{migration.version})"
+ 
+@@ -492,28 +499,28 @@ module ActiveRecord
+     def migrations
+       @migrations ||= begin
+         files = Dir["#{@migrations_path}/[0-9]*_*.rb"]
+-        
++
+         migrations = files.inject([]) do |klasses, file|
+           version, name = file.scan(/([0-9]+)_([_a-z0-9]*).rb/).first
+-          
++
+           raise IllegalMigrationNameError.new(file) unless version
+           version = version.to_i
+-          
++
+           if klasses.detect { |m| m.version == version }
+-            raise DuplicateMigrationVersionError.new(version) 
++            raise DuplicateMigrationVersionError.new(version)
+           end
+ 
+           if klasses.detect { |m| m.name == name.camelize }
+-            raise DuplicateMigrationNameError.new(name.camelize) 
++            raise DuplicateMigrationNameError.new(name.camelize)
+           end
+-          
++
+           klasses << returning(MigrationProxy.new) do |migration|
+             migration.name     = name.camelize
+             migration.version  = version
+             migration.filename = file
+           end
+         end
+-        
++
+         migrations = migrations.sort_by(&:version)
+         down? ? migrations.reverse : migrations
+       end
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index 2ec3d40..49a1a2c 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -367,7 +367,7 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert_equal 9, wealth_column.precision
+       assert_equal 7, wealth_column.scale
+     end
+-    
++
+     def test_native_types
+       Person.delete_all
+       Person.connection.add_column "people", "last_name", :string
+@@ -899,9 +899,9 @@ if ActiveRecord::Base.connection.supports_migrations?
+ 
+     def test_migrator_one_down
+       ActiveRecord::Migrator.up(MIGRATIONS_ROOT + "/valid")
+-    
++
+       ActiveRecord::Migrator.down(MIGRATIONS_ROOT + "/valid", 1)
+-    
++
+       Person.reset_column_information
+       assert Person.column_methods_hash.include?(:last_name)
+       assert !Reminder.table_exists?
+@@ -1037,20 +1037,20 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert Reminder.create("content" => "hello world", "remind_at" => Time.now)
+       assert_equal "hello world", Reminder.find(:first).content
+     end
+-    
++
+     def test_migrator_rollback
+       ActiveRecord::Migrator.migrate(MIGRATIONS_ROOT + "/valid")
+       assert_equal(3, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(2, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(1, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+     end
+@@ -1193,6 +1193,20 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def test_raise_error_when_naming_column_with_active_record_names
++      e = assert_raises(ActiveRecord::DangerousAttributeError) do
++        ActiveRecord::Migrator.run(:up, MIGRATIONS_ROOT + "/broken", 101)
++      end
++
++      assert_equal "destroy is defined by ActiveRecord", e.message
++
++      e = assert_raises(ActiveRecord::DangerousAttributeError) do
++        ActiveRecord::Migrator.run(:up, MIGRATIONS_ROOT + "/broken", 102)
++      end
++
++      assert_equal "destroy is defined by ActiveRecord", e.message
++    end
++
+     protected
+       def with_env_tz(new_tz = 'US/Eastern')
+         old_tz, ENV['TZ'] = ENV['TZ'], new_tz
+@@ -1202,7 +1216,7 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+ 
+   end
+-  
++
+   uses_mocha 'Sexy migration tests' do
+     class SexyMigrationsTest < ActiveRecord::TestCase
+       def test_references_column_type_adds_id
+diff --git a/activerecord/test/migrations/broken/101_migration_with_invalid_column_name.rb b/activerecord/test/migrations/broken/101_migration_with_invalid_column_name.rb
+new file mode 100644
+index 0000000..b13c7cd
+--- /dev/null
++++ b/activerecord/test/migrations/broken/101_migration_with_invalid_column_name.rb
+@@ -0,0 +1,9 @@
++class MigrationWithInvalidColumnName < ActiveRecord::Migration
++  def self.up
++    add_column "people", "destroy", :string
++  end
++
++  def self.down
++    remove_column "people", "destroy"
++  end
++end
+diff --git a/activerecord/test/migrations/broken/102_migration_renaming_column_with_invalid_name.rb b/activerecord/test/migrations/broken/102_migration_renaming_column_with_invalid_name.rb
+new file mode 100644
+index 0000000..653636b
+--- /dev/null
++++ b/activerecord/test/migrations/broken/102_migration_renaming_column_with_invalid_name.rb
+@@ -0,0 +1,9 @@
++class MigrationRenamingColumnWithInvalidName < ActiveRecord::Migration
++  def self.up
++    rename_column "people", "first_name", "destroy"
++  end
++
++  def self.down
++    rename_column "people", "destroy", "first_name"
++  end
++end
+-- 
+1.5.5.1
+

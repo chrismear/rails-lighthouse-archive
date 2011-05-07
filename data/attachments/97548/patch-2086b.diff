@@ -1,0 +1,202 @@
+From 35511d57bce9ff8f922ee1529071ed74870ea914 Mon Sep 17 00:00:00 2001
+From: Jaime Bellmyer <online@bellmyer.com>
+Date: Thu, 26 Feb 2009 09:48:58 -0600
+Subject: [PATCH] raises exception (ActiveRecord::ConfigurationError with message) on habtm association creation if join table contains a primary key
+
+---
+ .../has_and_belongs_to_many_association.rb         |    4 ++
+ .../connection_adapters/abstract_adapter.rb        |    7 +++
+ .../connection_adapters/mysql_adapter.rb           |   10 ++++
+ .../connection_adapters/postgresql_adapter.rb      |   11 +++++
+ .../connection_adapters/sqlite_adapter.rb          |    4 ++
+ .../cases/associations/habtm_join_table_test.rb    |   45 ++++++++++++++++++++
+ activerecord/test/cases/pk_test.rb                 |   18 ++++++++
+ 7 files changed, 99 insertions(+), 0 deletions(-)
+ create mode 100644 activerecord/test/cases/associations/habtm_join_table_test.rb
+
+diff --git a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+index af9ce3d..834f339 100644
+--- a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+@@ -29,6 +29,10 @@ module ActiveRecord
+         end
+ 
+         def insert_record(record, force = true, validate = true)
++          if ActiveRecord::Base.connection.supports_primary_key? && ActiveRecord::Base.connection.primary_key(@reflection.options[:join_table])
++            raise ActiveRecord::ConfigurationError, "Primary key is not allowed in a has_and_belongs_to_many join table (#{@reflection.options[:join_table]})."
++          end
++
+           if record.new_record?
+             if force
+               record.save!
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index a8cd9f0..6af4797 100755
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -53,6 +53,13 @@ module ActiveRecord
+       def supports_migrations?
+         false
+       end
++      
++      # Can this adapter determine the primary key for tables not attached
++      # to an ActiveRecord class, such as join tables?  Backend specific, as
++      # the abstract adapter always returns +false+.
++      def supports_primary_key?
++        false
++      end
+ 
+       # Does this adapter support using DISTINCT within COUNT?  This is +true+
+       # for all adapters except sqlite.
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 9300df2..6016483 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -212,6 +212,10 @@ module ActiveRecord
+         true
+       end
+       
++      def supports_primary_key? #:nodoc:
++        true
++      end
++      
+       def supports_savepoints? #:nodoc:
+         true
+       end
+@@ -553,6 +557,12 @@ module ActiveRecord
+         result.free
+         keys.length == 1 ? [keys.first, nil] : nil
+       end
++      
++      # Returns just a table's primary key
++      def primary_key(table)
++        pk_and_sequence = pk_and_sequence_for(table)
++        pk_and_sequence && pk_and_sequence.first
++      end
+ 
+       def case_sensitive_equality_operator
+         "= BINARY"
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 913bb52..57cbd50 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -248,6 +248,11 @@ module ActiveRecord
+       def supports_migrations?
+         true
+       end
++      
++      # Does PostgreSQL support finding primary key on non-ActiveRecord tables?
++      def supports_primary_key? #:nodoc:
++        true
++      end
+ 
+       # Does PostgreSQL support standard conforming strings?
+       def supports_standard_conforming_strings?
+@@ -776,6 +781,12 @@ module ActiveRecord
+         nil
+       end
+ 
++      # Returns just a table's primary key
++      def primary_key(table)
++        pk_and_sequence = pk_and_sequence_for(table)
++        pk_and_sequence && pk_and_sequence.first
++      end
++
+       # Renames a table.
+       def rename_table(name, new_name)
+         execute "ALTER TABLE #{quote_table_name(name)} RENAME TO #{quote_table_name(new_name)}"
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 6077ddc..e55606f 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -84,6 +84,10 @@ module ActiveRecord
+       def supports_migrations? #:nodoc:
+         true
+       end
++      
++      def supports_primary_key? #:nodoc:
++        true
++      end
+ 
+       def requires_reloading?
+         true
+diff --git a/activerecord/test/cases/associations/habtm_join_table_test.rb b/activerecord/test/cases/associations/habtm_join_table_test.rb
+new file mode 100644
+index 0000000..ac4236b
+--- /dev/null
++++ b/activerecord/test/cases/associations/habtm_join_table_test.rb
+@@ -0,0 +1,45 @@
++require 'cases/helper'
++
++class MyReader < ActiveRecord::Base
++  has_and_belongs_to_many :my_books
++end
++
++class MyBook < ActiveRecord::Base
++  has_and_belongs_to_many :my_readers
++end
++
++class JoinTableTest < ActiveRecord::TestCase
++  def setup
++    ActiveRecord::Base.connection.create_table :my_books, :force => true do |t|
++      t.string :name
++    end
++    assert ActiveRecord::Base.connection.table_exists?(:my_books)
++    
++    ActiveRecord::Base.connection.create_table :my_readers, :force => true do |t|
++      t.string :name
++    end
++    assert ActiveRecord::Base.connection.table_exists?(:my_readers)
++    
++    ActiveRecord::Base.connection.create_table :my_books_my_readers, :force => true do |t|
++      t.integer :my_book_id
++      t.integer :my_reader_id
++    end
++    assert ActiveRecord::Base.connection.table_exists?(:my_books_my_readers)
++  end
++  
++  def teardown
++    ActiveRecord::Base.connection.drop_table :my_books
++    ActiveRecord::Base.connection.drop_table :my_readers
++    ActiveRecord::Base.connection.drop_table :my_books_my_readers
++  end
++  
++  uses_transaction :test_should_raise_exception_when_join_table_has_a_primary_key
++  def test_should_raise_exception_when_join_table_has_a_primary_key
++    if ActiveRecord::Base.connection.supports_primary_key?
++      assert_raise ActiveRecord::ConfigurationError do
++        jaime = MyReader.create(:name=>"Jaime")
++        jaime.my_books << MyBook.create(:name=>'Great Expectations')
++      end
++    end
++  end
++end
+diff --git a/activerecord/test/cases/pk_test.rb b/activerecord/test/cases/pk_test.rb
+index 948a570..34b6ff6 100644
+--- a/activerecord/test/cases/pk_test.rb
++++ b/activerecord/test/cases/pk_test.rb
+@@ -98,4 +98,22 @@ class PrimaryKeysTest < ActiveRecord::TestCase
+   def test_instance_destroy_should_quote_pkey
+     assert_nothing_raised { MixedCaseMonkey.find(1).destroy }
+   end
++  
++  def test_supports_primary_key
++    assert_nothing_raised NoMethodError do
++      ActiveRecord::Base.connection.supports_primary_key?
++    end
++  end
++  
++  def test_primary_key_returns_value_if_it_exists
++    if ActiveRecord::Base.connection.supports_primary_key?
++      assert_equal 'id', ActiveRecord::Base.connection.primary_key('developers')
++    end
++  end
++  
++  def test_primary_key_returns_nil_if_it_does_not_exist
++    if ActiveRecord::Base.connection.supports_primary_key?
++      assert_nil ActiveRecord::Base.connection.primary_key('developers_projects')
++    end
++  end
+ end
+-- 
+1.5.4.3
+

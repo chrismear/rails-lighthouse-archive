@@ -1,0 +1,378 @@
+diff -Nruw lib/active_record/connection_adapters/firebird_adapter.rb lib-new/active_record/connection_adapters/firebird_adapter.rb
+--- lib/active_record/connection_adapters/firebird_adapter.rb	2008-10-09 21:31:36.976846397 +0300
++++ lib-new/active_record/connection_adapters/firebird_adapter.rb	2008-10-09 21:34:48.975764855 +0300
+@@ -21,8 +21,8 @@
+ end
+ 
+ module ActiveRecord
+-  class << Base
+-    def firebird_connection(config) # :nodoc:
++  class Base
++    def self.firebird_connection(config) # :nodoc:
+       require_library_or_gem 'fireruby'
+       unless defined? FireRuby::SQLType
+         raise AdapterNotFound,
+@@ -35,35 +35,31 @@
+       connection = db.connect(*connection_params)
+       ConnectionAdapters::FirebirdAdapter.new(connection, logger, connection_params)
+     end
++
++    after_save :write_blobs
++    def write_blobs #:nodoc:
++      if connection.is_a?(ConnectionAdapters::FirebirdAdapter)
++        connection.write_blobs(self.class.table_name, self.class, attributes)
++      end
++    end
++
++    private :write_blobs
+   end
+ 
+   module ConnectionAdapters
+     class FirebirdColumn < Column # :nodoc:
+       VARCHAR_MAX_LENGTH = 32_765
+-      BLOB_MAX_LENGTH    = 32_767
+ 
+       def initialize(name, domain, type, sub_type, length, precision, scale, default_source, null_flag)
+         @firebird_type = FireRuby::SQLType.to_base_type(type, sub_type).to_s
+ 
+         super(name.downcase, nil, @firebird_type, !null_flag)
+ 
+-        @default = parse_default(default_source) if default_source
+         @limit = decide_limit(length)
+         @domain, @sub_type, @precision, @scale = domain, sub_type, precision, scale.abs
+-      end
+-
+-      def type
+-        if @domain =~ /BOOLEAN/
+-          :boolean
+-        elsif @type == :binary and @sub_type == 1
+-          :text
+-        else
+-          @type
+-        end
+-      end
+-
+-      def default
+-        type_cast(decide_default) if @default
++        @type = simplified_type(@firebird_type)
++        @default = parse_default(default_source) if default_source
++        @default = type_cast(decide_default) if @default
+       end
+ 
+       def self.value_to_boolean(value)
+@@ -91,7 +87,7 @@
+         def firebird_cast_default
+           sql = "SELECT CAST(#{@default} AS #{column_def}) FROM RDB$DATABASE"
+           if connection = Base.active_connections.values.detect { |conn| conn && conn.adapter_name == 'Firebird' }
+-            connection.execute(sql).to_a.first['CAST']
++            connection.select_rows(sql).first[0]
+           else
+             raise ConnectionNotEstablished, "No Firebird connections established."
+           end
+@@ -100,8 +96,6 @@
+         def decide_limit(length)
+           if text? or number?
+             length
+-          elsif @firebird_type == 'BLOB'
+-            BLOB_MAX_LENGTH
+           end
+         end
+ 
+@@ -116,13 +110,22 @@
+         end
+ 
+         def simplified_type(field_type)
+-          if field_type == 'TIMESTAMP'
++          case field_type
++            when /timestamp/i
+             :datetime
++            when /decimal|numeric|number/i
++              @scale == 0 ? :integer : :decimal
++            when /blob/i
++              @subtype == 1 ? :text : :binary
++            else
++              if @domain =~ /boolean/i
++                :boolean
+           else
+             super
+           end
+         end
+     end
++    end
+ 
+     # The Firebird adapter relies on the FireRuby[http://rubyforge.org/projects/fireruby/]
+     # extension, version 0.4.0 or later (available as a gem or from
+@@ -166,10 +169,10 @@
+     #
+     # === BLOB Elements
+     # The Firebird adapter currently provides only limited support for +BLOB+
+-    # columns. You cannot currently retrieve or insert a +BLOB+ as an IO stream.
++    # columns. You cannot currently retrieve a +BLOB+ as an IO stream.
+     # When selecting a +BLOB+, the entire element is converted into a String.
+-    # When inserting or updating a +BLOB+, the entire value is included in-line
+-    # in the SQL statement, limiting you to values <= 32KB in size.
++    # +BLOB+ handling is supported by writing an empty +BLOB+ to the database on
++    # insert/update and then executing a second query to save the +BLOB+. 
+     #
+     # === Column Name Case Semantics
+     # Firebird and ActiveRecord have somewhat conflicting case semantics for
+@@ -317,9 +320,17 @@
+ 
+       # QUOTING ==================================================
+ 
++      # We use quoting in order to implement BLOB handling. In order to
++      # do this we quote a BLOB to an empty string which will force Firebird
++      # to create an empty BLOB in the db for us. Quoting is used in some
++      # other places besides insert/update like for column defaults. That is
++      # why we are checking caller to see where we're coming from. This isn't
++      # perfect but It works.
+       def quote(value, column = nil) # :nodoc:
+         if [Time, DateTime].include?(value.class)
+           "CAST('#{value.strftime("%Y-%m-%d %H:%M:%S")}' AS TIMESTAMP)"
++        elsif value && column && [:text, :binary].include?(column.type) && caller.to_s !~ /add_column_options!/i 
++          "''"
+         else
+           super
+         end
+@@ -360,22 +371,17 @@
+ 
+       # DATABASE STATEMENTS ======================================
+ 
+-      def select_all(sql, name = nil) # :nodoc:
+-        select(sql, name)
+-      end
+-
+-      def select_one(sql, name = nil) # :nodoc:
+-        select(sql, name).first
++      def select_rows(sql, name = nil)
++        select_raw(sql, name).last
+       end
+ 
+       def execute(sql, name = nil, &block) # :nodoc:
+-        log(sql, name) do
+-          if @transaction
+-            @connection.execute(sql, @transaction, &block)
+-          else
+-            @connection.execute_immediate(sql, &block)
+-          end
++        exec_result = execute_statement(sql, name, &block)
++        if exec_result.instance_of?(FireRuby::ResultSet)
++          exec_result.close
++          exec_result = nil
+         end
++        return exec_result
+       end
+ 
+       def begin_db_transaction() # :nodoc:
+@@ -409,6 +415,30 @@
+         FireRuby::Generator.new(sequence_name, @connection).next(1)
+       end
+ 
++      # Inserts the given fixture into the table. Overridden to properly handle blobs.
++      def insert_fixture(fixture, table_name)
++        super
++
++        klass = fixture.class_name.constantize rescue nil
++        if klass.respond_to?(:ancestors) && klass.ancestors.include?(ActiveRecord::Base)
++          write_blobs(table_name, klass, fixture)
++        end
++      end
++
++      # Writes BLOB values from attributes, as indicated by the BLOB columns of klass.      
++      def write_blobs(table_name, klass, attributes)
++        id = quote(attributes[klass.primary_key])
++        klass.columns.select { |col| col.sql_type =~ /BLOB$/i }.each do |col|
++          value = attributes[col.name]
++          value = value.to_yaml if col.text? && klass.serialized_attributes[col.name]
++          value = value.read if value.respond_to?(:read)
++          next if value.nil?  || (value == '')
++          s = FireRuby::Statement.new(@connection, @transaction, "UPDATE #{table_name} set #{col.name} = ? WHERE #{klass.primary_key} = #{id}", 3)       
++          s.execute_for([value.to_s])
++          s.close
++        end
++      end
++
+ 
+       # SCHEMA STATEMENTS ========================================
+ 
+@@ -419,7 +449,7 @@
+ 
+       def recreate_database! # :nodoc:
+         sql = "SELECT rdb$character_set_name FROM rdb$database"
+-        charset = execute(sql).to_a.first[0].rstrip
++        charset = select_rows(sql).first[0].rstrip
+         disconnect!
+         @connection.database.drop(*@connection_params)
+         FireRuby::Database.create(@connection.database.file,
+@@ -428,7 +458,7 @@
+ 
+       def tables(name = nil) # :nodoc:
+         sql = "SELECT rdb$relation_name FROM rdb$relations WHERE rdb$system_flag = 0"
+-        execute(sql, name).collect { |row| row[0].rstrip.downcase }
++        select_rows(sql, name).collect { |row| row[0].rstrip.downcase }
+       end
+ 
+       def indexes(table_name, name = nil) # :nodoc:
+@@ -452,11 +482,11 @@
+           WHERE r.rdb$relation_name = '#{table_name.to_s.upcase}'
+           ORDER BY r.rdb$field_position
+         end_sql
+-        execute(sql, name).collect do |field|
+-          field_values = field.values.collect do |value|
++
++        select_rows(sql, name).collect do |row|
++          field_values = row.collect do |value|
+             case value
+               when String         then value.rstrip
+-              when FireRuby::Blob then value.to_s
+               else value
+             end
+           end
+@@ -498,6 +528,7 @@
+         change_column_type(table_name, column_name, type, options)
+         change_column_position(table_name, column_name, options[:position]) if options.include?(:position)
+         change_column_default(table_name, column_name, options[:default]) if options_include_default?(options)
++        change_column_null(table_name, column_name, options[:null], options[:default]) if options.key?(:null)
+       end
+ 
+       def change_column_default(table_name, column_name, default) # :nodoc:
+@@ -517,17 +548,27 @@
+         end_sql
+         transaction do
+           add_column(table_name, TEMP_COLUMN_NAME, :string, :default => default)
+-          execute sql
++          execute_statement(sql)
+           remove_column(table_name, TEMP_COLUMN_NAME)
+         end
+       end
+ 
++      def change_column_null(table_name, column_name, null, default = nil)
++        table_name = table_name.to_s.upcase
++        column_name = column_name.to_s.upcase
++
++        unless null || default.nil?
++          execute_statement("UPDATE #{quote_table_name(table_name)} SET #{quote_column_name(column_name)}=#{quote(default)} WHERE #{quote_column_name(column_name)} IS NULL")
++        end
++        execute_statement("UPDATE RDB$RELATION_FIELDS SET RDB$NULL_FLAG = #{null ? 'null' : '1'} WHERE (RDB$FIELD_NAME = '#{column_name}') and (RDB$RELATION_NAME = '#{table_name}')")
++      end
++
+       def rename_column(table_name, column_name, new_column_name) # :nodoc:
+-        execute "ALTER TABLE #{table_name} ALTER COLUMN #{column_name} TO #{new_column_name}"
++        execute_statement("ALTER TABLE #{quote_table_name(table_name)} ALTER COLUMN #{quote_column_name(column_name)} TO #{quote_column_name(new_column_name)}")
+       end
+ 
+       def remove_index(table_name, options) #:nodoc:
+-        execute "DROP INDEX #{quote_column_name(index_name(table_name, options))}"
++        execute_statement("DROP INDEX #{quote_column_name(index_name(table_name, options))}")
+       end
+ 
+       def rename_table(name, new_name) # :nodoc:
+@@ -566,6 +607,16 @@
+       end
+ 
+       private
++        def execute_statement(sql, name = nil, &block) # :nodoc:
++          log(sql, name) do
++            if @transaction
++              @connection.execute(sql, @transaction, &block)
++            else
++              @connection.execute_immediate(sql, &block)
++            end
++          end
++        end
++
+         def integer_sql_type(limit)
+           case limit
+             when (1..2) then 'smallint'
+@@ -579,14 +630,36 @@
+         end
+ 
+         def select(sql, name = nil)
+-          execute(sql, name).collect do |row|
+-            hashed_row = {}
++          fields, rows = select_raw(sql, name)
++          result = []
++          for row in rows
++            row_hash = {}
++            fields.each_with_index do |f, i|
++              row_hash[f] = row[i]
++            end
++            result << row_hash
++          end
++          result
++        end
++
++        def select_raw(sql, name = nil)
++          fields = []
++          rows = []
++          execute_statement(sql, name) do |row|
++            array_row = []
+             row.each do |column, value|
+-              value = value.to_s if FireRuby::Blob === value
+-              hashed_row[fb_to_ar_case(column)] = value
++              fields << fb_to_ar_case(column) if row.number == 1
++
++              if FireRuby::Blob === value
++                temp = value.to_s
++                value.close
++                value = temp
++              end
++              array_row << value
+             end
+-            hashed_row
++            rows << array_row
+           end
++          return fields, rows 
+         end
+ 
+         def primary_key(table_name)
+@@ -609,20 +682,20 @@
+             sql << "AND (c.rdb$constraint_type IS NULL OR c.rdb$constraint_type != 'PRIMARY KEY')\n"
+           end
+           sql << "ORDER BY i.rdb$index_name, s.rdb$field_position\n"
+-          execute sql, name
++          execute_statement(sql, name)
+         end
+ 
+         def change_column_type(table_name, column_name, type, options = {})
+-          sql = "ALTER TABLE #{table_name} ALTER COLUMN #{column_name} TYPE #{type_to_sql(type, options[:limit])}"
+-          execute sql
++          sql = "ALTER TABLE #{quote_table_name(table_name)} ALTER COLUMN #{quote_column_name(column_name)} TYPE #{type_to_sql(type, options[:limit])}"
++          execute_statement(sql)
+         rescue StatementInvalid
+           raise unless non_existent_domain_error?
+           create_boolean_domain
+-          execute sql
++          execute_statement(sql)
+         end
+ 
+         def change_column_position(table_name, column_name, position)
+-          execute "ALTER TABLE #{table_name} ALTER COLUMN #{column_name} POSITION #{position}"
++          execute_statement("ALTER TABLE #{quote_table_name(table_name)} ALTER COLUMN #{quote_column_name(column_name)} POSITION #{position}")
+         end
+ 
+         def copy_table(from, to)
+@@ -657,12 +730,12 @@
+         end
+ 
+         def copy_table_data(from, to)
+-          execute "INSERT INTO #{to} SELECT * FROM #{from}", "Copy #{from} data to #{to}"
++          execute_statement("INSERT INTO #{to} SELECT * FROM #{from}", "Copy #{from} data to #{to}")
+         end
+ 
+         def copy_sequence_value(from, to)
+           sequence_value = FireRuby::Generator.new(default_sequence_name(from), @connection).last
+-          execute "SET GENERATOR #{default_sequence_name(to)} TO #{sequence_value}"
++          execute_statement("SET GENERATOR #{default_sequence_name(to)} TO #{sequence_value}")
+         end
+ 
+         def sequence_exists?(sequence_name)
+@@ -682,7 +755,7 @@
+             CREATE DOMAIN #{boolean_domain[:name]} AS #{boolean_domain[:type]}
+             CHECK (VALUE IN (#{quoted_true}, #{quoted_false}) OR VALUE IS NULL)
+           end_sql
+-          execute sql rescue nil
++          execute_statement(sql) rescue nil
+         end
+ 
+         def table_has_constraints_or_dependencies?(table_name)

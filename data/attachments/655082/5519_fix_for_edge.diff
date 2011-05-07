@@ -1,0 +1,145 @@
+From 668295b0ffbfbe1d644c78b873d90d512c35522f Mon Sep 17 00:00:00 2001
+From: Neeraj Singh <neerajdotname@gmail.com>
+Date: Wed, 1 Sep 2010 12:04:29 -0400
+Subject: [PATCH] order should always be concatenated.
+
+order that is declared first has highest priority in all cases.
+
+Here are some examples.
+
+Car.order('name desc').find(:first, :order => 'id').name
+
+Car.named_scope_with_order.named_scope_with_another_order
+
+Car.order('id DESC').scoping do
+  Car.find(:first, :order => 'id asc')
+end
+
+No special treatment to with_scope or scoping.
+
+Also note that if default_scope declares an order then the order
+declared in default_scope has the highest priority unless
+with_exclusive_scope is used.
+---
+ .../lib/active_record/relation/spawn_methods.rb    |    3 +--
+ activerecord/test/cases/base_test.rb               |    8 ++++----
+ activerecord/test/cases/relation_scoping_test.rb   |    4 ++--
+ activerecord/test/cases/relations_test.rb          |   18 ++++++++++++++++++
+ activerecord/test/fixtures/cars.yml                |    5 +++++
+ activerecord/test/models/car.rb                    |    5 +++++
+ 6 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/relation/spawn_methods.rb b/activerecord/lib/active_record/relation/spawn_methods.rb
+index 4b2c647..e3f1496 100644
+--- a/activerecord/lib/active_record/relation/spawn_methods.rb
++++ b/activerecord/lib/active_record/relation/spawn_methods.rb
+@@ -99,9 +99,8 @@ module ActiveRecord
+ 
+       relation = relation.readonly(options[:readonly]) if options.key? :readonly
+ 
+-      # Give precedence to newly-applied orders and groups to play nicely with with_scope
+       [:group, :order].each do |finder|
+-        relation.send("#{finder}_values=", Array.wrap(options[finder]) + relation.send("#{finder}_values")) if options.has_key?(finder)
++        relation.send("#{finder}_values=", relation.send("#{finder}_values") + Array.wrap(options[finder])) if options.has_key?(finder)
+       end
+ 
+       relation = relation.where(options[:conditions]) if options.has_key?(:conditions)
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 55f0b1c..8d5aa92 100644
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1139,18 +1139,18 @@ class BasicsTest < ActiveRecord::TestCase
+     scoped_developers = Developer.send(:with_scope, :find => { :limit => 1 }) do
+       Developer.find(:all, :order => 'salary DESC')
+     end
+-    # Test scope order + find order, find has priority
++    # Test scope order + find order, order has priority
+     scoped_developers = Developer.send(:with_scope, :find => { :limit => 3, :order => 'id DESC' }) do
+       Developer.find(:all, :order => 'salary ASC')
+     end
+     assert scoped_developers.include?(developers(:poor_jamis))
+-    assert scoped_developers.include?(developers(:david))
++    assert ! scoped_developers.include?(developers(:david))
+     assert ! scoped_developers.include?(developers(:jamis))
+     assert_equal 3, scoped_developers.size
+ 
+     # Test without scoped find conditions to ensure we get the right thing
+-    developers = Developer.find(:all, :order => 'id', :limit => 1)
+-    assert scoped_developers.include?(developers(:david))
++    assert ! scoped_developers.include?(Developer.find(1))
++    assert scoped_developers.include?(Developer.find(11))
+   end
+ 
+   def test_scoped_find_limit_offset_including_has_many_association
+diff --git a/activerecord/test/cases/relation_scoping_test.rb b/activerecord/test/cases/relation_scoping_test.rb
+index cdfd62a..e27bb65 100644
+--- a/activerecord/test/cases/relation_scoping_test.rb
++++ b/activerecord/test/cases/relation_scoping_test.rb
+@@ -398,8 +398,8 @@ class DefaultScopingTest < ActiveRecord::TestCase
+     assert_equal expected, received
+   end
+ 
+-  def test_overwriting_default_scope
+-    expected = Developer.find(:all, :order => 'salary').collect { |dev| dev.salary }
++  def test_order_in_default_scope_should_prevail
++    expected = Developer.find(:all, :order => 'salary desc').collect { |dev| dev.salary }
+     received = DeveloperOrderedBySalary.find(:all, :order => 'salary').collect { |dev| dev.salary }
+     assert_equal expected, received
+   end
+diff --git a/activerecord/test/cases/relations_test.rb b/activerecord/test/cases/relations_test.rb
+index aa75aa2..50c8404 100644
+--- a/activerecord/test/cases/relations_test.rb
++++ b/activerecord/test/cases/relations_test.rb
+@@ -667,4 +667,22 @@ class RelationTest < ActiveRecord::TestCase
+   def test_relations_limit_with_conditions_or_limit
+     assert_equal Post.limit(2).size, Post.limit(2).all.size
+   end
++
++  def test_order_with_find_with_order
++    assert_equal 'zyke', Car.order('name desc').find(:first, :order => 'id').name
++  end
++
++  def test_default_scope_order_with_named_scope_order
++    assert_equal 'zyke', Car.order_using_new_style.limit(1).first.name
++    assert_equal 'zyke', Car.order_using_old_style.limit(1).first.name
++  end
++
++  def test_order_using_scoping
++    car = Car.order('id DESC').scoping do
++      Car.find(:first, :order => 'id asc')
++    end
++    assert_equal 'zyke', car.name
++  end
++
++
+ end
+diff --git a/activerecord/test/fixtures/cars.yml b/activerecord/test/fixtures/cars.yml
+index 23c98e8..b4c748a 100644
+--- a/activerecord/test/fixtures/cars.yml
++++ b/activerecord/test/fixtures/cars.yml
+@@ -2,3 +2,8 @@ honda:
+   id: 1
+   name: honda
+   engines_count: 0
++
++zyke:
++  id: 2
++  name: zyke
++  engines_count: 0
+diff --git a/activerecord/test/models/car.rb b/activerecord/test/models/car.rb
+index 903ec53..a1e351b 100644
+--- a/activerecord/test/models/car.rb
++++ b/activerecord/test/models/car.rb
+@@ -7,4 +7,9 @@ class Car < ActiveRecord::Base
+   scope :incl_tyres, includes(:tyres)
+   scope :incl_engines, includes(:engines)
+ 
++  default_scope :order => 'name desc'
++
++  scope :order_using_new_style,  order('name asc')
++  scope :order_using_old_style,  :order => 'name asc'
++
+ end
+-- 
+1.7.2
+

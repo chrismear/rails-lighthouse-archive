@@ -1,0 +1,156 @@
+--- actionmailer-2.3.2/lib/action_mailer/base.rb	2009-04-21 15:32:23.000000000 +0200
++++ local/lib/ruby/gems/1.8/gems/actionmailer-2.3.2/lib/action_mailer/base.rb	2009-05-08 14:35:07.000000000 +0200
+@@ -233,6 +233,9 @@
+   # * <tt>default_charset</tt> - The default charset used for the body and to encode the subject. Defaults to UTF-8. You can also
+   #   pick a different charset from inside a method with +charset+.
+   #
++  # * <tt>default_arguments_charset</tt> - The default charset used for the arguments the ActionMailer was called with. Defaults to UTF-8. You can also
++  #   pick a different charset from inside a method with +arguments_charset+.
++  #
+   # * <tt>default_content_type</tt> - The default content type used for the main part of the message. Defaults to "text/plain". You
+   #   can also pick a different content type from inside a method with +content_type+.
+   #
+@@ -290,6 +293,9 @@
+     @@default_charset = "utf-8"
+     cattr_accessor :default_charset
+ 
++    @@default_arguments_charset = "utf-8"
++    cattr_accessor :default_arguments_charset
++
+     @@default_content_type = "text/plain"
+     cattr_accessor :default_content_type
+ 
+@@ -317,6 +323,10 @@
+     # +default_charset+ specified for ActionMailer::Base.
+     adv_attr_accessor :charset
+ 
++    # Specify the charset of the arguments the ActionMailer object was created with
++    # if this differs from the :charset 
++    adv_attr_accessor :arguments_charset
++
+     # Specify the content type for the message. This defaults to <tt>text/plain</tt>
+     # in most cases, but can be automatically set in some situations.
+     adv_attr_accessor :content_type
+@@ -475,6 +485,7 @@
+               :content_type => template.content_type,
+               :disposition => "inline",
+               :charset => charset,
++              :arguments_charset => arguments_charset,
+               :body => render_message(template, @body)
+             )
+           end
+@@ -496,7 +507,7 @@
+         # we shift it onto the front of the parts and set the body to nil (so
+         # that create_mail doesn't try to render it in addition to the parts).
+         if !@parts.empty? && String === @body
+-          @parts.unshift Part.new(:charset => charset, :body => @body)
++          @parts.unshift Part.new(:charset => charset, :arguments_charset => arguments_charset, :body => @body)
+           @body = nil
+         end
+       end
+@@ -534,6 +545,7 @@
+       # defaults.
+       def initialize_defaults(method_name)
+         @charset ||= @@default_charset.dup
++        @arguments_charset ||= @@default_arguments_charset.dup
+         @content_type ||= @@default_content_type.dup
+         @implicit_parts_order ||= @@default_implicit_parts_order.dup
+         @template ||= method_name
+@@ -630,14 +642,15 @@
+         parts
+       end
+ 
++
+       def create_mail
+         m = TMail::Mail.new
+ 
+-        m.subject,     = quote_any_if_necessary(charset, subject)
+-        m.to, m.from   = quote_any_address_if_necessary(charset, recipients, from)
+-        m.bcc          = quote_address_if_necessary(bcc, charset) unless bcc.nil?
+-        m.cc           = quote_address_if_necessary(cc, charset) unless cc.nil?
+-        m.reply_to     = quote_address_if_necessary(reply_to, charset) unless reply_to.nil?
++        m.subject,     = quote_any_if_necessary(charset, recode_if_necessary(subject))
++        m.to, m.from   = quote_any_address_if_necessary(charset, recode_if_necessary(recipients), recode_if_necessary(from))
++        m.bcc          = quote_address_if_necessary(recode_if_necessary(bcc), charset) unless bcc.nil?
++        m.cc           = quote_address_if_necessary(recode_if_necessary(cc), charset) unless cc.nil?
++        m.reply_to     = quote_address_if_necessary(recode_if_necessary(reply_to), charset) unless reply_to.nil?
+         m.mime_version = mime_version unless mime_version.nil?
+         m.date         = sent_on.to_time rescue sent_on if sent_on
+ 
+@@ -647,11 +660,11 @@
+ 
+         if @parts.empty?
+           m.set_content_type(real_content_type, nil, ctype_attrs)
+-          m.body = normalize_new_lines(body)
++          m.body = normalize_new_lines(recode_if_necessary(body))
+         else
+           if String === body
+             part = TMail::Mail.new
+-            part.body = normalize_new_lines(body)
++            part.body = normalize_new_lines(recode_if_necessary(body))
+             part.set_content_type(real_content_type, nil, ctype_attrs)
+             part.set_content_disposition "inline"
+             m.parts << part
+--- actionmailer-2.3.2/lib/action_mailer/utils.rb	2009-04-21 15:32:23.000000000 +0200
++++ local/lib/ruby/gems/1.8/gems/actionmailer-2.3.2/lib/action_mailer/utils.rb	2009-05-08 14:35:27.000000000 +0200
+@@ -1,7 +1,13 @@
++require 'iconv'
+ module ActionMailer
+   module Utils #:nodoc:
+     def normalize_new_lines(text)
+       text.to_s.gsub(/\r\n?/, "\n")
++    end        
++    def recode_if_necessary( str )                                         
++      # charset//IGNORE silently discardes conversion errors
++      # TODO: should we add default replacements when encoding e.g. UTF8 to ISO ? 
++      (!str.blank? && str.kind_of?(String) && charset != arguments_charset) ? Iconv.new(charset+'//IGNORE',arguments_charset).iconv(str) : str
+     end
+   end
+ end
+--- actionmailer-2.3.2/lib/action_mailer/part.rb	2009-04-21 15:32:23.000000000 +0200
++++ local/lib/ruby/gems/1.8/gems/actionmailer-2.3.2/lib/action_mailer/part.rb	2009-05-08 13:59:32.000000000 +0200
+@@ -15,6 +15,10 @@
+     # Specify the charset for this subpart. By default, it will be the charset
+     # of the containing part or mailer.
+     adv_attr_accessor :charset
++
++    # Specify the charset of the arguments the ActionMailer object was created with
++    # if this differs from the :charset 
++    adv_attr_accessor :arguments_charset
+     
+     # The content disposition of this part, typically either "inline" or
+     # "attachment".
+@@ -38,7 +42,8 @@
+     def initialize(params)
+       @content_type = params[:content_type]
+       @content_disposition = params[:disposition] || "inline"
+-      @charset = params[:charset]
++      @charset = params[:charset]   
++      @arguments_charset = params[:arguments_charset]
+       @body = params[:body]
+       @filename = params[:filename]
+       @transfer_encoding = params[:transfer_encoding] || "quoted-printable"
+@@ -57,11 +62,11 @@
+         part.content_transfer_encoding = transfer_encoding || "quoted-printable"
+         case (transfer_encoding || "").downcase
+           when "base64" then
+-            part.body = TMail::Base64.folding_encode(body)
++            part.body = TMail::Base64.folding_encode(recode_if_necessary(body))
+           when "quoted-printable"
+-            part.body = [normalize_new_lines(body)].pack("M*")
++            part.body = [normalize_new_lines(recode_if_necessary(body))].pack("M*")
+           else
+-            part.body = body
++            part.body = recode_if_necessary(body)
+         end
+ 
+         # Always set the content_type after setting the body and or parts!
+@@ -79,7 +84,7 @@
+         end        
+       else
+         if String === body
+-          @parts.unshift Part.new(:charset => charset, :body => @body, :content_type => 'text/plain')
++          @parts.unshift Part.new(:charset => charset, :arguments_charset => arguments_charset, :body => @body, :content_type => 'text/plain')
+           @body = nil
+         end
+           

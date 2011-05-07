@@ -1,0 +1,143 @@
+From 77ac9ed8b5ad0d4ec842a7c3d9bfc05ce0823cfe Mon Sep 17 00:00:00 2001
+From: ratnikov <ratnikov@gmail.com>
+Date: Mon, 30 Mar 2009 16:47:44 -0500
+Subject: [PATCH] Added :merge functionality to serialization.
+
+---
+ activerecord/lib/active_record/serialization.rb |    6 ++++
+ activerecord/test/cases/serialization_test.rb   |   37 +++++++++++++++++++++++
+ 2 files changed, 43 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/serialization.rb b/activerecord/lib/active_record/serialization.rb
+index 870b4b2..45eee41 100644
+--- a/activerecord/lib/active_record/serialization.rb
++++ b/activerecord/lib/active_record/serialization.rb
+@@ -40,6 +40,10 @@ module ActiveRecord #:nodoc:
+         serializable_attribute_names + serializable_method_names
+       end
+ 
++      def serializable_merged_attributes
++	options[:merge] || {}
++      end
++
+       # Add associations specified via the <tt>:includes</tt> option.
+       # Expects a block that takes as arguments:
+       #   +association+ - name of the association
+@@ -82,6 +86,8 @@ module ActiveRecord #:nodoc:
+               serializable_record[association] = self.class.new(records, opts).serializable_record
+             end
+           end
++
++	  serializable_record.merge! serializable_merged_attributes 
+         end
+       end
+ 
+diff --git a/activerecord/test/cases/serialization_test.rb b/activerecord/test/cases/serialization_test.rb
+index 8841694..8aa06c2 100644
+--- a/activerecord/test/cases/serialization_test.rb
++++ b/activerecord/test/cases/serialization_test.rb
+@@ -44,4 +44,41 @@ class SerializationTest < ActiveRecord::TestCase
+       assert_equal @contact_attributes[:awesome], contact.awesome, "For #{format}"
+     end
+   end
++
++  def test_serializabler_record_should_allow_custom_hash_merge
++    @serializer = ActiveRecord::Serialization::Serializer.new Contact.new(@contact_attributes)
++
++    @serializer.stubs(:options).returns :merge => { :foo => 'bar' }
++    assert_equal 'bar', @serializer.serializable_record[:foo], "Should contain merged hash"
++
++    @serializer.stubs(:options).returns :merge => { :foo => { :bar => 'baz' } }
++    assert_equal({ :bar => 'baz' }, @serializer.serializable_record[:foo], "Should support multi-level hashes")
++
++    @serializer.stubs(:options).returns :merge => { :name => 'Dmitry' }
++    assert_equal 'Dmitry', @serializer.serializable_record[:name], "Should prefer merged attributes to the defaults"
++
++    @serializer.stubs(:options).returns :merge => { :name => 'Dmitry' }, :except => :name
++    assert_equal 'Dmitry', @serializer.serializable_record[:name], 'Should disregard :except clause for merged attributes'
++  end
++
++  private
++
++  def serialized_contact_hash format, options = {}
++    puts "serialized: #{Contact.new(@contact_attributes).send("to_#{format}", options).inspect}"
++    full_hash = build_hash_from format, Contact.new(@contact_attributes).send("to_#{format}", options)
++
++    # get only the 'contact' part of it
++    full_hash["contact"] or flunk("Expected to get serialization of a contact")
++  end
++
++  def build_hash_from format, data
++    case format.to_s
++    when 'json' 
++      
++      ActiveSupport::JSON::decode(data)
++    when 'xml' then Hash.from_xml data
++    else
++      raise "Unsupported format: #{format.inspect}"
++    end
++  end
+ end
+-- 
+1.5.6.3
+
+
+From 4238dc629f131b0bf2522ba44ff9632558dd57d3 Mon Sep 17 00:00:00 2001
+From: ratnikov <ratnikov@gmail.com>
+Date: Mon, 30 Mar 2009 17:45:15 -0500
+Subject: [PATCH] Added tests for the json serializer.
+
+---
+ .../active_record/serializers/json_serializer.rb   |   11 +++++++++++
+ activerecord/test/cases/json_serialization_test.rb |   13 +++++++++++++
+ 2 files changed, 24 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/serializers/json_serializer.rb b/activerecord/lib/active_record/serializers/json_serializer.rb
+index 1fd65ed..8b59359 100644
+--- a/activerecord/lib/active_record/serializers/json_serializer.rb
++++ b/activerecord/lib/active_record/serializers/json_serializer.rb
+@@ -71,6 +71,17 @@ module ActiveRecord #:nodoc:
+     #                    "title": "Welcome to the weblog"},
+     #                   {"comments": [{"body": "Don't think too hard"}],
+     #                    "title": "So I was thinking"}]}
++    #
++    # It is also possible to merge arbitrary attributes using <tt>:merge</tt> option. The merged attributes 
++    # take precedence over model attributes. For example:
++    #
++    #   konata.to_json(:merge => { :voice => 'Ryo Hirohashi', :name => 'Kona-chan' })
++    #   # => {"id": 1, "name": "Kona-chan", "age": 16, "created_at": "2006/08/01", "awesome": true, "voice": "Ryo Hirohashi"}
++    #
++    # NOTE: Merged attributes ignore the <tt>:except</tt> setting:
++    #
++    #   konata.to_json(:merge => { :age => 18 }, :except => [ :id, :created_at, :age ])
++    #   # => {"name": "Konata Izumi", "age": 18", "awesome": true}
+     def to_json(options = {})
+       if include_root_in_json
+         "{#{self.class.json_class_name}: #{JsonSerializer.new(self, options).to_s}}"
+diff --git a/activerecord/test/cases/json_serialization_test.rb b/activerecord/test/cases/json_serialization_test.rb
+index 975acde..eb83556 100644
+--- a/activerecord/test/cases/json_serialization_test.rb
++++ b/activerecord/test/cases/json_serialization_test.rb
+@@ -86,6 +86,19 @@ class JsonSerializationTest < ActiveRecord::TestCase
+     assert_match %r{"label": "Has cheezburger"}, methods_json
+     assert_match %r{"favorite_quote": "Constraints are liberating"}, methods_json
+   end
++
++  def test_merging_custom_hash
++    assert_match %r{"voice": "Ryo Hirohashi"}, @contact.to_json(:merge => { :voice => 'Ryo Hirohashi' })
++
++    # Deep hash
++    assert_match %r{"voice": .*"english": "Wendee Lee"}, @contact.to_json(:only => :name, :merge => { :voice => { :english => 'Wendee Lee' } })
++
++    # should override attributes with specified custom options
++    assert_match %r{"name": "Kona-chan"}, @contact.to_json(:only => :name, :merge => { :name => 'Kona-chan' })
++
++    # should ignore :except restriction
++    assert_match %r{"age": 18}, @contact.to_json(:except => [ :id, :created_at, :age ], :merge => { :age => 18 })
++  end
+ end
+ 
+ class DatabaseConnectedJsonEncodingTest < ActiveRecord::TestCase
+-- 
+1.5.6.3
+

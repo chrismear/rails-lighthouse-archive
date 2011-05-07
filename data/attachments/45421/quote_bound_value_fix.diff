@@ -1,0 +1,188 @@
+From e952b3f40952b36c22f20dee725ddb46e4522fab Mon Sep 17 00:00:00 2001
+From: Manfred Stienstra <manfred@fngtps.com>
+Date: Thu, 11 Sep 2008 22:38:20 +0200
+Subject: [PATCH] Fix ActiveRecord::Base.quote_bound_value for ActiveSupper::Multibyte::Chars values.
+
+  - Adds String#acts_like_string?
+  - Adds Chars#acts_like_string?
+---
+ activerecord/lib/active_record/base.rb             |    2 +-
+ activerecord/test/cases/finder_test.rb             |   12 ++++++++-
+ activerecord/test/cases/sanitize_test.rb           |   25 ++++++++++++++++++++
+ .../lib/active_support/core_ext/string.rb          |    2 +
+ .../lib/active_support/core_ext/string/behavior.rb |   13 ++++++++++
+ .../lib/active_support/multibyte/chars.rb          |    5 ++++
+ activesupport/test/core_ext/string_ext_test.rb     |    6 ++++
+ activesupport/test/multibyte_chars_test.rb         |    4 +++
+ 8 files changed, 66 insertions(+), 3 deletions(-)
+ create mode 100644 activerecord/test/cases/sanitize_test.rb
+ create mode 100644 activesupport/lib/active_support/core_ext/string/behavior.rb
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index fc6d762..91b6974 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -2152,7 +2152,7 @@ module ActiveRecord #:nodoc:
+         end
+ 
+         def quote_bound_value(value) #:nodoc:
+-          if value.respond_to?(:map) && !value.is_a?(String)
++          if value.respond_to?(:map) && !value.acts_like?(:string)
+             if value.respond_to?(:empty?) && value.empty?
+               connection.quote(nil)
+             else
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index 1cbc518..aede8a6 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -297,7 +297,6 @@ class FinderTest < ActiveRecord::TestCase
+     assert_raises(ActiveRecord::RecordNotFound) { Topic.find(1, :conditions => { :author_name => "David", :title => "The First Topic", :replies_count => 1, :approved => true }) }
+   end
+ 
+-
+   def test_condition_interpolation
+     assert_kind_of Firm, Company.find(:first, :conditions => ["name = '%s'", "37signals"])
+     assert_nil Company.find(:first, :conditions => ["name = '%s'", "37signals!"])
+@@ -392,7 +391,7 @@ class FinderTest < ActiveRecord::TestCase
+       Company.find(:first, :conditions => ["id=? AND name = ?", 2])
+     }
+     assert_raises(ActiveRecord::PreparedStatementInvalid) {
+-	   Company.find(:first, :conditions => ["id=?", 2, 3, 4])
++     Company.find(:first, :conditions => ["id=?", 2, 3, 4])
+     }
+   end
+ 
+@@ -455,6 +454,15 @@ class FinderTest < ActiveRecord::TestCase
+     assert_equal ActiveRecord::Base.connection.quote(''), bind('?', '')
+   end
+ 
++  def test_bind_chars
++    quoted_bambi = ActiveRecord::Base.connection.quote("Bambi")
++    quoted_bambi_and_thumper = ActiveRecord::Base.connection.quote("Bambi\nand\nThumper")
++    assert_equal "name=#{quoted_bambi}", bind('name=?', "Bambi")
++    assert_equal "name=#{quoted_bambi_and_thumper}", bind('name=?', "Bambi\nand\nThumper")
++    assert_equal "name=#{quoted_bambi}", bind('name=?', "Bambi".chars)
++    assert_equal "name=#{quoted_bambi_and_thumper}", bind('name=?', "Bambi\nand\nThumper".chars)
++  end
++
+   def test_bind_record
+     o = Struct.new(:quoted_id).new(1)
+     assert_equal '1', bind('?', o)
+diff --git a/activerecord/test/cases/sanitize_test.rb b/activerecord/test/cases/sanitize_test.rb
+new file mode 100644
+index 0000000..0106572
+--- /dev/null
++++ b/activerecord/test/cases/sanitize_test.rb
+@@ -0,0 +1,25 @@
++require "cases/helper"
++require 'models/binary'
++
++class SanitizeTest < ActiveRecord::TestCase
++  def setup
++  end
++
++  def test_sanitize_sql_array_handles_string_interpolation
++    quoted_bambi = ActiveRecord::Base.connection.quote_string("Bambi")
++    assert_equal "name=#{quoted_bambi}", Binary.send(:sanitize_sql_array, ["name=%s", "Bambi"])
++    assert_equal "name=#{quoted_bambi}", Binary.send(:sanitize_sql_array, ["name=%s", "Bambi".chars])
++    quoted_bambi_and_thumper = ActiveRecord::Base.connection.quote_string("Bambi\nand\nThumper")
++    assert_equal "name=#{quoted_bambi_and_thumper}",Binary.send(:sanitize_sql_array, ["name=%s", "Bambi\nand\nThumper"])
++    assert_equal "name=#{quoted_bambi_and_thumper}",Binary.send(:sanitize_sql_array, ["name=%s", "Bambi\nand\nThumper".chars])
++  end
++
++  def test_sanitize_sql_array_handles_bind_variables
++    quoted_bambi = ActiveRecord::Base.connection.quote("Bambi")
++    assert_equal "name=#{quoted_bambi}", Binary.send(:sanitize_sql_array, ["name=?", "Bambi"])
++    assert_equal "name=#{quoted_bambi}", Binary.send(:sanitize_sql_array, ["name=?", "Bambi".chars])
++    quoted_bambi_and_thumper = ActiveRecord::Base.connection.quote("Bambi\nand\nThumper")
++    assert_equal "name=#{quoted_bambi_and_thumper}", Binary.send(:sanitize_sql_array, ["name=?", "Bambi\nand\nThumper"])
++    assert_equal "name=#{quoted_bambi_and_thumper}", Binary.send(:sanitize_sql_array, ["name=?", "Bambi\nand\nThumper".chars])
++  end
++end
+diff --git a/activesupport/lib/active_support/core_ext/string.rb b/activesupport/lib/active_support/core_ext/string.rb
+index 25386af..7ff2f11 100644
+--- a/activesupport/lib/active_support/core_ext/string.rb
++++ b/activesupport/lib/active_support/core_ext/string.rb
+@@ -6,6 +6,7 @@ require 'active_support/core_ext/string/iterators'
+ require 'active_support/core_ext/string/unicode'
+ require 'active_support/core_ext/string/xchar'
+ require 'active_support/core_ext/string/filters'
++require 'active_support/core_ext/string/behavior'
+ 
+ class String #:nodoc:
+   include ActiveSupport::CoreExtensions::String::Access
+@@ -15,4 +16,5 @@ class String #:nodoc:
+   include ActiveSupport::CoreExtensions::String::StartsEndsWith
+   include ActiveSupport::CoreExtensions::String::Iterators
+   include ActiveSupport::CoreExtensions::String::Unicode
++  include ActiveSupport::CoreExtensions::String::Behavior
+ end
+diff --git a/activesupport/lib/active_support/core_ext/string/behavior.rb b/activesupport/lib/active_support/core_ext/string/behavior.rb
+new file mode 100644
+index 0000000..a93ca30
+--- /dev/null
++++ b/activesupport/lib/active_support/core_ext/string/behavior.rb
+@@ -0,0 +1,13 @@
++module ActiveSupport #:nodoc:
++  module CoreExtensions #:nodoc:
++    module String #:nodoc:
++      module Behavior
++        # Enable more predictable duck-typing on String-like classes. See
++        # Object#acts_like?.
++        def acts_like_string?
++          true
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activesupport/lib/active_support/multibyte/chars.rb b/activesupport/lib/active_support/multibyte/chars.rb
+index 185d030..de2c83f 100644
+--- a/activesupport/lib/active_support/multibyte/chars.rb
++++ b/activesupport/lib/active_support/multibyte/chars.rb
+@@ -49,6 +49,11 @@ module ActiveSupport::Multibyte #:nodoc:
+         false
+     end
+ 
++    # Enable more predictable duck-typing on String-like classes. See Object#acts_like?.
++    def acts_like_string?
++      true
++    end
++
+     # Create a new Chars instance.
+     def initialize(str)
+       @string = str.respond_to?(:string) ? str.string : str
+diff --git a/activesupport/test/core_ext/string_ext_test.rb b/activesupport/test/core_ext/string_ext_test.rb
+index c9f959e..c0decf2 100644
+--- a/activesupport/test/core_ext/string_ext_test.rb
++++ b/activesupport/test/core_ext/string_ext_test.rb
+@@ -201,3 +201,9 @@ class StringInflectionsTest < Test::Unit::TestCase
+     end
+   end
+ end
++
++class StringBehaviourTest < Test::Unit::TestCase
++  def test_acts_like_string
++    assert 'Bambi'.acts_like_string?
++  end
++end
+\ No newline at end of file
+diff --git a/activesupport/test/multibyte_chars_test.rb b/activesupport/test/multibyte_chars_test.rb
+index 63cfadb..fb510f1 100644
+--- a/activesupport/test/multibyte_chars_test.rb
++++ b/activesupport/test/multibyte_chars_test.rb
+@@ -167,6 +167,10 @@ class CharsTest < Test::Unit::TestCase
+     assert_equal false, 'test'.chars.respond_to?(:a_method_that_doesnt_exist)
+   end
+   
++  def test_acts_like_string
++    assert 'Bambi'.chars.acts_like_string?
++  end
++  
+   protected
+ 
+   def with_kcode(kcode)
+-- 
+1.6.0
+

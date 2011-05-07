@@ -1,0 +1,242 @@
+From 9073a5a93d141e674b9eeb4da05ee8390836d18e Mon Sep 17 00:00:00 2001
+From: Santiago Pastorino <santiago@wyeworks.com>
+Date: Mon, 24 May 2010 11:41:43 -0300
+Subject: [PATCH 1/2] Revert "translation method of TranslationHelper module returns always SafeBuffer [#4194 status:resolved]"
+
+This reverts commit 2310aef29be306704c0361f1188200f71df657df.
+---
+ .../lib/action_view/helpers/translation_helper.rb  |    2 +-
+ .../test/fixtures/test/array_translation.erb       |    1 -
+ .../test/template/translation_helper_test.rb       |    9 +--------
+ 3 files changed, 2 insertions(+), 10 deletions(-)
+ delete mode 100644 actionpack/test/fixtures/test/array_translation.erb
+
+diff --git a/actionpack/lib/action_view/helpers/translation_helper.rb b/actionpack/lib/action_view/helpers/translation_helper.rb
+index 9296622..684e250 100644
+--- a/actionpack/lib/action_view/helpers/translation_helper.rb
++++ b/actionpack/lib/action_view/helpers/translation_helper.rb
+@@ -13,7 +13,7 @@ module ActionView
+       def translate(key, options = {})
+         options[:raise] = true
+         translation = I18n.translate(scope_key_by_partial(key), options)
+-        (translation.respond_to?(:join) ? translation.join : translation).html_safe
++        translation.respond_to?(:html_safe) ? translation.html_safe : translation
+       rescue I18n::MissingTranslationData => e
+         keys = I18n.send(:normalize_translation_keys, e.locale, e.key, e.options[:scope])
+         content_tag('span', keys.join(', '), :class => 'translation_missing')
+diff --git a/actionpack/test/fixtures/test/array_translation.erb b/actionpack/test/fixtures/test/array_translation.erb
+deleted file mode 100644
+index 12c0763..0000000
+--- a/actionpack/test/fixtures/test/array_translation.erb
++++ /dev/null
+@@ -1 +0,0 @@
+-<%= t(['foo', 'bar']) %>
+\ No newline at end of file
+diff --git a/actionpack/test/template/translation_helper_test.rb b/actionpack/test/template/translation_helper_test.rb
+index 24640e4..e59697c 100644
+--- a/actionpack/test/template/translation_helper_test.rb
++++ b/actionpack/test/template/translation_helper_test.rb
+@@ -20,14 +20,7 @@ class TranslationHelperTest < Test::Unit::TestCase
+   
+   def test_translation_of_an_array
+     I18n.expects(:translate).with(["foo", "bar"], :raise => true).returns(["foo", "bar"])
+-    assert_equal "foobar", translate(["foo", "bar"])
+-  end
+-
+-  def test_translation_of_an_array_with_html
+-    expected = '<a href="#">foo</a><a href="#">bar</a>'
+-    I18n.expects(:translate).with(["foo", "bar"], :raise => true).returns(['<a href="#">foo</a>', '<a href="#">bar</a>'])
+-    @view = ActionView::Base.new(ActionController::Base.view_paths, {})
+-    assert_equal expected, @view.render(:file => "test/array_translation")
++    assert_equal ["foo", "bar"], translate(["foo", "bar"])
+   end
+ 
+   def test_delegates_localize_to_i18n
+-- 
+1.7.1
+
+
+From 9723e2694ac3602ad096ed68c552a7fd89b1f584 Mon Sep 17 00:00:00 2001
+From: Santiago Pastorino <santiago@wyeworks.com>
+Date: Mon, 24 May 2010 14:08:24 -0300
+Subject: [PATCH 2/2] translation method of TranslationHelper module returns a SafeBuffer Array backport
+
+[#4675 state:committed]
+---
+ .../lib/action_view/helpers/translation_helper.rb  |   33 +++++++++-----
+ .../test/fixtures/test/array_translation.erb       |    1 +
+ .../fixtures/test/scoped_array_translation.erb     |    2 +-
+ actionpack/test/fixtures/test/translation.erb      |    1 +
+ .../test/template/translation_helper_test.rb       |   47 +++++++++++++++-----
+ 5 files changed, 60 insertions(+), 24 deletions(-)
+ create mode 100644 actionpack/test/fixtures/test/array_translation.erb
+ create mode 100644 actionpack/test/fixtures/test/translation.erb
+
+diff --git a/actionpack/lib/action_view/helpers/translation_helper.rb b/actionpack/lib/action_view/helpers/translation_helper.rb
+index 684e250..1f95d02 100644
+--- a/actionpack/lib/action_view/helpers/translation_helper.rb
++++ b/actionpack/lib/action_view/helpers/translation_helper.rb
+@@ -3,17 +3,21 @@ require 'action_view/helpers/tag_helper'
+ module ActionView
+   module Helpers
+     module TranslationHelper
+-      # Delegates to I18n#translate but also performs two additional functions. First, it'll catch MissingTranslationData exceptions 
++      # Delegates to I18n#translate but also performs two additional functions. First, it'll catch MissingTranslationData exceptions
+       # and turn them into inline spans that contains the missing key, such that you can see in a view what is missing where.
+       #
+       # Second, it'll scope the key by the current partial if the key starts with a period. So if you call translate(".foo") from the
+       # people/index.html.erb template, you'll actually be calling I18n.translate("people.index.foo"). This makes it less repetitive
+       # to translate many keys within the same partials and gives you a simple framework for scoping them consistently. If you don't
+       # prepend the key with a period, nothing is converted.
+-      def translate(key, options = {})
+-        options[:raise] = true
+-        translation = I18n.translate(scope_key_by_partial(key), options)
+-        translation.respond_to?(:html_safe) ? translation.html_safe : translation
++      def translate(keys, options = {})
++        options[:raise]  = true
++        are_keys_a_string  = keys.is_a?(String)
++        keys = scope_keys_by_partial(keys)
++
++        translations = I18n.translate(keys, options)
++        translations = html_safe_translation_keys(keys, Array.wrap(translations))
++        are_keys_a_string ? translations.first : translations
+       rescue I18n::MissingTranslationData => e
+         keys = I18n.send(:normalize_translation_keys, e.locale, e.key, e.options[:scope])
+         content_tag('span', keys.join(', '), :class => 'translation_missing')
+@@ -28,12 +32,19 @@ module ActionView
+ 
+ 
+       private
+-        def scope_key_by_partial(key)
+-          strkey = key.respond_to?(:join) ? key.join : key.to_s
+-          if strkey.first == "."
+-            template.path_without_format_and_extension.gsub(%r{/_?}, ".") + strkey
+-          else
+-            key
++        def scope_keys_by_partial(keys)
++          Array.wrap(keys).map do |key|
++            if key.to_s.first == "."
++              template.path_without_format_and_extension.gsub(%r{/_?}, ".") + key.to_s
++            else
++              key
++            end
++          end
++        end
++
++        def html_safe_translation_keys(keys, translations)
++          keys.zip(translations).map do |key, translation|
++            key =~ /(\b|_|\.)html$/ ? translation.html_safe : translation
+           end
+         end
+     end
+diff --git a/actionpack/test/fixtures/test/array_translation.erb b/actionpack/test/fixtures/test/array_translation.erb
+new file mode 100644
+index 0000000..bcdeea4
+--- /dev/null
++++ b/actionpack/test/fixtures/test/array_translation.erb
+@@ -0,0 +1 @@
++<% translation = t(['foo', 'bar', 'baz_html']) %><%= translation.first %>, <%= translation.second %>, <%= translation.third %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/scoped_array_translation.erb b/actionpack/test/fixtures/test/scoped_array_translation.erb
+index 0a0c79f..cb07fca 100644
+--- a/actionpack/test/fixtures/test/scoped_array_translation.erb
++++ b/actionpack/test/fixtures/test/scoped_array_translation.erb
+@@ -1 +1 @@
+-<%= t(['.foo', '.bar']) %>
+\ No newline at end of file
++<%= t(['.foo', '.bar']).join(", ") %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/translation.erb b/actionpack/test/fixtures/test/translation.erb
+new file mode 100644
+index 0000000..81a837d
+--- /dev/null
++++ b/actionpack/test/fixtures/test/translation.erb
+@@ -0,0 +1 @@
++<%= t('.helper') %>
+\ No newline at end of file
+diff --git a/actionpack/test/template/translation_helper_test.rb b/actionpack/test/template/translation_helper_test.rb
+index e59697c..c6ab64d 100644
+--- a/actionpack/test/template/translation_helper_test.rb
++++ b/actionpack/test/template/translation_helper_test.rb
+@@ -1,43 +1,66 @@
+ require 'abstract_unit'
+ 
+-class TranslationHelperTest < Test::Unit::TestCase
++class TranslationHelperTest < ActiveSupport::TestCase
+   include ActionView::Helpers::TagHelper
+   include ActionView::Helpers::TranslationHelper
+-  
++
+   attr_reader :request
+   def setup
+   end
+-  
++
+   def test_delegates_to_i18n_setting_the_raise_option
+-    I18n.expects(:translate).with(:foo, :locale => 'en', :raise => true).returns("")
++    I18n.expects(:translate).with([:foo], :locale => 'en', :raise => true).returns([""])
+     translate :foo, :locale => 'en'
+   end
+-  
++
+   def test_returns_missing_translation_message_wrapped_into_span
+     expected = '<span class="translation_missing">en, foo</span>'
+     assert_equal expected, translate(:foo)
+   end
+-  
++
+   def test_translation_of_an_array
+     I18n.expects(:translate).with(["foo", "bar"], :raise => true).returns(["foo", "bar"])
+     assert_equal ["foo", "bar"], translate(["foo", "bar"])
+   end
+ 
++  def test_translation_of_an_array_with_html
++    translate_expected = ['<a href="#">foo</a>', '<a href="#">bar</a>', '<a href="#">baz</a>']
++    I18n.expects(:translate).with(["foo", "bar", "baz_html"], :raise => true).returns(translate_expected)
++    @view = ActionView::Base.new(ActionController::Base.view_paths, {})
++    expected = '<a href="#">foo</a>, <a href="#">bar</a>, <a href="#">baz</a>'
++    assert_equal expected, @view.render(:file => "test/array_translation")
++  end
++
+   def test_delegates_localize_to_i18n
+     @time = Time.utc(2008, 7, 8, 12, 18, 38)
+     I18n.expects(:localize).with(@time)
+     localize @time
+   end
+-  
++
+   def test_scoping_by_partial
+-    expects(:template).returns(stub(:path_without_format_and_extension => "people/index"))
+-    I18n.expects(:translate).with("people.index.foo", :locale => 'en', :raise => true).returns("")
+-    translate ".foo", :locale => 'en'
++    I18n.expects(:translate).with(["test.translation.helper"], :raise => true).returns(["helper"])
++    @view = ActionView::Base.new(ActionController::Base.view_paths, {})
++    assert_equal "helper", @view.render(:file => "test/translation")
+   end
+ 
+   def test_scoping_by_partial_of_an_array
+-    I18n.expects(:translate).with("test.scoped_array_translation.foo.bar", :raise => true).returns(["foo", "bar"])
++    I18n.expects(:translate).with(["test.scoped_array_translation.foo", "test.scoped_array_translation.bar"], :raise => true).returns(["foo", "bar"])
+     @view = ActionView::Base.new(ActionController::Base.view_paths, {})
+-    assert_equal "foobar", @view.render(:file => "test/scoped_array_translation")
++    assert_equal "foo, bar", @view.render(:file => "test/scoped_array_translation")
++  end
++
++  def test_translate_does_not_mark_plain_text_as_safe_html
++    I18n.expects(:translate).with(["hello"], :raise => true).returns(["Hello World"])
++    assert_equal false, translate("hello").html_safe?
++  end
++
++  def test_translate_marks_translations_named_html_as_safe_html
++    I18n.expects(:translate).with(["html"], :raise => true).returns(["<a>Hello World</a>"])
++    assert translate("html").html_safe?
++  end
++
++  def test_translate_marks_translations_with_a_html_suffix_as_safe_html
++    I18n.expects(:translate).with(["hello_html"], :raise => true).returns(["<a>Hello World</a>"])
++    assert translate("hello_html").html_safe?
+   end
+ end
+-- 
+1.7.1
+

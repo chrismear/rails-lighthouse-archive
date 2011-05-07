@@ -1,0 +1,238 @@
+From ddc54fc9d1c39121c88218d76f1bc4cf8b2c0311 Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Thu, 28 Aug 2008 17:00:18 +0100
+Subject: [PATCH] Merge :joins instead of clobbering them when nesting scope
+
+---
+ activerecord/lib/active_record/associations.rb |    4 +-
+ activerecord/lib/active_record/base.rb         |   37 ++++++++---
+ activerecord/lib/active_record/calculations.rb |    2 +-
+ activerecord/test/cases/method_scoping_test.rb |   81 +++++++++++++++++++++++-
+ 4 files changed, 109 insertions(+), 15 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 4d93561..0ad5f72 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1596,7 +1596,7 @@ module ActiveRecord
+           sql = "SELECT #{column_aliases(join_dependency)} FROM #{(scope && scope[:from]) || options[:from] || quoted_table_name} "
+           sql << join_dependency.join_associations.collect{|join| join.association_join }.join
+ 
+-          add_joins!(sql, options, scope)
++          add_joins!(sql, options[:joins], scope)
+           add_conditions!(sql, options[:conditions], scope)
+           add_limited_ids_condition!(sql, options, join_dependency) if !using_limitable_reflections?(join_dependency.reflections) && ((scope && scope[:limit]) || options[:limit])
+ 
+@@ -1652,7 +1652,7 @@ module ActiveRecord
+ 
+           if is_distinct
+             sql << distinct_join_associations.collect { |assoc| assoc.association_join }.join
+-            add_joins!(sql, options, scope)
++            add_joins!(sql, options[:joins], scope)
+           end
+ 
+           add_conditions!(sql, options[:conditions], scope)
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 5c30f80..b5ffc47 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1549,7 +1549,7 @@ module ActiveRecord #:nodoc:
+           sql  = "SELECT #{options[:select] || (scope && scope[:select]) || ((options[:joins] || (scope && scope[:joins])) && quoted_table_name + '.*') || '*'} "
+           sql << "FROM #{(scope && scope[:from]) || options[:from] || quoted_table_name} "
+ 
+-          add_joins!(sql, options, scope)
++          add_joins!(sql, options[:joins], scope)
+           add_conditions!(sql, options[:conditions], scope)
+ 
+           add_group!(sql, options[:group], scope)
+@@ -1565,6 +1565,22 @@ module ActiveRecord #:nodoc:
+          (safe_to_array(first) + safe_to_array(second)).uniq
+         end
+ 
++        def merge_joins(first, second)
++          if first.is_a?(String) && second.is_a?(String)
++            "#{first} #{second}"
++          elsif first.is_a?(String) || second.is_a?(String)
++            if first.is_a?(String)
++              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, second, nil)
++              "#{first} #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join}"
++            else
++              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, first, nil)
++              "#{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} #{second}"
++            end
++          else
++            (safe_to_array(first) + safe_to_array(second)).uniq
++          end
++        end
++
+         # Object#to_a is deprecated, though it does have the desired behavior
+         def safe_to_array(o)
+           case o
+@@ -1620,16 +1636,15 @@ module ActiveRecord #:nodoc:
+         end
+ 
+         # The optional scope argument is for the current <tt>:find</tt> scope.
+-        def add_joins!(sql, options, scope = :auto)
++        def add_joins!(sql, joins, scope = :auto)
+           scope = scope(:find) if :auto == scope
+-          [(scope && scope[:joins]), options[:joins]].each do |join|
+-            case join
+-            when Symbol, Hash, Array
+-              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, join, nil)
+-              sql << " #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} "
+-            else
+-              sql << " #{join} "
+-            end
++          merged_joins = scope && scope[:joins] && joins ? merge_joins(scope[:joins], joins) : (joins || scope && scope[:joins])
++          case merged_joins
++          when Symbol, Hash, Array
++            join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, merged_joins, nil)
++            sql << " #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} "
++          when String
++            sql << " #{merged_joins} "
+           end
+         end
+ 
+@@ -1879,6 +1894,8 @@ module ActiveRecord #:nodoc:
+                         hash[method][key] = merge_conditions(params[key], hash[method][key])
+                       elsif key == :include && merge
+                         hash[method][key] = merge_includes(hash[method][key], params[key]).uniq
++                      elsif key == :joins && merge
++                        hash[method][key] = merge_joins(params[key], hash[method][key])
+                       else
+                         hash[method][key] = hash[method][key] || params[key]
+                       end
+diff --git a/activerecord/lib/active_record/calculations.rb b/activerecord/lib/active_record/calculations.rb
+index 08306f3..0325a8f 100644
+--- a/activerecord/lib/active_record/calculations.rb
++++ b/activerecord/lib/active_record/calculations.rb
+@@ -188,7 +188,7 @@ module ActiveRecord
+           end
+ 
+           joins = ""
+-          add_joins!(joins, options, scope)
++          add_joins!(joins, options[:joins], scope)
+ 
+           if merged_includes.any?
+             join_dependency = ActiveRecord::Associations::ClassMethods::JoinDependency.new(self, merged_includes, joins)
+diff --git a/activerecord/test/cases/method_scoping_test.rb b/activerecord/test/cases/method_scoping_test.rb
+index ee66ac9..af6fcd3 100644
+--- a/activerecord/test/cases/method_scoping_test.rb
++++ b/activerecord/test/cases/method_scoping_test.rb
+@@ -1,4 +1,5 @@
+ require "cases/helper"
++require 'models/author'
+ require 'models/developer'
+ require 'models/project'
+ require 'models/comment'
+@@ -6,7 +7,7 @@ require 'models/post'
+ require 'models/category'
+ 
+ class MethodScopingTest < ActiveRecord::TestCase
+-  fixtures :developers, :projects, :comments, :posts, :developers_projects
++  fixtures :authors, :developers, :projects, :comments, :posts, :developers_projects
+ 
+   def test_set_conditions
+     Developer.with_scope(:find => { :conditions => 'just a test...' }) do
+@@ -97,6 +98,46 @@ class MethodScopingTest < ActiveRecord::TestCase
+     assert_equal developers(:david).attributes, scoped_developers.first.attributes
+   end
+ 
++  def test_scoped_find_using_new_style_joins
++    scoped_developers = Developer.with_scope(:find => { :joins => :projects }) do
++      Developer.find(:all, :conditions => 'projects.id = 2')
++    end
++    assert scoped_developers.include?(developers(:david))
++    assert !scoped_developers.include?(developers(:jamis))
++    assert_equal 1, scoped_developers.size
++    assert_equal developers(:david).attributes, scoped_developers.first.attributes
++  end
++
++  def test_scoped_find_merges_old_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => 'INNER JOIN posts ON authors.id = posts.author_id ' }) do
++      Author.find(:all, :select => 'DISTINCT authors.*', :joins => 'INNER JOIN comments ON posts.id = comments.post_id', :conditions => 'comments.id = 1')
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
++
++  def test_scoped_find_merges_new_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => :posts }) do
++      Author.find(:all, :select => 'DISTINCT authors.*', :joins => :comments, :conditions => 'comments.id = 1')
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
++
++  def test_scoped_find_merges_new_and_old_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => :posts }) do
++      Author.find(:all, :select => 'DISTINCT authors.*', :joins => 'JOIN comments ON posts.id = comments.post_id', :conditions => 'comments.id = 1')
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
++
+   def test_scoped_count_include
+     # with the include, will retrieve only developers for the given project
+     Developer.with_scope(:find => { :include => :projects }) do
+@@ -152,7 +193,7 @@ class MethodScopingTest < ActiveRecord::TestCase
+ end
+ 
+ class NestedScopingTest < ActiveRecord::TestCase
+-  fixtures :developers, :projects, :comments, :posts
++  fixtures :authors, :developers, :projects, :comments, :posts
+ 
+   def test_merge_options
+     Developer.with_scope(:find => { :conditions => 'salary = 80000' }) do
+@@ -357,6 +398,42 @@ class NestedScopingTest < ActiveRecord::TestCase
+       assert_equal scoped_methods, Developer.instance_eval('current_scoped_methods')
+     end
+   end
++
++  def test_nested_scoped_find_merges_old_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => 'INNER JOIN posts ON authors.id = posts.author_id' }) do
++      Author.with_scope(:find => { :joins => 'INNER JOIN comments ON posts.id = comments.post_id' }) do
++        Author.find(:all, :select => 'DISTINCT authors.*', :conditions => 'comments.id = 1')
++      end
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
++
++  def test_nested_scoped_find_merges_new_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => :posts }) do
++      Author.with_scope(:find => { :joins => :comments }) do
++        Author.find(:all, :select => 'DISTINCT authors.*', :conditions => 'comments.id = 1')
++      end
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
++
++  def test_nested_scoped_find_merges_new_and_old_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => :posts }) do
++      Author.with_scope(:find => { :joins => 'INNER JOIN comments ON posts.id = comments.post_id' }) do
++        Author.find(:all, :select => 'DISTINCT authors.*', :joins => '', :conditions => 'comments.id = 1')
++      end
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
+ end
+ 
+ class HasManyScopingTest< ActiveRecord::TestCase
+-- 
+1.5.4.5
+

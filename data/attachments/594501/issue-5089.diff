@@ -1,0 +1,138 @@
+From 74bee27348dceb3401ee798297efcae84e751e6f Mon Sep 17 00:00:00 2001
+From: David J. Hamilton <davidjh@hjdivad.com>
+Date: Sun, 11 Jul 2010 19:22:23 -0700
+Subject: [PATCH] Patch for issue 5089.
+
+define_callbacks :rescuable => true did not work for errors in :before
+callbacks.
+---
+ activesupport/lib/active_support/callbacks.rb |   19 ++++++--
+ activesupport/test/callbacks_test.rb          |   61 +++++++++++++++++++++++++
+ 2 files changed, 75 insertions(+), 5 deletions(-)
+
+diff --git a/activesupport/lib/active_support/callbacks.rb b/activesupport/lib/active_support/callbacks.rb
+index 1c7802f..457b7c9 100644
+--- a/activesupport/lib/active_support/callbacks.rb
++++ b/activesupport/lib/active_support/callbacks.rb
+@@ -346,25 +346,34 @@ module ActiveSupport
+         method = []
+         method << "value = nil"
+         method << "halted = false"
++        method << "rescued_error = nil" if config[:rescuable]
+ 
+-        each do |callback|
++        around_callbacks  = select{|callback| callback.kind == :around }
++        other_callbacks   = reject{|callback| callback.kind == :around }
++
++        method << "begin" if config[:rescuable]
++
++        other_callbacks.each do |callback|
+           method << callback.start(key, object)
+         end
+ 
+-        if config[:rescuable]
+-          method << "rescued_error = nil"
+-          method << "begin"
++        around_callbacks.each do |around_callback|
++          method << around_callback.start(key, object)
+         end
+ 
+         method << "value = yield if block_given? && !halted"
+ 
++        around_callbacks.reverse_each do |around_callback|
++          method << around_callback.end(key, object)
++        end
++
+         if config[:rescuable]
+           method << "rescue Exception => e"
+           method << "rescued_error = e"
+           method << "end"
+         end
+ 
+-        reverse_each do |callback|
++        other_callbacks.reverse_each do |callback|
+           method << callback.end(key, object)
+         end
+ 
+diff --git a/activesupport/test/callbacks_test.rb b/activesupport/test/callbacks_test.rb
+index 70a2950..7f19b7a 100644
+--- a/activesupport/test/callbacks_test.rb
++++ b/activesupport/test/callbacks_test.rb
+@@ -71,6 +71,43 @@ module CallbacksTest
+     def no; false; end
+   end
+ 
++  class ErrorPerson < Person
++    reset_callbacks   :save
++    define_callbacks  :rescuable_save,              :rescuable => true
++    define_callbacks  :rescuable_save_with_around,  :rescuable => true
++
++    set_callback      :rescuable_save, :before do
++      raise "Error"
++    end
++
++    set_callback      :rescuable_save, :after do |r|
++      r.history << [:after_rescuable_save, :block]
++    end
++
++    def rescuable_save
++      run_callbacks :rescuable_save
++    end
++
++
++    set_callback    :rescuable_save_with_around, :before do
++      raise "Error"
++    end
++
++    set_callback    :rescuable_save_with_around,  :around do |&block|
++      r.history << [:before_rescuable_save_with_around, :around_block]
++      block.call
++      r.history << [:after_rescuable_save_with_around, :around_block]
++    end
++
++    set_callback      :rescuable_save_with_around, :after do |r|
++      r.history << [:after_rescuable_save_with_around, :block]
++    end
++
++    def rescuable_save_with_around
++      run_callbacks :rescuable_save_with_around
++    end
++  end
++
+   class ParentController
+     include ActiveSupport::Callbacks
+ 
+@@ -334,6 +371,30 @@ module CallbacksTest
+         [:after_save, :symbol]
+       ], person.history
+     end
++
++    def test_error_in_before_save
++      person = ErrorPerson.new
++      begin
++        person.rescuable_save
++        fail "expected exception"
++      rescue
++      end
++      assert_equal [
++        [:after_rescuable_save, :block],
++      ], person.history
++    end
++
++    def test_error_in_before_save_with_around
++      person = ErrorPerson.new
++      begin
++        person.rescuable_save_with_around
++        fail "expected exception"
++      rescue
++      end
++      assert_equal [
++        [:after_rescuable_save_with_around, :block],
++      ], person.history
++    end
+   end
+ 
+   class ConditionalCallbackTest < Test::Unit::TestCase
+-- 
+1.7.1.1.dirty
+

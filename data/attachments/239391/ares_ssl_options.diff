@@ -1,0 +1,287 @@
+From 6e33d151daa552f2b0934a4e0201964aed217c4e Mon Sep 17 00:00:00 2001
+From: Roy Nicholson <nicholson.roy@gmail.com>
+Date: Sun, 9 Aug 2009 13:57:20 -0400
+Subject: [PATCH] Add ability to set SSL options on ARes connections.
+
+---
+ activeresource/lib/active_resource/base.rb       |   41 +++++++++++++++++
+ activeresource/lib/active_resource/connection.rb |   35 ++++++++++++++-
+ activeresource/lib/active_resource/exceptions.rb |    8 +++
+ activeresource/test/base_test.rb                 |   51 ++++++++++++++++++++++
+ activeresource/test/connection_test.rb           |   18 ++++++++
+ 5 files changed, 150 insertions(+), 3 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 9db3588..7250fe5 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -103,6 +103,8 @@ module ActiveResource
+   #
+   # Many REST APIs will require authentication, usually in the form of basic
+   # HTTP authentication.  Authentication can be specified by:
++  #
++  # === HTTP Basic Authentication
+   # * putting the credentials in the URL for the +site+ variable.
+   #
+   #    class Person < ActiveResource::Base
+@@ -123,6 +125,19 @@ module ActiveResource
+   # Note: Some values cannot be provided in the URL passed to site.  e.g. email addresses
+   # as usernames.  In those situations you should use the separate user and password option.
+   #
++  # === Certificate Authentication
++  # 
++  # * End point uses an X509 certificate for authentication. <tt>See ssl_options=</tt> for all options.
++  #
++  #    class Person < ActiveResource::Base
++  #      self.site = "https://secure.api.people.com/"
++  #      self.ssl_options = {:cert         => OpenSSL::X509::Certificate.new(File.open(pem_file))
++  #                          :key          => OpenSSL::PKey::RSA.new(File.open(pem_file)),
++  #                          :ca_path      => "/path/to/OpenSSL/formatted/CA_Certs",
++  #                          :verify_mode  => OpenSSL::SSL::VERIFY_PEER}
++  #    end
++  #
++  #  
+   # == Errors & Validation
+   #
+   # Error handling and validation is handled in much the same manner as you're used to seeing in
+@@ -342,6 +357,31 @@ module ActiveResource
+         end
+       end
+ 
++      # Options that will get applied to an SSL connection.
++      #
++      # * <tt>:key</tt> - An OpenSSL::PKey::RSA or OpenSSL::PKey::DSA object.
++      # * <tt>:cert</tt> - An OpenSSL::X509::Certificate object as client certificate
++      # * <tt>:ca_file</tt> - Path to a CA certification file in PEM format. The file can contrain several CA certificates.
++      # * <tt>:ca_path</tt> - Path of a CA certification directory containing certifications in PEM format.
++      # * <tt>:verify_mode</tt> - Flags for server the certification verification at begining of SSL/TLS session. (OpenSSL::SSL::VERIFY_NONE or OpenSSL::SSL::VERIFY_PEER is acceptable)
++      # * <tt>:verify_callback</tt> - The verify callback for the server certification verification.
++      # * <tt>:verify_depth</tt> - The maximum depth for the certificate chain verification.  
++      # * <tt>:cert_store</tt> - OpenSSL::X509::Store to verify peer certificate.  
++      # * <tt>:ssl_timeout</tt> -The SSL timeout in seconds.
++      def ssl_options=(opts={})
++        @connection   = nil
++        @ssl_options  = opts
++      end
++      
++      # Returns the SSL options hash.
++      def ssl_options
++        if defined?(@ssl_options)
++          @ssl_options
++        elsif superclass != Object && superclass.ssl_options
++          superclass.ssl_options
++        end
++      end
++
+       # An instance of ActiveResource::Connection that is the base \connection to the remote service.
+       # The +refresh+ parameter toggles whether or not the \connection is refreshed at every request
+       # or not (defaults to <tt>false</tt>).
+@@ -352,6 +392,7 @@ module ActiveResource
+           @connection.user = user if user
+           @connection.password = password if password
+           @connection.timeout = timeout if timeout
++          @connection.ssl_options = ssl_options if ssl_options
+           @connection
+         else
+           superclass.connection
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index ef57c1f..2a639cd 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -16,7 +16,7 @@ module ActiveResource
+       :delete => 'Accept'
+     }
+ 
+-    attr_reader :site, :user, :password, :timeout, :proxy
++    attr_reader :site, :user, :password, :timeout, :proxy, :ssl_options
+     attr_accessor :format
+ 
+     class << self
+@@ -61,6 +61,11 @@ module ActiveResource
+       @timeout = timeout
+     end
+ 
++    # Hash of options applied to Net::HTTP instance when +site+ protocol is 'https'.
++    def ssl_options=(opts={})
++      @ssl_options = opts
++    end
++
+     # Executes a GET request.
+     # Used to get (find) resources.
+     def get(path, headers = {})
+@@ -102,6 +107,8 @@ module ActiveResource
+         handle_response(result)
+       rescue Timeout::Error => e
+         raise TimeoutError.new(e.message)
++      rescue OpenSSL::SSL::SSLError => e
++        raise SSLError.new(e.message)
+       end
+ 
+       # Handles response and error codes from the remote service.
+@@ -149,8 +156,7 @@ module ActiveResource
+       end
+ 
+       def configure_http(http)
+-        http.use_ssl = @site.is_a?(URI::HTTPS)
+-        http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl?
++        http = apply_ssl_options(http) 
+ 
+         # Net::HTTP timeouts default to 60 seconds.
+         if @timeout
+@@ -161,6 +167,29 @@ module ActiveResource
+         http
+       end
+ 
++      def apply_ssl_options(http)
++        return http unless @site.is_a?(URI::HTTPS)
++
++        http.use_ssl     = true
++        http.verify_mode = OpenSSL::SSL::VERIFY_NONE
++        return http unless defined?(@ssl_options)
++
++        http.ca_path     = @ssl_options[:ca_path] if @ssl_options[:ca_path]
++        http.ca_file     = @ssl_options[:ca_file] if @ssl_options[:ca_file]
++
++        http.cert        = @ssl_options[:cert] if @ssl_options[:cert]
++        http.key         = @ssl_options[:key]  if @ssl_options[:key]
++
++        http.cert_store  = @ssl_options[:cert_store]  if @ssl_options[:cert_store]
++        http.ssl_timeout = @ssl_options[:ssl_timeout] if @ssl_options[:ssl_timeout]
++
++        http.verify_mode     = @ssl_options[:verify_mode]     if @ssl_options[:verify_mode]
++        http.verify_callback = @ssl_options[:verify_callback] if @ssl_options[:verify_callback]
++        http.verify_depth    = @ssl_options[:verify_depth]    if @ssl_options[:verify_depth]
++
++        http
++      end
++
+       def default_header
+         @default_header ||= {}
+       end
+diff --git a/activeresource/lib/active_resource/exceptions.rb b/activeresource/lib/active_resource/exceptions.rb
+index 5e4b1d4..dd59146 100644
+--- a/activeresource/lib/active_resource/exceptions.rb
++++ b/activeresource/lib/active_resource/exceptions.rb
+@@ -20,6 +20,14 @@ module ActiveResource
+     def to_s; @message ;end
+   end
+ 
++  # Raised when a OpenSSL::SSL::SSLError occurs.
++  class SSLError < ConnectionError
++    def initialize(message)
++      @message = message
++    end
++    def to_s; @message ;end
++  end
++
+   # 3xx Redirection
+   class Redirection < ConnectionError # :nodoc:
+     def to_s; response['Location'] ? "#{super} => #{response['Location']}" : super; end
+diff --git a/activeresource/test/base_test.rb b/activeresource/test/base_test.rb
+index e68d562..2e1236c 100644
+--- a/activeresource/test/base_test.rb
++++ b/activeresource/test/base_test.rb
+@@ -166,6 +166,13 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal(5, Forum.connection.timeout)
+   end
+ 
++  def test_should_accept_setting_ssl_options
++    expected = {:verify => 1}
++    Forum.ssl_options= expected
++    assert_equal(expected, Forum.ssl_options)
++    assert_equal(expected, Forum.connection.ssl_options)
++  end
++
+   def test_user_variable_can_be_reset
+     actor = Class.new(ActiveResource::Base)
+     actor.site = 'http://cinema'
+@@ -196,6 +203,16 @@ class BaseTest < Test::Unit::TestCase
+     assert_nil actor.connection.timeout
+   end
+ 
++  def test_ssl_options_hash_can_be_reset
++    actor = Class.new(ActiveResource::Base)
++    actor.site = 'https://cinema'
++    assert_nil actor.ssl_options
++    actor.ssl_options = {:foo => 5}
++    actor.ssl_options = nil
++    assert_nil actor.ssl_options
++    assert_nil actor.connection.ssl_options
++  end
++
+   def test_credentials_from_site_are_decoded
+     actor = Class.new(ActiveResource::Base)
+     actor.site = 'http://my%40email.com:%31%32%33@cinema'
+@@ -395,6 +412,40 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal fruit.timeout, apple.timeout, 'subclass did not adopt changes from parent class'
+   end
+ 
++  def test_ssl_options_reader_uses_superclass_ssl_options_until_written
++    # Superclass is Object so returns nil.
++    assert_nil ActiveResource::Base.ssl_options
++    assert_nil Class.new(ActiveResource::Base).ssl_options
++    Person.ssl_options = {:foo => 'bar'}
++
++    # Subclass uses superclass ssl_options.
++    actor = Class.new(Person)
++    assert_equal Person.ssl_options, actor.ssl_options
++
++    # Changing subclass ssl_options doesn't change superclass ssl_options.
++    actor.ssl_options = {:baz => ''}
++    assert_not_equal Person.ssl_options, actor.ssl_options
++
++    # Changing superclass ssl_options doesn't overwrite subclass ssl_options.
++    Person.ssl_options = {:color => 'blue'}
++    assert_not_equal Person.ssl_options, actor.ssl_options
++
++    # Changing superclass ssl_options after subclassing changes subclass ssl_options.
++    jester = Class.new(actor)
++    actor.ssl_options = {:color => 'red'}
++    assert_equal actor.ssl_options, jester.ssl_options
++
++    # Subclasses are always equal to superclass ssl_options when not overridden.
++    fruit = Class.new(ActiveResource::Base)
++    apple = Class.new(fruit)
++
++    fruit.ssl_options = {:alpha => 'betas'}
++    assert_equal fruit.ssl_options, apple.ssl_options, 'subclass did not adopt changes from parent class'
++
++    fruit.ssl_options = {:omega => 'moos'}
++    assert_equal fruit.ssl_options, apple.ssl_options, 'subclass did not adopt changes from parent class'
++  end
++
+   def test_updating_baseclass_site_object_wipes_descendent_cached_connection_objects
+     # Subclasses are always equal to superclass site when not overridden
+     fruit = Class.new(ActiveResource::Base)
+diff --git a/activeresource/test/connection_test.rb b/activeresource/test/connection_test.rb
+index 12e8058..c85acd1 100644
+--- a/activeresource/test/connection_test.rb
++++ b/activeresource/test/connection_test.rb
+@@ -204,6 +204,24 @@ class ConnectionTest < Test::Unit::TestCase
+     assert_nothing_raised(Mocha::ExpectationError) { @conn.get(path, {'Accept' => 'application/xhtml+xml'}) }
+   end
+ 
++  def test_ssl_options_get_applied_to_http
++    http = Net::HTTP.new('')
++    @conn.site="https://secure"
++    @conn.ssl_options={:verify_mode => OpenSSL::SSL::VERIFY_PEER}
++    @conn.timeout = 10 # prevent warning about uninitialized.
++    @conn.send(:configure_http, http)
++
++    assert http.use_ssl
++    assert_equal http.verify_mode, OpenSSL::SSL::VERIFY_PEER
++  end
++
++  def test_ssl_error
++    http = Net::HTTP.new('')
++    @conn.expects(:http).returns(http)
++    http.expects(:get).raises(OpenSSL::SSL::SSLError, 'Expired certificate')
++    assert_raise(ActiveResource::SSLError) { @conn.get('/people/1.xml') }
++  end
++
+   protected
+     def assert_response_raises(klass, code)
+       assert_raise(klass, "Expected response code #{code} to raise #{klass}") do
+-- 
+1.6.3.3
+

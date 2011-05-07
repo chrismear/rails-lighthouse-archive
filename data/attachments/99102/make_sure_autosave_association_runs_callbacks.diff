@@ -1,0 +1,337 @@
+From ac79b84873a9bdbf67ca8a28adfdb1754be7c9d5 Mon Sep 17 00:00:00 2001
+From: Luca Guidi <guidi.luca@gmail.com>
+Date: Thu, 12 Mar 2009 16:09:39 +0100
+Subject: [PATCH] Make sure AutosaveAssociation runs remove callbacks. Added AssociationCollection::destroy for this purpose which works like AssociationCollection::delete in that it runs the remove callbacks, but then uses #destroy to actually destroy the record.
+ Signed-off-by: Eloy Duran <eloy.de.enige@gmail.com>
+
+---
+ .../associations/association_collection.rb         |   49 ++++++++++++--------
+ .../lib/active_record/autosave_association.rb      |    2 +-
+ .../has_and_belongs_to_many_associations_test.rb   |   27 +++++++++++
+ .../associations/has_many_associations_test.rb     |   24 ++++++++++
+ .../has_many_through_associations_test.rb          |   18 +++++++
+ .../test/cases/autosave_association_test.rb        |   35 ++++++++++++++
+ activerecord/test/models/pirate.rb                 |   49 +++++++++++++++++++-
+ 7 files changed, 183 insertions(+), 21 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index f024f99..ca1a211 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -186,7 +186,6 @@ module ActiveRecord
+         end
+       end
+ 
+-
+       # Removes +records+ from this association calling +before_remove+ and
+       # +after_remove+ callbacks.
+       #
+@@ -195,22 +194,25 @@ module ActiveRecord
+       # are actually removed from the database, that depends precisely on
+       # +delete_records+. They are in any case removed from the collection.
+       def delete(*records)
+-        records = flatten_deeper(records)
+-        records.each { |record| raise_on_type_mismatch(record) }
+-        
+-        transaction do
+-          records.each { |record| callback(:before_remove, record) }
+-          
+-          old_records = records.reject {|r| r.new_record? }
++        remove_records(records) do |records, old_records|
+           delete_records(old_records) if old_records.any?
+-          
+-          records.each do |record|
+-            @target.delete(record)
+-            callback(:after_remove, record)
+-          end
++          records.each { |record| @target.delete(record) }
+         end
+       end
+ 
++      # Destroy +records+ and remove from this association calling +before_remove+
++      # and +after_remove+ callbacks.
++      #
++      # Note this method will always remove records from database ignoring the
++      # +:dependent+ option.
++      def destroy(*records)
++        remove_records(records) do |records, old_records|
++          old_records.each { |record| record.destroy }
++        end
++
++        load_target
++      end
++
+       # Removes all records from this association.  Returns +self+ so method calls may be chained.
+       def clear
+         return self if length.zero? # forces load_target if it hasn't happened already
+@@ -223,15 +225,12 @@ module ActiveRecord
+ 
+         self
+       end
+-      
+-      def destroy_all
+-        transaction do
+-          each { |record| record.destroy }
+-        end
+ 
++      def destroy_all
++        destroy(self)
+         reset_target!
+       end
+-      
++
+       def create(attrs = {})
+         if attrs.is_a?(Array)
+           attrs.collect { |attr| create(attr) }
+@@ -431,6 +430,18 @@ module ActiveRecord
+           record
+         end
+ 
++        def remove_records(*records)
++          records = flatten_deeper(records)
++          records.each { |record| raise_on_type_mismatch(record) }
++
++          transaction do
++            records.each { |record| callback(:before_remove, record) }
++            old_records = records.reject { |r| r.new_record? }
++            yield(records, old_records)
++            records.each { |record| callback(:after_remove, record) }
++          end
++        end
++
+         def callback(method, record)
+           callbacks_for(method).each do |callback|
+             ActiveSupport::Callbacks::Callback.new(method, callback, record).call(@owner, record)
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 6dcc500..741aa2a 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -283,7 +283,7 @@ module ActiveRecord
+         if records = associated_records_to_validate_or_save(association, @new_record_before_save, autosave)
+           records.each do |record|
+             if autosave && record.marked_for_destruction?
+-              record.destroy
++              association.destroy(record)
+             elsif @new_record_before_save || record.new_record?
+               if autosave
+                 association.send(:insert_record, record, false, false)
+diff --git a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+index ca1772d..b3b9618 100644
+--- a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+@@ -381,6 +381,33 @@ class HasAndBelongsToManyAssociationsTest < ActiveRecord::TestCase
+     assert_date_from_db Date.new(2004, 10, 10), Developer.find(1).projects.first.joined_on.to_date
+   end
+ 
++  def test_destroying
++    david = Developer.find(1)
++    active_record = Project.find(1)
++    david.projects.reload
++    assert_equal 2, david.projects.size
++    assert_equal 3, active_record.developers.size
++
++    assert_difference "Project.count", -1 do
++      david.projects.destroy(active_record)      
++    end
++
++    assert_equal 1, david.reload.projects.size
++    assert_equal 1, david.projects(true).size
++  end
++
++  def test_destroying_array
++    david = Developer.find(1)
++    david.projects.reload
++    
++    assert_difference "Project.count", -Project.count do
++      david.projects.destroy(Project.find(:all))      
++    end
++
++    assert_equal 0, david.reload.projects.size
++    assert_equal 0, david.projects(true).size
++  end
++
+   def test_destroy_all
+     david = Developer.find(1)
+     david.projects.reload
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 99e4dc7..30edf79 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -680,6 +680,30 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_raise(ActiveRecord::AssociationTypeMismatch) { david.projects.delete(Project.find(1).developers) }
+   end
+ 
++  def test_destroying
++    force_signal37_to_load_all_clients_of_firm
++
++    assert_difference "Client.count", -1 do
++      companies(:first_firm).clients_of_firm.destroy(companies(:first_firm).clients_of_firm.first)
++    end
++
++    assert_equal 0, companies(:first_firm).reload.clients_of_firm.size
++    assert_equal 0, companies(:first_firm).clients_of_firm(true).size
++  end
++
++  def test_destroying_a_collection
++    force_signal37_to_load_all_clients_of_firm
++    companies(:first_firm).clients_of_firm.create("name" => "Another Client")
++    assert_equal 2, companies(:first_firm).clients_of_firm.size
++
++    assert_difference "Client.count", -2 do
++      companies(:first_firm).clients_of_firm.destroy([companies(:first_firm).clients_of_firm[0], companies(:first_firm).clients_of_firm[1]])
++    end
++
++    assert_equal 0, companies(:first_firm).reload.clients_of_firm.size
++    assert_equal 0, companies(:first_firm).clients_of_firm(true).size
++  end
++
+   def test_destroy_all
+     force_signal37_to_load_all_clients_of_firm
+     assert !companies(:first_firm).clients_of_firm.empty?, "37signals has clients after load"
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index c3ad0ee..97efca7 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -92,6 +92,24 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     assert posts(:welcome).reload.people(true).empty?
+   end
+ 
++  def test_destroy_association
++    assert_difference "Person.count", -1 do
++      posts(:welcome).people.destroy(people(:michael))
++    end
++
++    assert posts(:welcome).reload.people.empty?
++    assert posts(:welcome).people(true).empty?
++  end
++
++  def test_destroy_all
++    assert_difference "Person.count", -1 do
++      posts(:welcome).people.destroy_all
++    end
++
++    assert posts(:welcome).reload.people.empty?
++    assert posts(:welcome).people(true).empty?
++  end
++
+   def test_replace_association
+     assert_queries(4){posts(:welcome);people(:david);people(:michael); posts(:welcome).people(true)}
+     
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index b179bd8..436f50d 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -556,6 +556,41 @@ class TestDestroyAsPartOfAutosaveAssociation < ActiveRecord::TestCase
+       assert_raise(RuntimeError) { assert !@pirate.save }
+       assert_equal before, @pirate.reload.send(association_name)
+     end
++
++    # Add and remove callbacks tests for association collections.
++    %w{ method proc }.each do |callback_type|
++      define_method("test_should_run_add_callback_#{callback_type}s_for_#{association_name}") do
++        association_name_with_callbacks = "#{association_name}_with_#{callback_type}_callbacks"
++
++        pirate = Pirate.new(:catchphrase => "Arr")
++        pirate.send(association_name_with_callbacks).build(:name => "Crowe the One-Eyed")
++
++        expected = [
++          "before_adding_#{callback_type}_#{association_name.singularize}_<new>",
++          "after_adding_#{callback_type}_#{association_name.singularize}_<new>"
++        ]
++
++        assert_equal expected, pirate.ship_log
++      end
++
++      define_method("test_should_run_remove_callback_#{callback_type}s_for_#{association_name}") do
++        association_name_with_callbacks = "#{association_name}_with_#{callback_type}_callbacks"
++
++        @pirate.send(association_name_with_callbacks).create!(:name => "Crowe the One-Eyed")
++        @pirate.send(association_name_with_callbacks).each { |c| c.mark_for_destruction }
++        child_id = @pirate.send(association_name_with_callbacks).first.id
++
++        @pirate.ship_log.clear
++        @pirate.save
++
++        expected = [
++          "before_removing_#{callback_type}_#{association_name.singularize}_#{child_id}",
++          "after_removing_#{callback_type}_#{association_name.singularize}_#{child_id}"
++        ]
++
++        assert_equal expected, @pirate.ship_log
++      end
++    end
+   end
+ end
+ 
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 7bc50e0..6983ca9 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -1,16 +1,63 @@
+ class Pirate < ActiveRecord::Base
+   belongs_to :parrot
+   has_and_belongs_to_many :parrots
+-  has_many :treasures, :as => :looter
++  has_and_belongs_to_many :parrots_with_method_callbacks, :class_name => "Parrot",
++    :before_add    => :log_before_add,
++    :after_add     => :log_after_add,
++    :before_remove => :log_before_remove,
++    :after_remove  => :log_after_remove
++  has_and_belongs_to_many :parrots_with_proc_callbacks, :class_name => "Parrot",
++    :before_add    => proc {|p,pa| p.ship_log << "before_adding_proc_parrot_#{pa.id || '<new>'}"},
++    :after_add     => proc {|p,pa| p.ship_log << "after_adding_proc_parrot_#{pa.id || '<new>'}"},
++    :before_remove => proc {|p,pa| p.ship_log << "before_removing_proc_parrot_#{pa.id}"},
++    :after_remove  => proc {|p,pa| p.ship_log << "after_removing_proc_parrot_#{pa.id}"}
+ 
++  has_many :treasures, :as => :looter
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
+   # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
+   has_one :ship
+   has_many :birds
++  has_many :birds_with_method_callbacks, :class_name => "Bird",
++    :before_add    => :log_before_add,
++    :after_add     => :log_after_add,
++    :before_remove => :log_before_remove,
++    :after_remove  => :log_after_remove
++  has_many :birds_with_proc_callbacks, :class_name => "Bird",
++    :before_add     => proc {|p,b| p.ship_log << "before_adding_proc_bird_#{b.id || '<new>'}"},
++    :after_add      => proc {|p,b| p.ship_log << "after_adding_proc_bird_#{b.id || '<new>'}"},
++    :before_remove  => proc {|p,b| p.ship_log << "before_removing_proc_bird_#{b.id}"},
++    :after_remove   => proc {|p,b| p.ship_log << "after_removing_proc_bird_#{b.id}"}
+ 
+   accepts_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+   accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  accepts_nested_attributes_for :parrots_with_method_callbacks, :parrots_with_proc_callbacks,
++    :birds_with_method_callbacks, :birds_with_proc_callbacks, :allow_destroy => true
+ 
+   validates_presence_of :catchphrase
++
++  def ship_log
++    @ship_log ||= []
++  end
++
++  private
++    def log_before_add(record)
++      log(record, "before_adding_method")
++    end
++
++    def log_after_add(record)
++      log(record, "after_adding_method")
++    end
++
++    def log_before_remove(record)
++      log(record, "before_removing_method")
++    end
++
++    def log_after_remove(record)
++      log(record, "after_removing_method")
++    end
++    
++    def log(record, callback)
++      ship_log << "#{callback}_#{record.class.name.downcase}_#{record.id || '<new>'}"
++    end
+ end
+-- 
+1.6.0.2
+

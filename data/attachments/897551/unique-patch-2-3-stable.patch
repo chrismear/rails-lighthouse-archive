@@ -1,0 +1,739 @@
+From 48fcff95ae1b5e55837e81a4c132a3c208a235f8 Mon Sep 17 00:00:00 2001
+From: Michael Schuerig <michael@schuerig.de>
+Date: Sun, 5 Apr 2009 01:19:29 +0200
+Subject: [PATCH 1/5] Translate adapter errors that indicate a violated uniqueness constraint to ActiveRecord::RecordNotUnique exception derived from ActiveReecord::StatementInvalid.
+
+Signed-off-by: Michael Koziarski <michael@koziarski.com>
+---
+ activerecord/lib/active_record/base.rb             |    4 ++++
+ .../connection_adapters/abstract_adapter.rb        |    7 ++++++-
+ .../connection_adapters/mysql_adapter.rb           |    9 +++++++++
+ .../connection_adapters/postgresql_adapter.rb      |    9 +++++++++
+ .../connection_adapters/sqlite_adapter.rb          |   10 ++++++++++
+ activerecord/test/cases/adapter_test.rb            |    7 +++++++
+ 6 files changed, 45 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index ac82cc1..94468a4 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -56,6 +56,10 @@ module ActiveRecord #:nodoc:
+   class StatementInvalid < ActiveRecordError
+   end
+ 
++  # Raised when a record cannot be inserted because it would violate a uniqueness constraint.
++  class RecordNotUnique < StatementInvalid
++  end
++
+   # Raised when number of bind variables in statement given to <tt>:condition</tt> key (for example, when using +find+ method)
+   # does not match number of expected variables.
+   #
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index b8a6a71..6d21960 100755
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -224,9 +224,14 @@ module ActiveRecord
+           @last_verification = 0
+           message = "#{e.class.name}: #{e.message}: #{sql}"
+           log_info(message, name, 0)
+-          raise ActiveRecord::StatementInvalid, message
++          raise translate_exception(e, message)
+         end
+ 
++      def translate_exception(e, message)
++        # override in derived class
++        ActiveRecord::StatementInvalid.new(message)
++      end
++
+         def format_log_entry(message, dump = nil)
+           if ActiveRecord::Base.colorize_logging
+             if @@row_even
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 6f41f84..62d9417 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -602,6 +602,15 @@ module ActiveRecord
+           end
+         end
+ 
++        def translate_exception(exception, message)
++          case exception.errno
++          when 1062
++            RecordNotUnique.new(message)
++          else
++            super
++          end
++        end
++
+       private
+         def connect
+           encoding = @config[:encoding]
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index a348318..66afc3c 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -931,6 +931,15 @@ module ActiveRecord
+             end
+         end
+ 
++        def translate_exception(exception, message)
++          case exception.message
++          when /duplicate key value violates unique constraint/
++            RecordNotUnique.new(message)
++          else
++            super
++          end
++        end
++
+       private
+         # The internal PostgreSQL identifier of the money data type.
+         MONEY_COLUMN_TYPE_OID = 790 #:nodoc:
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 1616698..e0d04e6 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -436,6 +436,16 @@ module ActiveRecord
+             'INTEGER PRIMARY KEY NOT NULL'.freeze
+           end
+         end
++
++        def translate_exception(exception, message)
++          case exception.message
++          when /column(s)? .* (is|are) not unique/
++            RecordNotUnique.new(message)
++          else
++            super
++          end
++        end
++
+     end
+ 
+     class SQLite2Adapter < SQLiteAdapter # :nodoc:
+diff --git a/activerecord/test/cases/adapter_test.rb b/activerecord/test/cases/adapter_test.rb
+index b7fa6df..2118c10 100644
+--- a/activerecord/test/cases/adapter_test.rb
++++ b/activerecord/test/cases/adapter_test.rb
+@@ -141,4 +141,11 @@ class AdapterTest < ActiveRecord::TestCase
+       assert_equal " LIMIT 1,7 OFFSET 7", @connection.add_limit_offset!("", :limit=>sql_inject, :offset=>7)
+     end
+   end
++
++  def test_uniqueness_violations_are_translated_to_specific_exception
++    @connection.execute "INSERT INTO subscribers(nick) VALUES('me')"
++    assert_raises(ActiveRecord::RecordNotUnique) do
++      @connection.execute "INSERT INTO subscribers(nick) VALUES('me')"
++    end
++  end
+ end
+-- 
+1.7.2.1
+
+
+From 9efed026a931dc4203b4332b0951b8b09c669476 Mon Sep 17 00:00:00 2001
+From: Michael Schuerig <michael@schuerig.de>
+Date: Sun, 5 Apr 2009 01:42:21 +0200
+Subject: [PATCH 2/5] Translate foreign key violations to ActiveRecord::InvalidForeignKey exceptions.
+
+Signed-off-by: Michael Koziarski <michael@koziarski.com>
+---
+ activerecord/lib/active_record/base.rb             |    4 ++++
+ .../connection_adapters/mysql_adapter.rb           |    2 ++
+ .../connection_adapters/postgresql_adapter.rb      |    2 ++
+ activerecord/test/cases/adapter_test.rb            |    8 ++++++++
+ 4 files changed, 16 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 94468a4..c42b1ab 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -60,6 +60,10 @@ module ActiveRecord #:nodoc:
+   class RecordNotUnique < StatementInvalid
+   end
+ 
++  # Raised when a record cannot be inserted or updated because it references a non-existent record.
++  class InvalidForeignKey < StatementInvalid
++  end
++
+   # Raised when number of bind variables in statement given to <tt>:condition</tt> key (for example, when using +find+ method)
+   # does not match number of expected variables.
+   #
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 62d9417..e49908b 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -606,6 +606,8 @@ module ActiveRecord
+           case exception.errno
+           when 1062
+             RecordNotUnique.new(message)
++          when 1452
++            InvalidForeignKey.new(message)
+           else
+             super
+           end
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 66afc3c..d79aea5 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -935,6 +935,8 @@ module ActiveRecord
+           case exception.message
+           when /duplicate key value violates unique constraint/
+             RecordNotUnique.new(message)
++          when /violates foreign key constraint/
++            InvalidForeignKey.new(message)
+           else
+             super
+           end
+diff --git a/activerecord/test/cases/adapter_test.rb b/activerecord/test/cases/adapter_test.rb
+index 2118c10..7a9a289 100644
+--- a/activerecord/test/cases/adapter_test.rb
++++ b/activerecord/test/cases/adapter_test.rb
+@@ -148,4 +148,12 @@ class AdapterTest < ActiveRecord::TestCase
+       @connection.execute "INSERT INTO subscribers(nick) VALUES('me')"
+     end
+   end
++
++  def test_foreign_key_violations_are_translated_to_specific_exception
++    unless @connection.adapter_name == 'SQLite'
++      assert_raises(ActiveRecord::InvalidForeignKey) do
++        @connection.execute "INSERT INTO fk_test_has_fk (fk_id) VALUES (0)"
++      end
++    end
++  end
+ end
+-- 
+1.7.2.1
+
+
+From 3d2796f98d7f2c33bb63f6c2f2026588b99fb2c9 Mon Sep 17 00:00:00 2001
+From: Michael Koziarski <michael@koziarski.com>
+Date: Fri, 26 Jun 2009 16:59:27 +1200
+Subject: [PATCH 3/5] Make sure the wrapped exceptions also have the original exception available.
+
+[#2419 state:committed]
+---
+ activerecord/lib/active_record/base.rb             |   15 +++++++++++++--
+ .../connection_adapters/mysql_adapter.rb           |    4 ++--
+ .../connection_adapters/postgresql_adapter.rb      |    4 ++--
+ .../connection_adapters/sqlite_adapter.rb          |    2 +-
+ 4 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index c42b1ab..9fc1ea5 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -56,12 +56,23 @@ module ActiveRecord #:nodoc:
+   class StatementInvalid < ActiveRecordError
+   end
+ 
++  # Parent class for all specific exceptions which wrap database driver exceptions
++  # provides access to the original exception also.
++  class WrappedDatabaseException < StatementInvalid
++    attr_reader :original_exception
++
++    def initialize(message, original_exception)
++      super(message)
++      @original_exception, = original_exception
++    end
++  end
++
+   # Raised when a record cannot be inserted because it would violate a uniqueness constraint.
+-  class RecordNotUnique < StatementInvalid
++  class RecordNotUnique < WrappedDatabaseException
+   end
+ 
+   # Raised when a record cannot be inserted or updated because it references a non-existent record.
+-  class InvalidForeignKey < StatementInvalid
++  class InvalidForeignKey < WrappedDatabaseException
+   end
+ 
+   # Raised when number of bind variables in statement given to <tt>:condition</tt> key (for example, when using +find+ method)
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index e49908b..0ecab7b 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -605,9 +605,9 @@ module ActiveRecord
+         def translate_exception(exception, message)
+           case exception.errno
+           when 1062
+-            RecordNotUnique.new(message)
++            RecordNotUnique.new(message, exception)
+           when 1452
+-            InvalidForeignKey.new(message)
++            InvalidForeignKey.new(message, exception)
+           else
+             super
+           end
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index d79aea5..590a4f1 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -934,9 +934,9 @@ module ActiveRecord
+         def translate_exception(exception, message)
+           case exception.message
+           when /duplicate key value violates unique constraint/
+-            RecordNotUnique.new(message)
++            RecordNotUnique.new(message, exception)
+           when /violates foreign key constraint/
+-            InvalidForeignKey.new(message)
++            InvalidForeignKey.new(message, exception)
+           else
+             super
+           end
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index e0d04e6..ae1ffa0 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -440,7 +440,7 @@ module ActiveRecord
+         def translate_exception(exception, message)
+           case exception.message
+           when /column(s)? .* (is|are) not unique/
+-            RecordNotUnique.new(message)
++            RecordNotUnique.new(message, exception)
+           else
+             super
+           end
+-- 
+1.7.2.1
+
+
+From 11a16a9838ecabfb25f5fc89e93bdc3d7b25c4bf Mon Sep 17 00:00:00 2001
+From: Jordan Brough <jordan@animoto.com>
+Date: Wed, 11 Nov 2009 13:31:34 -0700
+Subject: [PATCH 4/5] Friendly ActiveRecord error handling for db-enforced unique constraints
+
+---
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/base.rb             |    1 +
+ .../connection_adapters/abstract_adapter.rb        |    7 +++
+ .../connection_adapters/mysql_adapter.rb           |   12 ++++++
+ .../connection_adapters/postgresql_adapter.rb      |   13 ++++++
+ .../connection_adapters/sqlite_adapter.rb          |    7 +++
+ activerecord/lib/active_record/locale/en.yml       |    2 +
+ .../lib/active_record/unique_constraints.rb        |   30 +++++++++++++++
+ activerecord/test/cases/adapter_test.rb            |   35 +++++++++++++++++
+ activerecord/test/cases/unique_constraints_test.rb |   40 ++++++++++++++++++++
+ activerecord/test/models/unique_item.rb            |    2 +
+ activerecord/test/schema/schema.rb                 |   15 +++++++
+ 12 files changed, 165 insertions(+), 0 deletions(-)
+ create mode 100644 activerecord/lib/active_record/unique_constraints.rb
+ create mode 100644 activerecord/test/cases/unique_constraints_test.rb
+ create mode 100644 activerecord/test/models/unique_item.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 0d0ada9..3404c16 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -68,6 +68,7 @@ module ActiveRecord
+   autoload :TestCase, 'active_record/test_case'
+   autoload :Timestamp, 'active_record/timestamp'
+   autoload :Transactions, 'active_record/transactions'
++  autoload :UniqueConstraints, 'active_record/unique_constraints'
+   autoload :Validations, 'active_record/validations'
+ 
+   module Locking
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 9fc1ea5..2e79954 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -3230,6 +3230,7 @@ module ActiveRecord #:nodoc:
+     include AutosaveAssociation, NestedAttributes
+ 
+     include Aggregations, Transactions, Reflection, Batches, Calculations, Serialization
++    include UniqueConstraints
+   end
+ end
+ 
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index 6d21960..c7e8269 100755
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -199,6 +199,13 @@ module ActiveRecord
+         end
+       end
+ 
++      # given an ActiveRecord::RecordNotUnique exception and a table name this returns the index whose
++      # unique constraint was violated, or nil if it can't determine the index
++      def index_for_record_not_unique(not_unique_exception, table_name) #:nodoc:
++        # override in derived class
++        nil
++      end
++
+       protected
+         def log(sql, name)
+           if block_given?
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 0ecab7b..64f8f87 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -588,6 +588,18 @@ module ActiveRecord
+         where_sql
+       end
+ 
++      def index_for_record_not_unique(exception, table_name) #:nodoc:
++        case exception.message
++        when /Duplicate entry.*for key (\d+)/
++          index_position = $1.to_i
++          # minus two b/c mysql message is one-based + rails excludes primary key index from indexes list
++          indexes(table_name)[index_position - 2]
++        when /Duplicate entry.*for key '(\w+)'/
++          index_name = $1
++          indexes(table_name).detect { |i| i.name == index_name }
++        end
++      end
++
+       protected
+         def quoted_columns_for_index(column_names, options = {})
+           length = options[:length] if options.is_a?(Hash)
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 590a4f1..2eb3fce 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -669,6 +669,12 @@ module ActiveRecord
+         indexes
+       end
+ 
++      # postgres doesn't let us query this in the middle of an aborted transaction so caching can come in handy
++      def cached_indexes(table_name)
++        @cached_indexes ||= {}
++        @cached_indexes[table_name] ||= indexes(table_name)
++      end
++
+       # Returns the list of all column definitions for a table.
+       def columns(table_name, name = nil)
+         # Limit, precision, and scale are all handled by the superclass.
+@@ -914,6 +920,13 @@ module ActiveRecord
+         sql.replace "SELECT * FROM (#{sql}) AS id_list ORDER BY #{order}"
+       end
+ 
++      def index_for_record_not_unique(exception, table_name) #:nodoc:
++        if match = exception.message.match(/unique constraint "(\w+)"/)
++          index_name = match[1]
++          cached_indexes(table_name).detect { |i| i.name == index_name }
++        end
++      end
++
+       protected
+         # Returns the version of the connected PostgreSQL version.
+         def postgresql_version
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index ae1ffa0..a43f6d4 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -316,6 +316,13 @@ module ActiveRecord
+         "INSERT INTO #{table_name} VALUES(NULL)"
+       end
+ 
++      def index_for_record_not_unique(exception, table_name) #:nodoc:
++        if match = exception.message.match(/column(?:s)? (.*) (?:is|are) not unique/)
++          index_columns = match[1].split(', ')
++          indexes(table_name).detect { |i| i.columns == index_columns }
++        end
++      end
++
+       protected
+         def select(sql, name = nil) #:nodoc:
+           execute(sql, name).map do |row|
+diff --git a/activerecord/lib/active_record/locale/en.yml b/activerecord/lib/active_record/locale/en.yml
+index 6dab5e2..353fbda 100644
+--- a/activerecord/lib/active_record/locale/en.yml
++++ b/activerecord/lib/active_record/locale/en.yml
+@@ -15,6 +15,8 @@ en:
+         too_short: "is too short (minimum is %{count} characters)"
+         wrong_length: "is the wrong length (should be %{count} characters)"
+         taken: "has already been taken"
++        taken_multiple: "has already been taken for %{context}"
++        taken_generic: "Unique requirement not met"
+         not_a_number: "is not a number"
+         greater_than: "must be greater than %{count}"
+         greater_than_or_equal_to: "must be greater than or equal to %{count}"
+diff --git a/activerecord/lib/active_record/unique_constraints.rb b/activerecord/lib/active_record/unique_constraints.rb
+new file mode 100644
+index 0000000..6702e37
+--- /dev/null
++++ b/activerecord/lib/active_record/unique_constraints.rb
+@@ -0,0 +1,30 @@
++module ActiveRecord
++  # See ActiveRecord::Transactions::ClassMethods for documentation.
++  module UniqueConstraints
++    def self.included(base)
++      base.class_eval do
++        alias_method_chain :save, :unique_constraints
++      end
++    end
++
++    # work around postgres not allowing us to query indexes in the middle of an aborted transaction
++    def cache_indexes
++      connection.cached_indexes(self.class.table_name) if connection.respond_to?(:cached_indexes)
++    end
++
++    def save_with_unique_constraints(perform_validation = true) #:nodoc:
++      cache_indexes
++      save_without_unique_constraints(perform_validation)
++    rescue ActiveRecord::RecordNotUnique => e
++      index = connection.index_for_record_not_unique(e.original_exception, self.class.table_name)
++      if !index
++        errors.add_to_base(I18n.translate(:'activerecord.errors.messages.taken_generic'))
++      elsif index.columns.size == 1
++        errors.add(index.columns.first, :taken, :value => attributes[index.columns.first])
++      else
++        errors.add(index.columns.first, :taken_multiple, :context => index.columns.slice(1..-1).join('/'), :value => attributes[index.columns.first])
++      end
++      false
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/adapter_test.rb b/activerecord/test/cases/adapter_test.rb
+index 7a9a289..f99e8d6 100644
+--- a/activerecord/test/cases/adapter_test.rb
++++ b/activerecord/test/cases/adapter_test.rb
+@@ -156,4 +156,39 @@ class AdapterTest < ActiveRecord::TestCase
+       end
+     end
+   end
++
++  # tests for db-enforced unique constraints
++  unique_scenarios = {
++    :single         => {:sql => "INSERT INTO unique_items(uniq) VALUES('abc')",
++                        :expected => ['uniq']},
++    :single_named   => {:sql => "INSERT INTO unique_items(uniq_named) VALUES('abc')",
++                        :expected => ['uniq_named']},
++    :multiple       => {:sql => "INSERT INTO unique_items(uniq_1, uniq_2, uniq_3) VALUES('a', 'b', 'c')",
++                        :expected => ['uniq_1', 'uniq_2', 'uniq_3']},
++    :multiple_named => {:sql => "INSERT INTO unique_items(uniq_1_named, uniq_2_named, uniq_3_named) VALUES('a', 'b', 'c')",
++                        :expected => ['uniq_1_named', 'uniq_2_named', 'uniq_3_named']}
++  }
++  unique_scenarios.each do |name, data|
++    test "finds index for unique constraint #{name}" do
++      @connection.execute data[:sql]
++      exception = get_exception(ActiveRecord::RecordNotUnique) do
++        @connection.execute data[:sql]
++      end
++      # postgres can't query indexes until transaction is rolled back
++      @connection.rollback_db_transaction if current_adapter?(:PostgreSQLAdapter)
++      assert_equal data[:expected], @connection.index_for_record_not_unique(exception, 'unique_items').columns
++    end
++  end
++
++  protected
++
++  def get_exception(expected_exception)
++    begin
++      yield
++    rescue expected_exception => e
++      e
++    else
++      flunk "Expected #{expected_exception} exception"
++    end
++  end
+ end
+diff --git a/activerecord/test/cases/unique_constraints_test.rb b/activerecord/test/cases/unique_constraints_test.rb
+new file mode 100644
+index 0000000..2b5d0ee
+--- /dev/null
++++ b/activerecord/test/cases/unique_constraints_test.rb
+@@ -0,0 +1,40 @@
++require "cases/helper"
++require 'models/unique_item'
++
++class UniquenessValidationTest < ActiveRecord::TestCase
++
++  def test_validate_uniqueness_on_create
++    valid_item = UniqueItem.create!(:uniq => 'abc')
++    invalid_item = UniqueItem.create(:uniq => 'abc')
++    assert_equal "has already been taken", invalid_item.errors[:uniq]
++  end
++
++  def test_validate_uniqueness_on_save
++    item_1 = UniqueItem.create!(:uniq => 'abc')
++    item_2 = UniqueItem.create!(:uniq => 'xyz')
++    item_2.uniq = item_1.uniq
++    item_2.save
++    assert_equal "has already been taken", item_2.errors[:uniq]
++  end
++
++  def test_validate_uniqueness_on_update
++    item_1 = UniqueItem.create!(:uniq => 'abc')
++    item_2 = UniqueItem.create!(:uniq => 'xyz')
++    item_2.update_attributes(:uniq => item_1.uniq)
++    assert_equal "has already been taken", item_2.errors[:uniq]
++  end
++
++  def test_validate_uniqueness_multiple
++    valid_item = UniqueItem.create!(:uniq_1 => 'a', :uniq_2 => 'b', :uniq_3 => 'c')
++    invalid_item = UniqueItem.create(:uniq_1 => 'a', :uniq_2 => 'b', :uniq_3 => 'c')
++    assert_equal "has already been taken for uniq_2/uniq_3", invalid_item.errors[:uniq_1]
++  end
++
++  def test_validate_uniqueness_generic
++    ActiveRecord::Base.connection.expects(:index_for_record_not_unique).returns(nil)
++    valid_item = UniqueItem.create!(:uniq_1 => 'a', :uniq_2 => 'b', :uniq_3 => 'c')
++    invalid_item = UniqueItem.create(:uniq_1 => 'a', :uniq_2 => 'b', :uniq_3 => 'c')
++    assert_equal "Unique requirement not met", invalid_item.errors[:base]
++  end
++
++end
+\ No newline at end of file
+diff --git a/activerecord/test/models/unique_item.rb b/activerecord/test/models/unique_item.rb
+new file mode 100644
+index 0000000..3c6f6f0
+--- /dev/null
++++ b/activerecord/test/models/unique_item.rb
+@@ -0,0 +1,2 @@
++class UniqueItem < ActiveRecord::Base
++end
+\ No newline at end of file
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 2e5299c..acd1f02 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -536,6 +536,21 @@ ActiveRecord::Schema.define do
+     t.string :title
+   end
+ 
++  create_table :unique_items, :force => true do |t|
++    t.string :uniq
++    t.string :uniq_1
++    t.string :uniq_2
++    t.string :uniq_3
++    t.string :uniq_named
++    t.string :uniq_1_named
++    t.string :uniq_2_named
++    t.string :uniq_3_named
++  end
++  add_index :unique_items, [:uniq], :unique => true
++  add_index :unique_items, [:uniq_named], :unique => true, :name => 'unique_named_single_index'
++  add_index :unique_items, [:uniq_1, :uniq_2, :uniq_3], :unique => true
++  add_index :unique_items, [:uniq_1_named, :uniq_2_named, :uniq_3_named], :unique => true, :name => 'unique_named_multiple_index'
++
+   except 'SQLite' do
+     # fk_test_has_fk should be before fk_test_has_pk
+     create_table :fk_test_has_fk, :force => true do |t|
+-- 
+1.7.2.1
+
+
+From 14feddfdda9a7fd3709c099a458bd4f8e81aea59 Mon Sep 17 00:00:00 2001
+From: Jordan Brough <jordan@animoto.com>
+Date: Fri, 15 Jan 2010 15:10:55 -0700
+Subject: [PATCH 5/5] Add bang method handling to db-enforced unique constraints
+
+---
+ .../lib/active_record/unique_constraints.rb        |   30 ++++++++++++++-----
+ activerecord/test/cases/unique_constraints_test.rb |   30 ++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/unique_constraints.rb b/activerecord/lib/active_record/unique_constraints.rb
+index 6702e37..b3c1234 100644
+--- a/activerecord/lib/active_record/unique_constraints.rb
++++ b/activerecord/lib/active_record/unique_constraints.rb
+@@ -4,6 +4,7 @@ module ActiveRecord
+     def self.included(base)
+       base.class_eval do
+         alias_method_chain :save, :unique_constraints
++        alias_method_chain :save!, :unique_constraints
+       end
+     end
+ 
+@@ -16,15 +17,28 @@ module ActiveRecord
+       cache_indexes
+       save_without_unique_constraints(perform_validation)
+     rescue ActiveRecord::RecordNotUnique => e
+-      index = connection.index_for_record_not_unique(e.original_exception, self.class.table_name)
+-      if !index
+-        errors.add_to_base(I18n.translate(:'activerecord.errors.messages.taken_generic'))
+-      elsif index.columns.size == 1
+-        errors.add(index.columns.first, :taken, :value => attributes[index.columns.first])
+-      else
+-        errors.add(index.columns.first, :taken_multiple, :context => index.columns.slice(1..-1).join('/'), :value => attributes[index.columns.first])
+-      end
++      parse_unique_exception(e)
+       false
+     end
++
++    def save_with_unique_constraints! #:nodoc:
++      cache_indexes
++      save_without_unique_constraints!
++    rescue ActiveRecord::RecordNotUnique => e
++      parse_unique_exception(e)
++      raise RecordInvalid.new(self)
++    end
++
++    protected
++      def parse_unique_exception(e)
++        index = connection.index_for_record_not_unique(e.original_exception, self.class.table_name)
++        if !index
++          errors.add_to_base(I18n.translate(:'activerecord.errors.messages.taken_generic'))
++        elsif index.columns.size == 1
++          errors.add(index.columns.first, :taken, :value => attributes[index.columns.first])
++        else
++          errors.add(index.columns.first, :taken_multiple, :context => index.columns.slice(1..-1).join('/'), :value => attributes[index.columns.first])
++        end
++      end
+   end
+ end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/unique_constraints_test.rb b/activerecord/test/cases/unique_constraints_test.rb
+index 2b5d0ee..8adae04 100644
+--- a/activerecord/test/cases/unique_constraints_test.rb
++++ b/activerecord/test/cases/unique_constraints_test.rb
+@@ -9,6 +9,12 @@ class UniquenessValidationTest < ActiveRecord::TestCase
+     assert_equal "has already been taken", invalid_item.errors[:uniq]
+   end
+ 
++  def test_validate_uniqueness_on_create!
++    valid_item = UniqueItem.create!(:uniq => 'abc')
++    e = get_unique_exception { UniqueItem.create!(:uniq => 'abc') }
++    assert_equal "has already been taken", e.record.errors[:uniq]
++  end
++
+   def test_validate_uniqueness_on_save
+     item_1 = UniqueItem.create!(:uniq => 'abc')
+     item_2 = UniqueItem.create!(:uniq => 'xyz')
+@@ -17,6 +23,14 @@ class UniquenessValidationTest < ActiveRecord::TestCase
+     assert_equal "has already been taken", item_2.errors[:uniq]
+   end
+ 
++  def test_validate_uniqueness_on_save!
++    item_1 = UniqueItem.create!(:uniq => 'abc')
++    item_2 = UniqueItem.create!(:uniq => 'xyz')
++    item_2.uniq = item_1.uniq
++    e = get_unique_exception { item_2.save! }
++    assert_equal("has already been taken", e.record.errors[:uniq])
++  end
++
+   def test_validate_uniqueness_on_update
+     item_1 = UniqueItem.create!(:uniq => 'abc')
+     item_2 = UniqueItem.create!(:uniq => 'xyz')
+@@ -24,6 +38,13 @@ class UniquenessValidationTest < ActiveRecord::TestCase
+     assert_equal "has already been taken", item_2.errors[:uniq]
+   end
+ 
++  def test_validate_uniqueness_on_update!
++    item_1 = UniqueItem.create!(:uniq => 'abc')
++    item_2 = UniqueItem.create!(:uniq => 'xyz')
++    e = get_unique_exception { item_2.update_attributes!(:uniq => item_1.uniq) }
++    assert_equal("has already been taken", e.record.errors[:uniq])
++  end
++
+   def test_validate_uniqueness_multiple
+     valid_item = UniqueItem.create!(:uniq_1 => 'a', :uniq_2 => 'b', :uniq_3 => 'c')
+     invalid_item = UniqueItem.create(:uniq_1 => 'a', :uniq_2 => 'b', :uniq_3 => 'c')
+@@ -37,4 +58,13 @@ class UniquenessValidationTest < ActiveRecord::TestCase
+     assert_equal "Unique requirement not met", invalid_item.errors[:base]
+   end
+ 
++  protected
++    def get_unique_exception
++      yield
++    rescue ActiveRecord::RecordInvalid => e
++      e
++    else
++      flunk "Expected ActiveRecord::RecordInvalid exception"
++    end
++
+ end
+\ No newline at end of file
+-- 
+1.7.2.1
+

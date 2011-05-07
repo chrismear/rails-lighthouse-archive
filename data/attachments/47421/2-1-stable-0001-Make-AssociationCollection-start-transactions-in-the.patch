@@ -1,0 +1,157 @@
+From 184cdcf50dfbe4511f523a813e4e58fe808aa737 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Sat, 20 Sep 2008 21:59:49 +0200
+Subject: [PATCH] Make AssociationCollection start transactions in the correct database.
+
+AssociationCollection now starts transactions by calling
+AssociationCollection#transaction instead of @owner.transaction or
+@reflection.klass.transaction.
+---
+ .../associations/association_collection.rb         |   23 ++++++++++++++++---
+ .../associations/has_many_through_association.rb   |    4 +-
+ .../has_and_belongs_to_many_associations_test.rb   |    9 +++++++
+ .../associations/has_many_associations_test.rb     |    9 +++++++
+ .../has_many_through_associations_test.rb          |    9 +++++++
+ 5 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 910e271..09422fb 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -95,7 +95,7 @@ module ActiveRecord
+         result = true
+         load_target if @owner.new_record?
+ 
+-        @owner.transaction do
++        transaction do
+           flatten_deeper(records).each do |record|
+             raise_on_type_mismatch(record)
+             add_record_to_target_with_callbacks(record) do |r|
+@@ -109,6 +109,21 @@ module ActiveRecord
+ 
+       alias_method :push, :<<
+       alias_method :concat, :<<
++      
++      # Starts a transaction in the association class's database connection.
++      #
++      #   class Author < ActiveRecord::Base
++      #     has_many :books
++      #   end
++      #   
++      #   Author.find(:first).books.transaction do
++      #     # same effect as calling Book.transaction
++      #   end
++      def transaction(*args)
++        @reflection.klass.transaction(*args) do
++          yield
++        end
++      end
+ 
+       # Remove all records from this association
+       def delete_all
+@@ -131,7 +146,7 @@ module ActiveRecord
+         records = flatten_deeper(records)
+         records.each { |record| raise_on_type_mismatch(record) }
+         
+-        @owner.transaction do
++        transaction do
+           records.each { |record| callback(:before_remove, record) }
+           
+           old_records = records.reject {|r| r.new_record? }
+@@ -158,7 +173,7 @@ module ActiveRecord
+       end
+       
+       def destroy_all
+-        @owner.transaction do
++        transaction do
+           each { |record| record.destroy }
+         end
+ 
+@@ -235,7 +250,7 @@ module ActiveRecord
+         other   = other_array.size < 100 ? other_array : other_array.to_set
+         current = @target.size < 100 ? @target : @target.to_set
+ 
+-        @owner.transaction do
++        transaction do
+           delete(@target.select { |v| !other.include?(v) })
+           concat(other_array.select { |v| !current.include?(v) })
+         end
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 52e99f0..c97f2e4 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -9,14 +9,14 @@ module ActiveRecord
+       alias_method :new, :build
+ 
+       def create!(attrs = nil)
+-        @reflection.klass.transaction do
++        transaction do
+           self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.create_association! } : @reflection.create_association!)
+           object
+         end
+       end
+ 
+       def create(attrs = nil)
+-        @reflection.klass.transaction do
++        transaction do
+           self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.create_association } : @reflection.create_association)
+           object
+         end
+diff --git a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+index 0572418..dff7fac 100644
+--- a/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_and_belongs_to_many_associations_test.rb
+@@ -703,4 +703,13 @@ class HasAndBelongsToManyAssociationsTest < ActiveRecord::TestCase
+     # due to Unknown column 'authors.id'
+     assert Category.find(1).posts_with_authors_sorted_by_author_id.find_by_title('Welcome to the weblog')
+   end
++  
++  uses_mocha 'mocking Post.transaction' do
++    def test_association_proxy_transaction_method_starts_transaction_in_association_class
++      Post.expects(:transaction)
++      Category.find(:first).posts.transaction do
++        # nothing
++      end
++    end
++  end
+ end
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 5704df8..8e6e564 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1030,5 +1030,14 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+   ensure
+     ActiveRecord::Base.store_full_sti_class = old
+   end
++  
++  uses_mocha 'mocking Comment.transaction' do
++    def test_association_proxy_transaction_method_starts_transaction_in_association_class
++      Comment.expects(:transaction)
++      Post.find(:first).comments.transaction do
++        # nothing
++      end
++    end
++  end
+ 
+ end
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index 652db3b..3f8565f 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -197,4 +197,13 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+   def test_count_with_include_should_alias_join_table
+     assert_equal 2, people(:michael).posts.count(:include => :readers)
+   end
++  
++  uses_mocha 'mocking Tag.transaction' do
++    def test_association_proxy_transaction_method_starts_transaction_in_association_class
++      Tag.expects(:transaction)
++      Post.find(:first).tags.transaction do
++        # nothing
++      end
++    end
++  end
+ end
+-- 
+1.6.0.2
+

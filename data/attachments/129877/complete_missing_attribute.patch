@@ -1,0 +1,73 @@
+diff --git a/shared/rails-2.3.2/activerecord/lib/active_record/attribute_methods.rb b/shared/rails-2.3.2/activerecord/lib/active_record/attribute_methods.rb
+index 3ffc489..f031347 100644
+--- a/shared/rails-2.3.2/activerecord/lib/active_record/attribute_methods.rb
++++ b/shared/rails-2.3.2/activerecord/lib/active_record/attribute_methods.rb
+@@ -126,6 +126,11 @@ module ActiveRecord
+         cached_attributes.include?(attr_name)
+       end
+ 
++      # returns +true+ if the provided attribute should raise a MissingAttributeError.
++      def miss_attribute?(attr_name)
++        attr_name.to_s != self.primary_key.to_s
++      end
++
+       private
+         # Suffixes a, ?, c become regexp /(a|\?|c)$/
+         def rebuild_attribute_method_regexp
+@@ -141,15 +146,18 @@ module ActiveRecord
+         def create_time_zone_conversion_attribute?(name, column)
+           time_zone_aware_attributes && !skip_time_zone_conversion_for_attributes.include?(name.to_sym) && [:datetime, :timestamp].include?(column.type)
+         end
++
++        # Generate the code necessary to raise a MissingAttributeError
++        def missing_attribute_code(attr_name)
++          miss_attribute?(attr_name) ? "missing_attribute('#{attr_name}', caller) unless @attributes.has_key?('#{attr_name}'); " : ""
++        end
+         
+         # Define an attribute reader method.  Cope with nil column.
+         def define_read_method(symbol, attr_name, column)
+           cast_code = column.type_cast_code('v') if column
+           access_code = cast_code ? "(v=@attributes['#{attr_name}']) && #{cast_code}" : "@attributes['#{attr_name}']"
+ 
+-          unless attr_name.to_s == self.primary_key.to_s
+-            access_code = access_code.insert(0, "missing_attribute('#{attr_name}', caller) unless @attributes.has_key?('#{attr_name}'); ")
+-          end
++          access_code = access_code.insert(0, missing_attribute_code(attr_name))
+           
+           if cache_attribute?(attr_name)
+             access_code = "@attributes_cache['#{attr_name}'] ||= (#{access_code})"
+@@ -159,7 +167,8 @@ module ActiveRecord
+ 
+         # Define read method for serialized attribute.
+         def define_read_method_for_serialized_attribute(attr_name)
+-          evaluate_attribute_method attr_name, "def #{attr_name}; unserialize_attribute('#{attr_name}'); end"
++          access_code = missing_attribute_code(attr_name) + "unserialize_attribute('#{attr_name}')"
++          evaluate_attribute_method attr_name, "def #{attr_name}; #{access_code}; end"
+         end
+         
+         # Defined for all +datetime+ and +timestamp+ attributes when +time_zone_aware_attributes+ are enabled.
+@@ -178,7 +187,8 @@ module ActiveRecord
+ 
+         # Defines a predicate method <tt>attr_name?</tt>.
+         def define_question_method(attr_name)
+-          evaluate_attribute_method attr_name, "def #{attr_name}?; query_attribute('#{attr_name}'); end", "#{attr_name}?"
++          access_code = missing_attribute_code(attr_name) + "query_attribute('#{attr_name}')"
++          evaluate_attribute_method attr_name, "def #{attr_name}?; #{access_code}; end", "#{attr_name}?"
+         end
+ 
+         def define_write_method(attr_name)
+diff --git a/shared/rails-2.3.2/activerecord/test/cases/finder_test.rb b/shared/rails-2.3.2/activerecord/test/cases/finder_test.rb
+index d877895..2af18b8 100644
+--- a/shared/rails-2.3.2/activerecord/test/cases/finder_test.rb
++++ b/shared/rails-2.3.2/activerecord/test/cases/finder_test.rb
+@@ -245,7 +245,9 @@ class FinderTest < ActiveRecord::TestCase
+ 
+   def test_find_only_some_columns
+     topic = Topic.find(1, :select => "author_name")
+-    assert_raise(ActiveRecord::MissingAttributeError) {topic.title}
++    assert_raise(ActiveRecord::MissingAttributeError) {topic.title}     # simple column reader
++    assert_raise(ActiveRecord::MissingAttributeError) {topic.approved?} # boolean column reader
++    assert_raise(ActiveRecord::MissingAttributeError) {topic.content}   # serialized column reader
+     assert_equal "David", topic.author_name
+     assert !topic.attribute_present?("title")
+     #assert !topic.respond_to?("title")

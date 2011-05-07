@@ -1,0 +1,1560 @@
+From 7640e7cd7a8a0af968df89a2f92821f88a9c9b29 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Wed, 21 Jan 2009 16:30:09 +0100
+Subject: [PATCH] Added NestedAttributes module which adds the accept_nested_attributes_for class method. With this method an attributes writer is defined for an association. This allows you to set and update attributes of associated models through the parent model as well as destroying them. Also included are adjustments to FormBuilder#fields_for to support such nested model attributes.
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb  |  207 +++++++++++-
+ actionpack/test/template/form_helper_test.rb       |  161 +++++++++-
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/base.rb             |    4 +-
+ .../lib/active_record/nested_attributes.rb         |  279 +++++++++++++++
+ activerecord/test/cases/nested_attributes_test.rb  |  359 ++++++++++++++++++++
+ activerecord/test/models/pirate.rb                 |   10 +-
+ activerecord/test/models/ship.rb                   |    4 +-
+ 8 files changed, 1005 insertions(+), 20 deletions(-)
+ create mode 100644 activerecord/lib/active_record/nested_attributes.rb
+ create mode 100644 activerecord/test/cases/nested_attributes_test.rb
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index a85751c..363d72c 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -269,10 +269,12 @@ module ActionView
+         options[:url] ||= polymorphic_path(object_or_array)
+       end
+ 
+-      # Creates a scope around a specific model object like form_for, but doesn't create the form tags themselves. This makes
+-      # fields_for suitable for specifying additional model objects in the same form:
++      # Creates a scope around a specific model object like form_for, but
++      # doesn't create the form tags themselves. This makes fields_for suitable
++      # for specifying additional model objects in the same form.
++      #
++      # === Generic Examples
+       #
+-      # ==== Examples
+       #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
+       #     First name: <%= person_form.text_field :first_name %>
+       #     Last name : <%= person_form.text_field :last_name %>
+@@ -282,20 +284,174 @@ module ActionView
+       #     <% end %>
+       #   <% end %>
+       #
+-      # ...or if you have an object that needs to be represented as a different parameter, like a Client that acts as a Person:
++      # ...or if you have an object that needs to be represented as a different
++      # parameter, like a Client that acts as a Person:
+       #
+       #   <% fields_for :person, @client do |permission_fields| %>
+       #     Admin?: <%= permission_fields.check_box :admin %>
+       #   <% end %>
+       #
+-      # ...or if you don't have an object, just a name of the parameter
++      # ...or if you don't have an object, just a name of the parameter:
+       #
+       #   <% fields_for :person do |permission_fields| %>
+       #     Admin?: <%= permission_fields.check_box :admin %>
+       #   <% end %>
+       #
+-      # Note: This also works for the methods in FormOptionHelper and DateHelper that are designed to work with an object as base,
+-      # like FormOptionHelper#collection_select and DateHelper#datetime_select.
++      # Note: This also works for the methods in FormOptionHelper and
++      # DateHelper that are designed to work with an object as base, like
++      # FormOptionHelper#collection_select and DateHelper#datetime_select.
++      #
++      # === Nested Attributes Examples
++      #
++      # When the object belonging to the current scope has a nested attribute
++      # writer for a certain attribute, fields_for will yield a new scope
++      # for that attribute. This allows you to create forms that set or change
++      # the attributes of a parent object and its associations in one go.
++      #
++      # Nested attribute writers are normal setter methods named after an
++      # association. The most common way of defining these writers is either
++      # with +accept_nested_attributes_for+ in a model definition or by
++      # defining a method with the proper name. For example: the attribute
++      # writer for the association <tt>:address</tt> is called
++      # <tt>address_attributes=</tt>.
++      #
++      # Whether a one-to-one or one-to-many style form builder will be yielded
++      # depends on whether the normal reader method returns a _single_ object
++      # or an _array_ of objects.
++      #
++      # ==== One-to-one
++      #
++      # Consider a Person class which returns a _single_ Address from the
++      # <tt>address</tt> reader method and responds to the
++      # <tt>address_attributes=</tt> writer method:
++      #
++      #   class Person
++      #     def address
++      #       @address
++      #     end
++      #
++      #     def address_attributes=(attributes)
++      #       # Process the attributes hash
++      #     end
++      #   end
++      #
++      # This model can now be used with a nested fields_for, like so:
++      #
++      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
++      #     ...
++      #     <% person_form.fields_for :address do |address_fields| %>
++      #       Street  : <%= address_fields.text_field :street %>
++      #       Zip code: <%= address_fields.text_field :zip_code %>
++      #     <% end %>
++      #   <% end %>
++      #
++      # When address is already an association on a Person you can use
++      # +accept_nested_attributes_for+ to define the writer method for you:
++      #
++      #   class Person < ActiveRecord::Base
++      #     has_one :address
++      #     accept_nested_attributes_for :address
++      #   end
++      #
++      # If you want to destroy the associated model through the form, you have
++      # to enable it first using the <tt>:allow_destroy</tt> option for
++      # +accept_nested_attributes_for+:
++      #
++      #   class Person < ActiveRecord::Base
++      #     has_one :address
++      #     accept_nested_attributes_for :address, :allow_destroy => true
++      #   end
++      #
++      # Now, when you use a form element with the <tt>_delete</tt> parameter,
++      # with a value that evaluates to +true+, you will destroy the associated
++      # model (eg. 1, '1', true, or 'true'):
++      #
++      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
++      #     ...
++      #     <% person_form.fields_for :address do |address_fields| %>
++      #       ...
++      #       Delete: <%= address_fields.check_box :_delete %>
++      #     <% end %>
++      #   <% end %>
++      #
++      # ==== One-to-many
++      #
++      # Consider a Person class which returns an _array_ of Project instances
++      # from the <tt>projects</tt> reader method and responds to the
++      # <tt>projects_attributes=</tt> writer method:
++      #
++      #   class Person
++      #     def projects
++      #       [@project1, @project2]
++      #     end
++      #
++      #     def projects_attributes=(attributes)
++      #       # Process the attributes hash
++      #     end
++      #   end
++      #
++      # This model can now be used with a nested fields_for, like so:
++      #
++      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
++      #     ...
++      #     <% person_form.fields_for :projects do |project_fields| %>
++      #       Name: <%= project_fields.text_field :name %>
++      #     <% end %>
++      #   <% end %>
++      #
++      # Note that the block given to the nested fields_for call will be
++      # repeated for each instance in the collection. The block can optionally
++      # take the actual instance as a second argument:
++      #
++      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
++      #     ...
++      #     <% person_form.fields_for :projects do |project_fields, project| %>
++      #       if project.active?
++      #         Name: <%= project_fields.text_field :name %>
++      #       end
++      #     <% end %>
++      #   <% end %>
++      #
++      # It's also possible to specify the instance to be used:
++      #
++      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
++      #     ...
++      #     <% @person.projects.each do |project| %>
++      #       <% if project.active? %>
++      #         <% person_form.fields_for :projects, project do |project_fields| %>
++      #           Name: <%= project_fields.text_field :name %>
++      #         <% end %>
++      #       <% end %>
++      #     <% end %>
++      #   <% end %>
++      #
++      # When projects is already an association on Person you can use
++      # +accept_nested_attributes_for+ to define the writer method for you:
++      #
++      #   class Person < ActiveRecord::Base
++      #     has_many :projects
++      #     accept_nested_attributes_for :projects
++      #   end
++      #
++      # If you want to destroy any of the associated models through the
++      # form, you have to enable it first using the <tt>:allow_destroy</tt>
++      # option for +accept_nested_attributes_for+:
++      #
++      #   class Person < ActiveRecord::Base
++      #     has_many :projects
++      #     accept_nested_attributes_for :projects, :allow_destroy => true
++      #   end
++      #
++      # This will allow you to specify which models to destroy in the
++      # by adding a form element for the <tt>_delete</tt> parameter with a
++      # value that evaluates to +true+ (eg. 1, '1', true, or 'true'):
++      #
++      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
++      #     ...
++      #     <% person_form.fields_for :projects do |project_fields| %>
++      #       Delete: <%= project_fields.check_box :_delete %>
++      #     <% end %>
++      #   <% end %>
+       def fields_for(record_or_name_or_array, *args, &block)
+         raise ArgumentError, "Missing block" unless block_given?
+         options = args.extract_options!
+@@ -760,7 +916,11 @@ module ActionView
+ 
+         case record_or_name_or_array
+         when String, Symbol
+-          name = "#{object_name}#{index}[#{record_or_name_or_array}]"
++          if nested_attributes_association?(record_or_name_or_array)
++            return fields_for_with_nested_attributes(record_or_name_or_array, args, block)
++          else
++            name = "#{object_name}#{index}[#{record_or_name_or_array}]"
++          end
+         when Array
+           object = record_or_name_or_array.last
+           name = "#{object_name}#{index}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
+@@ -802,6 +962,35 @@ module ActionView
+         def objectify_options(options)
+           @default_options.merge(options.merge(:object => @object))
+         end
++
++        def nested_attributes_association?(association_name)
++          @object.respond_to?("#{association_name}_attributes=")
++        end
++
++        def fields_for_with_nested_attributes(association_name, args, block)
++          name = "#{object_name}[#{association_name}_attributes]"
++          association = @object.send(association_name)
++
++          if association.is_a?(Array)
++            children = args.first.respond_to?(:new_record?) ? [args.first] : association
++
++            children.map do |child|
++              child_name = "#{name}[#{ child.new_record? ? new_child_id : child.id }]"
++
++              @template.fields_for(child_name, child, *args) do |form_builder|
++                block.arity == 2 ? block.call(form_builder, child) : block.call(form_builder)
++              end
++            end.join
++          else
++            @template.fields_for(name, association, *args, &block)
++          end
++        end
++
++        def new_child_id
++          value = (@child_counter ||= 1)
++          @child_counter += 1
++          "new_#{value}"
++        end
+     end
+   end
+ 
+@@ -809,4 +998,4 @@ module ActionView
+     cattr_accessor :default_form_builder
+     self.default_form_builder = ::ActionView::Helpers::FormBuilder
+   end
+-end
++end
+\ No newline at end of file
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 9454fd7..ff12dbf 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -15,21 +15,31 @@ silence_warnings do
+     def new_record?
+       @new_record
+     end
++
++    attr_accessor :author
++    def author_attributes=(attributes); end
++
++    attr_accessor :comments
++    def comments_attributes=(attributes); end
+   end
+ 
+   class Comment
+     attr_reader :id
+     attr_reader :post_id
++    def initialize(id = nil, post_id = nil); @id, @post_id = id, post_id end
+     def save; @id = 1; @post_id = 1 end
+     def new_record?; @id.nil? end
+     def to_param; @id; end
+     def name
+-      @id.nil? ? 'new comment' : "comment ##{@id}"
++      @id.nil? ? "new #{self.class.name.downcase}" : "#{self.class.name.downcase} ##{@id}"
+     end
+   end
+-end
+ 
+-class Comment::Nested < Comment; end
++  class Author < Comment
++    attr_accessor :post
++    def post_attributes=(attributes); end
++  end
++end
+ 
+ class FormHelperTest < ActionView::TestCase
+   tests ActionView::Helpers::FormHelper
+@@ -479,7 +489,7 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
+-  def test_nested_fields_for_with_index
++  def test_form_for_with_index_and_nested_fields_for
+     form_for(:post, @post, :index => 1) do |f|
+       f.fields_for(:comment, @post) do |c|
+         concat c.text_field(:title)
+@@ -558,6 +568,147 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_a_new_record_on_a_nested_attributes_one_to_one_association
++    @post.author = Author.new
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for(:author) do |af|
++        concat af.text_field(:name)
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_author_attributes_name" name="post[author_attributes][name]" size="30" type="text" value="new author" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_an_existing_record_on_a_nested_attributes_one_to_one_association
++    @post.author = Author.new(321)
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for(:author) do |af|
++        concat af.text_field(:name)
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_author_attributes_name" name="post[author_attributes][name]" size="30" type="text" value="author #321" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_existing_records_on_a_nested_attributes_collection_association
++    @post.comments = Array.new(2) { |id| Comment.new(id + 1) }
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      @post.comments.each do |comment|
++        f.fields_for(:comments, comment) do |cf|
++          concat cf.text_field(:name)
++        end
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="comment #1" />' +
++               '<input id="post_comments_attributes_2_name" name="post[comments_attributes][2][name]" size="30" type="text" value="comment #2" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_new_records_on_a_nested_attributes_collection_association
++    @post.comments = [Comment.new, Comment.new]
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      @post.comments.each do |comment|
++        f.fields_for(:comments, comment) do |cf|
++          concat cf.text_field(:name)
++        end
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_new_1_name" name="post[comments_attributes][new_1][name]" size="30" type="text" value="new comment" />' +
++               '<input id="post_comments_attributes_new_2_name" name="post[comments_attributes][new_2][name]" size="30" type="text" value="new comment" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_existing_and_new_records_on_a_nested_attributes_collection_association
++    @post.comments = [Comment.new(321), Comment.new]
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      @post.comments.each do |comment|
++        f.fields_for(:comments, comment) do |cf|
++          concat cf.text_field(:name)
++        end
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_321_name" name="post[comments_attributes][321][name]" size="30" type="text" value="comment #321" />' +
++               '<input id="post_comments_attributes_new_1_name" name="post[comments_attributes][new_1][name]" size="30" type="text" value="new comment" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_on_a_nested_attributes_collection_association_yields_only_builder
++    @post.comments = [Comment.new(321), Comment.new]
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for(:comments) do |cf|
++        concat cf.text_field(:name)
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_321_name" name="post[comments_attributes][321][name]" size="30" type="text" value="comment #321" />' +
++               '<input id="post_comments_attributes_new_1_name" name="post[comments_attributes][new_1][name]" size="30" type="text" value="new comment" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_on_a_nested_attributes_collection_association_yields_builder_and_member
++    @post.comments = [Comment.new(321), Comment.new]
++    yielded_comments = []
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for(:comments) do |cf, comment|
++        concat cf.text_field(:name)
++        yielded_comments << comment
++      end
++    end
++
++    assert_equal yielded_comments, @post.comments
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_321_name" name="post[comments_attributes][321][name]" size="30" type="text" value="comment #321" />' +
++               '<input id="post_comments_attributes_new_1_name" name="post[comments_attributes][new_1][name]" size="30" type="text" value="new comment" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
+   def test_fields_for
+     fields_for(:post, @post) do |f|
+       concat f.text_field(:title)
+@@ -974,4 +1125,4 @@ class FormHelperTest < ActionView::TestCase
+     def protect_against_forgery?
+       false
+     end
+-end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index fe59af5..fa804f6 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -56,6 +56,7 @@ module ActiveRecord
+   autoload :Migration, 'active_record/migration'
+   autoload :Migrator, 'active_record/migration'
+   autoload :NamedScope, 'active_record/named_scope'
++  autoload :NestedAttributes, 'active_record/nested_attributes'
+   autoload :Observing, 'active_record/observer'
+   autoload :QueryCache, 'active_record/query_cache'
+   autoload :Reflection, 'active_record/reflection'
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 1de4803..f9168c8 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -3137,9 +3137,9 @@ module ActiveRecord #:nodoc:
+     include Callbacks, Observing, Timestamp
+     include Associations, AssociationPreload, NamedScope
+ 
+-    # Needs to be included before Transactions, because we want
++    # AutosaveAssociation needs to be included before Transactions, because we want
+     # #save_with_autosave_associations to be wrapped inside a transaction.
+-    include AutosaveAssociation
++    include AutosaveAssociation, NestedAttributes
+ 
+     include Aggregations, Transactions, Reflection, Calculations, Serialization
+   end
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+new file mode 100644
+index 0000000..8a74efa
+--- /dev/null
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -0,0 +1,279 @@
++module ActiveRecord
++  module NestedAttributes #:nodoc:
++    def self.included(base)
++      base.extend(ClassMethods)
++      base.class_inheritable_accessor :reject_new_nested_attributes_procs, :instance_writer => false
++      base.reject_new_nested_attributes_procs = {}
++    end
++
++    # == Nested Attributes
++    #
++    # Nested attributes allow you to save attributes on associated records
++    # through the parent. By default nested attribute updating is turned off,
++    # you can enable it using the accept_nested_attributes_for class method.
++    # When you enable nested attributes an attribute writer is defined on
++    # the model.
++    #
++    # The attribute writer is named after the association, which means that
++    # in the following example, two new methods are added to your model:
++    # <tt>author_attributes=(attributes)</tt> and
++    # <tt>pages_attributes=(attributes)</tt>.
++    #
++    #   class Book < ActiveRecord::Base
++    #     has_one :author
++    #     has_many :pages
++    #
++    #     accept_nested_attributes_for :author, :pages
++    #   end
++    #
++    # Note that the <tt>:autosave</tt> option is automatically enabled on every
++    # association that accept_nested_attributes_for is used for.
++    #
++    # === One-to-one
++    #
++    # Consider a Member model that has one Avatar:
++    #
++    #   class Member < ActiveRecord::Base
++    #     has_one :avatar
++    #     accept_nested_attributes_for :avatar
++    #   end
++    #
++    # Enabling nested attributes on a one-to-one association allows you to
++    # create the member and avatar in one go:
++    #
++    #   params = { 'member' => { 'name' => 'Jack', 'avatar_attributes' => { 'icon' => 'smiling' } } }
++    #   member = Member.create(params)
++    #   member.avatar.icon #=> 'smiling'
++    #
++    # It also allows you to update the avatar through the member:
++    #
++    #   params = { 'member' => { 'avatar_attributes' => { 'icon' => 'sad' } } }
++    #   member.update_attributes params['member']
++    #   member.avatar.icon #=> 'sad'
++    #
++    # By default you will only be able to set and update attributes on the
++    # associated model. If you want to destroy the associated model through the
++    # attributes hash, you have to enable it first using the
++    # <tt>:allow_destroy</tt> option.
++    #
++    #   class Member < ActiveRecord::Base
++    #     has_one :avatar
++    #     accept_nested_attributes_for :avatar, :allow_destroy => true
++    #   end
++    #
++    # Now, when you add the <tt>_delete</tt> key to the attributes hash, with a
++    # value that evaluates to +true+, you will destroy the associated model:
++    #
++    #   member.avatar_attributes = { '_delete' => '1' }
++    #   member.avatar.marked_for_destruction? # => true
++    #   member.save
++    #   member.avatar #=> nil
++    #
++    # Note that the model will _not_ be destroyed until the parent is saved.
++    #
++    # === One-to-many
++    #
++    # Consider a member that has a number of posts:
++    #
++    #   class Member < ActiveRecord::Base
++    #     has_many :posts
++    #     accept_nested_attributes_for :posts, :reject_if => proc { |attributes| attributes['title'].blank? }
++    #   end
++    #
++    # You can now set or update attributes on an associated post model through
++    # the attribute hash.
++    #
++    # For each key in the hash that starts with the string 'new' a new model
++    # will be instantiated. When the proc given with the <tt>:reject_if</tt>
++    # option evaluates to +false+ for a certain attribute hash no record will
++    # be built for that hash.
++    #
++    #   params = { 'member' => {
++    #     'name' => 'joe', 'posts_attributes' => {
++    #       'new_12345' => { 'title' => 'Kari, the awesome Ruby documentation browser!' },
++    #       'new_54321' => { 'title' => 'The egalitarian assumption of the modern citizen' },
++    #       'new_67890' => { 'title' => '' } # This one matches the :reject_if proc and will not be instantiated.
++    #     }
++    #   }}
++    #
++    #   member = Member.create(params['member'])
++    #   member.posts.length #=> 2
++    #   member.posts.first.title #=> 'Kari, the awesome Ruby documentation browser!'
++    #   member.posts.second.title #=> 'The egalitarian assumption of the modern citizen'
++    #
++    # When the key for post attributes is an integer, the associated post with
++    # that ID will be updated:
++    #
++    #   member.attributes = {
++    #     'name' => 'Joe',
++    #     'posts_attributes' => {
++    #       '1' => { 'title' => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!' },
++    #       '2' => { 'title' => '[UPDATED] other post' }
++    #     }
++    #   }
++    #
++    # By default the associated models are protected from being destroyed. If
++    # you want to destroy any of the associated models through the attributes
++    # hash, you have to enable it first using the <tt>:allow_destroy</tt> 
++    # option.
++    #
++    # This will allow you to specify which models to destroy in the attributes
++    # hash by setting the '_delete' attribute to a value that evaluates to
++    # +true+:
++    #
++    #   class Member < ActiveRecord::Base
++    #     has_many :posts
++    #     accept_nested_attributes_for :posts, :allow_destroy => true
++    #   end
++    #
++    #   params = {'member' => { 'name' => 'joe', 'posts_attributes' => {
++    #     '2' => { '_delete' => '1' }
++    #   }}}
++    #   member.attributes = params['member']
++    #   member.posts.detect { |p| p.id == 2 }.marked_for_destruction? # => true
++    #   member.posts.length #=> 2
++    #   member.save
++    #   member.posts.length # => 1
++    #
++    # === Saving
++    #
++    # All changes to models, including the destruction of those marked for
++    # destruction, are saved and destroyed automatically and atomically when
++    # the parent model is saved. This happens inside the transaction initiated
++    # by the parents save method. See ActiveRecord::AutosaveAssociation.
++    module ClassMethods
++      # Defines an attributes writer for the specified association(s).
++      #
++      # Supported options:
++      # [:allow_destroy]
++      #   If true, destroys any members from the attributes hash with a
++      #   <tt>_delete</tt> key and a value that converts to +true+
++      #   (eg. 1, '1', true, or 'true'). This option is off by default.
++      # [:reject_if]
++      #   Allows you to specify a Proc that checks whether a record should be 
++      #   built for a certain attribute hash. The hash is passed to the Proc
++      #   and the Proc should return either +true+ or +false+. When no Proc
++      #   is specified a record will be built for all attribute hashes.
++      #
++      # Examples:
++      #   accept_nested_attributes_for :avatar
++      #   accept_nested_attributes_for :avatar, :allow_destroy => true
++      #   accept_nested_attributes_for :avatar, :reject_if => proc { ... }
++      #   accept_nested_attributes_for :avatar, :posts, :allow_destroy => true, :reject_if => proc { ... }
++      def accept_nested_attributes_for(*attr_names)
++        options = { :allow_destroy => false }
++        options.update(attr_names.extract_options!)
++        options.assert_valid_keys(:allow_destroy, :reject_if)
++
++        attr_names.each do |association_name|
++          if reflection = reflect_on_association(association_name)
++            type = case reflection.macro
++            when :has_one, :belongs_to
++              :one_to_one
++            when :has_many, :has_and_belongs_to_many
++              :collection
++            end
++
++            reflection.options[:autosave] = true
++            self.reject_new_nested_attributes_procs[association_name.to_sym] = options[:reject_if]
++
++            # def pirate_attributes=(attributes)
++            #   assign_nested_attributes_for_one_to_one_association(:pirate, attributes, false)
++            # end
++            class_eval %{
++              def #{association_name}_attributes=(attributes)
++                assign_nested_attributes_for_#{type}_association(:#{association_name}, attributes, #{options[:allow_destroy]})
++              end
++            }, __FILE__, __LINE__
++          else
++            raise ArgumentError, "No association found for name `#{association_name}'. Has it been defined yet?"
++          end
++        end
++      end
++    end
++
++    # Returns ActiveRecord::AutosaveAssociation::marked_for_destruction?
++    # It's used in conjunction with fields_for to build a form element
++    # for the destruction of this association.
++    #
++    # See ActionView::Helpers::FormHelper::fields_for for more info.
++    def _delete
++      marked_for_destruction?
++    end
++
++    private
++
++    # Assigns the given attributes to the association. An association will be
++    # build if it doesn't exist yet.
++    def assign_nested_attributes_for_one_to_one_association(association_name, attributes, allow_destroy)
++      if should_destroy_nested_attributes_record?(allow_destroy, attributes)
++        send(association_name).mark_for_destruction
++      else
++        (send(association_name) || send("build_#{association_name}")).attributes = attributes
++      end
++    end
++
++    # Assigns the given attributes to the collection association.
++    #
++    # Keys containing an ID for an associated record will update that record.
++    # Keys starting with <tt>new</tt> will instantiate a new record for that
++    # association.
++    #
++    # For example:
++    #
++    #   assign_nested_attributes_for_collection_association(:people, {
++    #     '1' => { 'name' => 'Peter' },
++    #     'new_43' => { 'name' => 'John' }
++    #   })
++    #
++    # Will update the name of the Person with ID 1 and create a new associated
++    # person with the name 'John'.
++    def assign_nested_attributes_for_collection_association(association_name, attributes, allow_destroy)
++      unless attributes.is_a?(Hash)
++        raise ArgumentError, "Hash expected, got #{attributes.class.name} (#{attributes.inspect})"
++      end
++
++      # Make sure any new records sorted by their id before they're build.
++      sorted_by_id = attributes.sort_by { |id, _| id.is_a?(String) ? id.sub(/^new_/, '').to_i : id }
++
++      sorted_by_id.each do |id, record_attributes|
++        if id.acts_like?(:string) && id.starts_with?('new_')
++          build_new_nested_attributes_record(association_name, record_attributes)
++        else
++          assign_to_or_destroy_nested_attributes_record(association_name, id, record_attributes, allow_destroy)
++        end
++      end
++    end
++
++    # Returns +true+ if <tt>allow_destroy</tt> is enabled and the attributes
++    # contains a truthy value for the key <tt>'_delete'</tt>.
++    #
++    # It will _always_ remove the <tt>'_delete'</tt> key, if present.
++    def should_destroy_nested_attributes_record?(allow_destroy, attributes)
++      ConnectionAdapters::Column.value_to_boolean(attributes.delete('_delete')) && allow_destroy
++    end
++
++    # Builds a new record with the given attributes.
++    #
++    # If a <tt>:reject_if</tt> proc exists for this association, it will be
++    # called with the attributes as its argument. If the proc returns a truthy
++    # value, the record is _not_ build.
++    def build_new_nested_attributes_record(association_name, attributes)
++      if reject_proc = self.class.reject_new_nested_attributes_procs[association_name]
++        return if reject_proc.call(attributes)
++      end
++      send(association_name).build(attributes)
++    end
++
++    # Assigns the attributes to the record specified by +id+. Or marks it for
++    # destruction if #should_destroy_nested_attributes_record? returns +true+.
++    def assign_to_or_destroy_nested_attributes_record(association_name, id, attributes, allow_destroy)
++      record = send(association_name).detect { |record| record.id == id.to_i }
++      if should_destroy_nested_attributes_record?(allow_destroy, attributes)
++        record.mark_for_destruction
++      else
++        record.attributes = attributes
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+new file mode 100644
+index 0000000..dd11422
+--- /dev/null
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -0,0 +1,359 @@
++require "cases/helper"
++require "models/pirate"
++require "models/ship"
++require "models/bird"
++require "models/parrot"
++require "models/treasure"
++
++module AssertRaiseWithMessage
++  def assert_raise_with_message(expected_exception, expected_message)
++    begin
++      error_raised = false
++      yield
++    rescue expected_exception => error
++      error_raised = true
++      actual_message = error.message
++    end
++    assert error_raised
++    assert_equal expected_message, actual_message
++  end
++end
++
++class TestNestedAttributesInGeneral < ActiveRecord::TestCase
++  include AssertRaiseWithMessage
++
++  def teardown
++    Pirate.accept_nested_attributes_for :ship, :allow_destroy => true
++  end
++
++  def test_base_should_have_an_empty_reject_new_nested_attributes_procs
++    assert_equal Hash.new, ActiveRecord::Base.reject_new_nested_attributes_procs
++  end
++
++  def test_should_add_a_proc_to_reject_new_nested_attributes_procs
++    [:parrots, :birds].each do |name|
++      assert_instance_of Proc, Pirate.reject_new_nested_attributes_procs[name]
++    end
++  end
++
++  def test_should_raise_an_ArgumentError_for_non_existing_associations
++    assert_raise_with_message ArgumentError, "No association found for name `honesty'. Has it been defined yet?" do
++      Pirate.accept_nested_attributes_for :honesty
++    end
++  end
++
++  def test_should_disable_allow_destroy_by_default
++    Pirate.accept_nested_attributes_for :ship
++
++    pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    ship = pirate.create_ship(:name => 'Nights Dirty Lightning')
++
++    assert_no_difference('Ship.count') do
++      pirate.update_attributes(:ship_attributes => { '_delete' => true })
++    end
++  end
++
++  def test_a_model_should_respond_to_underscore_delete_and_return_if_it_is_marked_for_destruction
++    ship = Ship.create!(:name => 'Nights Dirty Lightning')
++    assert !ship._delete
++    ship.mark_for_destruction
++    assert ship._delete
++  end
++end
++
++class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
++  def setup
++    @pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @ship = @pirate.create_ship(:name => 'Nights Dirty Lightning')
++  end
++
++  def test_should_define_an_attribute_writer_method_for_the_association
++    assert_respond_to @pirate, :ship_attributes=
++  end
++
++  def test_should_automatically_instantiate_an_associated_model_if_there_is_none
++    @ship.destroy
++    @pirate.reload.ship_attributes = { :name => 'Davy Jones Gold Dagger' }
++
++    assert @pirate.ship.new_record?
++    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
++  end
++
++  def test_should_take_a_hash_and_assign_the_attributes_to_the_existing_associated_model
++    @pirate.ship_attributes = { :name => 'Davy Jones Gold Dagger' }
++    assert !@pirate.ship.new_record?
++    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
++  end
++
++  def test_should_also_work_with_a_HashWithIndifferentAccess
++    @pirate.ship_attributes = HashWithIndifferentAccess.new(:name => 'Davy Jones Gold Dagger')
++    assert !@pirate.ship.new_record?
++    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
++  end
++
++  def test_should_work_with_update_attributes_as_well
++    @pirate.update_attributes({ :catchphrase => 'Arr', :ship_attributes => { :name => 'Mister Pablo' } })
++    @pirate.reload
++
++    assert_equal 'Arr', @pirate.catchphrase
++    assert_equal 'Mister Pablo', @pirate.ship.name
++  end
++
++  def test_should_be_possible_to_destroy_the_associated_model
++    @pirate.ship.destroy
++    ['1', 1, 'true', true].each do |true_variable|
++      @pirate.reload.create_ship(:name => 'Mister Pablo')
++      assert_difference('Ship.count', -1) do
++        @pirate.update_attributes(:ship_attributes => { '_delete' => true_variable })
++      end
++    end
++  end
++
++  def test_should_not_destroy_the_associated_model_with_a_non_truthy_argument
++    [nil, '0', 0, 'false', false].each do |false_variable|
++      assert_no_difference('Ship.count') do
++        @pirate.update_attributes(:ship_attributes => { '_delete' => false_variable })
++      end
++    end
++  end
++
++  def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
++    assert_no_difference('Ship.count') do
++      @pirate.attributes = { :ship_attributes => { '_delete' => true } }
++    end
++    assert_difference('Ship.count', -1) { @pirate.save }
++  end
++
++  def test_should_automatically_enable_autosave_on_the_association
++    assert Pirate.reflect_on_association(:ship).options[:autosave]
++  end
++end
++
++class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
++  def setup
++    @ship = Ship.create!(:name => 'Nights Dirty Lightning')
++    @pirate = @ship.create_pirate(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++  end
++
++  def test_should_define_an_attribute_writer_method_for_the_association
++    assert_respond_to @ship, :pirate_attributes=
++  end
++
++  def test_should_automatically_instantiate_an_associated_model_if_there_is_none
++    @pirate.destroy
++    @ship.reload.pirate_attributes = { :catchphrase => 'Arr' }
++
++    assert @ship.pirate.new_record?
++    assert_equal 'Arr', @ship.pirate.catchphrase
++  end
++
++  def test_should_take_a_hash_and_assign_the_attributes_to_the_existing_associated_model
++    @ship.pirate_attributes = { :catchphrase => 'Arr' }
++    assert !@ship.pirate.new_record?
++    assert_equal 'Arr', @ship.pirate.catchphrase
++  end
++
++  def test_should_also_work_with_a_HashWithIndifferentAccess
++    @ship.pirate_attributes = HashWithIndifferentAccess.new(:catchphrase => 'Arr')
++    assert !@ship.pirate.new_record?
++    assert_equal 'Arr', @ship.pirate.catchphrase
++  end
++
++  def test_should_work_with_update_attributes_as_well
++    @ship.update_attributes({ :name => 'Mister Pablo', :pirate_attributes => { :catchphrase => 'Arr' } })
++    @ship.reload
++
++    assert_equal 'Mister Pablo', @ship.name
++    assert_equal 'Arr', @ship.pirate.catchphrase
++  end
++
++  def test_should_be_possible_to_destroy_the_associated_model
++    @ship.pirate.destroy
++    ['1', 1, 'true', true].each do |true_variable|
++      @ship.reload.create_pirate(:catchphrase => 'Arr')
++      assert_difference('Pirate.count', -1) do
++        @ship.update_attributes(:pirate_attributes => { '_delete' => true_variable })
++      end
++    end
++  end
++
++  def test_should_not_destroy_the_associated_model_with_a_non_truthy_argument
++    [nil, '', '0', 0, 'false', false].each do |false_variable|
++      assert_no_difference('Pirate.count') do
++        @ship.update_attributes(:pirate_attributes => { '_delete' => false_variable })
++      end
++    end
++  end
++
++  def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
++    assert_no_difference('Pirate.count') do
++      @ship.attributes = { :pirate_attributes => { '_delete' => true } }
++    end
++    assert_difference('Pirate.count', -1) { @ship.save }
++  end
++
++  def test_should_automatically_enable_autosave_on_the_association
++    assert Ship.reflect_on_association(:pirate).options[:autosave]
++  end
++end
++
++module NestedAttributesOnACollectionAssociationTests
++  include AssertRaiseWithMessage
++
++  def test_should_define_an_attribute_writer_method_for_the_association
++    assert_respond_to @pirate, association_setter
++  end
++
++  def test_should_take_a_hash_with_string_keys_and_assign_the_attributes_to_the_associated_models
++    @alternate_params[association_getter].stringify_keys!
++    @pirate.update_attributes @alternate_params
++    assert_equal ['Grace OMalley', 'Privateers Greed'], [@child_1.reload.name, @child_2.reload.name]
++  end
++
++  def test_should_also_work_with_a_HashWithIndifferentAccess
++    @pirate.send(association_setter, HashWithIndifferentAccess.new(@child_1.id => HashWithIndifferentAccess.new(:name => 'Grace OMalley')))
++    @pirate.save
++    assert_equal 'Grace OMalley', @child_1.reload.name
++  end
++
++  def test_should_take_a_hash_with_integer_keys_and_assign_the_attributes_to_the_associated_models
++    @pirate.attributes = @alternate_params
++    assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
++    assert_equal 'Privateers Greed', @pirate.send(@association_name).last.name
++  end
++
++  def test_should_automatically_build_new_associated_models_for_each_entry_in_a_hash_where_the_id_starts_with_the_string_new_
++    @pirate.send(@association_name).destroy_all
++    @pirate.reload.attributes = { association_getter => { 'new_1' => { :name => 'Grace OMalley' }, 'new_2' => { :name => 'Privateers Greed' }}}
++
++    assert @pirate.send(@association_name).first.new_record?
++    assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
++
++    assert @pirate.send(@association_name).last.new_record?
++    assert_equal 'Privateers Greed', @pirate.send(@association_name).last.name
++  end
++
++  def test_should_sort_the_hash_by_the_keys_before_building_new_associated_models
++    attributes = ActiveSupport::OrderedHash.new
++    attributes['new_123726353'] = { :name => 'Grace OMalley' }
++    attributes['new_2'] = { :name => 'Privateers Greed' } # 2 is lower then 123726353
++    @pirate.send(association_setter, attributes)
++
++    assert_equal ['Posideons Killer', 'Killer bandita Dionne', 'Privateers Greed', 'Grace OMalley'], @pirate.send(@association_name).map(&:name)
++  end
++
++  def test_should_raise_an_argument_error_if_something_else_than_a_hash_is_passed
++    assert_nothing_raised(ArgumentError) { @pirate.send(association_setter, {}) }
++    assert_nothing_raised(ArgumentError) { @pirate.send(association_setter, ActiveSupport::OrderedHash.new) }
++
++    assert_raise_with_message ArgumentError, 'Hash expected, got String ("foo")' do
++      @pirate.send(association_setter, "foo")
++    end
++    assert_raise_with_message ArgumentError, 'Hash expected, got Array ([:foo, :bar])' do
++      @pirate.send(association_setter, [:foo, :bar])
++    end
++  end
++
++  def test_should_work_with_update_attributes_as_well
++    @pirate.update_attributes({ :catchphrase => 'Arr', association_getter => { @child_1.id => { :name => 'Grace OMalley' }}})
++    assert_equal 'Grace OMalley', @child_1.reload.name
++  end
++
++  def test_should_automatically_reject_any_new_record_if_a_reject_if_proc_exists_and_returns_false
++    @alternate_params[association_getter]["new_12345"] = {}
++    assert_no_difference("@pirate.send(@association_name).length") do
++      @pirate.attributes = @alternate_params
++    end
++  end
++
++  def test_should_update_existing_records_and_add_new_ones_that_have_an_id_that_start_with_the_string_new_
++    @alternate_params[association_getter]['new_12345'] = { :name => 'Buccaneers Servant' }
++    assert_difference('@pirate.send(@association_name).count', +1) do
++      @pirate.update_attributes @alternate_params
++    end
++    assert_equal ['Grace OMalley', 'Privateers Greed', 'Buccaneers Servant'], @pirate.reload.send(@association_name).map(&:name)
++  end
++
++  def test_should_be_possible_to_destroy_a_record
++    ['1', 1, 'true', true].each do |true_variable|
++      record = @pirate.reload.send(@association_name).create!(:name => 'Grace OMalley')
++      @pirate.send(association_setter,
++        @alternate_params[association_getter].merge(record.id => { '_delete' => true_variable })
++      )
++
++      assert_difference('@pirate.send(@association_name).count', -1) do
++        @pirate.save
++      end
++    end
++  end
++
++  def test_should_not_destroy_the_associated_model_with_a_non_truthy_argument
++    [nil, '', '0', 0, 'false', false].each do |false_variable|
++      @alternate_params[association_getter][@child_1.id]['_delete'] = false_variable
++      assert_no_difference('@pirate.send(@association_name).count') do
++        @pirate.update_attributes(@alternate_params)
++      end
++    end
++  end
++
++  def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
++    assert_no_difference('@pirate.send(@association_name).count') do
++      @pirate.send(association_setter, @alternate_params[association_getter].merge(@child_1.id => { '_delete' => true }))
++    end
++    assert_difference('@pirate.send(@association_name).count', -1) { @pirate.save }
++  end
++
++  def test_should_automatically_enable_autosave_on_the_association
++    assert Pirate.reflect_on_association(@association_name).options[:autosave]
++  end
++
++  private
++
++  def association_setter
++    @association_setter ||= "#{@association_name}_attributes=".to_sym
++  end
++
++  def association_getter
++    @association_getter ||= "#{@association_name}_attributes".to_sym
++  end
++end
++
++class TestNestedAttributesOnAHasManyAssociation < ActiveRecord::TestCase
++  def setup
++    @association_type = :has_many
++    @association_name = :birds
++
++    @pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @child_1 = @pirate.birds.create!(:name => 'Posideons Killer')
++    @child_2 = @pirate.birds.create!(:name => 'Killer bandita Dionne')
++
++    @alternate_params = {
++      :birds_attributes => {
++        @child_1.id => { :name => 'Grace OMalley' },
++        @child_2.id => { :name => 'Privateers Greed' }
++      }
++    }
++  end
++
++  include NestedAttributesOnACollectionAssociationTests
++end
++
++class TestNestedAttributesOnAHasAndBelongsToManyAssociation < ActiveRecord::TestCase
++  def setup
++    @association_type = :has_and_belongs_to_many
++    @association_name = :parrots
++
++    @pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @child_1 = @pirate.parrots.create!(:name => 'Posideons Killer')
++    @child_2 = @pirate.parrots.create!(:name => 'Killer bandita Dionne')
++
++    @alternate_params = {
++      :parrots_attributes => {
++        @child_1.id => { :name => 'Grace OMalley' },
++        @child_2.id => { :name => 'Privateers Greed' }
++      }
++    }
++  end
++
++  include NestedAttributesOnACollectionAssociationTests
++end
+\ No newline at end of file
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 7556574..e32bc31 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -1,12 +1,16 @@
+ class Pirate < ActiveRecord::Base
+   belongs_to :parrot
+-  has_and_belongs_to_many :parrots, :autosave => true
++  has_and_belongs_to_many :parrots
+   has_many :treasures, :as => :looter
+ 
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
+-  has_one :ship, :autosave => true
+-  has_many :birds, :autosave => true
++  # These both have :autosave enabled because accept_nested_attributes_for is used on them.
++  has_one :ship
++  has_many :birds
++
++  accept_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  accept_nested_attributes_for :ship, :allow_destroy => true
+ 
+   validates_presence_of :catchphrase
+ end
+diff --git a/activerecord/test/models/ship.rb b/activerecord/test/models/ship.rb
+index 3673e72..737b040 100644
+--- a/activerecord/test/models/ship.rb
++++ b/activerecord/test/models/ship.rb
+@@ -1,8 +1,10 @@
+ class Ship < ActiveRecord::Base
+   self.record_timestamps = false
+ 
+-  belongs_to :pirate, :autosave => true
++  belongs_to :pirate
+   has_many :parts, :class_name => 'ShipPart', :autosave => true
+ 
++  accept_nested_attributes_for :pirate, :allow_destroy => true
++
+   validates_presence_of :name
+ end
+\ No newline at end of file
+-- 
+1.6.0.2
+
+
+From fbc023f49de43f7f179c4432006e8c3b9519cb82 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Wed, 21 Jan 2009 18:08:29 +0100
+Subject: [PATCH] Corrected sentence error.
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb |    5 +++--
+ 1 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 363d72c..8288576 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -443,8 +443,9 @@ module ActionView
+       #   end
+       #
+       # This will allow you to specify which models to destroy in the
+-      # by adding a form element for the <tt>_delete</tt> parameter with a
+-      # value that evaluates to +true+ (eg. 1, '1', true, or 'true'):
++      # attributes hash by adding a form element for the <tt>_delete</tt>
++      # parameter with a value that evaluates to +true+
++      # (eg. 1, '1', true, or 'true'):
+       #
+       #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
+       #     ...
+-- 
+1.6.0.2
+
+
+From b206ec5392385eb053c74bdfedd32d7be7a860f0 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Thu, 22 Jan 2009 11:13:40 +0100
+Subject: [PATCH] Removed the optional second argument for a nested fields_for block, which was the object. I didn't know #object was public. Thanks Koz.
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb |   24 +++++---------------
+ actionpack/test/template/form_helper_test.rb      |   24 +-------------------
+ 2 files changed, 8 insertions(+), 40 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 8288576..6fed595 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -390,25 +390,16 @@ module ActionView
+       #     end
+       #   end
+       #
+-      # This model can now be used with a nested fields_for, like so:
++      # This model can now be used with a nested fields_for. The block given to
++      # the nested fields_for call will be repeated for each instance in the
++      # collection:
+       #
+       #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
+       #     ...
+       #     <% person_form.fields_for :projects do |project_fields| %>
+-      #       Name: <%= project_fields.text_field :name %>
+-      #     <% end %>
+-      #   <% end %>
+-      #
+-      # Note that the block given to the nested fields_for call will be
+-      # repeated for each instance in the collection. The block can optionally
+-      # take the actual instance as a second argument:
+-      #
+-      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
+-      #     ...
+-      #     <% person_form.fields_for :projects do |project_fields, project| %>
+-      #       if project.active?
++      #       <% if project_fields.object.active? %>
+       #         Name: <%= project_fields.text_field :name %>
+-      #       end
++      #       <% end %>
+       #     <% end %>
+       #   <% end %>
+       #
+@@ -977,10 +968,7 @@ module ActionView
+ 
+             children.map do |child|
+               child_name = "#{name}[#{ child.new_record? ? new_child_id : child.id }]"
+-
+-              @template.fields_for(child_name, child, *args) do |form_builder|
+-                block.arity == 2 ? block.call(form_builder, child) : block.call(form_builder)
+-              end
++              @template.fields_for(child_name, child, *args, &block)
+             end.join
+           else
+             @template.fields_for(name, association, *args, &block)
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index ff12dbf..33a542a 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -669,11 +669,13 @@ class FormHelperTest < ActionView::TestCase
+ 
+   def test_nested_fields_for_on_a_nested_attributes_collection_association_yields_only_builder
+     @post.comments = [Comment.new(321), Comment.new]
++    yielded_comments = []
+ 
+     form_for(:post, @post) do |f|
+       concat f.text_field(:title)
+       f.fields_for(:comments) do |cf|
+         concat cf.text_field(:name)
++        yielded_comments << cf.object
+       end
+     end
+ 
+@@ -684,29 +686,7 @@ class FormHelperTest < ActionView::TestCase
+                '</form>'
+ 
+     assert_dom_equal expected, output_buffer
+-  end
+-
+-  def test_nested_fields_for_on_a_nested_attributes_collection_association_yields_builder_and_member
+-    @post.comments = [Comment.new(321), Comment.new]
+-    yielded_comments = []
+-
+-    form_for(:post, @post) do |f|
+-      concat f.text_field(:title)
+-      f.fields_for(:comments) do |cf, comment|
+-        concat cf.text_field(:name)
+-        yielded_comments << comment
+-      end
+-    end
+-
+     assert_equal yielded_comments, @post.comments
+-
+-    expected = '<form action="http://www.example.com" method="post">' +
+-               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
+-               '<input id="post_comments_attributes_321_name" name="post[comments_attributes][321][name]" size="30" type="text" value="comment #321" />' +
+-               '<input id="post_comments_attributes_new_1_name" name="post[comments_attributes][new_1][name]" size="30" type="text" value="new comment" />' +
+-               '</form>'
+-
+-    assert_dom_equal expected, output_buffer
+   end
+ 
+   def test_fields_for
+-- 
+1.6.0.2
+
+
+From d474ba19b9e911a15b07cfaf2887a7608bee9ddc Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 27 Jan 2009 11:25:41 +0100
+Subject: [PATCH] Renamed the accept_nested_attributes_for method to accepts_nested_attributes_for.
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb  |   18 +++++++-------
+ .../lib/active_record/nested_attributes.rb         |   24 ++++++++++----------
+ activerecord/test/cases/nested_attributes_test.rb  |    6 ++--
+ activerecord/test/models/pirate.rb                 |    6 ++--
+ activerecord/test/models/ship.rb                   |    2 +-
+ 5 files changed, 28 insertions(+), 28 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 6fed595..2ac2427 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -310,7 +310,7 @@ module ActionView
+       #
+       # Nested attribute writers are normal setter methods named after an
+       # association. The most common way of defining these writers is either
+-      # with +accept_nested_attributes_for+ in a model definition or by
++      # with +accepts_nested_attributes_for+ in a model definition or by
+       # defining a method with the proper name. For example: the attribute
+       # writer for the association <tt>:address</tt> is called
+       # <tt>address_attributes=</tt>.
+@@ -346,20 +346,20 @@ module ActionView
+       #   <% end %>
+       #
+       # When address is already an association on a Person you can use
+-      # +accept_nested_attributes_for+ to define the writer method for you:
++      # +accepts_nested_attributes_for+ to define the writer method for you:
+       #
+       #   class Person < ActiveRecord::Base
+       #     has_one :address
+-      #     accept_nested_attributes_for :address
++      #     accepts_nested_attributes_for :address
+       #   end
+       #
+       # If you want to destroy the associated model through the form, you have
+       # to enable it first using the <tt>:allow_destroy</tt> option for
+-      # +accept_nested_attributes_for+:
++      # +accepts_nested_attributes_for+:
+       #
+       #   class Person < ActiveRecord::Base
+       #     has_one :address
+-      #     accept_nested_attributes_for :address, :allow_destroy => true
++      #     accepts_nested_attributes_for :address, :allow_destroy => true
+       #   end
+       #
+       # Now, when you use a form element with the <tt>_delete</tt> parameter,
+@@ -417,20 +417,20 @@ module ActionView
+       #   <% end %>
+       #
+       # When projects is already an association on Person you can use
+-      # +accept_nested_attributes_for+ to define the writer method for you:
++      # +accepts_nested_attributes_for+ to define the writer method for you:
+       #
+       #   class Person < ActiveRecord::Base
+       #     has_many :projects
+-      #     accept_nested_attributes_for :projects
++      #     accepts_nested_attributes_for :projects
+       #   end
+       #
+       # If you want to destroy any of the associated models through the
+       # form, you have to enable it first using the <tt>:allow_destroy</tt>
+-      # option for +accept_nested_attributes_for+:
++      # option for +accepts_nested_attributes_for+:
+       #
+       #   class Person < ActiveRecord::Base
+       #     has_many :projects
+-      #     accept_nested_attributes_for :projects, :allow_destroy => true
++      #     accepts_nested_attributes_for :projects, :allow_destroy => true
+       #   end
+       #
+       # This will allow you to specify which models to destroy in the
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index 8a74efa..1742cc9 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -10,7 +10,7 @@ module ActiveRecord
+     #
+     # Nested attributes allow you to save attributes on associated records
+     # through the parent. By default nested attribute updating is turned off,
+-    # you can enable it using the accept_nested_attributes_for class method.
++    # you can enable it using the accepts_nested_attributes_for class method.
+     # When you enable nested attributes an attribute writer is defined on
+     # the model.
+     #
+@@ -23,11 +23,11 @@ module ActiveRecord
+     #     has_one :author
+     #     has_many :pages
+     #
+-    #     accept_nested_attributes_for :author, :pages
++    #     accepts_nested_attributes_for :author, :pages
+     #   end
+     #
+     # Note that the <tt>:autosave</tt> option is automatically enabled on every
+-    # association that accept_nested_attributes_for is used for.
++    # association that accepts_nested_attributes_for is used for.
+     #
+     # === One-to-one
+     #
+@@ -35,7 +35,7 @@ module ActiveRecord
+     #
+     #   class Member < ActiveRecord::Base
+     #     has_one :avatar
+-    #     accept_nested_attributes_for :avatar
++    #     accepts_nested_attributes_for :avatar
+     #   end
+     #
+     # Enabling nested attributes on a one-to-one association allows you to
+@@ -58,7 +58,7 @@ module ActiveRecord
+     #
+     #   class Member < ActiveRecord::Base
+     #     has_one :avatar
+-    #     accept_nested_attributes_for :avatar, :allow_destroy => true
++    #     accepts_nested_attributes_for :avatar, :allow_destroy => true
+     #   end
+     #
+     # Now, when you add the <tt>_delete</tt> key to the attributes hash, with a
+@@ -77,7 +77,7 @@ module ActiveRecord
+     #
+     #   class Member < ActiveRecord::Base
+     #     has_many :posts
+-    #     accept_nested_attributes_for :posts, :reject_if => proc { |attributes| attributes['title'].blank? }
++    #     accepts_nested_attributes_for :posts, :reject_if => proc { |attributes| attributes['title'].blank? }
+     #   end
+     #
+     # You can now set or update attributes on an associated post model through
+@@ -123,7 +123,7 @@ module ActiveRecord
+     #
+     #   class Member < ActiveRecord::Base
+     #     has_many :posts
+-    #     accept_nested_attributes_for :posts, :allow_destroy => true
++    #     accepts_nested_attributes_for :posts, :allow_destroy => true
+     #   end
+     #
+     #   params = {'member' => { 'name' => 'joe', 'posts_attributes' => {
+@@ -156,11 +156,11 @@ module ActiveRecord
+       #   is specified a record will be built for all attribute hashes.
+       #
+       # Examples:
+-      #   accept_nested_attributes_for :avatar
+-      #   accept_nested_attributes_for :avatar, :allow_destroy => true
+-      #   accept_nested_attributes_for :avatar, :reject_if => proc { ... }
+-      #   accept_nested_attributes_for :avatar, :posts, :allow_destroy => true, :reject_if => proc { ... }
+-      def accept_nested_attributes_for(*attr_names)
++      #   accepts_nested_attributes_for :avatar
++      #   accepts_nested_attributes_for :avatar, :allow_destroy => true
++      #   accepts_nested_attributes_for :avatar, :reject_if => proc { ... }
++      #   accepts_nested_attributes_for :avatar, :posts, :allow_destroy => true, :reject_if => proc { ... }
++      def accepts_nested_attributes_for(*attr_names)
+         options = { :allow_destroy => false }
+         options.update(attr_names.extract_options!)
+         options.assert_valid_keys(:allow_destroy, :reject_if)
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index dd11422..b982adc 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -23,7 +23,7 @@ class TestNestedAttributesInGeneral < ActiveRecord::TestCase
+   include AssertRaiseWithMessage
+ 
+   def teardown
+-    Pirate.accept_nested_attributes_for :ship, :allow_destroy => true
++    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true
+   end
+ 
+   def test_base_should_have_an_empty_reject_new_nested_attributes_procs
+@@ -38,12 +38,12 @@ class TestNestedAttributesInGeneral < ActiveRecord::TestCase
+ 
+   def test_should_raise_an_ArgumentError_for_non_existing_associations
+     assert_raise_with_message ArgumentError, "No association found for name `honesty'. Has it been defined yet?" do
+-      Pirate.accept_nested_attributes_for :honesty
++      Pirate.accepts_nested_attributes_for :honesty
+     end
+   end
+ 
+   def test_should_disable_allow_destroy_by_default
+-    Pirate.accept_nested_attributes_for :ship
++    Pirate.accepts_nested_attributes_for :ship
+ 
+     pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
+     ship = pirate.create_ship(:name => 'Nights Dirty Lightning')
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index e32bc31..6a2416a 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -5,12 +5,12 @@ class Pirate < ActiveRecord::Base
+ 
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
+-  # These both have :autosave enabled because accept_nested_attributes_for is used on them.
++  # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
+   has_one :ship
+   has_many :birds
+ 
+-  accept_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+-  accept_nested_attributes_for :ship, :allow_destroy => true
++  accepts_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  accepts_nested_attributes_for :ship, :allow_destroy => true
+ 
+   validates_presence_of :catchphrase
+ end
+diff --git a/activerecord/test/models/ship.rb b/activerecord/test/models/ship.rb
+index 737b040..c46e27f 100644
+--- a/activerecord/test/models/ship.rb
++++ b/activerecord/test/models/ship.rb
+@@ -4,7 +4,7 @@ class Ship < ActiveRecord::Base
+   belongs_to :pirate
+   has_many :parts, :class_name => 'ShipPart', :autosave => true
+ 
+-  accept_nested_attributes_for :pirate, :allow_destroy => true
++  accepts_nested_attributes_for :pirate, :allow_destroy => true
+ 
+   validates_presence_of :name
+ end
+\ No newline at end of file
+-- 
+1.6.0.2
+

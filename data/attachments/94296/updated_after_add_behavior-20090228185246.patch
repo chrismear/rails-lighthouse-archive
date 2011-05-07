@@ -1,0 +1,243 @@
+From 6ac49a4e2d0acfc56a38964ce5f273b3d0b24626 Mon Sep 17 00:00:00 2001
+From: Kenneth Kalmer <kenneth.kalmer@gmail.com>
+Date: Sat, 28 Feb 2009 17:10:27 +0200
+Subject: [PATCH] Changed the behavior of association collection's #after_add callback to run when association membership is persisted
+
+---
+ .../associations/association_collection.rb         |   13 +++-
+ .../test/cases/associations/callbacks_test.rb      |   97 ++++++++++++++++++--
+ 2 files changed, 100 insertions(+), 10 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0fefec1..42115be 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -427,7 +427,18 @@ module ActiveRecord
+           yield(record) if block_given?
+           @target ||= [] unless loaded?
+           @target << record unless @reflection.options[:uniq] && @target.include?(record)
+-          callback(:after_add, record)
++          if record.new_record?
++            record.instance_variable_set("@delayed_after_add", Proc.new { |r| callback(:after_add, r) })
++            record.class_eval <<-EOF
++              def after_create_with_after_add
++                after_create_without_after_add
++                @delayed_after_add.call( self )
++              end
++              alias_method_chain :after_create, :after_add
++            EOF
++          else
++            callback(:after_add, record)
++          end
+           record
+         end
+ 
+diff --git a/activerecord/test/cases/associations/callbacks_test.rb b/activerecord/test/cases/associations/callbacks_test.rb
+index 91b1af1..9034c73 100644
+--- a/activerecord/test/cases/associations/callbacks_test.rb
++++ b/activerecord/test/cases/associations/callbacks_test.rb
+@@ -16,6 +16,32 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+     assert @david.post_log.empty?
+   end
+ 
++  def test_building_macros_callbacks
++    post = @david.posts_with_callbacks.build( :title => 'Work in progress' )
++    assert post.new_record?
++    assert_equal ["before_adding<new>"], @david.post_log
++
++    assert post.save
++    assert_equal ["before_adding<new>", "after_adding#{post.id}"], @david.post_log
++  end
++
++  def test_building_macros_callbacks_twice
++    post = @david.posts_with_callbacks.build( :title => 'Work in progress' )
++    assert post.new_record?
++    assert_equal ["before_adding<new>"], @david.post_log
++
++    another_post = @david.posts_with_callbacks.build( :title => 'Lacking creativity' )
++    assert another_post.new_record?
++    assert_equal ["before_adding<new>", "before_adding<new>"], @david.post_log
++
++    assert post.save
++    assert_equal ["before_adding<new>", "before_adding<new>", "after_adding#{post.id}"], @david.post_log
++
++    assert another_post.save
++    assert_equal ["before_adding<new>", "before_adding<new>", "after_adding#{post.id}",
++                  "after_adding#{another_post.id}"], @david.post_log
++  end
++  
+   def test_adding_macro_callbacks
+     @david.posts_with_callbacks << @thinking
+     assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @david.post_log
+@@ -24,6 +50,45 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+                   "after_adding#{@thinking.id}"], @david.post_log
+   end
+ 
++  def test_building_and_adding_macro_callbacks
++    post = @david.posts_with_callbacks.build( :title => 'Work in progress' )
++    assert post.new_record?
++    assert_equal ["before_adding<new>"], @david.post_log
++
++    assert post.save
++    assert_equal ["before_adding<new>", "after_adding#{post.id}"], @david.post_log
++
++    @david.posts_with_callbacks << @thinking
++    assert_equal ["before_adding<new>", "after_adding#{post.id}", "before_adding#{@thinking.id}",
++                  "after_adding#{@thinking.id}"], @david.post_log
++  end
++
++  def test_building_with_proc_callbacks
++    post = @david.posts_with_proc_callbacks.build( :title => 'Work in progress' )
++    assert post.new_record?
++    assert_equal ["before_adding<new>"], @david.post_log
++
++    assert post.save
++    assert_equal ["before_adding<new>", "after_adding#{post.id}"], @david.post_log
++  end
++
++  def test_building_with_proc_callbacks_twice
++    post = @david.posts_with_proc_callbacks.build( :title => 'Work in progress' )
++    assert post.new_record?
++    assert_equal ["before_adding<new>"], @david.post_log
++
++    another_post = @david.posts_with_proc_callbacks.build( :title => 'Lacking creativity' )
++    assert another_post.new_record?
++    assert_equal ["before_adding<new>", "before_adding<new>"], @david.post_log
++
++    assert post.save
++    assert_equal ["before_adding<new>", "before_adding<new>", "after_adding#{post.id}"], @david.post_log
++
++    assert another_post.save
++    assert_equal ["before_adding<new>", "before_adding<new>", "after_adding#{post.id}",
++                  "after_adding#{another_post.id}"], @david.post_log
++  end
++
+   def test_adding_with_proc_callbacks
+     @david.posts_with_proc_callbacks << @thinking
+     assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @david.post_log
+@@ -32,6 +97,20 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+                   "after_adding#{@thinking.id}"], @david.post_log
+   end
+ 
++  def test_building_and_adding_with_proc_callbacks
++    post = @david.posts_with_proc_callbacks.build( :title => 'Work in progress' )
++    assert post.new_record?
++    assert_equal ["before_adding<new>"], @david.post_log
++
++    @david.posts_with_proc_callbacks << @thinking
++    assert_equal ["before_adding<new>", "before_adding#{@thinking.id}",
++                  "after_adding#{@thinking.id}"], @david.post_log
++
++    assert post.save
++    assert_equal ["before_adding<new>", "before_adding#{@thinking.id}", "after_adding#{@thinking.id}",
++                  "after_adding#{post.id}"], @david.post_log
++  end
++
+   def test_removing_with_macro_callbacks
+     first_post, second_post = @david.posts_with_callbacks[0, 2]
+     @david.posts_with_callbacks.delete(first_post)
+@@ -76,11 +155,10 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+     jack = Author.new :name => "Jack"
+     post = jack.posts_with_callbacks.build :title => "Call me back!", :body => "Before you wake up and after you sleep"
+ 
+-    callback_log = ["before_adding<new>", "after_adding#{jack.posts_with_callbacks.first.id}"]
+-    assert_equal callback_log, jack.post_log
++    assert_equal ["before_adding<new>"], jack.post_log
+     assert jack.save
+     assert_equal 1, jack.posts_with_callbacks.count
+-    assert_equal callback_log, jack.post_log
++    assert_equal ["before_adding<new>", "after_adding#{jack.posts_with_callbacks.first.id}"], jack.post_log
+   end
+ 
+   def test_has_and_belongs_to_many_add_callback
+@@ -104,8 +182,10 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+     bob = ar.developers_with_callbacks.create(:name => 'bob')
+     assert_equal "after_adding#{bob.id}", ar.developers_log.last
+ 
+-    ar.developers_with_callbacks.build(:name => 'charlie')
+-    assert_equal "after_adding<new>", ar.developers_log.last
++    charlie = ar.developers_with_callbacks.build(:name => 'charlie')
++    assert_equal "before_adding<new>", ar.developers_log.last
++    charlie.save
++    assert_equal "after_adding#{charlie.id}", ar.developers_log.last
+   end
+ 
+ 
+@@ -138,13 +218,12 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+ 
+   def test_has_many_and_belongs_to_many_callbacks_for_save_on_parent
+     project = Project.new :name => "Callbacks"
+-    project.developers_with_callbacks.build :name => "Jack", :salary => 95000
++    jack = project.developers_with_callbacks.build :name => "Jack", :salary => 95000
+ 
+-    callback_log = ["before_adding<new>", "after_adding<new>"]
+-    assert_equal callback_log, project.developers_log
++    assert_equal ["before_adding<new>"], project.developers_log
+     assert project.save
+     assert_equal 1, project.developers_with_callbacks.size
+-    assert_equal callback_log, project.developers_log
++    assert_equal ["before_adding<new>", "after_adding#{jack.id}"], project.developers_log
+   end
+ 
+   def test_dont_add_if_before_callback_raises_exception
+-- 
+1.6.0.6
+
+
+From 7d5c80b46df144f8befaf01c1ee5b68be56c34f0 Mon Sep 17 00:00:00 2001
+From: Kenneth Kalmer <kenneth.kalmer@gmail.com>
+Date: Sat, 28 Feb 2009 18:51:31 +0200
+Subject: [PATCH] Updated has_many :through tests to new after_add behavior
+
+---
+ .../has_many_through_associations_test.rb          |   16 +++++++++++++---
+ 1 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index 1e5d1a0..37832eb 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -6,6 +6,8 @@ require 'models/comment'
+ require 'models/tag'
+ require 'models/tagging'
+ require 'models/author'
++require 'models/reference'
++require 'models/job'
+ 
+ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+   fixtures :posts, :readers, :people, :comments, :authors
+@@ -169,20 +171,28 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+       [:added, :after, "Lary"]
+     ],log.last(6)
+ 
+-    post.people_with_callbacks.build(:first_name => "Ted")
++    ted = post.people_with_callbacks.build(:first_name => "Ted")
++    assert_equal [
++      [:added, :after, "Lary"],
++      [:added, :before, "Ted"]
++    ], log.last(2)
++    
++    ted.save
+     assert_equal [
+       [:added, :before, "Ted"],
+       [:added, :after, "Ted"]
+     ], log.last(2)
++    # WARNING: This is flawed!?
++    #assert post.people_with_callbacks.include?( ted )
+ 
+     post.people_with_callbacks.create(:first_name => "Sam")
+     assert_equal [
+       [:added, :before, "Sam"],
+       [:added, :after, "Sam"]
+     ], log.last(2)
+-
++    
+     post.people_with_callbacks = [people(:michael),people(:david), Person.new(:first_name => "Julian"), Person.create!(:first_name => "Roger")]
+-    assert_equal (%w(Ted Bob Sam Lary) * 2).sort, log[-12..-5].collect(&:last).sort
++    assert_equal (%w(Bob Sam Sam Lary) * 2).sort, log[-12..-5].collect(&:last).sort
+     assert_equal [
+       [:added, :before, "Julian"],
+       [:added, :after, "Julian"],
+-- 
+1.6.0.6
+

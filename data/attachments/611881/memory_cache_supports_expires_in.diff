@@ -1,0 +1,133 @@
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index 070ba12..0a8e313 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -188,9 +188,9 @@ module ActiveSupport
+       # The specific cache store implementation will decide what to do with
+       # +options+.
+       # 
+-      # For example, MemCacheStore supports the +:expires_in+ option, which
+-      # tells the memcached server to automatically expire the cache item after
+-      # a certain period:
++      # For example, MemoryStore and MemCacheStore support the +:expires_in+
++      # option, which tells the memcached server to automatically expire the
++      # cache item after a certain period:
+       #
+       #   cache = ActiveSupport::Cache::MemCacheStore.new
+       #   cache.write("foo", "bar", :expires_in => 5.seconds)
+diff --git a/activesupport/lib/active_support/cache/memory_store.rb b/activesupport/lib/active_support/cache/memory_store.rb
+index b4a7438..d60c9e7 100644
+--- a/activesupport/lib/active_support/cache/memory_store.rb
++++ b/activesupport/lib/active_support/cache/memory_store.rb
+@@ -9,6 +9,14 @@ module ActiveSupport
+     # then using MemoryStore is ok. Otherwise, consider carefully whether you
+     # should be using this cache store.
+     #
++    # MemoryStore supports the :expires_in option. Because MemoryStore is often
++    # used in testing environments, its implementation of :expires_in is compatible
++    # with "time travel" libraries (e.g. Timecop). Specifically, time-traveling
++    # to a point after the cache entry should expire, querying the cache for the
++    # entry, and then time-traveling back to before expiration will result in
++    # the entry still existing (or "existing again" depending on your frame
++    # of reference.)
++    #
+     # MemoryStore is not only able to store strings, but also arbitrary Ruby
+     # objects.
+     #
+@@ -16,7 +24,7 @@ module ActiveSupport
+     # if you need thread-safety.
+     class MemoryStore < Store
+       def initialize
+-        @data = {}
++        @data = {} # of the form {key => [value, expires_at or nil]}
+       end
+ 
+       def read_multi(*names)
+@@ -27,12 +35,24 @@ module ActiveSupport
+ 
+       def read(name, options = nil)
+         super
+-        @data[name]
++        value, expires_at = @data[name]
++        if value && (expires_at.blank? || expires_at > Time.now)
++          value
++        else
++          nil
++        end
+       end
+ 
+       def write(name, value, options = nil)
+         super
+-        @data[name] = value.freeze
++        expires_at = if options && options.respond_to?(:[]) && options[:expires_in]
++          Time.now + options.delete(:expires_in)
++        else
++          nil
++        end
++        value.freeze.tap do |val|
++          @data[name] = [value, expires_at]
++        end
+       end
+ 
+       def delete(name, options = nil)
+@@ -47,7 +67,8 @@ module ActiveSupport
+ 
+       def exist?(name, options = nil)
+         super
+-        @data.has_key?(name)
++        _, expires_at = @data[name]
++        @data.has_key?(name) && (expires_at.blank? || expires_at > Time.now)
+       end
+ 
+       def clear
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index 918ca8b..ef6fbb7 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -175,6 +175,46 @@ class MemoryStoreTest < ActiveSupport::TestCase
+     result = @cache.read_multi('foo', 'goo')
+     assert_equal({'foo' => 1, 'goo' => 2}, result)
+   end
++  
++  def test_read_not_expired
++    @cache.write('foo', 'bar', :expires_in => 30.seconds)
++    now = Time.now
++    Time.stubs(:now).returns(now + 10.seconds)
++    assert_equal 'bar', @cache.read('foo')
++  end
++  
++  def test_read_expired
++    @cache.write('foo', 'bar', :expires_in => 30.seconds)
++    now = Time.now
++    Time.stubs(:now).returns(now + 1.minute)
++    assert_nil @cache.read('foo')
++  end
++  
++  def test_exist_not_expired
++    @cache.write('foo', 'bar', :expires_in => 30.seconds)
++    now = Time.now
++    Time.stubs(:now).returns(now + 10.seconds)
++    assert @cache.exist?('foo')
++  end
++
++  def test_exist_expired
++    @cache.write('foo', 'bar', :expires_in => 30.seconds)
++    now = Time.now
++    Time.stubs(:now).returns(now + 1.minute)
++    assert !@cache.exist?('foo')
++  end
++  
++  def test_expires_in_compatible_with_time_travel
++    # ensure a read after expiration time doesn't affect
++    # "subsequent" reads _before_ expiration time:
++    @cache.write('foo', 'bar', :expires_in => 30.seconds)
++    now = Time.now
++    Time.stubs(:now).returns(now + 1.minute)
++    @cache.read('foo')
++    Time.stubs(:now).returns(now + 10.seconds)
++    assert_equal 'bar', @cache.read('foo')
++  end
++    
+ end
+ 
+ uses_memcached 'memcached backed store' do

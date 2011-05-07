@@ -1,0 +1,154 @@
+From 1fd1beda42e9bd6bfef800da9b92729b7e12adc0 Mon Sep 17 00:00:00 2001
+From: Ben Scofield <git@turrean.com>
+Date: Wed, 3 Sep 2008 19:50:55 +0200
+Subject: [PATCH] refactor assert_generated_migration to assert_generated_model_migration to more accurately reflect intent; add find_generated_migration_timestamp
+
+---
+ railties/test/generators/generator_test_helper.rb  |   13 +++++++++++--
+ .../test/generators/rails_model_generator_test.rb  |    4 ++--
+ .../generators/rails_resource_generator_test.rb    |    2 +-
+ .../generators/rails_scaffold_generator_test.rb    |    4 ++--
+ 4 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/railties/test/generators/generator_test_helper.rb b/railties/test/generators/generator_test_helper.rb
+index 0901b21..1eedbd5 100644
+--- a/railties/test/generators/generator_test_helper.rb
++++ b/railties/test/generators/generator_test_helper.rb
+@@ -247,14 +247,23 @@ class GeneratorTestCase < Test::Unit::TestCase
+     end
+   end
+ 
+-  def assert_generated_migration(name, parent = "ActiveRecord::Migration")
++  def assert_generated_migration(name, parent = "ActiveRecord::Migration", regex = /self\.up/)
+     file = Dir.glob("#{RAILS_ROOT}/db/migrate/*_#{name.to_s.underscore}.rb").first
+     file = file.match(/db\/migrate\/[0-9]+_\w+/).to_s
+     assert_generated_class file, parent do |body|
+-      assert_match /timestamps/, body, "should have timestamps defined"
++      assert_match regex, body, "should have #{regex.to_s} defined"
+       yield body if block_given?
+     end
+   end
++  
++  def find_generated_migration_timestamp(name)
++    file = Dir.glob("#{RAILS_ROOT}/db/migrate/*_#{name.to_s.underscore}.rb").first
++    file.match(/db\/migrate\/([0-9]+)_\w+/)[1]
++  end
++
++  def assert_generated_model_migration(name, parent = "ActiveRecord::Migration")
++    assert_generated_migration(name, parent, /timestamps/)
++  end
+ 
+   # Asserts that the given migration file was not generated.
+   # It takes the name of the migration as a parameter.
+diff --git a/railties/test/generators/rails_model_generator_test.rb b/railties/test/generators/rails_model_generator_test.rb
+index aea2aba..41cae44 100644
+--- a/railties/test/generators/rails_model_generator_test.rb
++++ b/railties/test/generators/rails_model_generator_test.rb
+@@ -7,7 +7,7 @@ class RailsModelGeneratorTest < GeneratorTestCase
+ 
+     assert_generated_model_for :product
+     assert_generated_fixtures_for :products
+-    assert_generated_migration :create_products
++    assert_generated_model_migration :create_products
+   end
+ 
+   def test_model_skip_migration_skips_migration
+@@ -23,7 +23,7 @@ class RailsModelGeneratorTest < GeneratorTestCase
+ 
+     assert_generated_model_for :product
+     assert_generated_fixtures_for :products
+-    assert_generated_migration :create_products do |t|
++    assert_generated_model_migration :create_products do |t|
+       assert_generated_column t, :name, :string
+       assert_generated_column t, :supplier_id, :integer
+       assert_generated_column t, :created_at, :timestamp
+diff --git a/railties/test/generators/rails_resource_generator_test.rb b/railties/test/generators/rails_resource_generator_test.rb
+index 45e4850..6a5feb5 100644
+--- a/railties/test/generators/rails_resource_generator_test.rb
++++ b/railties/test/generators/rails_resource_generator_test.rb
+@@ -10,7 +10,7 @@ class RailsResourceGeneratorTest < GeneratorTestCase
+     assert_generated_fixtures_for :products
+     assert_generated_functional_test_for :products
+     assert_generated_helper_for :products
+-    assert_generated_migration :create_products
++    assert_generated_model_migration :create_products
+     assert_added_route_for :products
+   end
+ 
+diff --git a/railties/test/generators/rails_scaffold_generator_test.rb b/railties/test/generators/rails_scaffold_generator_test.rb
+index de6b38d..fc60ae5 100644
+--- a/railties/test/generators/rails_scaffold_generator_test.rb
++++ b/railties/test/generators/rails_scaffold_generator_test.rb
+@@ -46,7 +46,7 @@ class RailsScaffoldGeneratorTest < GeneratorTestCase
+     assert_generated_stylesheet :scaffold
+     assert_generated_views_for :products, "index.html.erb", "new.html.erb", "edit.html.erb", "show.html.erb"
+ 
+-    assert_generated_migration :create_products
++    assert_generated_model_migration :create_products
+     assert_added_route_for :products
+   end
+ 
+@@ -96,7 +96,7 @@ class RailsScaffoldGeneratorTest < GeneratorTestCase
+     assert_generated_stylesheet :scaffold
+     assert_generated_views_for :products, "index.html.erb", "new.html.erb", "edit.html.erb", "show.html.erb"
+ 
+-    assert_generated_migration :create_products do |t|
++    assert_generated_model_migration :create_products do |t|
+       assert_generated_column t, :name, :string
+       assert_generated_column t, :supplier_id, :integer
+       assert_generated_column t, :created_at, :timestamp
+-- 
+1.5.4.1
+
+
+From 0d834699722dafbf2291efa42f1f3e3d4619e8c7 Mon Sep 17 00:00:00 2001
+From: Ben Scofield <git@turrean.com>
+Date: Wed, 3 Sep 2008 19:51:25 +0200
+Subject: [PATCH] add migration generator test file and test/code to ensure that migrations created in quick succession have distinct timestamps
+
+---
+ railties/lib/rails_generator/commands.rb           |    3 ++-
+ .../generators/rails_migration_generator_test.rb   |   17 +++++++++++++++++
+ 2 files changed, 19 insertions(+), 1 deletions(-)
+ create mode 100644 railties/test/generators/rails_migration_generator_test.rb
+
+diff --git a/railties/lib/rails_generator/commands.rb b/railties/lib/rails_generator/commands.rb
+index 59af730..bc0085f 100644
+--- a/railties/lib/rails_generator/commands.rb
++++ b/railties/lib/rails_generator/commands.rb
+@@ -82,7 +82,8 @@ module Rails
+ 
+           def next_migration_string(padding = 3)
+             if ActiveRecord::Base.timestamped_migrations
+-              Time.now.utc.strftime("%Y%m%d%H%M%S")
++              time = Time.now.utc
++              "#{time.strftime("%Y%m%d%H%M%S")}#{time.usec}"
+             else
+               "%.#{padding}d" % next_migration_number
+             end
+diff --git a/railties/test/generators/rails_migration_generator_test.rb b/railties/test/generators/rails_migration_generator_test.rb
+new file mode 100644
+index 0000000..81e01f9
+--- /dev/null
++++ b/railties/test/generators/rails_migration_generator_test.rb
+@@ -0,0 +1,17 @@
++require 'generators/generator_test_helper'
++
++class RailsMigrationGeneratorTest < GeneratorTestCase
++  def test_migration_generates_files
++    run_generator('migration', %w(AddColumnToTable))
++
++    assert_generated_migration :AddColumnToTable
++  end
++  
++  def test_multiple_migrations_generate_distinct_timestamps
++    run_generator('migration', %w(AddColumnToTable1))
++    run_generator('migration', %w(AddColumnToTable2))
++
++    assert_not_equal find_generated_migration_timestamp(:AddColumnToTable1),
++      find_generated_migration_timestamp(:AddColumnToTable2)
++  end
++end
+-- 
+1.5.4.1
+

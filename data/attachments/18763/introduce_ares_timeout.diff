@@ -1,0 +1,244 @@
+From 659a1b3a561d42715680d5e5670e9e2e2917f6af Mon Sep 17 00:00:00 2001
+From: Cheah Chu Yeow <chuyeow@gmail.com>
+Date: Sun, 13 Apr 2008 14:40:30 +0800
+Subject: [PATCH] Introduce ActiveResource::Base.timeout. This allows a timeout to be set on the internal Net::HTTP instance ARes uses (default is 60 seconds). Setting a low timeout allows ARes clients to fail-fast in the event of a unresponsive/crashed server, rather than cause cascading failures in your application.
+
+---
+ activeresource/lib/active_resource/base.rb       |   38 ++++++++++++-
+ activeresource/lib/active_resource/connection.rb |   12 +++-
+ activeresource/test/base_test.rb                 |   66 ++++++++++++++++++++++
+ activeresource/test/connection_test.rb           |    5 ++
+ 4 files changed, 117 insertions(+), 4 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index cd53c5d..cd1763b 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -166,6 +166,26 @@ module ActiveResource
+   # 
+   # Learn more about Active Resource's validation features in the ActiveResource::Validations documentation.
+   #
++  # === Timeouts
++  #
++  # Active Resource relies on HTTP to access RESTful APIs and as such is inherently susceptible to slow or
++  # unresponsive servers. In such cases, your Active Resource method calls could timeout. You can control the 
++  # amount of time before Active Resource times out with the +timeout+ variable.
++  #
++  #   class Person < ActiveResource::Base
++  #     self.site = "http://api.people.com:3000/"
++  #     self.timeout = 5
++  #   end
++  #
++  # This sets the +timeout+ to 5 seconds. You can adjust the timeout to a value suitable for the RESTful API
++  # you are accessing. It is recommended to set this to a reasonably low value to allow your Active Resource
++  # clients (especially if you are using Active Resource in a Rails application) to fail-fast (see
++  # http://en.wikipedia.org/wiki/Fail-fast) rather than cause cascading failures that could incapacitate your
++  # server.
++  #
++  # Internally, Active Resource relies on Ruby's Net::HTTP library to make HTTP requests. Setting +timeout+
++  # sets the <tt>read_timeout</tt> of the internal Net::HTTP instance to the same value. The default
++  # <tt>read_timeout</tt> is 60 seconds on most Ruby implementations.
+   class Base
+     # The logger for diagnosing and tracing Active Resource calls.
+     cattr_accessor :logger
+@@ -257,12 +277,27 @@ module ActiveResource
+         write_inheritable_attribute("format", format)
+         connection.format = format if site
+       end
+-      
++
+       # Returns the current format, default is ActiveResource::Formats::XmlFormat
+       def format # :nodoc:
+         read_inheritable_attribute("format") || ActiveResource::Formats[:xml]
+       end
+ 
++      # Sets the number of seconds after which requests to the REST API should time out.
++      def timeout=(timeout)
++        @connection = nil
++        @timeout = timeout
++      end
++
++      # Gets tthe number of seconds after which requests to the REST API should time out.
++      def timeout
++        if defined?(@timeout)
++          @timeout
++        elsif superclass != Object && superclass.timeout
++          superclass.timeout
++        end
++      end
++
+       # An instance of ActiveResource::Connection that is the base connection to the remote service.
+       # The +refresh+ parameter toggles whether or not the connection is refreshed at every request
+       # or not (defaults to <tt>false</tt>).
+@@ -271,6 +306,7 @@ module ActiveResource
+           @connection = Connection.new(site, format) if refresh || @connection.nil?
+           @connection.user = user if user
+           @connection.password = password if password
++          @connection.timeout = timeout if timeout
+           @connection
+         else
+           superclass.connection
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index c8cee7a..3b61009 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -55,7 +55,7 @@ module ActiveResource
+   # This class is used by ActiveResource::Base to interface with REST
+   # services.
+   class Connection
+-    attr_reader :site, :user, :password
++    attr_reader :site, :user, :password, :timeout
+     attr_accessor :format
+ 
+     class << self
+@@ -90,6 +90,11 @@ module ActiveResource
+       @password = password
+     end
+ 
++    # Set the number of seconds after which HTTP requests to the remote service should time out.
++    def timeout=(timeout)
++      @timeout = timeout
++    end
++
+     # Execute a GET request.
+     # Used to get (find) resources.
+     def get(path, headers = {})
+@@ -167,18 +172,19 @@ module ActiveResource
+         http             = Net::HTTP.new(@site.host, @site.port)
+         http.use_ssl     = @site.is_a?(URI::HTTPS)
+         http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl
++        http.read_timeout = @timeout if @timeout # If timeout is not set, the default Net::HTTP timeout (60s) is used.
+         http
+       end
+ 
+       def default_header
+         @default_header ||= { 'Content-Type' => format.mime_type }
+       end
+-      
++
+       # Builds headers for request to remote service.
+       def build_request_headers(headers)
+         authorization_header.update(default_header).update(headers)
+       end
+-      
++
+       # Sets authorization header
+       def authorization_header
+         (@user || @password ? { 'Authorization' => 'Basic ' + ["#{@user}:#{ @password}"].pack('m').delete("\r\n") } : {})
+diff --git a/activeresource/test/base_test.rb b/activeresource/test/base_test.rb
+index 9caca80..9e2f6c1 100644
+--- a/activeresource/test/base_test.rb
++++ b/activeresource/test/base_test.rb
+@@ -88,6 +88,12 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal('test123', Forum.connection.password)
+   end
+ 
++  def test_should_accept_setting_timeout
++    Forum.timeout = 5
++    assert_equal(5, Forum.timeout)
++    assert_equal(5, Forum.connection.timeout)
++  end
++
+   def test_user_variable_can_be_reset
+     actor = Class.new(ActiveResource::Base)
+     actor.site = 'http://cinema'
+@@ -108,6 +114,16 @@ class BaseTest < Test::Unit::TestCase
+     assert_nil actor.connection.password
+   end
+ 
++  def test_timeout_variable_can_be_reset
++    actor = Class.new(ActiveResource::Base)
++    actor.site = 'http://cinema'
++    assert_nil actor.timeout
++    actor.timeout = 5
++    actor.timeout = nil
++    assert_nil actor.timeout
++    assert_nil actor.connection.timeout
++  end
++
+   def test_credentials_from_site_are_decoded
+     actor = Class.new(ActiveResource::Base)
+     actor.site = 'http://my%40email.com:%31%32%33@cinema'
+@@ -232,6 +248,40 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal fruit.password, apple.password, 'subclass did not adopt changes from parent class'
+   end
+ 
++  def test_timeout_reader_uses_superclass_timeout_until_written
++    # Superclass is Object so returns nil.
++    assert_nil ActiveResource::Base.timeout
++    assert_nil Class.new(ActiveResource::Base).timeout
++    Person.timeout = 5
++
++    # Subclass uses superclass timeout.
++    actor = Class.new(Person)
++    assert_equal Person.timeout, actor.timeout
++
++    # Changing subclass timeout doesn't change superclass timeout.
++    actor.timeout = 10
++    assert_not_equal Person.timeout, actor.timeout
++
++    # Changing superclass timeout doesn't overwrite subclass timeout.
++    Person.timeout = 15
++    assert_not_equal Person.timeout, actor.timeout
++
++    # Changing superclass timeout after subclassing changes subclass timeout.
++    jester = Class.new(actor)
++    actor.timeout = 20
++    assert_equal actor.timeout, jester.timeout
++
++    # Subclasses are always equal to superclass timeout when not overridden.
++    fruit = Class.new(ActiveResource::Base)
++    apple = Class.new(fruit)
++
++    fruit.timeout = 25
++    assert_equal fruit.timeout, apple.timeout, 'subclass did not adopt changes from parent class'
++
++    fruit.timeout = 30
++    assert_equal fruit.timeout, apple.timeout, 'subclass did not adopt changes from parent class'
++  end
++
+   def test_updating_baseclass_site_object_wipes_descendent_cached_connection_objects
+     # Subclasses are always equal to superclass site when not overridden    
+     fruit = Class.new(ActiveResource::Base)
+@@ -279,6 +329,22 @@ class BaseTest < Test::Unit::TestCase
+     assert_not_equal(first_connection, second_connection, 'Connection should be re-created')
+   end
+ 
++  def test_updating_baseclass_timeout_wipes_descendent_cached_connection_objects
++    # Subclasses are always equal to superclass timeout when not overridden
++    fruit = Class.new(ActiveResource::Base)
++    apple = Class.new(fruit)
++    fruit.site = 'http://market'
++
++    fruit.timeout = 5
++    assert_equal fruit.connection.timeout, apple.connection.timeout
++    first_connection = apple.connection.object_id
++
++    fruit.timeout = 10
++    assert_equal fruit.connection.timeout, apple.connection.timeout
++    second_connection = apple.connection.object_id
++    assert_not_equal(first_connection, second_connection, 'Connection should be re-created')
++  end
++
+   def test_collection_name
+     assert_equal "people", Person.collection_name
+   end
+diff --git a/activeresource/test/connection_test.rb b/activeresource/test/connection_test.rb
+index 38fdbd3..6c90761 100644
+--- a/activeresource/test/connection_test.rb
++++ b/activeresource/test/connection_test.rb
+@@ -101,6 +101,11 @@ class ConnectionTest < Test::Unit::TestCase
+     assert_equal site, @conn.site
+   end
+ 
++  def test_timeout_accessor
++    @conn.timeout = 5
++    assert_equal 5, @conn.timeout
++  end
++
+   def test_get
+     matz = @conn.get("/people/1.xml")
+     assert_equal "Matz", matz["name"]
+-- 
+1.5.3.4
+

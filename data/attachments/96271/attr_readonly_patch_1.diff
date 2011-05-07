@@ -1,0 +1,111 @@
+From 0d053c09f279f1a72fe34a781273da2a38784db0 Mon Sep 17 00:00:00 2001
+From: Trevor Turk <trevorturk@yahoo.com>
+Date: Wed, 4 Mar 2009 22:59:40 -0600
+Subject: [PATCH] Change update_attribute to raise a ReadOnlyAttributeError if provided a readonly attribute, instead of appearing to update the attribute until a reload.
+
+---
+ activerecord/lib/active_record/base.rb |   24 ++++++++++++++++++------
+ activerecord/test/cases/base_test.rb   |   23 +++++++++++++++++++++++
+ 2 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 206b4ef..e6243de 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -125,6 +125,10 @@ module ActiveRecord #:nodoc:
+   # Raised when unknown attributes are supplied via mass assignment.
+   class UnknownAttributeError < NoMethodError
+   end
++  
++  # Raised when a readonly attribute is supplied to update_attribute.
++  class ReadOnlyAttributeError < NoMethodError
++  end
+ 
+   # Raised when an error occurred while doing a mass assignment to an attribute through the
+   # <tt>attributes=</tt> method. The exception has an +attribute+ property that is the name of the
+@@ -811,7 +815,7 @@ module ActiveRecord #:nodoc:
+ 
+       # Updates all records with details given if they match a set of conditions supplied, limits and order can
+       # also be supplied. This method constructs a single SQL UPDATE statement and sends it straight to the
+-      # database. It does not instantiate the involved models and it does not trigger Active Record callbacks.
++      # database. It does not instantiate the involved models and it does not trigger Active Record validations or callbacks.
+       #
+       # ==== Parameters
+       #
+@@ -2616,7 +2620,13 @@ module ActiveRecord #:nodoc:
+       # Updates a single attribute and saves the record without going through the normal validation procedure.
+       # This is especially useful for boolean flags on existing records. The regular +update_attribute+ method
+       # in Base is replaced with this when the validations module is mixed in, which it is by default.
++      #
++      # This method can update protected attributes, but will raise an exception if provided a readonly attribute.
++      # If you need to update a readonly attribute, consider using +Base.update_all+ and only updating a single record.
++      # Note that +Base.update_all+ bypasses Active Record callbacks as well as validations.
++      # <tt>Person.update_all("name = 'careful!'", "id = 1")</tt>
+       def update_attribute(name, value)
++        raise(ReadOnlyAttributeError, "#{name.to_s} is a readonly attribute") if self.class.readonly_attributes_include?(name)
+         send(name.to_s + '=', value)
+         save(false)
+       end
+@@ -2952,11 +2962,13 @@ module ActiveRecord #:nodoc:
+ 
+       # Removes attributes which have been marked as readonly.
+       def remove_readonly_attributes(attributes)
+-        unless self.class.readonly_attributes.nil?
+-          attributes.delete_if { |key, value| self.class.readonly_attributes.include?(key.gsub(/\(.+/,"")) }
+-        else
+-          attributes
+-        end
++        attributes.delete_if { |key, value| self.class.readonly_attributes_include?(key) }
++      end
++
++      # Returns true if the class has a readonly attribute with the symbol or string provided, otherwise false.
++      def self.readonly_attributes_include?(attribute)
++        return false if self.readonly_attributes.nil?
++        self.readonly_attributes.include?(attribute.to_s.gsub(/\(.+/,"")) ? true : false
+       end
+ 
+       def log_protected_attribute_removal(*attributes)
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index eec16c0..cac188a 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -873,6 +873,21 @@ class BasicsTest < ActiveRecord::TestCase
+     Topic.find(1).update_attribute(:approved, false)
+     assert !Topic.find(1).approved?
+   end
++  
++  def test_update_attribute_raises_an_exception_if_given_a_readonly_attribute
++    assert_equal Set.new([ 'title' , 'comments_count' ]), ReadonlyTitlePost.readonly_attributes
++
++    post = ReadonlyTitlePost.create(:title => "cannot change this")
++    post.reload
++    assert_equal "cannot change this", post.title
++
++    assert_raises(ActiveRecord::ReadOnlyAttributeError) do
++      post.update_attribute(:title, "try to change")
++    end
++
++    post.reload
++    assert_equal "cannot change this", post.title
++  end
+ 
+   def test_update_attributes
+     topic = Topic.find(1)
+@@ -1002,6 +1017,14 @@ class BasicsTest < ActiveRecord::TestCase
+     assert_equal "cannot change this", post.title
+     assert_equal "changed", post.body
+   end
++  
++  def test_readonly_attributes_include
++    assert_equal Set.new([ 'title' , 'comments_count' ]), ReadonlyTitlePost.readonly_attributes
++    assert ReadonlyTitlePost.readonly_attributes_include?('title')
++    assert ReadonlyTitlePost.readonly_attributes_include?(:title)
++    assert !ReadonlyTitlePost.readonly_attributes_include?('body')
++    assert !ReadonlyTitlePost.readonly_attributes_include?(:body)
++  end
+ 
+   def test_multiparameter_attributes_on_date
+     attributes = { "last_read(1i)" => "2004", "last_read(2i)" => "6", "last_read(3i)" => "24" }
+-- 
+1.6.1
+

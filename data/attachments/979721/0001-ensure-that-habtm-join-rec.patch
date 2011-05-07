@@ -1,0 +1,174 @@
+From 390836ce8629277d08220acd7a621df627a83a99 Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Sat, 26 Mar 2011 23:47:59 +0000
+Subject: [PATCH] Ensure that habtm join records are deleted after any before destroy callbacks, but before the record itself is destroy (so as not to violate any foreign keys)
+
+---
+ .../builder/has_and_belongs_to_many.rb             |   22 +++++++++----------
+ activerecord/lib/active_record/persistence.rb      |    6 +++++
+ .../test/cases/habtm_destroy_order_test.rb         |   10 ++++++++-
+ activerecord/test/models/assembly.rb               |   12 ++++++++++
+ activerecord/test/models/part.rb                   |    3 ++
+ activerecord/test/schema/schema.rb                 |   17 +++++++++++++-
+ 6 files changed, 55 insertions(+), 15 deletions(-)
+ create mode 100644 activerecord/test/models/assembly.rb
+ create mode 100644 activerecord/test/models/part.rb
+
+diff --git a/activerecord/lib/active_record/associations/builder/has_and_belongs_to_many.rb b/activerecord/lib/active_record/associations/builder/has_and_belongs_to_many.rb
+index 4b48757..093e280 100644
+--- a/activerecord/lib/active_record/associations/builder/has_and_belongs_to_many.rb
++++ b/activerecord/lib/active_record/associations/builder/has_and_belongs_to_many.rb
+@@ -7,24 +7,22 @@ module ActiveRecord::Associations::Builder
+     def build
+       reflection = super
+       check_validity(reflection)
+-      define_after_destroy_method
++      define_destroy_associations_method
+       reflection
+     end
+ 
+     private
+ 
+-      def define_after_destroy_method
++      def define_destroy_associations_method
+         name = self.name
+-        model.send(:class_eval, <<-eoruby, __FILE__, __LINE__ + 1)
+-          def #{after_destroy_method_name}
+-            association(#{name.to_sym.inspect}).delete_all
+-          end
+-        eoruby
+-        model.after_destroy after_destroy_method_name
+-      end
+-
+-      def after_destroy_method_name
+-        "has_and_belongs_to_many_after_destroy_for_#{name}"
++        model.send(:include, Module.new {
++          class_eval <<-eoruby, __FILE__, __LINE__ + 1
++            def destroy_associations
++              #{name}.clear
++              super
++            end
++          eoruby
++        })
+       end
+ 
+       # TODO: These checks should probably be moved into the Reflection, and we should not be
+diff --git a/activerecord/lib/active_record/persistence.rb b/activerecord/lib/active_record/persistence.rb
+index 3377a59..2af0169 100644
+--- a/activerecord/lib/active_record/persistence.rb
++++ b/activerecord/lib/active_record/persistence.rb
+@@ -75,6 +75,8 @@ module ActiveRecord
+     # Deletes the record in the database and freezes this instance to reflect
+     # that no changes should be made (since they can't be persisted).
+     def destroy
++      destroy_associations
++      
+       if persisted?
+         IdentityMap.remove(self) if IdentityMap.enabled?
+         self.class.unscoped.where(self.class.arel_table[self.class.primary_key].eq(id)).delete_all
+@@ -249,6 +251,10 @@ module ActiveRecord
+     end
+ 
+   private
++    # A hook to be overriden by association modules.
++    def destroy_associations
++    end
++
+     def create_or_update
+       raise ReadOnlyRecord if readonly?
+       result = new_record? ? create : update
+diff --git a/activerecord/test/cases/habtm_destroy_order_test.rb b/activerecord/test/cases/habtm_destroy_order_test.rb
+index f2b91d9..6501159 100644
+--- a/activerecord/test/cases/habtm_destroy_order_test.rb
++++ b/activerecord/test/cases/habtm_destroy_order_test.rb
+@@ -1,7 +1,8 @@
+ require "cases/helper"
+ require "models/lesson"
+ require "models/student"
+-
++require "models/assembly"
++require "models/part"
+ class HabtmDestroyOrderTest < ActiveRecord::TestCase
+   test "may not delete a lesson with students" do
+     sicp = Lesson.new(:name => "SICP")
+@@ -16,6 +17,13 @@ class HabtmDestroyOrderTest < ActiveRecord::TestCase
+     assert !sicp.destroyed?
+   end
+ 
++  test "join records should be removed before the destroy" do
++    car = Assembly.create(:name => "car")
++    wheels = Part.create(:name => "wheels")
++    car.parts << wheels
++    car.destroy
++  end
++  
+   test "not destroying a student with lessons leaves student<=>lesson association intact" do
+     # test a normal before_destroy doesn't destroy the habtm joins
+     begin
+diff --git a/activerecord/test/models/assembly.rb b/activerecord/test/models/assembly.rb
+new file mode 100644
+index 0000000..5b53e5e
+--- /dev/null
++++ b/activerecord/test/models/assembly.rb
+@@ -0,0 +1,12 @@
++class Assembly < ActiveRecord::Base
++  after_destroy :check_for_associated_records
++  has_and_belongs_to_many :parts
++  
++  def check_for_associated_records
++    if parts.any?
++      raise 'Association should have been cleared'
++    end
++  end
++end
++
++  
+\ No newline at end of file
+diff --git a/activerecord/test/models/part.rb b/activerecord/test/models/part.rb
+new file mode 100644
+index 0000000..5c9ec5b
+--- /dev/null
++++ b/activerecord/test/models/part.rb
+@@ -0,0 +1,3 @@
++class Part < ActiveRecord::Base
++  has_and_belongs_to_many :assemblies
++end
+\ No newline at end of file
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 362475d..0f5019b 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -39,7 +39,16 @@ ActiveRecord::Schema.define do
+     t.string :name
+     t.references :account
+   end
+-
++  
++  create_table :assemblies, :force => true do |t|
++    t.string :name
++  end
++  
++  create_table :assemblies_parts, :force => true, :id => false do |t|
++    t.integer :part_id
++    t.integer :assembly_id
++  end
++  
+   create_table :audit_logs, :force => true do |t|
+     t.column :message, :string, :null=>false
+     t.column :developer_id, :integer, :null=>false
+@@ -429,7 +438,11 @@ ActiveRecord::Schema.define do
+     t.column :parrot_id, :integer
+     t.column :treasure_id, :integer
+   end
+-
++  
++  create_table :parts, :force => true do |t|
++    t.string :name
++  end
++  
+   create_table :people, :force => true do |t|
+     t.string     :first_name, :null => false
+     t.references :primary_contact
+-- 
+1.7.3.3
+

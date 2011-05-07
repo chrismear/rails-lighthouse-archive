@@ -1,0 +1,406 @@
+From a1aee9e6d613887d48836f06f589f9973f6cce25 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Tue, 11 Aug 2009 13:39:48 +0200
+Subject: [PATCH] Fix reloading of metal pieces.
+ - Do not hold references to old metal objects after metal classes have
+   been reloaded.
+ - Obtain the reloader lock before building the middleware stack, so that
+   reloading of metal pieces works in the face of multithreading.
+
+---
+ actionpack/lib/action_controller/dispatcher.rb |   27 ++++++--
+ actionpack/lib/action_controller/reloader.rb   |   22 +++----
+ actionpack/test/abstract_unit.rb               |   16 +++++
+ actionpack/test/controller/dispatcher_test.rb  |   61 +++++++++++++++---
+ actionpack/test/controller/reloader_test.rb    |   79 ++++++++----------------
+ 5 files changed, 123 insertions(+), 82 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/dispatcher.rb b/actionpack/lib/action_controller/dispatcher.rb
+index 07931e4..94eafe1 100644
+--- a/actionpack/lib/action_controller/dispatcher.rb
++++ b/actionpack/lib/action_controller/dispatcher.rb
+@@ -2,13 +2,12 @@ module ActionController
+   # Dispatches requests to the appropriate controller and takes care of
+   # reloading the app after each request when Dependencies.load? is true.
+   class Dispatcher
++    @@cache_classes = true
++    
+     class << self
+       def define_dispatcher_callbacks(cache_classes)
++        @@cache_classes = cache_classes
+         unless cache_classes
+-          unless self.middleware.include?(Reloader)
+-            self.middleware.insert_after(Failsafe, Reloader)
+-          end
+-
+           ActionView::Helpers::AssetTagHelper.cache_asset_timestamps = false
+         end
+ 
+@@ -79,7 +78,7 @@ module ActionController
+     # DEPRECATE: Remove arguments, since they are only used by CGI
+     def initialize(output = $stdout, request = nil, response = nil)
+       @output = output
+-      @app = @@middleware.build(lambda { |env| self.dup._call(env) })
++      build_middleware_stack if @@cache_classes
+     end
+ 
+     def dispatch
+@@ -103,7 +102,18 @@ module ActionController
+     end
+ 
+     def call(env)
+-      @app.call(env)
++      if @@cache_classes
++        @app.call(env)
++      else
++        Reloader.run do
++          # When class reloading is turned on, we will want to rebuild the
++          # middleware stack every time we process a request. If we don't
++          # rebuild the middleware stack, then the stack may contain references
++          # to old classes metal classes, which will b0rk class reloading.
++          build_middleware_stack
++          @app.call(env)
++        end
++      end
+     end
+ 
+     def _call(env)
+@@ -114,5 +124,10 @@ module ActionController
+     def flush_logger
+       Base.logger.flush
+     end
++    
++    private
++      def build_middleware_stack
++        @app = @@middleware.build(lambda { |env| self.dup._call(env) })
++      end
+   end
+ end
+diff --git a/actionpack/lib/action_controller/reloader.rb b/actionpack/lib/action_controller/reloader.rb
+index e47d5ce..83bc9a9 100644
+--- a/actionpack/lib/action_controller/reloader.rb
++++ b/actionpack/lib/action_controller/reloader.rb
+@@ -2,7 +2,8 @@ require 'thread'
+ 
+ module ActionController
+   class Reloader
+-    @@lock = Mutex.new
++    @@default_lock = Mutex.new
++    cattr_accessor :default_lock
+ 
+     class BodyWrapper
+       def initialize(body, lock)
+@@ -25,17 +26,12 @@ module ActionController
+         symbol == :close || @body.respond_to?(symbol, include_private)
+       end
+     end
+-
+-    def initialize(app, lock = @@lock)
+-      @app = app
+-      @lock = lock
+-    end
+-
+-    def call(env)
+-      @lock.lock
+-      Dispatcher.reload_application
++    
++    def self.run(lock = @@default_lock)
++      lock.lock
+       begin
+-        status, headers, body = @app.call(env)
++        Dispatcher.reload_application
++        status, headers, body = yield
+         # We do not want to call 'cleanup_application' in an ensure block
+         # because the returned Rack response body may lazily generate its data. This
+         # is for example the case if one calls
+@@ -48,9 +44,9 @@ module ActionController
+         # completely finished. So we wrap the body in a BodyWrapper class so that
+         # when the Rack handler calls #close during the end of the request, we get to
+         # run our cleanup code.
+-        [status, headers, BodyWrapper.new(body, @lock)]
++        [status, headers, BodyWrapper.new(body, lock)]
+       rescue Exception
+-        @lock.unlock
++        lock.unlock
+         raise
+       end
+     end
+diff --git a/actionpack/test/abstract_unit.rb b/actionpack/test/abstract_unit.rb
+index 0b67e56..8acc451 100644
+--- a/actionpack/test/abstract_unit.rb
++++ b/actionpack/test/abstract_unit.rb
+@@ -43,3 +43,19 @@ ActionController::Base.view_paths = FIXTURE_LOAD_PATH
+ CACHED_VIEW_PATHS = ActionView::Base.cache_template_loading? ?
+                       ActionController::Base.view_paths :
+                       ActionController::Base.view_paths.map {|path| ActionView::Template::EagerPath.new(path.to_s)}
++
++class DummyMutex
++  def lock
++    @locked = true
++  end
++
++  def unlock
++    @locked = false
++  end
++
++  def locked?
++    @locked
++  end
++end
++
++ActionController::Reloader.default_lock = DummyMutex.new
+\ No newline at end of file
+diff --git a/actionpack/test/controller/dispatcher_test.rb b/actionpack/test/controller/dispatcher_test.rb
+index 3aa5bf9..c3ba34c 100644
+--- a/actionpack/test/controller/dispatcher_test.rb
++++ b/actionpack/test/controller/dispatcher_test.rb
+@@ -2,25 +2,17 @@ require 'abstract_unit'
+ 
+ class DispatcherTest < Test::Unit::TestCase
+   Dispatcher = ActionController::Dispatcher
++  Reloader   = ActionController::Reloader
+ 
+   def setup
+     ENV['REQUEST_METHOD'] = 'GET'
+-
+-    Dispatcher.middleware = ActionController::MiddlewareStack.new do |middleware|
+-      middlewares = File.expand_path(File.join(File.dirname(__FILE__), "../../lib/action_controller/middlewares.rb"))
+-      middleware.instance_eval(File.read(middlewares))
+-    end
+-
+-    # Clear callbacks as they are redefined by Dispatcher#define_dispatcher_callbacks
+-    Dispatcher.instance_variable_set("@prepare_dispatch_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-    Dispatcher.instance_variable_set("@before_dispatch_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-    Dispatcher.instance_variable_set("@after_dispatch_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-
++    reset_dispatcher
+     Dispatcher.stubs(:require_dependency)
+   end
+ 
+   def teardown
+     ENV.delete 'REQUEST_METHOD'
++    reset_dispatcher
+   end
+ 
+   def test_clears_dependencies_after_dispatch_if_in_loading_mode
+@@ -40,6 +32,34 @@ class DispatcherTest < Test::Unit::TestCase
+ 
+     dispatch
+   end
++  
++  def test_builds_middleware_stack_only_during_initialization_if_not_in_loading_mode
++    dispatcher = create_dispatcher
++    assert_not_nil dispatcher.instance_variable_get(:"@app")
++    dispatcher.instance_variable_set(:"@app", lambda {})
++    dispatcher.expects(:build_middleware_stack).never
++    dispatcher.call(nil)
++    dispatcher.call(nil)
++  end
++  
++  def test_rebuilds_middleware_stack_on_every_request_if_in_loading_mode
++    dispatcher = create_dispatcher(false)
++    dispatcher.instance_variable_set(:"@app", lambda {})
++    dispatcher.expects(:build_middleware_stack).twice
++    dispatcher.call(nil)
++    Reloader.default_lock.unlock
++    dispatcher.call(nil)
++  end
++  
++  def test_doesnt_wrap_call_in_reloader_if_not_in_loading_mode
++    Reloader.expects(:run).never
++    dispatch
++  end
++  
++  def test_wraps_call_in_reloader_if_in_loading_mode
++    Reloader.expects(:run).once
++    dispatch(false)
++  end
+ 
+   # Stub out dispatch error logger
+   class << Dispatcher
+@@ -98,6 +118,25 @@ class DispatcherTest < Test::Unit::TestCase
+       Dispatcher.define_dispatcher_callbacks(cache_classes)
+       Dispatcher.new.call({'rack.input' => StringIO.new('')})
+     end
++    
++    def create_dispatcher(cache_classes = true)
++      Dispatcher.define_dispatcher_callbacks(cache_classes)
++      Dispatcher.new
++    end
++    
++    def reset_dispatcher
++      Dispatcher.middleware = ActionController::MiddlewareStack.new do |middleware|
++        middlewares = File.expand_path(File.join(File.dirname(__FILE__), "../../lib/action_controller/middlewares.rb"))
++        middleware.instance_eval(File.read(middlewares))
++      end
++
++      # Clear callbacks as they are redefined by Dispatcher#define_dispatcher_callbacks
++      Dispatcher.instance_variable_set("@prepare_dispatch_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
++      Dispatcher.instance_variable_set("@before_dispatch_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
++      Dispatcher.instance_variable_set("@after_dispatch_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
++      
++      Dispatcher.define_dispatcher_callbacks(true)
++    end
+ 
+     def assert_subclasses(howmany, klass, message = klass.subclasses.inspect)
+       assert_equal howmany, klass.subclasses.size, message
+diff --git a/actionpack/test/controller/reloader_test.rb b/actionpack/test/controller/reloader_test.rb
+index 9eab9e1..e530549 100644
+--- a/actionpack/test/controller/reloader_test.rb
++++ b/actionpack/test/controller/reloader_test.rb
+@@ -22,87 +22,62 @@ class ReloaderTests < ActiveSupport::TestCase
+     end
+   end
+ 
+-  class MyLock
+-    def lock
+-      @locked = true
+-    end
+-
+-    def unlock
+-      @locked = false
+-    end
+-
+-    def locked?
+-      @locked
+-    end
+-  end
+-
+   def setup
+     @lock = Mutex.new
+   end
+ 
+-  def setup_and_return_body(app = lambda { |env| })
++  def test_it_reloads_the_application_before_yielding
+     Dispatcher.expects(:reload_application)
+-    reloader = Reloader.new(app, @lock)
+-    headers, status, body = reloader.call({ })
+-    body
+-  end
+-
+-  def test_it_reloads_the_application_before_the_request
+-    Dispatcher.expects(:reload_application)
+-    reloader = Reloader.new(lambda { |env|
++    Reloader.run(@lock) do
+       [200, { "Content-Type" => "text/html" }, [""]]
+-    }, @lock)
+-    reloader.call({ })
++    end
+   end
+ 
+-  def test_it_locks_before_calling_app
+-    lock = MyLock.new
++  def test_it_locks_before_yielding
++    lock = DummyMutex.new
+     Dispatcher.expects(:reload_application)
+-    reloader = Reloader.new(lambda { |env|
++    Reloader.run(lock) do
++      assert lock.locked?
+       [200, { "Content-Type" => "text/html" }, [""]]
+-    }, lock)
+-    assert !lock.locked?
+-    reloader.call({ })
++    end
+     assert lock.locked?
+   end
+ 
+   def test_it_unlocks_upon_calling_close_on_body
+-    lock = MyLock.new
++    lock = DummyMutex.new
+     Dispatcher.expects(:reload_application)
+-    reloader = Reloader.new(lambda { |env|
++    headers, status, body = Reloader.run(lock) do
+       [200, { "Content-Type" => "text/html" }, [""]]
+-    }, lock)
+-    headers, status, body = reloader.call({ })
++    end
+     body.close
+     assert !lock.locked?
+   end
+ 
+   def test_it_unlocks_if_app_object_raises_exception
+-    lock = MyLock.new
++    lock = DummyMutex.new
+     Dispatcher.expects(:reload_application)
+-    reloader = Reloader.new(lambda { |env|
+-      raise "oh no!"
+-    }, lock)
+     assert_raise(RuntimeError) do
+-      reloader.call({ })
++      Reloader.run(lock) do
++        raise "oh no!"
++      end
+     end
+     assert !lock.locked?
+   end
+ 
+   def test_returned_body_object_always_responds_to_close
+-    body = setup_and_return_body(lambda { |env|
++    status, headers, body = Reloader.run(@lock) do
+       [200, { "Content-Type" => "text/html" }, [""]]
+-    })
++    end
+     assert body.respond_to?(:close)
+   end
+ 
+   def test_returned_body_object_behaves_like_underlying_object
+-    body = setup_and_return_body(lambda { |env|
++    status, headers, body = Reloader.run(@lock) do
+       b = MyBody.new
+       b << "hello"
+       b << "world"
+       [200, { "Content-Type" => "text/html" }, b]
+-    })
++    end
+     assert_equal 2, body.size
+     assert_equal "hello", body[0]
+     assert_equal "world", body[1]
+@@ -112,20 +87,20 @@ class ReloaderTests < ActiveSupport::TestCase
+ 
+   def test_it_calls_close_on_underlying_object_when_close_is_called_on_body
+     close_called = false
+-    body = setup_and_return_body(lambda { |env|
++    status, headers, body = Reloader.run(@lock) do
+       b = MyBody.new do
+         close_called = true
+       end
+       [200, { "Content-Type" => "text/html" }, b]
+-    })
++    end
+     body.close
+     assert close_called
+   end
+ 
+   def test_returned_body_object_responds_to_all_methods_supported_by_underlying_object
+-    body = setup_and_return_body(lambda { |env|
++    status, headers, body = Reloader.run(@lock) do
+       [200, { "Content-Type" => "text/html" }, MyBody.new]
+-    })
++    end
+     assert body.respond_to?(:size)
+     assert body.respond_to?(:each)
+     assert body.respond_to?(:foo)
+@@ -134,16 +109,16 @@ class ReloaderTests < ActiveSupport::TestCase
+ 
+   def test_it_doesnt_clean_up_the_application_after_call
+     Dispatcher.expects(:cleanup_application).never
+-    body = setup_and_return_body(lambda { |env|
++    status, headers, body = Reloader.run(@lock) do
+       [200, { "Content-Type" => "text/html" }, MyBody.new]
+-    })
++    end
+   end
+ 
+   def test_it_cleans_up_the_application_when_close_is_called_on_body
+     Dispatcher.expects(:cleanup_application)
+-    body = setup_and_return_body(lambda { |env|
++    status, headers, body = Reloader.run(@lock) do
+       [200, { "Content-Type" => "text/html" }, MyBody.new]
+-    })
++    end
+     body.close
+   end
+ end
+-- 
+1.6.0.5
+

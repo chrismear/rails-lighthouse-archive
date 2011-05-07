@@ -1,0 +1,214 @@
+From e3af308e72e79b56e6df12fc4f8391ff5ef5d475 Mon Sep 17 00:00:00 2001
+From: Diego Carrion <dc.rec1@gmail.com>
+Date: Wed, 9 Jun 2010 02:05:36 -0300
+Subject: [PATCH] added shallow routes to new router [#3765]
+
+---
+ actionpack/lib/action_dispatch/routing/mapper.rb |   76 ++++++++++++++++++++--
+ actionpack/test/dispatch/routing_test.rb         |   47 +++++++++++++
+ 2 files changed, 116 insertions(+), 7 deletions(-)
+
+diff --git a/actionpack/lib/action_dispatch/routing/mapper.rb b/actionpack/lib/action_dispatch/routing/mapper.rb
+index 7b79b6b..98e7a1a 100644
+--- a/actionpack/lib/action_dispatch/routing/mapper.rb
++++ b/actionpack/lib/action_dispatch/routing/mapper.rb
+@@ -295,6 +295,19 @@ module ActionDispatch
+           super
+         end
+ 
++        def id_scope
++          scope(':id') do
++            @scope[:name_prefix] = nil if @scope[:shallow]
++            yield
++          end
++        end
++
++        def resource_scope(resource)
++          scope(:path => resource.path, :controller => resource.controller, :shallow => resource.shallow?) do
++            yield
++          end
++        end
++
+         def scope(*args)
+           options = args.extract_options!
+           options = options.dup
+@@ -374,12 +387,51 @@ module ActionDispatch
+             @scope_options ||= private_methods.grep(/^merge_(.+)_scope$/) { $1.to_sym }
+           end
+ 
++          def merge_shallow_scope(parent, child)
++            parent or child
++          end
++
+           def merge_path_scope(parent, child)
+-            Mapper.normalize_path("#{parent}/#{child}")
++            parent_path = @scope[:shallow] ? format_parent_shallow_path(parent, child) : parent
++            Mapper.normalize_path "#{parent_path}/#{child}"
++          end
++
++          def format_parent_shallow_path(parent, child)
++            if child.eql?(':id')
++              parent.split('/').last
++            elsif inner_resource?
++              inner_resource_shallow_path
++            else
++              parent
++            end
++          end
++
++          def inner_resource?
++            @scope[:name_prefix]
++          end
++
++          def inner_resource_shallow_path
++            if @scope[:scope_level_resource].singleton?
++              @scope[:not_singleton_path]
++            else
++              @scope[:not_singleton_path] = "/#{@scope[:name_prefix].pluralize}/:#{@scope[:name_prefix]}_id/"
++            end
+           end
+ 
+           def merge_name_prefix_scope(parent, child)
+-            parent ? "#{parent}_#{child}" : child
++            if @scope[:shallow]
++              shallow_name_prefix parent, child
++            else
++              parent ? "#{parent}_#{child}" : child
++            end
++          end
++
++          def shallow_name_prefix(parent, child)
++            singleton_path? ? parent : child
++          end
++
++          def singleton_path?
++            @scope[:scope_level_resource].singleton?
+           end
+ 
+           def merge_module_scope(parent, child)
+@@ -522,6 +574,14 @@ module ActionDispatch
+             options["#{singular}_id".to_sym] = id_constraint if id_constraint?
+             options
+           end
++
++          def shallow?
++            options[:shallow]
++          end
++
++          def singleton?
++            false
++          end
+         end
+ 
+         class SingletonResource < Resource #:nodoc:
+@@ -555,6 +615,10 @@ module ActionDispatch
+           def nested_options
+             { :name_prefix => member_name }
+           end
++
++          def singleton?
++            true
++          end
+         end
+ 
+         def initialize(*args) #:nodoc:
+@@ -572,9 +636,8 @@ module ActionDispatch
+ 
+           resource = SingletonResource.new(resources.pop, options)
+ 
+-          scope(:path => resource.path, :controller => resource.controller) do
++          resource_scope(resource) do
+             with_scope_level(:resource, resource) do
+-
+               yield if block_given?
+ 
+               with_scope_level(:member) do
+@@ -603,10 +666,9 @@ module ActionDispatch
+ 
+           resource = Resource.new(resources.pop, options)
+ 
+-          scope(:path => resource.path, :controller => resource.controller) do
++          resource_scope(resource) do
+             with_scope_level(:resources, resource) do
+               yield if block_given?
+-
+               with_scope_level(:collection) do
+                 scope(resource.collection_options) do
+                   get  :index if resource.actions.include?(:index)
+@@ -616,7 +678,7 @@ module ActionDispatch
+               end
+ 
+               with_scope_level(:member) do
+-                scope(':id') do
++                id_scope do
+                   scope(resource.options) do
+                     get    :show if resource.actions.include?(:show)
+                     put    :update if resource.actions.include?(:update)
+diff --git a/actionpack/test/dispatch/routing_test.rb b/actionpack/test/dispatch/routing_test.rb
+index e13960e..7e823c3 100644
+--- a/actionpack/test/dispatch/routing_test.rb
++++ b/actionpack/test/dispatch/routing_test.rb
+@@ -34,6 +34,36 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+         end
+       end
+ 
++      resources :users, :shallow => true do
++        resources :photos do
++          resources :types do
++            member do
++              post :preview
++            end
++            collection do
++              delete :erase
++            end
++          end
++        end
++      end
++
++      scope :shallow => true do
++        resources :teams do
++          resources :players
++        end
++
++        resources :countries do
++          resources :cities do
++            resources :places
++            resource :major do
++              resource :minor do
++                resource :patch
++              end
++            end
++          end
++        end
++      end
++
+       match 'account/logout' => redirect("/logout"), :as => :logout_redirect
+       match 'account/login', :to => redirect("/login")
+ 
+@@ -762,6 +792,23 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  def test_shallow_routes
++    with_test_routes do
++      assert_equal '/photos/4', photo_path(4)
++      assert_equal '/types/10/edit', edit_type_path(10) 
++      assert_equal '/types/5/preview', preview_type_path(5)
++      assert_equal '/photos/2/types', photo_types_path(2)
++      assert_equal '/cities/1/places', url_for(:controller => :places, :action => :index, :city_id => 1, :only_path => true)
++      assert_equal '/teams/new', url_for(:controller => :teams, :action => :new, :only_path => true)
++      assert_equal '/photos/11/types/erase', url_for(:controller => :types, :action => :erase, :photo_id => 11, :only_path => true)
++      assert_equal '/cities/10/major', city_major_path(10)
++      assert_equal '/cities/10/major/new', url_for(:controller => :majors, :action => :new, :city_id => 10, :only_path => true)
++      assert_equal '/cities/10/minor', url_for(:controller => :minors, :action => :show, :city_id => 10, :only_path => true)
++      assert_equal '/cities/10/patch', url_for(:controller => :patches, :action => :show, :city_id => 10, :only_path => true)
++      assert_equal '/cities/10/patch', city_patch_path(10)
++    end
++  end
++
+   def test_update_project_person
+     with_test_routes do
+       get '/projects/1/people/2/update'
+-- 
+1.6.5.2
+

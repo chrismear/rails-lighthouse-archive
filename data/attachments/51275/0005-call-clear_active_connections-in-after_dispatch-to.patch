@@ -1,0 +1,63 @@
+From 1bac8ee568e20f61dcd1edfb61a8d0a8c80ed95f Mon Sep 17 00:00:00 2001
+From: Aliaksey Kandratsenka <alk@tut.by>
+Date: Thu, 2 Oct 2008 22:59:03 +0300
+Subject: [PATCH] call clear_active_connections! in :after_dispatch to give pooled connections back
+
+This fixes connection pool exhaustion for web servers which create new thread per connection (e.g. Webrick).
+
+integration.rb changes are required to keep test transaction active for several requests.
+---
+ actionpack/lib/action_controller/dispatcher.rb  |   16 ++++++++++++++++
+ actionpack/lib/action_controller/integration.rb |    2 +-
+ 2 files changed, 17 insertions(+), 1 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/dispatcher.rb b/actionpack/lib/action_controller/dispatcher.rb
+index 2e43aea..4daa278 100644
+--- a/actionpack/lib/action_controller/dispatcher.rb
++++ b/actionpack/lib/action_controller/dispatcher.rb
+@@ -22,6 +22,7 @@ module ActionController
+         end
+ 
+         if defined?(ActiveRecord)
++          after_dispatch :checkin_connections
+           before_dispatch { ActiveRecord::Base.verify_active_connections! }
+           to_prepare(:activerecord_instantiate_observers) { ActiveRecord::Base.instantiate_observers }
+         end
+@@ -149,6 +150,21 @@ module ActionController
+       Base.logger.flush
+     end
+ 
++    def mark_as_test_request!
++      @this_is_test_request = true
++      self
++    end
++
++    def test_request?
++      defined?(@this_is_test_request) && @this_is_test_request
++    end
++
++    def checkin_connections
++      # Don't return connection (and peform implicit rollback) if this request is a part of integration test
++      return if test_request?
++      ActiveRecord::Base.clear_active_connections!
++    end
++
+     protected
+       def handle_request
+         @controller = Routing::Routes.recognize(@request)
+diff --git a/actionpack/lib/action_controller/integration.rb b/actionpack/lib/action_controller/integration.rb
+index a98c1af..fc473c2 100644
+--- a/actionpack/lib/action_controller/integration.rb
++++ b/actionpack/lib/action_controller/integration.rb
+@@ -276,7 +276,7 @@ module ActionController
+           ActionController::Base.clear_last_instantiation!
+ 
+           env['rack.input'] = data.is_a?(IO) ? data : StringIO.new(data || '')
+-          @status, @headers, result_body = ActionController::Dispatcher.new.call(env)
++          @status, @headers, result_body = ActionController::Dispatcher.new.mark_as_test_request!.call(env)
+           @request_count += 1
+ 
+           @controller = ActionController::Base.last_instantiation
+-- 
+1.5.6.5
+

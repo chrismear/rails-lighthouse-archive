@@ -1,0 +1,791 @@
+From ef2abc8d379039efef2d64076c9de5599b5bc6e9 Mon Sep 17 00:00:00 2001
+From: Jeroen van Dijk <jeroen@jeevidee.nl> and Sven Fuchs <svenfuchs@artweb-design.de>
+Date: Sat, 15 May 2010 19:43:45 +0200
+Subject: [PATCH] Make ActiveModel::Errors#add_on_blank and #add_on_empty accept an options hash
+ and make various Validators pass their (filtered) options.
+
+This makes it possible to pass additional options through Validators to message
+generation. E.g. plugin authors want to add validates_presence_of :foo, :format
+=> "some format".
+
+Also, cleanup the :default vs :message options confusion in ActiveModel
+validation message generation.
+
+Also, deprecate ActiveModel::Errors#add_on_blank(attributes, custom_message) in
+favor of ActiveModel::Errors#add_on_blank(attributes, options).
+
+Original patch by Sven Fuchs, some minor changes and has been changed to be applicable to master again
+---
+ activemodel/lib/active_model/errors.rb             |   54 ++++++++++---
+ .../lib/active_model/validations/acceptance.rb     |    2 +-
+ .../lib/active_model/validations/confirmation.rb   |    2 +-
+ .../lib/active_model/validations/exclusion.rb      |    2 +-
+ activemodel/lib/active_model/validations/format.rb |    4 +-
+ .../lib/active_model/validations/inclusion.rb      |    2 +-
+ activemodel/lib/active_model/validations/length.rb |    4 +-
+ .../lib/active_model/validations/numericality.rb   |    8 +-
+ .../lib/active_model/validations/presence.rb       |    2 +-
+ .../i18n_generate_message_validation_test.rb       |   82 ++++++++++----------
+ .../test/cases/validations/i18n_validation_test.rb |   64 ++++++++--------
+ .../lib/active_record/validations/associated.rb    |    2 +-
+ .../lib/active_record/validations/uniqueness.rb    |    2 +-
+ .../i18n_generate_message_validation_test.rb       |   12 ++--
+ .../test/cases/validations/i18n_validation_test.rb |    8 +-
+ 15 files changed, 139 insertions(+), 111 deletions(-)
+
+diff --git a/activemodel/lib/active_model/errors.rb b/activemodel/lib/active_model/errors.rb
+index 14afc52..1d2b35b 100644
+--- a/activemodel/lib/active_model/errors.rb
++++ b/activemodel/lib/active_model/errors.rb
+@@ -179,25 +179,45 @@ module ActiveModel
+     # If +message+ is a Proc, it will be called, allowing for things like Time.now to be used within an error
+     def add(attribute, message = nil, options = {})
+       message ||= :invalid
+-      message = generate_message(attribute, message, options) if message.is_a?(Symbol)
++
++      reserved = [:minimum, :maximum, :is, :within , :in, :allow_nil, :allow_blank, :case_sensitive,
++                  :too_long, :too_short, :wrong_length, :on, :if, :unless , :tokenizer, :invalid,
++                  :only_integer, :odd, :even, :less_than, :with, :accept]
++
++      message = generate_message(attribute, message, options.except(*reserved)) if message.is_a?(Symbol)
++
+       message = message.call if message.is_a?(Proc)
+       self[attribute] << message
+     end
+ 
+     # Will add an error message to each of the attributes in +attributes+ that is empty.
+-    def add_on_empty(attributes, custom_message = nil)
++    def add_on_empty(attributes, options = {})
++      if options && !options.is_a?(Hash)
++        options = { :message => options }
++        ActiveSupport::Deprecation.warn \
++          "ActiveModel::Errors#add_on_empty(attributes, custom_message) has been deprecated.\n" +
++          "Instead of passing a custom_message pass an options Hash { :message => custom_message }."
++      end
++
+       [attributes].flatten.each do |attribute|
+         value = @base.send(:read_attribute_for_validation, attribute)
+         is_empty = value.respond_to?(:empty?) ? value.empty? : false
+-        add(attribute, :empty, :default => custom_message) unless !value.nil? && !is_empty
++        add(attribute, :empty, options) if value.nil? || is_empty
+       end
+     end
+ 
+     # Will add an error message to each of the attributes in +attributes+ that is blank (using Object#blank?).
+-    def add_on_blank(attributes, custom_message = nil)
++    def add_on_blank(attributes, options = {})
++      if options && !options.is_a?(Hash)
++        options = { :message => options }
++        ActiveSupport::Deprecation.warn \
++          "ActiveModel::Errors#add_on_blank(attributes, custom_message) has been deprecated.\n" +
++          "Instead of passing a custom_message pass an options Hash { :message => custom_message }."
++      end
++
+       [attributes].flatten.each do |attribute|
+         value = @base.send(:read_attribute_for_validation, attribute)
+-        add(attribute, :blank, :default => custom_message) if value.blank?
++        add(attribute, :blank, options) if value.blank?
+       end
+     end
+ 
+@@ -254,18 +274,26 @@ module ActiveModel
+     # <li><tt>errors.attributes.title.blank</tt></li>
+     # <li><tt>errors.messages.blank</tt></li>
+     # </ol>
+-    def generate_message(attribute, message = :invalid, options = {})
+-      message, options[:default] = options[:default], message if options[:default].is_a?(Symbol)
++
++    def generate_message(attribute, type = :invalid, options = {})
++      type = options.delete(:message) if options[:message].is_a?(Symbol)
++
++      if options[:default]
++        ActiveSupport::Deprecation.warn \
++          "ActiveModel::Errors#generate_message(attributes, custom_message) has been deprecated.\n" +
++          "Use ActiveModel::Errors#generate_message(attributes, :message => 'your message') instead."
++        options[:message] = options.delete(:default)
++      end
+ 
+       defaults = @base.class.lookup_ancestors.map do |klass|
+-        [ :"#{@base.class.i18n_scope}.errors.models.#{klass.model_name.underscore}.attributes.#{attribute}.#{message}",
+-          :"#{@base.class.i18n_scope}.errors.models.#{klass.model_name.underscore}.#{message}" ]
++        [ :"#{@base.class.i18n_scope}.errors.models.#{klass.model_name.underscore}.attributes.#{attribute}.#{type}",
++          :"#{@base.class.i18n_scope}.errors.models.#{klass.model_name.underscore}.#{type}" ]
+       end
+ 
+-      defaults << options.delete(:default)
+-      defaults << :"#{@base.class.i18n_scope}.errors.messages.#{message}"
+-      defaults << :"errors.attributes.#{attribute}.#{message}"
+-      defaults << :"errors.messages.#{message}"
++      defaults << options.delete(:message)
++      defaults << :"#{@base.class.i18n_scope}.errors.messages.#{type}"
++      defaults << :"errors.attributes.#{attribute}.#{type}"
++      defaults << :"errors.messages.#{type}"
+ 
+       defaults.compact!
+       defaults.flatten!
+diff --git a/activemodel/lib/active_model/validations/acceptance.rb b/activemodel/lib/active_model/validations/acceptance.rb
+index 26b12b5..ced083b 100644
+--- a/activemodel/lib/active_model/validations/acceptance.rb
++++ b/activemodel/lib/active_model/validations/acceptance.rb
+@@ -7,7 +7,7 @@ module ActiveModel
+ 
+       def validate_each(record, attribute, value)
+         unless value == options[:accept]
+-          record.errors.add(attribute, :accepted, :default => options[:message])
++          record.errors.add(attribute, :accepted, options)
+         end
+       end
+       
+diff --git a/activemodel/lib/active_model/validations/confirmation.rb b/activemodel/lib/active_model/validations/confirmation.rb
+index 5144534..66bce0d 100644
+--- a/activemodel/lib/active_model/validations/confirmation.rb
++++ b/activemodel/lib/active_model/validations/confirmation.rb
+@@ -4,7 +4,7 @@ module ActiveModel
+       def validate_each(record, attribute, value)
+         confirmed = record.send(:"#{attribute}_confirmation")
+         return if confirmed.nil? || value == confirmed
+-        record.errors.add(attribute, :confirmation, :default => options[:message])
++        record.errors.add(attribute, :confirmation, options)
+       end
+       
+       def setup(klass)
+diff --git a/activemodel/lib/active_model/validations/exclusion.rb b/activemodel/lib/active_model/validations/exclusion.rb
+index 2ee78f5..da4c84f 100644
+--- a/activemodel/lib/active_model/validations/exclusion.rb
++++ b/activemodel/lib/active_model/validations/exclusion.rb
+@@ -8,7 +8,7 @@ module ActiveModel
+ 
+       def validate_each(record, attribute, value)
+         return unless options[:in].include?(value)
+-        record.errors.add(attribute, :exclusion, :default => options[:message], :value => value)
++        record.errors.add(attribute, :exclusion, options.merge(:value => value))
+       end
+     end
+ 
+diff --git a/activemodel/lib/active_model/validations/format.rb b/activemodel/lib/active_model/validations/format.rb
+index c34c860..2667baa 100644
+--- a/activemodel/lib/active_model/validations/format.rb
++++ b/activemodel/lib/active_model/validations/format.rb
+@@ -3,9 +3,9 @@ module ActiveModel
+     class FormatValidator < EachValidator
+       def validate_each(record, attribute, value)
+         if options[:with] && value.to_s !~ options[:with]
+-          record.errors.add(attribute, :invalid, :default => options[:message], :value => value)
++          record.errors.add(attribute, :invalid, options.merge(:value => value))
+         elsif options[:without] && value.to_s =~ options[:without]
+-          record.errors.add(attribute, :invalid, :default => options[:message], :value => value)
++          record.errors.add(attribute, :invalid, options.merge(:value => value))
+         end
+       end
+       
+diff --git a/activemodel/lib/active_model/validations/inclusion.rb b/activemodel/lib/active_model/validations/inclusion.rb
+index 446646d..0ddf191 100644
+--- a/activemodel/lib/active_model/validations/inclusion.rb
++++ b/activemodel/lib/active_model/validations/inclusion.rb
+@@ -8,7 +8,7 @@ module ActiveModel
+ 
+       def validate_each(record, attribute, value)
+         return if options[:in].include?(value)
+-        record.errors.add(attribute, :inclusion, :default => options[:message], :value => value)
++        record.errors.add(attribute, :inclusion, options.merge(:value => value))
+       end
+     end
+ 
+diff --git a/activemodel/lib/active_model/validations/length.rb b/activemodel/lib/active_model/validations/length.rb
+index d7218f4..9b671f5 100644
+--- a/activemodel/lib/active_model/validations/length.rb
++++ b/activemodel/lib/active_model/validations/length.rb
+@@ -37,7 +37,7 @@ module ActiveModel
+ 
+         CHECKS.each do |key, validity_check|
+           next unless check_value = options[key]
+-          custom_message = options[:message] || options[MESSAGES[key]]
++          options[:message] ||= options[MESSAGES[key]] if options[MESSAGES[key]]
+ 
+           valid_value = if key == :maximum
+             value.nil? || value.size.send(validity_check, check_value)
+@@ -46,7 +46,7 @@ module ActiveModel
+           end
+ 
+           next if valid_value
+-          record.errors.add(attribute, MESSAGES[key], :default => custom_message, :count => check_value)
++          record.errors.add(attribute, MESSAGES[key], options.merge(:count => check_value))
+         end
+       end
+     end
+diff --git a/activemodel/lib/active_model/validations/numericality.rb b/activemodel/lib/active_model/validations/numericality.rb
+index 716010e..d407258 100644
+--- a/activemodel/lib/active_model/validations/numericality.rb
++++ b/activemodel/lib/active_model/validations/numericality.rb
+@@ -26,13 +26,13 @@ module ActiveModel
+         return if options[:allow_nil] && raw_value.nil?
+ 
+         unless value = parse_raw_value_as_a_number(raw_value)
+-          record.errors.add(attr_name, :not_a_number, :value => raw_value, :default => options[:message])
++          record.errors.add(attr_name, :not_a_number, options.merge(:value => raw_value))
+           return
+         end
+ 
+         if options[:only_integer]
+           unless value = parse_raw_value_as_an_integer(raw_value)
+-            record.errors.add(attr_name, :not_an_integer, :value => raw_value, :default => options[:message])
++            record.errors.add(attr_name, :not_an_integer, options.merge(:value => raw_value))
+             return
+           end
+         end
+@@ -41,14 +41,14 @@ module ActiveModel
+           case option
+           when :odd, :even
+             unless value.to_i.send(CHECKS[option])
+-              record.errors.add(attr_name, option, :value => value, :default => options[:message])
++              record.errors.add(attr_name, option, options.merge(:value => value))
+             end
+           else
+             option_value = option_value.call(record) if option_value.is_a?(Proc)
+             option_value = record.send(option_value) if option_value.is_a?(Symbol)
+ 
+             unless value.send(CHECKS[option], option_value)
+-              record.errors.add(attr_name, option, :default => options[:message], :value => value, :count => option_value)
++              record.errors.add(attr_name, option, options.merge(:value => value, :count => option_value))
+             end
+           end
+         end
+diff --git a/activemodel/lib/active_model/validations/presence.rb b/activemodel/lib/active_model/validations/presence.rb
+index b319f48..2826a10 100644
+--- a/activemodel/lib/active_model/validations/presence.rb
++++ b/activemodel/lib/active_model/validations/presence.rb
+@@ -4,7 +4,7 @@ module ActiveModel
+   module Validations
+     class PresenceValidator < EachValidator
+       def validate(record)
+-        record.errors.add_on_blank(attributes, options[:message])
++        record.errors.add_on_blank(attributes, options)
+       end
+     end
+ 
+diff --git a/activemodel/test/cases/validations/i18n_generate_message_validation_test.rb b/activemodel/test/cases/validations/i18n_generate_message_validation_test.rb
+index 58a8d17..0679e67 100644
+--- a/activemodel/test/cases/validations/i18n_generate_message_validation_test.rb
++++ b/activemodel/test/cases/validations/i18n_generate_message_validation_test.rb
+@@ -8,131 +8,131 @@ class I18nGenerateMessageValidationTest < ActiveModel::TestCase
+     @person = Person.new
+   end
+ 
+-  # validates_inclusion_of: generate_message(attr_name, :inclusion, :default => configuration[:message], :value => value)
++  # validates_inclusion_of: generate_message(attr_name, :inclusion, :message => custom_message, :value => value)
+   def test_generate_message_inclusion_with_default_message
+-    assert_equal 'is not included in the list', @person.errors.generate_message(:title, :inclusion, :default => nil, :value => 'title')
++    assert_equal 'is not included in the list', @person.errors.generate_message(:title, :inclusion, :value => 'title')
+   end
+ 
+   def test_generate_message_inclusion_with_custom_message
+-    assert_equal 'custom message title', @person.errors.generate_message(:title, :inclusion, :default => 'custom message %{value}', :value => 'title')
++    assert_equal 'custom message title', @person.errors.generate_message(:title, :inclusion, :message => 'custom message %{value}', :value => 'title')
+   end
+ 
+-  # validates_exclusion_of: generate_message(attr_name, :exclusion, :default => configuration[:message], :value => value)
++  # validates_exclusion_of: generate_message(attr_name, :exclusion, :message => custom_message, :value => value)
+   def test_generate_message_exclusion_with_default_message
+-    assert_equal 'is reserved', @person.errors.generate_message(:title, :exclusion, :default => nil, :value => 'title')
++    assert_equal 'is reserved', @person.errors.generate_message(:title, :exclusion, :value => 'title')
+   end
+ 
+   def test_generate_message_exclusion_with_custom_message
+-    assert_equal 'custom message title', @person.errors.generate_message(:title, :exclusion, :default => 'custom message %{value}', :value => 'title')
++    assert_equal 'custom message title', @person.errors.generate_message(:title, :exclusion, :message => 'custom message %{value}', :value => 'title')
+   end
+ 
+-  # validates_format_of:  generate_message(attr_name, :invalid, :default => configuration[:message], :value => value)
++  # validates_format_of:  generate_message(attr_name, :invalid, :message => custom_message, :value => value)
+   def test_generate_message_invalid_with_default_message
+-    assert_equal 'is invalid', @person.errors.generate_message(:title, :invalid, :default => nil, :value => 'title')
++    assert_equal 'is invalid', @person.errors.generate_message(:title, :invalid, :value => 'title')
+   end
+ 
+   def test_generate_message_invalid_with_custom_message
+-    assert_equal 'custom message title', @person.errors.generate_message(:title, :invalid, :default => 'custom message %{value}', :value => 'title')
++    assert_equal 'custom message title', @person.errors.generate_message(:title, :invalid, :message => 'custom message %{value}', :value => 'title')
+   end
+ 
+-  # validates_confirmation_of: generate_message(attr_name, :confirmation, :default => configuration[:message])
++  # validates_confirmation_of: generate_message(attr_name, :confirmation, :message => custom_message)
+   def test_generate_message_confirmation_with_default_message
+-    assert_equal "doesn't match confirmation", @person.errors.generate_message(:title, :confirmation, :default => nil)
++    assert_equal "doesn't match confirmation", @person.errors.generate_message(:title, :confirmation)
+   end
+ 
+   def test_generate_message_confirmation_with_custom_message
+-    assert_equal 'custom message', @person.errors.generate_message(:title, :confirmation, :default => 'custom message')
++    assert_equal 'custom message', @person.errors.generate_message(:title, :confirmation, :message => 'custom message')
+   end
+ 
+-  # validates_acceptance_of: generate_message(attr_name, :accepted, :default => configuration[:message])
++  # validates_acceptance_of: generate_message(attr_name, :accepted, :message => custom_message)
+   def test_generate_message_accepted_with_default_message
+-    assert_equal "must be accepted", @person.errors.generate_message(:title, :accepted, :default => nil)
++    assert_equal "must be accepted", @person.errors.generate_message(:title, :accepted)
+   end
+ 
+   def test_generate_message_accepted_with_custom_message
+-    assert_equal 'custom message', @person.errors.generate_message(:title, :accepted, :default => 'custom message')
++    assert_equal 'custom message', @person.errors.generate_message(:title, :accepted, :message => 'custom message')
+   end
+ 
+-  # add_on_empty: generate_message(attr, :empty, :default => custom_message)
++  # add_on_empty: generate_message(attr, :empty, :message => custom_message)
+   def test_generate_message_empty_with_default_message
+-    assert_equal "can't be empty", @person.errors.generate_message(:title, :empty, :default => nil)
++    assert_equal "can't be empty", @person.errors.generate_message(:title, :empty)
+   end
+ 
+   def test_generate_message_empty_with_custom_message
+-    assert_equal 'custom message', @person.errors.generate_message(:title, :empty, :default => 'custom message')
++    assert_equal 'custom message', @person.errors.generate_message(:title, :empty, :message => 'custom message')
+   end
+ 
+-  # add_on_blank: generate_message(attr, :blank, :default => custom_message)
++  # add_on_blank: generate_message(attr, :blank, :message => custom_message)
+   def test_generate_message_blank_with_default_message
+-    assert_equal "can't be blank", @person.errors.generate_message(:title, :blank, :default => nil)
++    assert_equal "can't be blank", @person.errors.generate_message(:title, :blank)
+   end
+ 
+   def test_generate_message_blank_with_custom_message
+-    assert_equal 'custom message', @person.errors.generate_message(:title, :blank, :default => 'custom message')
++    assert_equal 'custom message', @person.errors.generate_message(:title, :blank, :message => 'custom message')
+   end
+ 
+-  # validates_length_of: generate_message(attr, :too_long, :default => options[:too_long], :count => option_value.end)
++  # validates_length_of: generate_message(attr, :too_long, :message => custom_message, :count => option_value.end)
+   def test_generate_message_too_long_with_default_message
+-    assert_equal "is too long (maximum is 10 characters)", @person.errors.generate_message(:title, :too_long, :default => nil, :count => 10)
++    assert_equal "is too long (maximum is 10 characters)", @person.errors.generate_message(:title, :too_long, :count => 10)
+   end
+ 
+   def test_generate_message_too_long_with_custom_message
+-    assert_equal 'custom message 10', @person.errors.generate_message(:title, :too_long, :default => 'custom message %{count}', :count => 10)
++    assert_equal 'custom message 10', @person.errors.generate_message(:title, :too_long, :message => 'custom message %{count}', :count => 10)
+   end
+ 
+-  # validates_length_of: generate_message(attr, :too_short, :default => options[:too_short], :count => option_value.begin)
++  # validates_length_of: generate_message(attr, :too_short, :default => custom_message, :count => option_value.begin)
+   def test_generate_message_too_short_with_default_message
+-    assert_equal "is too short (minimum is 10 characters)", @person.errors.generate_message(:title, :too_short, :default => nil, :count => 10)
++    assert_equal "is too short (minimum is 10 characters)", @person.errors.generate_message(:title, :too_short, :count => 10)
+   end
+ 
+   def test_generate_message_too_short_with_custom_message
+-    assert_equal 'custom message 10', @person.errors.generate_message(:title, :too_short, :default => 'custom message %{count}', :count => 10)
++    assert_equal 'custom message 10', @person.errors.generate_message(:title, :too_short, :message => 'custom message %{count}', :count => 10)
+   end
+ 
+-  # validates_length_of: generate_message(attr, key, :default => custom_message, :count => option_value)
++  # validates_length_of: generate_message(attr, :wrong_length, :message => custom_message, :count => option_value)
+   def test_generate_message_wrong_length_with_default_message
+-    assert_equal "is the wrong length (should be 10 characters)", @person.errors.generate_message(:title, :wrong_length, :default => nil, :count => 10)
++    assert_equal "is the wrong length (should be 10 characters)", @person.errors.generate_message(:title, :wrong_length, :count => 10)
+   end
+ 
+   def test_generate_message_wrong_length_with_custom_message
+-    assert_equal 'custom message 10', @person.errors.generate_message(:title, :wrong_length, :default => 'custom message %{count}', :count => 10)
++    assert_equal 'custom message 10', @person.errors.generate_message(:title, :wrong_length, :message => 'custom message %{count}', :count => 10)
+   end
+ 
+-  # validates_numericality_of: generate_message(attr_name, :not_a_number, :value => raw_value, :default => configuration[:message])
++  # validates_numericality_of: generate_message(attr_name, :not_a_number, :value => raw_value, :message => custom_message)
+   def test_generate_message_not_a_number_with_default_message
+-    assert_equal "is not a number", @person.errors.generate_message(:title, :not_a_number, :default => nil, :value => 'title')
++    assert_equal "is not a number", @person.errors.generate_message(:title, :not_a_number, :value => 'title')
+   end
+ 
+   def test_generate_message_not_a_number_with_custom_message
+-    assert_equal 'custom message title', @person.errors.generate_message(:title, :not_a_number, :default => 'custom message %{value}', :value => 'title')
++    assert_equal 'custom message title', @person.errors.generate_message(:title, :not_a_number, :message => 'custom message %{value}', :value => 'title')
+   end
+ 
+-  # validates_numericality_of: generate_message(attr_name, option, :value => raw_value, :default => configuration[:message])
++  # validates_numericality_of: generate_message(attr_name, option, :value => raw_value, :default => custom_message)
+   def test_generate_message_greater_than_with_default_message
+-    assert_equal "must be greater than 10", @person.errors.generate_message(:title, :greater_than, :default => nil, :value => 'title', :count => 10)
++    assert_equal "must be greater than 10", @person.errors.generate_message(:title, :greater_than, :value => 'title', :count => 10)
+   end
+ 
+   def test_generate_message_greater_than_or_equal_to_with_default_message
+-    assert_equal "must be greater than or equal to 10", @person.errors.generate_message(:title, :greater_than_or_equal_to, :default => nil, :value => 'title', :count => 10)
++    assert_equal "must be greater than or equal to 10", @person.errors.generate_message(:title, :greater_than_or_equal_to, :value => 'title', :count => 10)
+   end
+ 
+   def test_generate_message_equal_to_with_default_message
+-    assert_equal "must be equal to 10", @person.errors.generate_message(:title, :equal_to, :default => nil, :value => 'title', :count => 10)
++    assert_equal "must be equal to 10", @person.errors.generate_message(:title, :equal_to, :value => 'title', :count => 10)
+   end
+ 
+   def test_generate_message_less_than_with_default_message
+-    assert_equal "must be less than 10", @person.errors.generate_message(:title, :less_than, :default => nil, :value => 'title', :count => 10)
++    assert_equal "must be less than 10", @person.errors.generate_message(:title, :less_than, :value => 'title', :count => 10)
+   end
+ 
+   def test_generate_message_less_than_or_equal_to_with_default_message
+-    assert_equal "must be less than or equal to 10", @person.errors.generate_message(:title, :less_than_or_equal_to, :default => nil, :value => 'title', :count => 10)
++    assert_equal "must be less than or equal to 10", @person.errors.generate_message(:title, :less_than_or_equal_to, :value => 'title', :count => 10)
+   end
+ 
+   def test_generate_message_odd_with_default_message
+-    assert_equal "must be odd", @person.errors.generate_message(:title, :odd, :default => nil, :value => 'title', :count => 10)
++    assert_equal "must be odd", @person.errors.generate_message(:title, :odd, :value => 'title', :count => 10)
+   end
+ 
+   def test_generate_message_even_with_default_message
+-    assert_equal "must be even", @person.errors.generate_message(:title, :even, :default => nil, :value => 'title', :count => 10)
++    assert_equal "must be even", @person.errors.generate_message(:title, :even, :value => 'title', :count => 10)
+   end
+ end
+diff --git a/activemodel/test/cases/validations/i18n_validation_test.rb b/activemodel/test/cases/validations/i18n_validation_test.rb
+index 547d80f..eff2b78 100644
+--- a/activemodel/test/cases/validations/i18n_validation_test.rb
++++ b/activemodel/test/cases/validations/i18n_validation_test.rb
+@@ -22,23 +22,23 @@ class I18nValidationTest < ActiveModel::TestCase
+   end
+ 
+   def test_errors_add_on_empty_generates_message
+-    @person.errors.expects(:generate_message).with(:title, :empty, {:default => nil})
++    @person.errors.expects(:generate_message).with(:title, :empty, {})
+     @person.errors.add_on_empty :title
+   end
+ 
+   def test_errors_add_on_empty_generates_message_with_custom_default_message
+-    @person.errors.expects(:generate_message).with(:title, :empty, {:default => 'custom'})
+-    @person.errors.add_on_empty :title, 'custom'
++    @person.errors.expects(:generate_message).with(:title, :empty, {:message => 'custom'})
++    @person.errors.add_on_empty :title, :message => 'custom'
+   end
+ 
+   def test_errors_add_on_blank_generates_message
+-    @person.errors.expects(:generate_message).with(:title, :blank, {:default => nil})
++    @person.errors.expects(:generate_message).with(:title, :blank, {})
+     @person.errors.add_on_blank :title
+   end
+ 
+   def test_errors_add_on_blank_generates_message_with_custom_default_message
+-    @person.errors.expects(:generate_message).with(:title, :blank, {:default => 'custom'})
+-    @person.errors.add_on_blank :title, 'custom'
++    @person.errors.expects(:generate_message).with(:title, :blank, {:message => 'custom'})
++    @person.errors.add_on_blank :title, :message => 'custom'
+   end
+ 
+   def test_full_message_encoding
+@@ -66,14 +66,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_confirmation_of_generates_message
+     Person.validates_confirmation_of :title
+     @person.title_confirmation = 'foo'
+-    @person.errors.expects(:generate_message).with(:title, :confirmation, {:default => nil})
++    @person.errors.expects(:generate_message).with(:title, :confirmation, {})
+     @person.valid?
+   end
+ 
+   def test_validates_confirmation_of_generates_message_with_custom_default_message
+     Person.validates_confirmation_of :title, :message => 'custom'
+     @person.title_confirmation = 'foo'
+-    @person.errors.expects(:generate_message).with(:title, :confirmation, {:default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :confirmation, {:message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -81,13 +81,13 @@ class I18nValidationTest < ActiveModel::TestCase
+ 
+   def test_validates_acceptance_of_generates_message
+     Person.validates_acceptance_of :title, :allow_nil => false
+-    @person.errors.expects(:generate_message).with(:title, :accepted, {:default => nil})
++    @person.errors.expects(:generate_message).with(:title, :accepted, {})
+     @person.valid?
+   end
+ 
+   def test_validates_acceptance_of_generates_message_with_custom_default_message
+     Person.validates_acceptance_of :title, :message => 'custom', :allow_nil => false
+-    @person.errors.expects(:generate_message).with(:title, :accepted, {:default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :accepted, {:message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -95,13 +95,13 @@ class I18nValidationTest < ActiveModel::TestCase
+ 
+   def test_validates_presence_of_generates_message
+     Person.validates_presence_of :title
+-    @person.errors.expects(:generate_message).with(:title, :blank, {:default => nil})
++    @person.errors.expects(:generate_message).with(:title, :blank, {})
+     @person.valid?
+   end
+ 
+   def test_validates_presence_of_generates_message_with_custom_default_message
+     Person.validates_presence_of :title, :message => 'custom'
+-    @person.errors.expects(:generate_message).with(:title, :blank, {:default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :blank, {:message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -109,27 +109,27 @@ class I18nValidationTest < ActiveModel::TestCase
+ 
+   def test_validates_length_of_within_generates_message_with_title_too_short
+     Person.validates_length_of :title, :within => 3..5
+-    @person.errors.expects(:generate_message).with(:title, :too_short, {:count => 3, :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :too_short, {:count => 3})
+     @person.valid?
+   end
+ 
+   def test_validates_length_of_within_generates_message_with_title_too_short_and_custom_default_message
+     Person.validates_length_of :title, :within => 3..5, :too_short => 'custom'
+-    @person.errors.expects(:generate_message).with(:title, :too_short, {:count => 3, :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :too_short, {:count => 3, :message => 'custom'})
+     @person.valid?
+   end
+ 
+   def test_validates_length_of_within_generates_message_with_title_too_long
+     Person.validates_length_of :title, :within => 3..5
+     @person.title = 'this title is too long'
+-    @person.errors.expects(:generate_message).with(:title, :too_long, {:count => 5, :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :too_long, {:count => 5})
+     @person.valid?
+   end
+ 
+   def test_validates_length_of_within_generates_message_with_title_too_long_and_custom_default_message
+     Person.validates_length_of :title, :within => 3..5, :too_long => 'custom'
+     @person.title = 'this title is too long'
+-    @person.errors.expects(:generate_message).with(:title, :too_long, {:count => 5, :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :too_long, {:count => 5, :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -137,13 +137,13 @@ class I18nValidationTest < ActiveModel::TestCase
+ 
+   def test_validates_length_of_is_generates_message
+     Person.validates_length_of :title, :is => 5
+-    @person.errors.expects(:generate_message).with(:title, :wrong_length, {:count => 5, :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :wrong_length, {:count => 5})
+     @person.valid?
+   end
+ 
+   def test_validates_length_of_is_generates_message_with_custom_default_message
+     Person.validates_length_of :title, :is => 5, :message => 'custom'
+-    @person.errors.expects(:generate_message).with(:title, :wrong_length, {:count => 5, :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :wrong_length, {:count => 5, :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -152,14 +152,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_format_of_generates_message
+     Person.validates_format_of :title, :with => /^[1-9][0-9]*$/
+     @person.title = '72x'
+-    @person.errors.expects(:generate_message).with(:title, :invalid, {:value => '72x', :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :invalid, {:value => '72x'})
+     @person.valid?
+   end
+ 
+   def test_validates_format_of_generates_message_with_custom_default_message
+     Person.validates_format_of :title, :with => /^[1-9][0-9]*$/, :message => 'custom'
+     @person.title = '72x'
+-    @person.errors.expects(:generate_message).with(:title, :invalid, {:value => '72x', :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :invalid, {:value => '72x', :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -168,14 +168,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_inclusion_of_generates_message
+     Person.validates_inclusion_of :title, :in => %w(a b c)
+     @person.title = 'z'
+-    @person.errors.expects(:generate_message).with(:title, :inclusion, {:value => 'z', :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :inclusion, {:value => 'z'})
+     @person.valid?
+   end
+ 
+   def test_validates_inclusion_of_generates_message_with_custom_default_message
+     Person.validates_inclusion_of :title, :in => %w(a b c), :message => 'custom'
+     @person.title = 'z'
+-    @person.errors.expects(:generate_message).with(:title, :inclusion, {:value => 'z', :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :inclusion, {:value => 'z', :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -184,14 +184,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_exclusion_of_generates_message
+     Person.validates_exclusion_of :title, :in => %w(a b c)
+     @person.title = 'a'
+-    @person.errors.expects(:generate_message).with(:title, :exclusion, {:value => 'a', :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :exclusion, {:value => 'a'})
+     @person.valid?
+   end
+ 
+   def test_validates_exclusion_of_generates_message_with_custom_default_message
+     Person.validates_exclusion_of :title, :in => %w(a b c), :message => 'custom'
+     @person.title = 'a'
+-    @person.errors.expects(:generate_message).with(:title, :exclusion, {:value => 'a', :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :exclusion, {:value => 'a', :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -200,14 +200,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_numericality_of_generates_message
+     Person.validates_numericality_of :title
+     @person.title = 'a'
+-    @person.errors.expects(:generate_message).with(:title, :not_a_number, {:value => 'a', :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :not_a_number, {:value => 'a'})
+     @person.valid?
+   end
+ 
+   def test_validates_numericality_of_generates_message_with_custom_default_message
+     Person.validates_numericality_of :title, :message => 'custom'
+     @person.title = 'a'
+-    @person.errors.expects(:generate_message).with(:title, :not_a_number, {:value => 'a', :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :not_a_number, {:value => 'a', :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -216,14 +216,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_numericality_of_only_integer_generates_message
+     Person.validates_numericality_of :title, :only_integer => true
+     @person.title = '0.0'
+-    @person.errors.expects(:generate_message).with(:title, :not_an_integer, {:value => '0.0', :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :not_an_integer, {:value => '0.0'})
+     @person.valid?
+   end
+ 
+   def test_validates_numericality_of_only_integer_generates_message_with_custom_default_message
+     Person.validates_numericality_of :title, :only_integer => true, :message => 'custom'
+     @person.title = '0.0'
+-    @person.errors.expects(:generate_message).with(:title, :not_an_integer, {:value => '0.0', :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :not_an_integer, {:value => '0.0', :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -232,14 +232,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_numericality_of_odd_generates_message
+     Person.validates_numericality_of :title, :only_integer => true, :odd => true
+     @person.title = 0
+-    @person.errors.expects(:generate_message).with(:title, :odd, {:value => 0, :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :odd, {:value => 0})
+     @person.valid?
+   end
+ 
+   def test_validates_numericality_of_odd_generates_message_with_custom_default_message
+     Person.validates_numericality_of :title, :only_integer => true, :odd => true, :message => 'custom'
+     @person.title = 0
+-    @person.errors.expects(:generate_message).with(:title, :odd, {:value => 0, :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :odd, {:value => 0, :message => 'custom'})
+     @person.valid?
+   end
+ 
+@@ -248,14 +248,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   def test_validates_numericality_of_less_than_generates_message
+     Person.validates_numericality_of :title, :only_integer => true, :less_than => 0
+     @person.title = 1
+-    @person.errors.expects(:generate_message).with(:title, :less_than, {:value => 1, :count => 0, :default => nil})
++    @person.errors.expects(:generate_message).with(:title, :less_than, {:value => 1, :count => 0})
+     @person.valid?
+   end
+ 
+   def test_validates_numericality_of_less_than_odd_generates_message_with_custom_default_message
+     Person.validates_numericality_of :title, :only_integer => true, :less_than => 0, :message => 'custom'
+     @person.title = 1
+-    @person.errors.expects(:generate_message).with(:title, :less_than, {:value => 1, :count => 0, :default => 'custom'})
++    @person.errors.expects(:generate_message).with(:title, :less_than, {:value => 1, :count => 0, :message => 'custom'})
+     @person.valid?
+   end
+ 
+diff --git a/activerecord/lib/active_record/validations/associated.rb b/activerecord/lib/active_record/validations/associated.rb
+index e416351..0b0f568 100644
+--- a/activerecord/lib/active_record/validations/associated.rb
++++ b/activerecord/lib/active_record/validations/associated.rb
+@@ -3,7 +3,7 @@ module ActiveRecord
+     class AssociatedValidator < ActiveModel::EachValidator
+       def validate_each(record, attribute, value)
+         return if (value.is_a?(Array) ? value : [value]).collect{ |r| r.nil? || r.valid? }.all?
+-        record.errors.add(attribute, :invalid, :default => options[:message], :value => value)
++        record.errors.add(attribute, :invalid, options.merge(:value => value))
+       end
+     end
+ 
+diff --git a/activerecord/lib/active_record/validations/uniqueness.rb b/activerecord/lib/active_record/validations/uniqueness.rb
+index 6283bdd..f256107 100644
+--- a/activerecord/lib/active_record/validations/uniqueness.rb
++++ b/activerecord/lib/active_record/validations/uniqueness.rb
+@@ -32,7 +32,7 @@ module ActiveRecord
+         end
+ 
+         if relation.exists?
+-          record.errors.add(attribute, :taken, :default => options[:message], :value => value)
++          record.errors.add(attribute, :taken, options.merge(:value => value))
+         end
+       end
+ 
+diff --git a/activerecord/test/cases/validations/i18n_generate_message_validation_test.rb b/activerecord/test/cases/validations/i18n_generate_message_validation_test.rb
+index 8ee2a58..454e42e 100644
+--- a/activerecord/test/cases/validations/i18n_generate_message_validation_test.rb
++++ b/activerecord/test/cases/validations/i18n_generate_message_validation_test.rb
+@@ -9,22 +9,22 @@ class I18nGenerateMessageValidationTest < ActiveRecord::TestCase
+     I18n.backend = I18n::Backend::Simple.new
+   end
+ 
+-  # validates_associated: generate_message(attr_name, :invalid, :default => configuration[:message], :value => value)
++  # validates_associated: generate_message(attr_name, :invalid, :message => custom_message, :value => value)
+   def test_generate_message_invalid_with_default_message
+-    assert_equal 'is invalid', @topic.errors.generate_message(:title, :invalid, :default => nil, :value => 'title')
++    assert_equal 'is invalid', @topic.errors.generate_message(:title, :invalid, :value => 'title')
+   end
+ 
+   def test_generate_message_invalid_with_custom_message
+-    assert_equal 'custom message title', @topic.errors.generate_message(:title, :invalid, :default => 'custom message %{value}', :value => 'title')
++    assert_equal 'custom message title', @topic.errors.generate_message(:title, :invalid, :message => 'custom message %{value}', :value => 'title')
+   end
+ 
+-  # validates_uniqueness_of: generate_message(attr_name, :taken, :default => configuration[:message])
++  # validates_uniqueness_of: generate_message(attr_name, :taken, :message => custom_message)
+   def test_generate_message_taken_with_default_message
+-    assert_equal "has already been taken", @topic.errors.generate_message(:title, :taken, :default => nil, :value => 'title')
++    assert_equal "has already been taken", @topic.errors.generate_message(:title, :taken, :value => 'title')
+   end
+ 
+   def test_generate_message_taken_with_custom_message
+-    assert_equal 'custom message title', @topic.errors.generate_message(:title, :taken, :default => 'custom message %{value}', :value => 'title')
++    assert_equal 'custom message title', @topic.errors.generate_message(:title, :taken, :message => 'custom message %{value}', :value => 'title')
+   end
+ 
+   # ActiveRecord#RecordInvalid exception
+diff --git a/activerecord/test/cases/validations/i18n_validation_test.rb b/activerecord/test/cases/validations/i18n_validation_test.rb
+index 38fa2b8..79f32e4 100644
+--- a/activerecord/test/cases/validations/i18n_validation_test.rb
++++ b/activerecord/test/cases/validations/i18n_validation_test.rb
+@@ -36,14 +36,14 @@ class I18nValidationTest < ActiveRecord::TestCase
+   def test_validates_uniqueness_of_generates_message
+     Topic.validates_uniqueness_of :title
+     @topic.title = unique_topic.title
+-    @topic.errors.expects(:generate_message).with(:title, :taken, {:default => nil, :value => 'unique!'})
++    @topic.errors.expects(:generate_message).with(:title, :taken, {:value => 'unique!'})
+     @topic.valid?
+   end
+ 
+   def test_validates_uniqueness_of_generates_message_with_custom_default_message
+     Topic.validates_uniqueness_of :title, :message => 'custom'
+     @topic.title = unique_topic.title
+-    @topic.errors.expects(:generate_message).with(:title, :taken, {:default => 'custom', :value => 'unique!'})
++    @topic.errors.expects(:generate_message).with(:title, :taken, {:message => 'custom', :value => 'unique!'})
+     @topic.valid?
+   end
+ 
+@@ -51,13 +51,13 @@ class I18nValidationTest < ActiveRecord::TestCase
+ 
+   def test_validates_associated_generates_message
+     Topic.validates_associated :replies
+-    replied_topic.errors.expects(:generate_message).with(:replies, :invalid, {:value => replied_topic.replies, :default => nil})
++    replied_topic.errors.expects(:generate_message).with(:replies, :invalid, {:value => replied_topic.replies})
+     replied_topic.valid?
+   end
+ 
+   def test_validates_associated_generates_message_with_custom_default_message
+     Topic.validates_associated :replies
+-    replied_topic.errors.expects(:generate_message).with(:replies, :invalid, {:value => replied_topic.replies, :default => nil})
++    replied_topic.errors.expects(:generate_message).with(:replies, :invalid, {:value => replied_topic.replies})
+     replied_topic.valid?
+   end
+ 
+-- 
+1.6.0.2
+

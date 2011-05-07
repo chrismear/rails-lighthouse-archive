@@ -1,0 +1,179 @@
+From c4f2587d4644b18343203da094cd058905e9c7ab Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Mon, 25 May 2009 17:28:22 +0200
+Subject: [PATCH] In the default failsafe message and the default 500.html, instruct the administrator to read the log files to find out what's wrong. Added documentation and unit tests for Failsafe.
+
+---
+ actionpack/lib/action_controller/failsafe.rb  |   42 ++++++++++++++++--
+ actionpack/test/controller/dispatcher_test.rb |   11 +++--
+ actionpack/test/controller/failsafe_test.rb   |   60 +++++++++++++++++++++++++
+ railties/html/500.html                        |    1 +
+ 4 files changed, 105 insertions(+), 9 deletions(-)
+ create mode 100644 actionpack/test/controller/failsafe_test.rb
+
+diff --git a/actionpack/lib/action_controller/failsafe.rb b/actionpack/lib/action_controller/failsafe.rb
+index 36d0ab5..b7e3571 100644
+--- a/actionpack/lib/action_controller/failsafe.rb
++++ b/actionpack/lib/action_controller/failsafe.rb
+@@ -1,4 +1,17 @@
+ module ActionController
++  # The Failsafe middleware is usually the top-most middleware in the Rack
++  # middleware chain. It returns the underlying middleware's response, but if
++  # the underlying middle raises an exception then Failsafe will log the
++  # exception into the Rails log file, and will attempt to return an error
++  # message response.
++  #
++  # Failsafe is a last resort for logging errors and for telling the HTTP
++  # client that something went wrong. Do not confuse this with the
++  # ActionController::Rescue module, which is responsible for catching
++  # exceptions at deeper levels. Unlike Failsafe, which is as simple as
++  # possible, Rescue provides features that allow developers to hook into
++  # the error handling logic, and can customize the error message response
++  # based on the HTTP client's IP.
+   class Failsafe
+     cattr_accessor :error_file_path
+     self.error_file_path = Rails.public_path if defined?(Rails.public_path)
+@@ -27,12 +40,33 @@ module ActionController
+       end
+ 
+       def failsafe_response_body
+-        error_path = "#{self.class.error_file_path}/500.html"
+-        if File.exist?(error_path)
+-          File.read(error_path)
++        error_template_path = "#{self.class.error_file_path}/500.html"
++        if File.exist?(error_template_path)
++          begin
++            result = read_template_file(error_template_path)
++          rescue Exception
++            result = nil
++          end
+         else
+-          "<html><body><h1>500 Internal Server Error</h1></body></html>"
++          result = nil
+         end
++        if result.nil?
++          result = "<html><body><h1>500 Internal Server Error</h1>" <<
++            "If you are the administrator of this website, then please read this web " <<
++            "application's log file and/or the web server's log file to find out what " <<
++            "went wrong.</body></html>"
++        end
++        result
++      end
++      
++      # The default 500.html uses the h() method.
++      def h(text) # :nodoc:
++        ERB::Util.h(text)
++      end
++      
++      # Method exists to facilitate unit testing.
++      def read_template_file(filename) # :nodoc:
++        File.read(filename)
+       end
+ 
+       def log_failsafe_exception(exception)
+diff --git a/actionpack/test/controller/dispatcher_test.rb b/actionpack/test/controller/dispatcher_test.rb
+index 1e6243f..070a43e 100644
+--- a/actionpack/test/controller/dispatcher_test.rb
++++ b/actionpack/test/controller/dispatcher_test.rb
+@@ -49,13 +49,14 @@ class DispatcherTest < Test::Unit::TestCase
+     Dispatcher.any_instance.expects(:dispatch).raises('b00m')
+     ActionController::Failsafe.any_instance.expects(:log_failsafe_exception)
+ 
++    response = nil
+     assert_nothing_raised do
+-      assert_equal [
+-        500,
+-        {"Content-Type" => "text/html"},
+-        "<html><body><h1>500 Internal Server Error</h1></body></html>"
+-      ], dispatch
++      response = dispatch
+     end
++    assert_equal 3, response.size
++    assert_equal 500, response[0]
++    assert_equal({"Content-Type" => "text/html"}, response[1])
++    assert_match /500 Internal Server Error/, response[2]
+   end
+ 
+   def test_prepare_callbacks
+diff --git a/actionpack/test/controller/failsafe_test.rb b/actionpack/test/controller/failsafe_test.rb
+new file mode 100644
+index 0000000..73c3478
+--- /dev/null
++++ b/actionpack/test/controller/failsafe_test.rb
+@@ -0,0 +1,60 @@
++require 'abstract_unit'
++require 'stringio'
++require 'logger'
++
++class FailsafeTest < ActionController::TestCase
++  FIXTURE_PUBLIC = "#{File.dirname(__FILE__)}/../fixtures/public".freeze
++  
++  def setup
++    @old_error_file_path = ActionController::Failsafe.error_file_path
++    ActionController::Failsafe.error_file_path = FIXTURE_PUBLIC
++    @app = mock
++    @log_io = StringIO.new
++    @logger = Logger.new(@log_io)
++    @failsafe = ActionController::Failsafe.new(@app)
++    @failsafe.stubs(:failsafe_logger).returns(@logger)
++  end
++  
++  def teardown
++    ActionController::Failsafe.error_file_path = @old_error_file_path
++  end
++  
++  def app_will_raise_error!
++    @app.expects(:call).then.raises(RuntimeError.new("Printer on fire"))
++  end
++  
++  def test_calls_app_and_returns_its_return_value
++    @app.expects(:call).returns([200, { "Content-Type" => "text/html" }, "ok"])
++    assert_equal [200, { "Content-Type" => "text/html" }, "ok"], @failsafe.call({})
++  end
++  
++  def test_writes_to_log_file_on_exception
++    app_will_raise_error!
++    @failsafe.call({})
++    assert_match /Printer on fire/, @log_io.string     # Logs exception message.
++    assert_match /failsafe_test\.rb/, @log_io.string   # Logs backtrace.
++  end
++  
++  def test_returns_500_internal_server_error_on_exception
++    app_will_raise_error!
++    response = @failsafe.call({})
++    assert_equal 3, response.size    # It is a valid Rack response.
++    assert_equal 500, response[0]    # Status is 500.
++  end
++  
++  def test_returns_error_page_file_as_response_body
++    app_will_raise_error!
++    response = @failsafe.call({})
++    assert_equal 500, response[0]
++    assert_equal "500 error fixture\n", response[2]
++  end
++  
++  def test_returns_a_default_message_if_error_page_file_cannot_be_loaded
++    app_will_raise_error!
++    @failsafe.expects(:read_template_file).raises(RuntimeError.new("Harddisk is crashing"))
++    response = @failsafe.call({})
++    assert_equal 500, response[0]
++    assert_match /500 Internal Server Error/, response[2]
++    assert_match %r(please read this web application's log file and/or the web server's log file), response[2]
++  end
++end
+\ No newline at end of file
+diff --git a/railties/html/500.html b/railties/html/500.html
+index ec3bbf0..d3ed737 100644
+--- a/railties/html/500.html
++++ b/railties/html/500.html
+@@ -25,6 +25,7 @@
+   <div class="dialog">
+     <h1>We're sorry, but something went wrong.</h1>
+     <p>We've been notified about this issue and we'll take a look at it shortly.</p>
++    <small>(If you're the administrator of this website, then please read this application's log file and/or the web server's log file to find out what went wrong.)</small>
+   </div>
+ </body>
+ </html>
+-- 
+1.6.0.5
+

@@ -1,0 +1,127 @@
+From 67f59923c2187fd6a21b7c3553fc4ef08d33cb0f Mon Sep 17 00:00:00 2001
+From: Jack Christensen <jack@jackchristensen.com>
+Date: Sat, 23 Jan 2010 20:16:29 -0600
+Subject: [PATCH] Make Rails time zone support work with PostgreSQL TIMESTAMP WITH ZONE type.
+
+---
+ .../connection_adapters/postgresql_adapter.rb      |    6 +++-
+ .../test/cases/datatype_test_postgresql.rb         |   39 ++++++++++++++++++++
+ .../test/schema/postgresql_specific_schema.rb      |    9 ++++-
+ 3 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 1d52c5e..b3ce8c7 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -998,7 +998,7 @@ module ActiveRecord
+           configure_connection
+         end
+ 
+-        # Configures the encoding, verbosity, and schema search path of the connection.
++        # Configures the encoding, verbosity, schema search path, and time zone of the connection.
+         # This is called by #connect and should not be called manually.
+         def configure_connection
+           if @config[:encoding]
+@@ -1010,6 +1010,10 @@ module ActiveRecord
+           end
+           self.client_min_messages = @config[:min_messages] if @config[:min_messages]
+           self.schema_search_path = @config[:schema_search_path] || @config[:schema_order]
++          
++          # If using ActiveRecord's time zone support configure the connection to return
++          # TIMESTAMP WITH ZONE types in UTC.
++          execute("SET time zone 'UTC'") if ActiveRecord::Base.default_timezone == :utc
+         end
+ 
+         # Returns the current ID of a table's sequence.
+diff --git a/activerecord/test/cases/datatype_test_postgresql.rb b/activerecord/test/cases/datatype_test_postgresql.rb
+index 88fb6f7..9454b6e 100644
+--- a/activerecord/test/cases/datatype_test_postgresql.rb
++++ b/activerecord/test/cases/datatype_test_postgresql.rb
+@@ -21,6 +21,9 @@ end
+ class PostgresqlOid < ActiveRecord::Base
+ end
+ 
++class PostgresqlTimestampWithZone < ActiveRecord::Base
++end
++
+ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+   self.use_transactional_fixtures = false
+ 
+@@ -50,6 +53,8 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+ 
+     @connection.execute("INSERT INTO postgresql_oids (obj_id) VALUES (1234)")
+     @first_oid = PostgresqlOid.find(1)
++    
++    @connection.execute("INSERT INTO postgresql_timestamp_with_zones (time) VALUES ('2010-01-01 10:00:00-1')")
+   end
+ 
+   def test_data_type_of_array_types
+@@ -201,4 +206,38 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     assert @first_oid.reload
+     assert_equal @first_oid.obj_id, new_value
+   end
++
++  def test_timestamp_with_zone_values_with_rails_time_zone_support
++    old_tz         = ActiveRecord::Base.time_zone_aware_attributes
++    old_default_tz = ActiveRecord::Base.default_timezone
++
++    ActiveRecord::Base.time_zone_aware_attributes = true
++    ActiveRecord::Base.default_timezone = :utc
++
++    @connection.reconnect!
++
++    @first_timestamp_with_zone = PostgresqlTimestampWithZone.find(1)
++    assert_equal Time.utc(2010,1,1, 11,0,0), @first_timestamp_with_zone.time
++  ensure
++    ActiveRecord::Base.default_timezone = old_default_tz
++    ActiveRecord::Base.time_zone_aware_attributes = old_tz
++    @connection.reconnect!
++  end
++
++  def test_timestamp_with_zone_values_without_rails_time_zone_support
++    old_tz         = ActiveRecord::Base.time_zone_aware_attributes
++    old_default_tz = ActiveRecord::Base.default_timezone
++
++    ActiveRecord::Base.time_zone_aware_attributes = false
++    ActiveRecord::Base.default_timezone = :local
++
++    @connection.reconnect!
++
++    @first_timestamp_with_zone = PostgresqlTimestampWithZone.find(1)
++    assert_equal Time.utc(2010,1,1, 11,0,0), @first_timestamp_with_zone.time
++  ensure
++    ActiveRecord::Base.default_timezone = old_default_tz
++    ActiveRecord::Base.time_zone_aware_attributes = old_tz
++    @connection.reconnect!
++  end
+ end
+diff --git a/activerecord/test/schema/postgresql_specific_schema.rb b/activerecord/test/schema/postgresql_specific_schema.rb
+index 3d8911b..065d8cf 100644
+--- a/activerecord/test/schema/postgresql_specific_schema.rb
++++ b/activerecord/test/schema/postgresql_specific_schema.rb
+@@ -1,7 +1,7 @@
+ ActiveRecord::Schema.define do
+ 
+   %w(postgresql_arrays postgresql_moneys postgresql_numbers postgresql_times postgresql_network_addresses postgresql_bit_strings
+-      postgresql_oids postgresql_xml_data_type defaults geometrics).each do |table_name|
++      postgresql_oids postgresql_xml_data_type defaults geometrics postgresql_timestamp_with_zones).each do |table_name|
+     execute "DROP TABLE  IF EXISTS #{quote_table_name table_name}"
+   end
+ 
+@@ -100,6 +100,13 @@ _SQL
+     obj_id OID
+   );
+ _SQL
++  
++  execute <<_SQL
++  CREATE TABLE postgresql_timestamp_with_zones (
++    id SERIAL PRIMARY KEY,
++    time TIMESTAMP WITH TIME ZONE
++  );
++_SQL
+ 
+   begin
+     execute <<_SQL
+-- 
+1.6.0.4
+

@@ -1,0 +1,873 @@
+From 7613ddb023dba2ac8bfde0cbf26092992c72e56c Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Wed, 21 Jan 2009 16:25:27 +0100
+Subject: [PATCH] Added AutosaveAssociation, which is a module that takes care of automatically saving your associations when the parent is saved. In addition to saving, it also destroys any associations that were marked for destruction.
+
+---
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/associations.rb     |   13 +
+ .../lib/active_record/autosave_association.rb      |  213 +++++++++++
+ activerecord/lib/active_record/base.rb             |    5 +
+ activerecord/lib/active_record/reflection.rb       |    5 +
+ .../test/cases/autosave_association_test.rb        |  386 ++++++++++++++++++++
+ activerecord/test/cases/dirty_test.rb              |    2 +-
+ activerecord/test/cases/reflection_test.rb         |    9 +
+ activerecord/test/models/bird.rb                   |    3 +
+ activerecord/test/models/parrot.rb                 |    2 +
+ activerecord/test/models/pirate.rb                 |    5 +-
+ activerecord/test/models/ship.rb                   |    5 +
+ activerecord/test/models/ship_part.rb              |    5 +
+ activerecord/test/schema/schema.rb                 |   11 +
+ 14 files changed, 663 insertions(+), 2 deletions(-)
+ create mode 100644 activerecord/lib/active_record/autosave_association.rb
+ create mode 100644 activerecord/test/cases/autosave_association_test.rb
+ create mode 100644 activerecord/test/models/bird.rb
+ create mode 100644 activerecord/test/models/ship_part.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index e1265b7..fe59af5 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -46,6 +46,7 @@ module ActiveRecord
+   autoload :AssociationPreload, 'active_record/association_preload'
+   autoload :Associations, 'active_record/associations'
+   autoload :AttributeMethods, 'active_record/attribute_methods'
++  autoload :AutosaveAssociation, 'active_record/autosave_association'
+   autoload :Base, 'active_record/base'
+   autoload :Calculations, 'active_record/calculations'
+   autoload :Callbacks, 'active_record/callbacks'
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 7377b13..7a88465 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -268,6 +268,10 @@ module ActiveRecord
+     # You can manipulate objects and associations before they are saved to the database, but there is some special behavior you should be
+     # aware of, mostly involving the saving of associated objects.
+     #
++    # Unless you enable the :autosave option on a <tt>has_one</tt>, <tt>belongs_to</tt>,
++    # <tt>has_many</tt>, or <tt>has_and_belongs_to_many</tt> association,
++    # in which case the members are always saved.
++    #
+     # === One-to-one associations
+     #
+     # * Assigning an object to a +has_one+ association automatically saves that object and the object being replaced (if there is one), in
+@@ -764,6 +768,9 @@ module ActiveRecord
+       #   If true, all the associated objects are readonly through the association.
+       # [:validate]
+       #   If false, don't validate the associated objects when saving the parent object. true by default.
++      # [:autosave]
++      #   If true, always save any loaded members and destroy members marked for destruction, when saving the parent object. Off by default.
++      #
+       # Option examples:
+       #   has_many :comments, :order => "posted_on"
+       #   has_many :comments, :include => :author
+@@ -877,6 +884,8 @@ module ActiveRecord
+       #   If true, the associated object is readonly through the association.
+       # [:validate]
+       #   If false, don't validate the associated object when saving the parent object. +false+ by default.
++      # [:autosave]
++      #   If true, always save the associated object or destroy it if marked for destruction, when saving the parent object. Off by default.
+       #
+       # Option examples:
+       #   has_one :credit_card, :dependent => :destroy  # destroys the associated credit card
+@@ -988,6 +997,8 @@ module ActiveRecord
+       #   If true, the associated object is readonly through the association.
+       # [:validate]
+       #   If false, don't validate the associated objects when saving the parent object. +false+ by default.
++      # [:autosave]
++      #   If true, always save the associated object or destroy it if marked for destruction, when saving the parent object. Off by default.
+       #
+       # Option examples:
+       #   belongs_to :firm, :foreign_key => "client_of"
+@@ -1200,6 +1211,8 @@ module ActiveRecord
+       #   If true, all the associated objects are readonly through the association.
+       # [:validate]
+       #   If false, don't validate the associated objects when saving the parent object. +true+ by default.
++      # [:autosave]
++      #   If true, always save any loaded members and destroy members marked for destruction, when saving the parent object. Off by default.
+       #
+       # Option examples:
+       #   has_and_belongs_to_many :projects
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+new file mode 100644
+index 0000000..07660eb
+--- /dev/null
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -0,0 +1,213 @@
++module ActiveRecord
++  # AutosaveAssociation is a module that takes care of automatically saving
++  # your associations when the parent is saved. In addition to saving, it
++  # also destroys any associations that were marked for destruction.
++  # (See mark_for_destruction and marked_for_destruction?)
++  #
++  # Saving of the parent, its associations, and the destruction of marked
++  # associations, all happen inside 1 transaction. This should never leave the
++  # database in an inconsistent state after, for instance, mass assigning
++  # attributes and saving them.
++  #
++  # If validations for any of the associations fail, their error messages will
++  # be applied to the parent.
++  #
++  # Note that it also means that associations marked for destruction won't
++  # be destroyed directly. They will however still be marked for destruction.
++  #
++  # === One-to-one Example
++  #
++  # Consider a Post model with one Author:
++  #
++  #   class Post
++  #     has_one :author, :autosave => true
++  #   end
++  #
++  # Saving changes to the parent and its associated model can now be performed
++  # automatically _and_ atomically:
++  #
++  #   post = Post.find(1)
++  #   post.title # => "The current global position of migrating ducks"
++  #   post.author.name # => "alloy"
++  #
++  #   post.title = "On the migration of ducks"
++  #   post.author.name = "Eloy Duran"
++  #
++  #   post.save
++  #   post.reload
++  #   post.title # => "On the migration of ducks"
++  #   post.author.name # => "Eloy Duran"
++  #
++  # Destroying an associated model, as part of the parent's save action, is as
++  # simple as marking it for destruction:
++  #
++  #   post.author.mark_for_destruction
++  #   post.author.marked_for_destruction? # => true
++  #
++  # Note that the model is _not_ yet removed from the database:
++  #   id = post.author.id
++  #   Author.find_by_id(id).nil? # => false
++  #
++  #   post.save
++  #   post.reload.author # => nil
++  #
++  # Now it _is_ removed from the database:
++  #   Author.find_by_id(id).nil? # => true
++  #
++  # === One-to-many Example
++  #
++  # Consider a Post model with many Comments:
++  #
++  #   class Post
++  #     has_many :comments, :autosave => true
++  #   end
++  #
++  # Saving changes to the parent and its associated model can now be performed
++  # automatically _and_ atomically:
++  #
++  #   post = Post.find(1)
++  #   post.title # => "The current global position of migrating ducks"
++  #   post.comments.first.body # => "Wow, awesome info thanks!"
++  #   post.comments.last.body # => "Actually, your article should be named differently."
++  #
++  #   post.title = "On the migration of ducks"
++  #   post.comments.last.body = "Actually, your article should be named differently. [UPDATED]: You are right, thanks."
++  #
++  #   post.save
++  #   post.reload
++  #   post.title # => "On the migration of ducks"
++  #   post.comments.last.body # => "Actually, your article should be named differently. [UPDATED]: You are right, thanks."
++  #
++  # Destroying one of the associated models members, as part of the parent's
++  # save action, is as simple as marking it for destruction:
++  #
++  #   post.comments.last.mark_for_destruction
++  #   post.comments.last.marked_for_destruction? # => true
++  #   post.comments.length # => 2
++  #
++  # Note that the model is _not_ yet removed from the database:
++  #   id = post.comments.last.id
++  #   Comment.find_by_id(id).nil? # => false
++  #
++  #   post.save
++  #   post.reload.comments.length # => 1
++  #
++  # Now it _is_ removed from the database:
++  #   Comment.find_by_id(id).nil? # => true
++  #
++  # === Validation
++  #
++  # Validation is performed on the parent as usual, but also on all autosave
++  # enabled associations. If any of the associations fail validation, its
++  # error messages will be applied on the parents errors object and validation
++  # of the parent will fail.
++  #
++  # Consider a Post model with Author which validates the presence of its name
++  # attribute:
++  #
++  #   class Post
++  #     has_one :author, :autosave => true
++  #   end
++  #
++  #   class Author
++  #     validates_presence_of :name
++  #   end
++  #
++  #   post = Post.find(1)
++  #   post.author.name = ''
++  #   post.save # => false
++  #   post.errors # => #<ActiveRecord::Errors:0x174498c @errors={"author_name"=>["can't be blank"]}, @base=#<Post ...>>
++  #
++  # No validations will be performed on the associated models when validations
++  # are skipped for the parent:
++  #
++  #   post = Post.find(1)
++  #   post.author.name = ''
++  #   post.save(false) # => true
++  module AutosaveAssociation
++    def self.included(base)
++      base.class_eval do
++        alias_method_chain :reload, :autosave_associations
++        alias_method_chain :save,   :autosave_associations
++        alias_method_chain :valid?, :autosave_associations
++
++        %w{ has_one belongs_to has_many has_and_belongs_to_many }.each do |type|
++          base.send("valid_keys_for_#{type}_association") << :autosave
++        end
++      end
++    end
++
++    # Saves the parent, <tt>self</tt>, and any loaded autosave associations.
++    # In addition, it destroys all children that were marked for destruction
++    # with mark_for_destruction.
++    #
++    # This all happens inside a transaction, _if_ the Transactions module is included into
++    # ActiveRecord::Base after the AutosaveAssociation module, which it does by default.
++    def save_with_autosave_associations(perform_validation = true)
++      returning(save_without_autosave_associations(perform_validation)) do |valid|
++        if valid
++          self.class.reflect_on_all_autosave_associations.each do |reflection|
++            if (association = association_instance_get(reflection.name)) && association.loaded?
++              if association.is_a?(Array)
++                association.proxy_target.each do |child|
++                  child.marked_for_destruction? ? child.destroy : child.save(perform_validation)
++                end
++              else
++                association.marked_for_destruction? ? association.destroy : association.save(perform_validation)
++              end
++            end
++          end
++        end
++      end
++    end
++
++    # Returns whether or not the parent, <tt>self</tt>, and any loaded autosave associations are valid.
++    def valid_with_autosave_associations?
++      if valid_without_autosave_associations?
++        self.class.reflect_on_all_autosave_associations.all? do |reflection|
++          if (association = association_instance_get(reflection.name)) && association.loaded?
++            if association.is_a?(Array)
++              association.proxy_target.all? { |child| autosave_association_valid?(reflection, child) }
++            else
++              autosave_association_valid?(reflection, association)
++            end
++          else
++            true # association not loaded yet, so it should be valid
++          end
++        end
++      else
++        false # self was not valid
++      end
++    end
++
++    # Returns whether or not the association is valid and applies any errors to the parent, <tt>self</tt>, if it wasn't.
++    def autosave_association_valid?(reflection, association)
++      returning(association.valid?) do |valid|
++        association.errors.each do |attribute, message|
++          errors.add "#{reflection.name}_#{attribute}", message
++        end unless valid
++      end
++    end
++
++    # Reloads the attributes of the object as usual and removes a mark for destruction.
++    def reload_with_autosave_associations(options = nil)
++      @marked_for_destruction = false
++      reload_without_autosave_associations(options)
++    end
++
++    # Marks this record to be destroyed as part of the parents save transaction.
++    # This does _not_ actually destroy the record yet, rather it will be destroyed when <tt>parent.save</tt> is called.
++    #
++    # Only useful if the <tt>:autosave</tt> option on the parent is enabled for this associated model.
++    def mark_for_destruction
++      @marked_for_destruction = true
++    end
++
++    # Returns whether or not this record will be destroyed as part of the parents save transaction.
++    #
++    # Only useful if the <tt>:autosave</tt> option on the parent is enabled for this associated model.
++    def marked_for_destruction?
++      @marked_for_destruction
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index ebc0b77..1cf4304 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -3117,6 +3117,11 @@ module ActiveRecord #:nodoc:
+     include Dirty
+     include Callbacks, Observing, Timestamp
+     include Associations, AssociationPreload, NamedScope
++
++    # Needs to be included before Transactions, because we want
++    # #save_with_autosave_associations to be wrapped inside a transaction.
++    include AutosaveAssociation
++
+     include Aggregations, Transactions, Reflection, Calculations, Serialization
+   end
+ end
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 1937abd..e69bfb1 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -65,6 +65,11 @@ module ActiveRecord
+       def reflect_on_association(association)
+         reflections[association].is_a?(AssociationReflection) ? reflections[association] : nil
+       end
++
++      # Returns an array of AssociationReflection objects for all associations which have <tt>:autosave</tt> enabled.
++      def reflect_on_all_autosave_associations
++        reflections.values.select { |reflection| reflection.options[:autosave] }
++      end
+     end
+ 
+ 
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+new file mode 100644
+index 0000000..8d136be
+--- /dev/null
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -0,0 +1,386 @@
++require "cases/helper"
++require "models/pirate"
++require "models/ship"
++require "models/ship_part"
++require "models/bird"
++require "models/parrot"
++require "models/treasure"
++
++class TestAutosaveAssociationsInGeneral < ActiveRecord::TestCase
++  def test_autosave_should_be_a_valid_option_for_has_one
++    assert base.valid_keys_for_has_one_association.include?(:autosave)
++  end
++
++  def test_autosave_should_be_a_valid_option_for_belongs_to
++    assert base.valid_keys_for_belongs_to_association.include?(:autosave)
++  end
++
++  def test_autosave_should_be_a_valid_option_for_has_many
++    assert base.valid_keys_for_has_many_association.include?(:autosave)
++  end
++
++  def test_autosave_should_be_a_valid_option_for_has_and_belongs_to_many
++    assert base.valid_keys_for_has_and_belongs_to_many_association.include?(:autosave)
++  end
++
++  private
++
++  def base
++    ActiveRecord::Base
++  end
++end
++
++class TestDestroyAsPartOfAutosaveAssociation < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @ship = @pirate.create_ship(:name => 'Nights Dirty Lightning')
++  end
++
++  # reload
++  def test_a_marked_for_destruction_record_should_not_be_be_marked_after_reload
++    @pirate.mark_for_destruction
++    @pirate.ship.mark_for_destruction
++
++    assert !@pirate.reload.marked_for_destruction?
++    assert !@pirate.ship.marked_for_destruction?
++  end
++
++  # has_one
++  def test_should_destroy_a_child_association_as_part_of_the_save_transaction_if_it_was_marked_for_destroyal
++    assert !@pirate.ship.marked_for_destruction?
++
++    @pirate.ship.mark_for_destruction
++    id = @pirate.ship.id
++
++    assert @pirate.ship.marked_for_destruction?
++    assert Ship.find_by_id(id)
++
++    @pirate.save
++    assert_nil @pirate.reload.ship
++    assert_nil Ship.find_by_id(id)
++  end
++
++  def test_should_rollback_destructions_if_an_exception_occurred_while_saving_a_child
++    # Stub the save method of the @pirate.ship instance to destroy and then raise an exception
++    class << @pirate.ship
++      def save(*args)
++        super
++        destroy
++        raise 'Oh noes!'
++      end
++    end
++
++    assert_raise(RuntimeError) { assert !@pirate.save }
++    assert_not_nil @pirate.reload.ship
++  end
++
++  # belongs_to
++  def test_should_destroy_a_parent_association_as_part_of_the_save_transaction_if_it_was_marked_for_destroyal
++    assert !@ship.pirate.marked_for_destruction?
++
++    @ship.pirate.mark_for_destruction
++    id = @ship.pirate.id
++
++    assert @ship.pirate.marked_for_destruction?
++    assert Pirate.find_by_id(id)
++
++    @ship.save
++    assert_nil @ship.reload.pirate
++    assert_nil Pirate.find_by_id(id)
++  end
++
++  def test_should_rollback_destructions_if_an_exception_occurred_while_saving_a_parent
++    # Stub the save method of the @ship.pirate instance to destroy and then raise an exception
++    class << @ship.pirate
++      def save(*args)
++        super
++        destroy
++        raise 'Oh noes!'
++      end
++    end
++
++    assert_raise(RuntimeError) { assert !@ship.save }
++    assert_not_nil @ship.reload.pirate
++  end
++  
++  # has_many & has_and_belongs_to
++  %w{ parrots birds }.each do |association_name|
++    define_method("test_should_destroy_#{association_name}_as_part_of_the_save_transaction_if_they_were_marked_for_destroyal") do
++      2.times { |i| @pirate.send(association_name).create!(:name => "#{association_name}_#{i}") }
++
++      assert !@pirate.send(association_name).any? { |child| child.marked_for_destruction? }
++
++      @pirate.send(association_name).each { |child| child.mark_for_destruction }
++      klass = @pirate.send(association_name).first.class
++      ids = @pirate.send(association_name).map(&:id)
++
++      assert @pirate.send(association_name).all? { |child| child.marked_for_destruction? }
++      ids.each { |id| assert klass.find_by_id(id) }
++
++      @pirate.save
++      assert @pirate.reload.send(association_name).empty?
++      ids.each { |id| assert_nil klass.find_by_id(id) }
++    end
++    
++    define_method("test_should_rollback_destructions_if_an_exception_occurred_while_saving_#{association_name}") do
++      2.times { |i| @pirate.send(association_name).create!(:name => "#{association_name}_#{i}") }
++      before = @pirate.send(association_name).map { |c| c }
++
++      # Stub the save method of the first child to destroy and the second to raise an exception
++      class << before.first
++        def save(*args)
++          super
++          destroy
++        end
++      end
++      class << before.last
++        def save(*args)
++          super
++          raise 'Oh noes!'
++        end
++      end
++
++      assert_raise(RuntimeError) { assert !@pirate.save }
++      assert_equal before, @pirate.reload.send(association_name)
++    end
++  end
++end
++
++class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @ship = @pirate.create_ship(:name => 'Nights Dirty Lightning')
++  end
++
++  def test_should_still_work_without_an_associated_model
++    @ship.destroy
++    @pirate.reload.catchphrase = "Arr"
++    @pirate.save
++    assert 'Arr', @pirate.reload.catchphrase
++  end
++
++  def test_should_automatically_save_the_associated_model
++    @pirate.ship.name = 'The Vile Insanity'
++    @pirate.save
++    assert_equal 'The Vile Insanity', @pirate.reload.ship.name
++  end
++
++  def test_should_automatically_validate_the_associated_model
++    @pirate.ship.name = ''
++    assert !@pirate.valid?
++    assert !@pirate.errors.on(:ship_name).blank?
++  end
++
++  def test_should_still_allow_to_bypass_validations_on_the_associated_model
++    @pirate.catchphrase = ''
++    @pirate.ship.name = ''
++    @pirate.save(false)
++    assert_equal ['', ''], [@pirate.reload.catchphrase, @pirate.ship.name]
++  end
++
++  def test_should_allow_to_bypass_validations_on_associated_models_at_any_depth
++    2.times { |i| @pirate.ship.parts.create!(:name => "part #{i}") }
++
++    @pirate.catchphrase = ''
++    @pirate.ship.name = ''
++    @pirate.ship.parts.each { |part| part.name = '' }
++    @pirate.save(false)
++
++    values = [@pirate.reload.catchphrase, @pirate.ship.name, *@pirate.ship.parts.map(&:name)]
++    assert_equal ['', '', '', ''], values
++  end
++
++  def test_should_still_raise_an_ActiveRecordRecord_Invalid_exception_if_we_want_that
++    @pirate.ship.name = ''
++    assert_raise(ActiveRecord::RecordInvalid) do
++      @pirate.save!
++    end
++  end
++
++  def test_should_rollback_any_changes_if_an_exception_occurred_while_saving
++    before = [@pirate.catchphrase, @pirate.ship.name]
++
++    @pirate.catchphrase = 'Arr'
++    @pirate.ship.name = 'The Vile Insanity'
++
++    # Stub the save method of the @pirate.ship instance to raise an exception
++    class << @pirate.ship
++      def save(*args)
++        super
++        raise 'Oh noes!'
++      end
++    end
++
++    assert_raise(RuntimeError) { assert !@pirate.save }
++    assert_equal before, [@pirate.reload.catchphrase, @pirate.ship.name]
++  end
++
++  def test_should_not_load_the_associated_model
++    assert_queries(1) { @pirate.catchphrase = 'Arr'; @pirate.save! }
++  end
++end
++
++class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @ship = Ship.create(:name => 'Nights Dirty Lightning')
++    @pirate = @ship.create_pirate(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++  end
++
++  def test_should_still_work_without_an_associated_model
++    @pirate.destroy
++    @ship.reload.name = "The Vile Insanity"
++    @ship.save
++    assert 'The Vile Insanity', @ship.reload.name
++  end
++
++  def test_should_automatically_save_the_associated_model
++    @ship.pirate.catchphrase = 'Arr'
++    @ship.save
++    assert_equal 'Arr', @ship.reload.pirate.catchphrase
++  end
++
++  def test_should_automatically_validate_the_associated_model
++    @ship.pirate.catchphrase = ''
++    assert !@ship.valid?
++    assert !@ship.errors.on(:pirate_catchphrase).blank?
++  end
++
++  def test_should_still_allow_to_bypass_validations_on_the_associated_model
++    @ship.pirate.catchphrase = ''
++    @ship.name = ''
++    @ship.save(false)
++    assert_equal ['', ''], [@ship.reload.name, @ship.pirate.catchphrase]
++  end
++
++  def test_should_still_raise_an_ActiveRecordRecord_Invalid_exception_if_we_want_that
++    @ship.pirate.catchphrase = ''
++    assert_raise(ActiveRecord::RecordInvalid) do
++      @ship.save!
++    end
++  end
++
++  def test_should_rollback_any_changes_if_an_exception_occurred_while_saving
++    before = [@ship.pirate.catchphrase, @ship.name]
++
++    @ship.pirate.catchphrase = 'Arr'
++    @ship.name = 'The Vile Insanity'
++
++    # Stub the save method of the @ship.pirate instance to raise an exception
++    class << @ship.pirate
++      def save(*args)
++        super
++        raise 'Oh noes!'
++      end
++    end
++
++    assert_raise(RuntimeError) { assert !@ship.save }
++    # TODO: Why does using reload on @ship looses the associated pirate?
++    assert_equal before, [@ship.pirate.reload.catchphrase, @ship.reload.name]
++  end
++
++  def test_should_not_load_the_associated_model
++    assert_queries(1) { @ship.name = 'The Vile Insanity'; @ship.save! }
++  end
++end
++
++module AutosaveAssociationOnACollectionAssociationTests
++  def test_should_automatically_save_the_associated_models
++    new_names = ['Grace OMalley', 'Privateers Greed']
++    @pirate.send(@association_name).each_with_index { |child, i| child.name = new_names[i] }
++
++    @pirate.save
++    assert_equal new_names, @pirate.reload.send(@association_name).map(&:name)
++  end
++
++  def test_should_automatically_validate_the_associated_models
++    @pirate.send(@association_name).each { |child| child.name = '' }
++
++    assert !@pirate.valid?
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert @pirate.errors.on(@association_name).blank?
++  end
++
++  def test_should_still_allow_to_bypass_validations_on_the_associated_models
++    @pirate.catchphrase = ''
++    @pirate.send(@association_name).each { |child| child.name = '' }
++
++    assert @pirate.save(false)
++    assert_equal ['', '', ''], [
++      @pirate.reload.catchphrase,
++      @pirate.send(@association_name).first.name,
++      @pirate.send(@association_name).last.name
++    ]
++  end
++
++  def test_should_rollback_any_changes_if_an_exception_occurred_while_saving
++    before = [@pirate.catchphrase, *@pirate.send(@association_name).map(&:name)]
++    new_names = ['Grace OMalley', 'Privateers Greed']
++
++    @pirate.catchphrase = 'Arr'
++    @pirate.send(@association_name).each_with_index { |child, i| child.name = new_names[i] }
++
++    # Stub the save method of the first child instance to raise an exception
++    class << @pirate.send(@association_name).first
++      def save(*args)
++        super
++        raise 'Oh noes!'
++      end
++    end
++
++    assert_raise(RuntimeError) { assert !@pirate.save }
++    assert_equal before, [@pirate.reload.catchphrase, *@pirate.send(@association_name).map(&:name)]
++  end
++
++  def test_should_still_raise_an_ActiveRecordRecord_Invalid_exception_if_we_want_that
++    @pirate.send(@association_name).each { |child| child.name = '' }
++    assert_raise(ActiveRecord::RecordInvalid) do
++      @pirate.save!
++    end
++  end
++
++  def test_should_not_load_the_associated_models_if_they_were_not_loaded_yet
++    assert_queries(1) { @pirate.catchphrase = 'Arr'; @pirate.save! }
++
++    assert_queries(2) do
++      @pirate.catchphrase = 'Yarr'
++      new_names = ['Grace OMalley', 'Privateers Greed']
++      @pirate.send(@association_name).each_with_index { |child, i| child.name = new_names[i] }
++      @pirate.save!
++    end
++  end
++end
++
++class TestAutosaveAssociationOnAHasManyAssociation < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @association_name = :birds
++    
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @child_1 = @pirate.birds.create(:name => 'Posideons Killer')
++    @child_2 = @pirate.birds.create(:name => 'Killer bandita Dionne')
++  end
++
++  include AutosaveAssociationOnACollectionAssociationTests
++end
++
++class TestAutosaveAssociationOnAHasAndBelongsToManyAssociation < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @association_name = :parrots
++    @habtm = true
++    
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @child_1 = @pirate.parrots.create(:name => 'Posideons Killer')
++    @child_2 = @pirate.parrots.create(:name => 'Killer bandita Dionne')
++  end
++
++  include AutosaveAssociationOnACollectionAssociationTests
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/dirty_test.rb b/activerecord/test/cases/dirty_test.rb
+index 1c9e281..5f5707b 100644
+--- a/activerecord/test/cases/dirty_test.rb
++++ b/activerecord/test/cases/dirty_test.rb
+@@ -166,7 +166,7 @@ class DirtyTest < ActiveRecord::TestCase
+ 
+   def test_association_assignment_changes_foreign_key
+     pirate = Pirate.create!(:catchphrase => 'jarl')
+-    pirate.parrot = Parrot.create!
++    pirate.parrot = Parrot.create!(:name => 'Lorre')
+     assert pirate.changed?
+     assert_equal %w(parrot_id), pirate.changed
+   end
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index e0ed3e5..8b1c714 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -91,6 +91,15 @@ class ReflectionTest < ActiveRecord::TestCase
+     assert_equal Money, Customer.reflect_on_aggregation(:balance).klass
+   end
+ 
++  def test_reflect_on_all_autosave_associations
++    expected = Pirate.reflect_on_all_associations.select { |r| r.options[:autosave] }
++    received = Pirate.reflect_on_all_autosave_associations
++
++    assert !received.empty?
++    assert_not_equal Pirate.reflect_on_all_associations.length, received.length
++    assert_equal expected, received
++  end
++
+   def test_has_many_reflection
+     reflection_for_clients = ActiveRecord::Reflection::AssociationReflection.new(:has_many, :clients, { :order => "id", :dependent => :destroy }, Firm)
+ 
+diff --git a/activerecord/test/models/bird.rb b/activerecord/test/models/bird.rb
+new file mode 100644
+index 0000000..341d2ee
+--- /dev/null
++++ b/activerecord/test/models/bird.rb
+@@ -0,0 +1,3 @@
++class Bird < ActiveRecord::Base
++  validates_presence_of :name
++end
+\ No newline at end of file
+diff --git a/activerecord/test/models/parrot.rb b/activerecord/test/models/parrot.rb
+index b9431fd..4a7ed52 100644
+--- a/activerecord/test/models/parrot.rb
++++ b/activerecord/test/models/parrot.rb
+@@ -4,6 +4,8 @@ class Parrot < ActiveRecord::Base
+   has_and_belongs_to_many :treasures
+   has_many :loots, :as => :looter
+   alias_attribute :title, :name
++
++  validates_presence_of :name
+ end
+ 
+ class LiveParrot < Parrot
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 51c8183..7556574 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -1,9 +1,12 @@
+ class Pirate < ActiveRecord::Base
+   belongs_to :parrot
+-  has_and_belongs_to_many :parrots
++  has_and_belongs_to_many :parrots, :autosave => true
+   has_many :treasures, :as => :looter
+ 
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
++  has_one :ship, :autosave => true
++  has_many :birds, :autosave => true
++
+   validates_presence_of :catchphrase
+ end
+diff --git a/activerecord/test/models/ship.rb b/activerecord/test/models/ship.rb
+index 05b09fc..3673e72 100644
+--- a/activerecord/test/models/ship.rb
++++ b/activerecord/test/models/ship.rb
+@@ -1,3 +1,8 @@
+ class Ship < ActiveRecord::Base
+   self.record_timestamps = false
++
++  belongs_to :pirate, :autosave => true
++  has_many :parts, :class_name => 'ShipPart', :autosave => true
++
++  validates_presence_of :name
+ end
+\ No newline at end of file
+diff --git a/activerecord/test/models/ship_part.rb b/activerecord/test/models/ship_part.rb
+new file mode 100644
+index 0000000..184ff6f
+--- /dev/null
++++ b/activerecord/test/models/ship_part.rb
+@@ -0,0 +1,5 @@
++class ShipPart < ActiveRecord::Base
++  belongs_to :ship
++  
++  validates_presence_of :name
++end
+\ No newline at end of file
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 094932d..ca5a97a 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -55,6 +55,11 @@ ActiveRecord::Schema.define do
+     t.binary :data
+   end
+ 
++  create_table :birds, :force => true do |t|
++    t.string :name
++    t.integer :pirate_id
++  end
++
+   create_table :books, :force => true do |t|
+     t.column :name, :string
+   end
+@@ -351,12 +356,18 @@ ActiveRecord::Schema.define do
+ 
+   create_table :ships, :force => true do |t|
+     t.string :name
++    t.integer :pirate_id
+     t.datetime :created_at
+     t.datetime :created_on
+     t.datetime :updated_at
+     t.datetime :updated_on
+   end
+ 
++  create_table :ship_parts, :force => true do |t|
++    t.string :name
++    t.integer :ship_id
++  end
++
+   create_table :sponsors, :force => true do |t|
+     t.integer :club_id
+     t.integer :sponsorable_id
+-- 
+1.6.0.2
+

@@ -1,0 +1,160 @@
+From 023a06907987b5aa04f575db3e2f77b230883248 Mon Sep 17 00:00:00 2001
+From: Jonathan Viney <jonathan.viney@gmail.com>
+Date: Wed, 2 Jul 2008 16:01:26 +1200
+Subject: [PATCH] Move the transaction counter to the connection object rather than maintaining it on the current Thread. Closes #533.
+
+---
+ .../connection_adapters/abstract_adapter.rb        |   13 ++++++++++
+ activerecord/lib/active_record/fixtures.rb         |    8 +++---
+ activerecord/lib/active_record/transactions.rb     |   17 ++-----------
+ activerecord/test/cases/fixtures_test.rb           |    6 ++--
+ activerecord/test/cases/multiple_db_test.rb        |   25 ++++++++++++++++++++
+ 5 files changed, 48 insertions(+), 21 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index f48b107..1fedeb7 100755
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -117,6 +117,19 @@ module ActiveRecord
+       def raw_connection
+         @connection
+       end
++      
++      def open_transactions
++        @open_transactions ||= 0
++      end
++      
++      def increment_open_transactions
++        @open_transactions ||= 0
++        @open_transactions += 1
++      end
++      
++      def decrement_open_transactions
++        @open_transactions -= 1
++      end
+ 
+       def log_info(sql, name, runtime)
+         if @logger && @logger.debug?
+diff --git a/activerecord/lib/active_record/fixtures.rb b/activerecord/lib/active_record/fixtures.rb
+index e19614e..355000b 100755
+--- a/activerecord/lib/active_record/fixtures.rb
++++ b/activerecord/lib/active_record/fixtures.rb
+@@ -515,7 +515,7 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+ 
+           all_loaded_fixtures.update(fixtures_map)
+ 
+-          connection.transaction(Thread.current['open_transactions'].to_i == 0) do
++          connection.transaction(connection.open_transactions.zero?) do
+             fixtures.reverse.each { |fixture| fixture.delete_existing_fixtures }
+             fixtures.each { |fixture| fixture.insert_fixtures }
+ 
+@@ -929,7 +929,7 @@ module Test #:nodoc:
+             load_fixtures
+             @@already_loaded_fixtures[self.class] = @loaded_fixtures
+           end
+-          ActiveRecord::Base.send :increment_open_transactions
++          ActiveRecord::Base.connection.increment_open_transactions
+           ActiveRecord::Base.connection.begin_db_transaction
+         # Load fixtures for every test.
+         else
+@@ -950,9 +950,9 @@ module Test #:nodoc:
+         end
+ 
+         # Rollback changes if a transaction is active.
+-        if use_transactional_fixtures? && Thread.current['open_transactions'] != 0
++        if use_transactional_fixtures? && ActiveRecord::Base.connection.open_transactions != 0
+           ActiveRecord::Base.connection.rollback_db_transaction
+-          Thread.current['open_transactions'] = 0
++          ActiveRecord::Base.connection.decrement_open_transactions
+         end
+         ActiveRecord::Base.verify_active_connections!
+       end
+diff --git a/activerecord/lib/active_record/transactions.rb b/activerecord/lib/active_record/transactions.rb
+index 3b68357..354a6c8 100644
+--- a/activerecord/lib/active_record/transactions.rb
++++ b/activerecord/lib/active_record/transactions.rb
+@@ -73,25 +73,14 @@ module ActiveRecord
+     # trigger a ROLLBACK when raised, but not be re-raised by the transaction block.
+     module ClassMethods
+       def transaction(&block)
+-        increment_open_transactions
++        connection.increment_open_transactions
+ 
+         begin
+-          connection.transaction(Thread.current['start_db_transaction'], &block)
++          connection.transaction(connection.open_transactions == 1, &block)
+         ensure
+-          decrement_open_transactions
++          connection.decrement_open_transactions
+         end
+       end
+-
+-      private
+-        def increment_open_transactions #:nodoc:
+-          open = Thread.current['open_transactions'] ||= 0
+-          Thread.current['start_db_transaction'] = open.zero?
+-          Thread.current['open_transactions'] = open + 1
+-        end
+-
+-        def decrement_open_transactions #:nodoc:
+-          Thread.current['open_transactions'] -= 1
+-        end
+     end
+ 
+     def transaction(&block)
+diff --git a/activerecord/test/cases/fixtures_test.rb b/activerecord/test/cases/fixtures_test.rb
+index aca7cfb..ce9092a 100755
+--- a/activerecord/test/cases/fixtures_test.rb
++++ b/activerecord/test/cases/fixtures_test.rb
+@@ -432,11 +432,11 @@ class FixturesBrokenRollbackTest < ActiveRecord::TestCase
+   alias_method :teardown, :blank_teardown
+ 
+   def test_no_rollback_in_teardown_unless_transaction_active
+-    assert_equal 0, Thread.current['open_transactions']
++    assert_equal 0, ActiveRecord::Base.connection.open_transactions
+     assert_raise(RuntimeError) { ar_setup_fixtures }
+-    assert_equal 0, Thread.current['open_transactions']
++    assert_equal 0, ActiveRecord::Base.connection.open_transactions
+     assert_nothing_raised { ar_teardown_fixtures }
+-    assert_equal 0, Thread.current['open_transactions']
++    assert_equal 0, ActiveRecord::Base.connection.open_transactions
+   end
+ 
+   private
+diff --git a/activerecord/test/cases/multiple_db_test.rb b/activerecord/test/cases/multiple_db_test.rb
+index eb3e43c..7c3e0f2 100644
+--- a/activerecord/test/cases/multiple_db_test.rb
++++ b/activerecord/test/cases/multiple_db_test.rb
+@@ -57,4 +57,29 @@ class MultipleDbTest < ActiveRecord::TestCase
+ 
+     assert Course.connection
+   end
++
++  def test_transactions_across_databases
++    c1 = Course.find(1)
++    e1 = Entrant.find(1)
++
++    begin
++      Course.transaction do
++        Entrant.transaction do
++          c1.name = "Typo"
++          e1.name = "Typo"
++          c1.save
++          e1.save
++          raise "No I messed up."
++        end
++      end
++    rescue
++      # Yup caught it
++    end
++
++    assert_equal "Typo", c1.name
++    assert_equal "Typo", e1.name
++
++    assert_equal "Ruby Development", Course.find(1).name
++    assert_equal "Ruby Developer", Entrant.find(1).name
++  end
+ end
+-- 
+1.5.4.3
+

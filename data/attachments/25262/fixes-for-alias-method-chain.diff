@@ -1,0 +1,120 @@
+From 705b09e781af7461dba4667152524ecbb5b4e23b Mon Sep 17 00:00:00 2001
+From: Tammo Freese <tammofreese@tammo-freeses-macbook.local>
+Date: Sat, 31 May 2008 11:54:25 +0200
+Subject: [PATCH] I made alias_method_chain more extensible, it now calls aliased methods from superclass and replacements of the ..._with_... methods
+
+---
+ .../lib/active_support/core_ext/module/aliasing.rb |   19 ++++++++-
+ activesupport/lib/active_support/deprecation.rb    |    9 +++-
+ activesupport/test/core_ext/module_test.rb         |   43 ++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/module/aliasing.rb b/activesupport/lib/active_support/core_ext/module/aliasing.rb
+index 1894e3b..98e4881 100644
+--- a/activesupport/lib/active_support/core_ext/module/aliasing.rb
++++ b/activesupport/lib/active_support/core_ext/module/aliasing.rb
+@@ -28,9 +28,26 @@ class Module
+     
+     with_method, without_method = "#{aliased_target}_with_#{feature}#{punctuation}", "#{aliased_target}_without_#{feature}#{punctuation}"
+     
++    method_defined_here = (instance_methods(false) + private_instance_methods(false)).include?(RUBY_VERSION < '1.9' ? target.to_s : target)
++    unless method_defined_here
++      module_eval <<-EOS
++        def #{target}(*args, &block)
++          super
++        end
++      EOS
++    end  
++    
+     alias_method without_method, target
+-    alias_method target, with_method
+     
++    target_method_exists = (instance_methods + private_instance_methods).include?(RUBY_VERSION < '1.9' ? with_method : with_method.to_sym) 
++    raise NameError unless target_method_exists
++    
++    module_eval <<-EOS
++      def #{target}(*args, &block)
++        self.__send__(:'#{with_method}', *args, &block)
++      end
++    EOS
++
+     case
+       when public_method_defined?(without_method)
+         public target
+diff --git a/activesupport/lib/active_support/deprecation.rb b/activesupport/lib/active_support/deprecation.rb
+index 758aef5..ed68d4e 100644
+--- a/activesupport/lib/active_support/deprecation.rb
++++ b/activesupport/lib/active_support/deprecation.rb
+@@ -67,10 +67,15 @@ module ActiveSupport
+         end
+ 
+         def extract_callstack(callstack)
+-          if md = callstack.first.match(/^(.+?):(\d+)(?::in `(.*?)')?/)
++          # Depending on ruby version, the caller of the deprecated method 
++          # is the second or third element of the callstack:
++          # In 1.8, the first is __send__, the second is the deprecated method. 
++          # In 1.9, the first is the deprecated method.
++          call = callstack[RUBY_VERSION < '1.9' ? 2 : 1]
++          if md = call.match(/^(.+?):(\d+)(?::in `(.*?)')?/)
+             md.captures
+           else
+-            callstack.first
++            call
+           end
+         end
+     end
+diff --git a/activesupport/test/core_ext/module_test.rb b/activesupport/test/core_ext/module_test.rb
+index ecdea38..5671aa5 100644
+--- a/activesupport/test/core_ext/module_test.rb
++++ b/activesupport/test/core_ext/module_test.rb
+@@ -290,4 +290,47 @@ class MethodAliasingTest < Test::Unit::TestCase
+     assert_equal 'duck_with_orange', @instance.duck
+     assert FooClassWithBarMethod.public_method_defined?(:duck)
+   end
++  
++  def test_alias_method_chain_allows_redefinition_of_aliased_public_method_in_superclass
++    Object.const_set :FooClassSubClass, Class.new(FooClassWithBarMethod)
++    FooClassSubClass.class_eval do
++      include BarMethodAliaser
++    end
++    FooClassWithBarMethod.class_eval do
++      def bar_with_new; 'new_bar' end
++      alias_method_chain :bar, :new
++    end
++    assert_equal 'new_bar_with_baz', FooClassSubClass.new.bar
++  ensure
++    Object.instance_eval { remove_const :FooClassSubClass }
++  end
++  
++  def test_alias_method_chain_allows_redefinition_of_aliased_private_method_in_superclass
++    Object.const_set :FooClassSubClass, Class.new(FooClassWithBarMethod)
++    FooClassWithBarMethod.class_eval do
++      private :bar
++    end  
++    FooClassSubClass.class_eval do
++      include BarMethodAliaser
++    end
++    FooClassWithBarMethod.class_eval do
++      private
++      def bar_with_new; 'new_bar' end
++      alias_method_chain :bar, :new
++    end
++    assert_equal 'new_bar_with_baz', FooClassSubClass.new.__send__(:bar)
++  ensure
++    Object.instance_eval { remove_const :FooClassSubClass }
++  end
++  
++  def test_alias_method_chain_allows_redefinition_of_with_method
++    FooClassWithBarMethod.class_eval do
++      include BarMethodAliaser
++      def bar_with_baz_with_buzz
++        bar_with_baz_without_buzz << '_with_buzz'
++      end
++      alias_method_chain :bar_with_baz, :buzz
++    end  
++    assert_equal 'bar_with_baz_with_buzz', FooClassWithBarMethod.new.bar
++  end  
+ end
+-- 
+1.5.4.5
+

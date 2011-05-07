@@ -1,0 +1,202 @@
+From 49a99f4fddd051600a6dbc1a1e6222040db11404 Mon Sep 17 00:00:00 2001
+From: Jamis Buck <jamis@37signals.com>
+Date: Thu, 8 Apr 2010 12:15:13 -0600
+Subject: [PATCH] Add support for singleton resources
+
+---
+ activeresource/lib/active_resource/base.rb  |   55 +++++++++++++++++++++++++-
+ activeresource/test/cases/singleton_test.rb |   50 ++++++++++++++++++++++++
+ activeresource/test/fixtures/status.rb      |    4 ++
+ 3 files changed, 106 insertions(+), 3 deletions(-)
+ create mode 100644 activeresource/test/cases/singleton_test.rb
+ create mode 100644 activeresource/test/fixtures/status.rb
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 1e81fc0..842c727 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -554,11 +554,37 @@ module ActiveResource
+         @headers ||= {}
+       end
+ 
++      # Indicates that this resource is a singleton. Singleton resources are accessed
++      # without an id, and via an unpluralized path. For instance:
++      #
++      #   http://example.com/status.xml
++      #
++      # would be a singleton resource on "status", while:
++      #
++      #   http://example.com/statuses/1234.xml
++      #
++      # would be a non-singleton resource on "status".
++      def singleton(flag=true)
++        @singleton = true
++      end
++
++      # Returns true if the model represents a singleton resource, or false otherwise.
++      def singleton?
++        @singleton if defined?(@singleton)
++      end
++
+       # Do not include any modules in the default element name. This makes it easier to seclude ARes objects
+       # in a separate namespace without having to set element_name repeatedly.
+       attr_accessor_with_default(:element_name)    { ActiveSupport::Inflector.underscore(to_s.split("::").last) } #:nodoc:
+ 
+-      attr_accessor_with_default(:collection_name) { ActiveSupport::Inflector.pluralize(element_name) } #:nodoc:
++      attr_accessor_with_default(:collection_name) do #:nodoc:
++        if singleton?
++          element_name
++        else
++          ActiveSupport::Inflector.pluralize(element_name)
++        end
++      end
++
+       attr_accessor_with_default(:primary_key, 'id') #:nodoc:
+ 
+       # Gets the \prefix for a resource's nested URL (e.g., <tt>prefix/collectionname/1.xml</tt>)
+@@ -606,6 +632,8 @@ module ActiveResource
+       # Gets the element path for the given ID in +id+.  If the +query_options+ parameter is omitted, Rails
+       # will split from the \prefix options.
+       #
++      # For singleton resources, the element path ignores the +id+ parameter.
++      #
+       # ==== Options
+       # +prefix_options+ - A \hash to add a \prefix to the request for nested URLs (e.g., <tt>:account_id => 19</tt>
+       #                    would yield a URL like <tt>/accounts/19/purchases.xml</tt>).
+@@ -624,9 +652,15 @@ module ActiveResource
+       #   Comment.element_path(1, {:post_id => 5}, {:active => 1})
+       #   # => /posts/5/comments/1.xml?active=1
+       #
+-      def element_path(id, prefix_options = {}, query_options = nil)
++      def element_path(id=nil, prefix_options = {}, query_options = nil)
+         prefix_options, query_options = split_options(prefix_options) if query_options.nil?
+-        "#{prefix(prefix_options)}#{collection_name}/#{id}.#{format.extension}#{query_string(query_options)}"
++
++        path = "#{prefix(prefix_options)}#{collection_name}"
++        unless singleton?
++          raise ArgumentError, "id is required for non-singleton resources" if id.nil?
++          path << "/#{id}"
++        end
++        path << ".#{format.extension}#{query_string(query_options)}"
+       end
+ 
+       # Gets the new element path for REST resources.
+@@ -716,6 +750,9 @@ module ActiveResource
+ 
+       # Core method for finding resources.  Used similarly to Active Record's +find+ method.
+       #
++      # For singleton resources, it may be invoked without any arguments. This will return
++      # the singleton resource.
++      #
+       # ==== Arguments
+       # The first argument is considered to be the scope of the query.  That is, how many
+       # resources are returned from the request.  It can be one of the following.
+@@ -725,6 +762,8 @@ module ActiveResource
+       # * <tt>:last</tt> - Returns the last resource found.
+       # * <tt>:all</tt> - Returns every resource that matches the request.
+       #
++      # It may also be +nil+, for singleton resources.
++      #
+       # ==== Options
+       #
+       # * <tt>:from</tt> - Sets the path or custom method that resources will be fetched from.
+@@ -761,6 +800,10 @@ module ActiveResource
+       #   StreetAddress.find(1, :params => { :person_id => 1 })
+       #   # => GET /people/1/street_addresses/1.xml
+       #
++      #   # assuming Status is a singleton resource:
++      #   Status.find
++      #   # => GET /status.xml
++      #
+       # == Failure or missing data
+       #   A failure to find the requested object raises a ResourceNotFound
+       #   exception if the find was called with an id.
+@@ -777,6 +820,8 @@ module ActiveResource
+         scope   = arguments.slice!(0)
+         options = arguments.slice!(0) || {}
+ 
++        scope = :one if scope.nil? && singleton?
++
+         case scope
+           when :all   then find_every(options)
+           when :first then find_every(options).first
+@@ -875,6 +920,10 @@ module ActiveResource
+           when String
+             path = "#{from}#{query_string(options[:params])}"
+             instantiate_record(connection.get(path, headers))
++          when nil
++            prefix_options, query_options = split_options(options[:params])
++            path = element_path(nil, prefix_options, query_options)
++            instantiate_record(connection.get(path, headers))
+           end
+         end
+ 
+diff --git a/activeresource/test/cases/singleton_test.rb b/activeresource/test/cases/singleton_test.rb
+new file mode 100644
+index 0000000..03a11ef
+--- /dev/null
++++ b/activeresource/test/cases/singleton_test.rb
+@@ -0,0 +1,50 @@
++require 'abstract_unit'
++require "fixtures/status"
++require 'active_support/core_ext/hash/conversions'
++
++class SingletonTest < Test::Unit::TestCase
++  def setup
++    @status_new = { :description => "Status description here" }
++    @status = { :id => 1, :updated_at => 1.hour.ago.utc, :description => "All systems go" }
++
++    ActiveResource::HttpMock.respond_to do |mock|
++      mock.get    "/status.xml",     {}, @status.to_xml(:root => "status")
++      mock.get    "/status/new.xml", {}, @status_new.to_xml(:root => "status")
++      mock.put    "/status.xml",     {}, nil, 204, 'Location' => '/status.xml'
++      mock.post   "/status.xml",     {}, @status.to_xml(:root => "status"), 201, 'Location' => '/status.xml'
++      mock.delete "/status.xml",     {}, nil, 200
++    end
++  end
++
++  def test_find
++    status = Status.find
++    assert_kind_of Status, status
++    assert !status.new?
++    assert_equal @status[:description], status.description
++    assert_equal @status[:updated_at].to_s, status.updated_at.to_s
++  end
++
++  def test_new
++    status = Status.build
++    assert_kind_of Status, status
++    assert status.new?
++    assert_equal @status_new[:description], status.description
++  end
++
++  def test_update
++    status = Status.find
++    status.description = "Code red!"
++    assert status.save
++  end
++
++  def test_create
++    status = Status.create(:description => "Code red!")
++    assert_kind_of Status, status
++    assert !status.new?
++  end
++
++  def test_destroy
++    status = Status.find
++    assert_equal 200, status.destroy.code
++  end
++end
+diff --git a/activeresource/test/fixtures/status.rb b/activeresource/test/fixtures/status.rb
+new file mode 100644
+index 0000000..a0e678e
+--- /dev/null
++++ b/activeresource/test/fixtures/status.rb
+@@ -0,0 +1,4 @@
++class Status < ActiveResource::Base
++  singleton
++  self.site = "http://37s.sunrise.i:3000"
++end
+-- 
+1.6.4.4
+

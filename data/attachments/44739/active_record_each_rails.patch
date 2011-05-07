@@ -1,0 +1,191 @@
+From 65871b5b8dfb85cadf25dfc6e55b8281b7f92b99 Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Guillermo=20=C3=81lvarez=20Fern=C3=A1ndez?= <guillermo@cientifico.net>
+Date: Tue, 9 Sep 2008 14:33:32 +0200
+Subject: [PATCH] Added ActiveRecord.each (and collect and map)
+
+---
+ activerecord/lib/active_record.rb      |    2 +
+ activerecord/lib/active_record/each.rb |   91 ++++++++++++++++++++++++++++++++
+ activerecord/test/cases/each_test.rb   |   52 ++++++++++++++++++
+ 3 files changed, 145 insertions(+), 0 deletions(-)
+ create mode 100644 activerecord/lib/active_record/each.rb
+ create mode 100644 activerecord/test/cases/each_test.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index a6bbd6f..2a59e08 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -52,6 +52,7 @@ require 'active_record/serialization'
+ require 'active_record/attribute_methods'
+ require 'active_record/dirty'
+ require 'active_record/dynamic_finder_match'
++require 'active_record/each'
+ 
+ ActiveRecord::Base.class_eval do
+   extend ActiveRecord::QueryCache
+@@ -71,6 +72,7 @@ ActiveRecord::Base.class_eval do
+   include ActiveRecord::Reflection
+   include ActiveRecord::Calculations
+   include ActiveRecord::Serialization
++  include ActiveRecord::Each
+ end
+ 
+ require 'active_record/connection_adapters/abstract_adapter'
+diff --git a/activerecord/lib/active_record/each.rb b/activerecord/lib/active_record/each.rb
+new file mode 100644
+index 0000000..979a489
+--- /dev/null
++++ b/activerecord/lib/active_record/each.rb
+@@ -0,0 +1,91 @@
++
++module ActiveRecord 
++  module Each #:nodoc:
++    def self.included(base)
++      base.extend(ClassMethods)
++    end
++
++    module ClassMethods
++
++      
++      # Each goes througt all entries in a model, without loading all
++      # You can pass to it any parameter like find. See find for options you can pass
++      # If you set an :order, you will get a slow query in tables with a lot of rows
++      #
++      # ==== Examples:
++      #
++      #   # Goes throught all users wich name starts by g
++      #   User.each (:conditions => "users.name LIKE 'g%'") do |u|
++      #     puts u.name
++      #   end
++      #
++      def each(*args,&block)
++        options = args.extract_options!
++        validate_find_options(options)
++        set_readonly_option!(options)
++
++        # if we're passed order then fast mode MAY not work, so we'll stick
++        # with the slow mode
++        if options[:order]
++          slow_each(options,&block)
++        else
++          fast_each(options, &block) # for unsorted querys
++        end
++      end
++
++      # Invokes block once for each element of self. Creates a new array containing the values returned by the block
++      #
++      # ==== Example:
++      #
++      #   #Get password from md5hash
++      #   clean_password = User.map { |u| magic_recover_password(u.md5) }
++      #
++      def map(*args)
++        options = args.extract_options!
++        validate_find_options(options)
++        set_readonly_option!(options)
++
++        results = Array.new
++        each(options) do |i|
++          results << yield(i)
++        end
++        results
++      end
++
++      # Collect is an alias for map
++      alias_method :collect, :map
++      
++    private
++      def slow_each(options)
++        count(options).times do |i|
++          yield(find_initial(options.merge({:offset => i})))
++        end      
++      end
++
++      # because :offset can be quite slow for large tables as really the DB
++      # still has to execute the query and then seek into the query to return 
++      # you the row you want.
++      # using the primary_key allows us to piggy back on the index
++      def fast_each(options)
++        i=minimum("#{table_name}.#{primary_key}", options)
++        
++        # not all the backends always sort primay_key columns so do it manuall
++        options.update(:order => "#{table_name}.#{primary_key} ASC")
++        
++        i=minimum("#{table_name}.#{primary_key}", options) or return
++        # first the first object by id
++        yield(o=find_one(i, {}))
++        # as long as we keep finding objects, keep going
++        while o
++          with_scope(:find => {:conditions => [ "#{table_name}.#{primary_key} > ?", i]} ) do
++            if o=find_initial(options)
++              i=o.send primary_key
++              yield(o) 
++            end
++          end
++        end
++      end
++    end
++  end
++end
++
+diff --git a/activerecord/test/cases/each_test.rb b/activerecord/test/cases/each_test.rb
+new file mode 100644
+index 0000000..9355117
+--- /dev/null
++++ b/activerecord/test/cases/each_test.rb
+@@ -0,0 +1,52 @@
++require "cases/helper"
++require 'models/topic'
++require 'models/reply'
++require 'models/task'
++require 'models/course'
++require 'models/category'
++require 'models/post'
++
++class EachTest < ActiveRecord::TestCase
++  fixtures :tasks, :topics, :categories, :posts, :categories_posts
++  def setup
++    @posts = Post.all(:order => "id asc")
++    @total = Post.count
++  end
++  
++  def test_each_method
++    assert Post.respond_to?(:each)
++  end
++  
++  def test_map_method
++    assert Post.respond_to?(:map)
++    assert Post.respond_to?(:collect)
++    assert_equal @posts, Post.map {|p| p }
++  end
++
++  def test_each_with_conditions
++    i=0
++    Post.each(:conditions => {:title => "sti comments"} ) {|u| i+=1 }
++    assert_equal 1, i
++  end
++
++  def test_each_without_conditions
++    i=0
++    Post.each {|u| i+=1 }
++    assert_equal @total, i
++  end
++
++  def test_backwards_primary_key_map
++    assert_equal Post.find(:all, :order => "id desc"), Post.map(:order => "id desc") { |p| p }
++    assert_equal Post.find(:all, :order => "id desc"), Post.map(:order => "posts.id desc") { |p| p }
++  end
++
++  def test_map_method_with_conditions
++    assert_equal [4], Post.map(:conditions => {:title => "sti comments"}) {|u| u.id}
++  end
++
++  def test_empty_result_set_dont_throw_exception
++    assert_nothing_raised (ActiveRecord::RecordNotFound) do
++      Post.each(:conditions => "id = -1") { |u| u.name }
++    end
++  end
++end
+-- 
+1.5.6.3
+

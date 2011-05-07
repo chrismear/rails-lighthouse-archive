@@ -1,0 +1,149 @@
+From 2c9ef85c83995ee738734874f3f9dff0145db154 Mon Sep 17 00:00:00 2001
+From: Erik Andrejko <eandrejko@gmail.com>
+Date: Wed, 27 Aug 2008 22:41:56 -0500
+Subject: [PATCH] 
+
+---
+ actionpack/test/controller/new_render_test.rb |   10 ++++++++++
+ 1 files changed, 10 insertions(+), 0 deletions(-)
+
+diff --git a/actionpack/test/controller/new_render_test.rb b/actionpack/test/controller/new_render_test.rb
+index 82919b7..a566c83 100644
+--- a/actionpack/test/controller/new_render_test.rb
++++ b/actionpack/test/controller/new_render_test.rb
+@@ -212,6 +212,11 @@ class NewRenderTestController < ActionController::Base
+     render :partial => "customer"
+   end
+ 
++  def partial_with_implicit_local_assignment_shadowed
++    @customer = Customer.new("Marcel")
++    render :partial => "customer", :object => Customer.new('Maggie')
++  end
++
+   def missing_partial
+     render :partial => 'thisFileIsntHere'
+   end
+@@ -836,6 +841,11 @@ EOS
+     assert_equal "Hello: Marcel", @response.body
+   end
+ 
++  def test_partial_with_implicit_local_assignment_shadowed
++    get :partial_with_implicit_local_assignment_shadowed
++    assert_equal "Hello: Maggie", @response.body
++  end
++
+   def test_render_missing_partial_template
+     assert_raises(ActionView::MissingTemplate) do
+       get :missing_partial
+-- 
+1.5.5.1
+
+
+From cd30b972d2e6060cb51fae01654f595ebaaa664c Mon Sep 17 00:00:00 2001
+From: Erik Andrejko <eandrejko@gmail.com>
+Date: Thu, 28 Aug 2008 08:45:16 -0500
+Subject: [PATCH] Added test and fix so that partial rendering with :object overrides any controller instance variables, even when nil.
+
+---
+ actionpack/lib/action_view/partials.rb           |    5 +++--
+ actionpack/lib/action_view/renderable_partial.rb |   17 +++++++++++------
+ actionpack/test/controller/new_render_test.rb    |   12 +++++++++++-
+ actionpack/test/fixtures/test/_customer.erb      |    2 +-
+ 4 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/actionpack/lib/action_view/partials.rb b/actionpack/lib/action_view/partials.rb
+index 443c49b..37ca417 100644
+--- a/actionpack/lib/action_view/partials.rb
++++ b/actionpack/lib/action_view/partials.rb
+@@ -149,7 +149,7 @@ module ActionView
+           if options.has_key?(:collection)
+             render_partial_collection(options)
+           else
+-            _pick_partial_template(partial_path).render_partial(self, options[:object], local_assigns)
++            _pick_partial_template(partial_path).render_partial(self, options, local_assigns)
+           end
+         when ActionView::Helpers::FormBuilder
+           builder_partial_path = partial_path.class.to_s.demodulize.underscore.sub(/_builder$/, '')
+@@ -181,7 +181,8 @@ module ActionView
+             ActionController::RecordIdentifier.partial_path(object, controller.class.controller_path)
+           template = _pick_partial_template(_partial_path)
+           local_assigns[template.counter_name] = index
+-          result = template.render_partial(self, object, local_assigns, as)
++          options[:object] = object
++          result = template.render_partial(self, options, local_assigns, as)
+           index += 1
+           result
+         end.join(spacer)
+diff --git a/actionpack/lib/action_view/renderable_partial.rb b/actionpack/lib/action_view/renderable_partial.rb
+index 5203e57..7e5b7c3 100644
+--- a/actionpack/lib/action_view/renderable_partial.rb
++++ b/actionpack/lib/action_view/renderable_partial.rb
+@@ -25,15 +25,20 @@ module ActionView
+       end
+     end
+ 
+-    def render_partial(view, object = nil, local_assigns = {}, as = nil)
+-      object ||= local_assigns[:object] ||
+-        local_assigns[variable_name] ||
+-        view.controller.instance_variable_get("@#{variable_name}") if view.respond_to?(:controller)
+-
++    def render_partial(view, options = {}, local_assigns = {}, as = nil)
++      # allow :object => nil to override non-nil instance variable @#{variable_name}
++      if options.has_key?(:object)
++        object = options[:object] || local_assigns[variable_name] || local_assigns[:object]
++      else
++        object = options[:object] || 
++          local_assigns[:object] ||
++          local_assigns[variable_name] ||
++          view.controller.instance_variable_get("@#{variable_name}") if view.respond_to?(:controller)
++      end
++        
+       # Ensure correct object is reassigned to other accessors
+       local_assigns[:object] = local_assigns[variable_name] = object
+       local_assigns[as] = object if as
+-
+       render_template(view, local_assigns)
+     end
+   end
+diff --git a/actionpack/test/controller/new_render_test.rb b/actionpack/test/controller/new_render_test.rb
+index a566c83..078da41 100644
+--- a/actionpack/test/controller/new_render_test.rb
++++ b/actionpack/test/controller/new_render_test.rb
+@@ -214,7 +214,12 @@ class NewRenderTestController < ActionController::Base
+ 
+   def partial_with_implicit_local_assignment_shadowed
+     @customer = Customer.new("Marcel")
+-    render :partial => "customer", :object => Customer.new('Maggie')
++    render :partial => "customer", :object => Customer.new("Maggie")
++  end
++
++  def partial_with_implicit_local_assignment_shadowed_by_nil
++    @customer = Customer.new("Marcel")
++    render :partial => "customer", :object => nil
+   end
+ 
+   def missing_partial
+@@ -846,6 +851,11 @@ EOS
+     assert_equal "Hello: Maggie", @response.body
+   end
+ 
++  def test_partial_with_implicit_local_assignment_shadowed_by_nil
++    get :partial_with_implicit_local_assignment_shadowed_by_nil
++    assert_equal "Hello: ", @response.body
++  end
++
+   def test_render_missing_partial_template
+     assert_raises(ActionView::MissingTemplate) do
+       get :missing_partial
+diff --git a/actionpack/test/fixtures/test/_customer.erb b/actionpack/test/fixtures/test/_customer.erb
+index 872d8c4..247ff6d 100644
+--- a/actionpack/test/fixtures/test/_customer.erb
++++ b/actionpack/test/fixtures/test/_customer.erb
+@@ -1 +1 @@
+-Hello: <%= customer.name %>
+\ No newline at end of file
++Hello: <%= customer.nil? ? '' : customer.name %>
+\ No newline at end of file
+-- 
+1.5.5.1
+

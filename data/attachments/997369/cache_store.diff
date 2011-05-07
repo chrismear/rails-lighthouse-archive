@@ -1,0 +1,364 @@
+From 5e6af94bd5d9d521439e619ec65239b53cd6568f Mon Sep 17 00:00:00 2001
+From: Brian Durand <brian@embellishedvisions.com>
+Date: Tue, 5 Apr 2011 14:00:32 -0500
+Subject: [PATCH] Add ActionDispatch::Session::CacheStore as a generic way of storing sessions in a cache. [#6675 state:resolved]
+
+---
+ actionpack/lib/action_dispatch.rb                  |    1 +
+ .../middleware/session/cache_store.rb              |   50 ++++++
+ .../test/dispatch/session/cache_store_test.rb      |  181 ++++++++++++++++++++
+ activesupport/lib/active_support/cache.rb          |   11 +-
+ .../source/action_controller_overview.textile      |   12 +-
+ railties/guides/source/rails_on_rack.textile       |    5 +-
+ railties/guides/source/security.textile            |    4 +-
+ 7 files changed, 253 insertions(+), 11 deletions(-)
+ create mode 100644 actionpack/lib/action_dispatch/middleware/session/cache_store.rb
+ create mode 100644 actionpack/test/dispatch/session/cache_store_test.rb
+
+diff --git a/actionpack/lib/action_dispatch.rb b/actionpack/lib/action_dispatch.rb
+index 49971fc..7500b32 100644
+--- a/actionpack/lib/action_dispatch.rb
++++ b/actionpack/lib/action_dispatch.rb
+@@ -81,6 +81,7 @@ module ActionDispatch
+     autoload :AbstractStore, 'action_dispatch/middleware/session/abstract_store'
+     autoload :CookieStore,   'action_dispatch/middleware/session/cookie_store'
+     autoload :MemCacheStore, 'action_dispatch/middleware/session/mem_cache_store'
++    autoload :CacheStore,    'action_dispatch/middleware/session/cache_store'
+   end
+ 
+   autoload_under 'testing' do
+diff --git a/actionpack/lib/action_dispatch/middleware/session/cache_store.rb b/actionpack/lib/action_dispatch/middleware/session/cache_store.rb
+new file mode 100644
+index 0000000..d3b6fd1
+--- /dev/null
++++ b/actionpack/lib/action_dispatch/middleware/session/cache_store.rb
+@@ -0,0 +1,50 @@
++require 'action_dispatch/middleware/session/abstract_store'
++require 'rack/session/memcache'
++
++module ActionDispatch
++  module Session
++    # Session store that uses an ActiveSupport::Cache::Store to store the sessions. This store is most useful
++    # if you don't store critical data in your sessions and you don't need them to live for extended periods
++    # of time.
++    class CacheStore < AbstractStore
++      # Create a new store. The cache to use can be passed in the <tt>:cache</tt> option. If it is
++      # not specified, <tt>Rails.cache</tt> will be used.
++      def initialize(app, options = {})
++        @cache = options[:cache] || Rails.cache
++        options[:expire_after] ||= @cache.options[:expires_in]
++        super
++      end
++
++      # Get a session from the cache.
++      def get_session(env, sid)
++        sid ||= generate_sid
++        session = @cache.read(cache_key(sid))
++        session ||= {}
++        [sid, session]
++      end
++
++      # Set a session in the cache.
++      def set_session(env, sid, session, options)
++        key = cache_key(sid)
++        if session
++          @cache.write(key, session, :expires_in => options[:expire_after])
++        else
++          @cache.delete(key)
++        end
++        sid
++      end
++
++      # Remove a session from the cache.
++      def destroy_session(env, sid, options)
++        @cache.delete(cache_key(sid))
++        generate_sid
++      end
++
++      private
++        # Turn the session id into a cache key.
++        def cache_key(sid)
++          "_session_id:#{sid}"
++        end
++    end
++  end
++end
+diff --git a/actionpack/test/dispatch/session/cache_store_test.rb b/actionpack/test/dispatch/session/cache_store_test.rb
+new file mode 100644
+index 0000000..73e056d
+--- /dev/null
++++ b/actionpack/test/dispatch/session/cache_store_test.rb
+@@ -0,0 +1,181 @@
++require 'abstract_unit'
++
++class CacheStoreTest < ActionDispatch::IntegrationTest
++  class TestController < ActionController::Base
++    def no_session_access
++      head :ok
++    end
++
++    def set_session_value
++      session[:foo] = "bar"
++      head :ok
++    end
++
++    def set_serialized_session_value
++      session[:foo] = SessionAutoloadTest::Foo.new
++      head :ok
++    end
++
++    def get_session_value
++      render :text => "foo: #{session[:foo].inspect}"
++    end
++
++    def get_session_id
++      render :text => "#{request.session_options[:id]}"
++    end
++
++    def call_reset_session
++      session[:bar]
++      reset_session
++      session[:bar] = "baz"
++      head :ok
++    end
++
++    def rescue_action(e) raise end
++  end
++
++  def test_setting_and_getting_session_value
++    with_test_route_set do
++      get '/set_session_value'
++      assert_response :success
++      assert cookies['_session_id']
++
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: "bar"', response.body
++    end
++  end
++
++  def test_getting_nil_session_value
++    with_test_route_set do
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body
++    end
++  end
++
++  def test_getting_session_value_after_session_reset
++    with_test_route_set do
++      get '/set_session_value'
++      assert_response :success
++      assert cookies['_session_id']
++      session_cookie = cookies.send(:hash_for)['_session_id']
++
++      get '/call_reset_session'
++      assert_response :success
++      assert_not_equal [], headers['Set-Cookie']
++
++      cookies << session_cookie # replace our new session_id with our old, pre-reset session_id
++
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body, "data for this session should have been obliterated from cache"
++    end
++  end
++
++  def test_getting_from_nonexistent_session
++    with_test_route_set do
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body
++      assert_nil cookies['_session_id'], "should only create session on write, not read"
++    end
++  end
++
++  def test_setting_session_value_after_session_reset
++    with_test_route_set do
++      get '/set_session_value'
++      assert_response :success
++      assert cookies['_session_id']
++      session_id = cookies['_session_id']
++
++      get '/call_reset_session'
++      assert_response :success
++      assert_not_equal [], headers['Set-Cookie']
++
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body
++
++      get '/get_session_id'
++      assert_response :success
++      assert_not_equal session_id, response.body
++    end
++  end
++
++  def test_getting_session_id
++    with_test_route_set do
++      get '/set_session_value'
++      assert_response :success
++      assert cookies['_session_id']
++      session_id = cookies['_session_id']
++
++      get '/get_session_id'
++      assert_response :success
++      assert_equal session_id, response.body, "should be able to read session id without accessing the session hash"
++    end
++  end
++
++  def test_deserializes_unloaded_class
++    with_test_route_set do
++      with_autoload_path "session_autoload_test" do
++        get '/set_serialized_session_value'
++        assert_response :success
++        assert cookies['_session_id']
++      end
++      with_autoload_path "session_autoload_test" do
++        get '/get_session_id'
++        assert_response :success
++      end
++      with_autoload_path "session_autoload_test" do
++        get '/get_session_value'
++        assert_response :success
++        assert_equal 'foo: #<SessionAutoloadTest::Foo bar:"baz">', response.body, "should auto-load unloaded class"
++      end
++    end
++  end
++
++  def test_doesnt_write_session_cookie_if_session_id_is_already_exists
++    with_test_route_set do
++      get '/set_session_value'
++      assert_response :success
++      assert cookies['_session_id']
++
++      get '/get_session_value'
++      assert_response :success
++      assert_equal nil, headers['Set-Cookie'], "should not resend the cookie again if session_id cookie is already exists"
++    end
++  end
++
++  def test_prevents_session_fixation
++    with_test_route_set do
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body
++      session_id = cookies['_session_id']
++
++      reset!
++
++      get '/set_session_value', :_session_id => session_id
++      assert_response :success
++      assert_not_equal session_id, cookies['_session_id']
++    end
++  end
++
++  private
++    def with_test_route_set
++      with_routing do |set|
++        set.draw do
++          match ':action', :to => ::CacheStoreTest::TestController
++        end
++
++        @app = self.class.build_app(set) do |middleware|
++          cache = ActiveSupport::Cache::MemoryStore.new
++          middleware.use ActionDispatch::Session::CacheStore, :key => '_session_id', :cache => cache
++          middleware.delete "ActionDispatch::ShowExceptions"
++        end
++
++        yield
++      end
++    end
++end
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index 10c457b..fc0e5b3 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -608,14 +608,21 @@ module ActiveSupport
+       end
+ 
+       # Returns the size of the cached value. This could be less than value.size
+-      # if the data is compressed.
++      # if the data is compressed. This value is used for calculating approximate
++      # cache sizes and should not be considered authoritative.
+       def size
+         if @value.nil?
+           0
+         elsif @value.respond_to?(:bytesize)
+           @value.bytesize
+         else
+-          Marshal.dump(@value).bytesize
++          begin
++            Marshal.dump(@value).bytesize
++          rescue
++            # Just guess at the size if there is a problem with marshalling.
++            # If there is a real error, it will be raise when the object is used.
++            @value.inspect.bytesize
++          end
+         end
+       end
+ 
+diff --git a/railties/guides/source/action_controller_overview.textile b/railties/guides/source/action_controller_overview.textile
+index 496dc72..c9e791f 100644
+--- a/railties/guides/source/action_controller_overview.textile
++++ b/railties/guides/source/action_controller_overview.textile
+@@ -140,17 +140,19 @@ h3. Session
+ 
+ Your application has a session for each user in which you can store small amounts of data that will be persisted between requests. The session is only available in the controller and the view and can use one of a number of different storage mechanisms:
+ 
+-* CookieStore - Stores everything on the client.
+-* DRbStore - Stores the data on a DRb server.
+-* MemCacheStore - Stores the data in a memcache.
+-* ActiveRecordStore - Stores the data in a database using Active Record.
++* ActionDispatch::Session::CookieStore - Stores everything on the client.
++* ActiveRecord::SessionStore - Stores the data in a database using Active Record.
++* ActionDispatch::Session::CacheStore - Stores the data in the Rails cache.
++* ActionDispatch::Session::MemCacheStore - Stores the data in a memcached cluster (this is a legacy implementation; consider using CacheStore instead).
+ 
+ All session stores use a cookie to store a unique ID for each session (you must use a cookie, Rails will not allow you to pass the session ID in the URL as this is less secure).
+ 
+-For most stores this ID is used to look up the session data on the server, e.g. in a database table. There is one exception, and that is the default and recommended session store - the CookieStore - which stores all session data in the cookie itself (the ID is still available to you if you need it). This has the advantage of being very lightweight and it requires zero setup in a new application in order to use the session. The cookie data is cryptographically signed to make it tamper-proof, but it is not encrypted, so anyone with access to it can read its contents but not edit it (Rails will not accept it if it has been edited).
++For most stores this ID is used to look up the session data on the server, e.g. in a database table. There is one exception, and that is the default session store - the CookieStore - which stores all session data in the cookie itself (the ID is still available to you if you need it). This has the advantage of being very lightweight and it requires zero setup in a new application in order to use the session. The cookie data is cryptographically signed to make it tamper-proof, but it is not encrypted, so anyone with access to it can read its contents but not edit it (Rails will not accept it if it has been edited).
+ 
+ The CookieStore can store around 4kB of data -- much less than the others -- but this is usually enough. Storing large amounts of data in the session is discouraged no matter which session store your application uses. You should especially avoid storing complex objects (anything other than basic Ruby objects, the most common example being model instances) in the session, as the server might not be able to reassemble them between requests, which will result in an error.
+ 
++If your user sessions don't store critical data or don't need to be around for long periods (for instance if you just use the flash for messaging), you can consider using ActionDispatch::Session::CacheStore. This will store sessions using the cache implementation you have configured for your application. The advantage of this is that you can use your existing cache infrastructure for storing sessions without requiring any additional setup or administration. The downside, of course, is that the sessions will be ephemeral and could disappear at any time.
++
+ Read more about session storage in the "Security Guide":security.html.
+ 
+ If you need a different session storage mechanism, you can change it in the +config/initializers/session_store.rb+ file:
+diff --git a/railties/guides/source/rails_on_rack.textile b/railties/guides/source/rails_on_rack.textile
+index b1db294..7d37ad3 100644
+--- a/railties/guides/source/rails_on_rack.textile
++++ b/railties/guides/source/rails_on_rack.textile
+@@ -161,8 +161,9 @@ Much of Action Controller's functionality is implemented as Middlewares. The fol
+ |+Rack::Lock+|Sets +env["rack.multithread"]+ flag to +true+ and wraps the application within a Mutex.|
+ |+ActionController::Failsafe+|Returns HTTP Status +500+ to the client if an exception gets raised while dispatching.|
+ |+ActiveRecord::QueryCache+|Enables the Active Record query cache.|
+-|+ActionController::Session::CookieStore+|Uses the cookie based session store.|
+-|+ActionController::Session::MemCacheStore+|Uses the memcached based session store.|
++|+ActionDispatch::Session::CookieStore+|Uses the cookie based session store.|
++|+ActionDispatch::Session::CacheStore+|Uses the Rails cache based session store.|
++|+ActionDispatch::Session::MemCacheStore+|Uses the memcached based session store.|
+ |+ActiveRecord::SessionStore+|Uses the database based session store.|
+ |+Rack::MethodOverride+|Sets HTTP method based on +_method+ parameter or +env["HTTP_X_HTTP_METHOD_OVERRIDE"]+.|
+ |+Rack::Head+|Discards the response body if the client sends a +HEAD+ request.|
+diff --git a/railties/guides/source/security.textile b/railties/guides/source/security.textile
+index 893f658..5fc1770 100644
+--- a/railties/guides/source/security.textile
++++ b/railties/guides/source/security.textile
+@@ -83,9 +83,9 @@ This will also be a good idea, if you modify the structure of an object and old
+ 
+ h4. Session Storage
+ 
+--- _Rails provides several storage mechanisms for the session hashes. The most important are ActiveRecordStore and CookieStore._
++-- _Rails provides several storage mechanisms for the session hashes. The most important are ActiveRecord::SessionStore and ActionDispatch::Session::CookieStore._
+ 
+-There are a number of session storages, i.e. where Rails saves the session hash and session id. Most real-live applications choose ActiveRecordStore (or one of its derivatives) over file storage due to performance and maintenance reasons. ActiveRecordStore keeps the session id and hash in a database table and saves and retrieves the hash on every request.
++There are a number of session storages, i.e. where Rails saves the session hash and session id. Most real-live applications choose ActiveRecord::SessionStore (or one of its derivatives) over file storage due to performance and maintenance reasons. ActiveRecord::SessionStore keeps the session id and hash in a database table and saves and retrieves the hash on every request.
+ 
+ Rails 2 introduced a new default session storage, CookieStore. CookieStore saves the session hash directly in a cookie on the client-side. The server retrieves the session hash from the cookie and eliminates the need for a session id. That will greatly increase the speed of the application, but it is a controversial storage option and you have to think about the security implications of it:
+ 
+-- 
+1.7.3.4
+

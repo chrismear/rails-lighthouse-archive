@@ -1,0 +1,83 @@
+From fc1e331785d047e595776251d40bfb8f3dbf04f3 Mon Sep 17 00:00:00 2001
+From: Peter Jones <pjones@pmade.com>
+Date: Wed, 7 May 2008 16:04:18 -0600
+Subject: [PATCH] Bug: Earlier Check for Session in Forgery Protection
+
+The session is used by the form_authenticity_token method before it is
+tested to be valid.  This patch moves a few lines around so that the
+session is validated first.
+
+Without this patch, if you try to use forgery protection with sessions
+turned off, you get this exception message:
+
+  undefined method `session_id' for {}:Hash
+
+The patch includes a test that can be used to see this behavior before
+the request_forgery_protection.rb file is patched to fix it.
+---
+ .../request_forgery_protection.rb                  |    6 ++--
+ .../controller/request_forgery_protection_test.rb  |   24 ++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/request_forgery_protection.rb b/actionpack/lib/action_controller/request_forgery_protection.rb
+index 7e6961d..fc2ccf7 100644
+--- a/actionpack/lib/action_controller/request_forgery_protection.rb
++++ b/actionpack/lib/action_controller/request_forgery_protection.rb
+@@ -105,12 +105,12 @@ module ActionController #:nodoc:
+       # Sets the token value for the current session.  Pass a <tt>:secret</tt> option
+       # in +protect_from_forgery+ to add a custom salt to the hash.
+       def form_authenticity_token
+-        @form_authenticity_token ||= if request_forgery_protection_options[:secret]
++        @form_authenticity_token ||= if !session.respond_to?(:session_id)
++          raise InvalidAuthenticityToken, "Request Forgery Protection requires a valid session.  Use #allow_forgery_protection to disable it, or use a valid session."
++        elsif request_forgery_protection_options[:secret]
+           authenticity_token_from_session_id
+         elsif session.respond_to?(:dbman) && session.dbman.respond_to?(:generate_digest)
+           authenticity_token_from_cookie_session
+-        elsif session.nil?
+-          raise InvalidAuthenticityToken, "Request Forgery Protection requires a valid session.  Use #allow_forgery_protection to disable it, or use a valid session."
+         else
+           raise InvalidAuthenticityToken, "No :secret given to the #protect_from_forgery call.  Set that or use a session store capable of generating its own keys (Cookie Session Store)."
+         end
+diff --git a/actionpack/test/controller/request_forgery_protection_test.rb b/actionpack/test/controller/request_forgery_protection_test.rb
+index d0c3c6e..7022713 100644
+--- a/actionpack/test/controller/request_forgery_protection_test.rb
++++ b/actionpack/test/controller/request_forgery_protection_test.rb
+@@ -50,6 +50,14 @@ class CsrfCookieMonsterController < ActionController::Base
+   protect_from_forgery :only => :index
+ end
+ 
++# sessions are turned off
++class SessionOffController < ActionController::Base
++  protect_from_forgery :secret => 'foobar'
++  session :off
++  def rescue_action(e) raise e end
++  include RequestForgeryProtectionActions
++end
++
+ class FreeCookieController < CsrfCookieMonsterController
+   self.allow_forgery_protection = false
+   
+@@ -224,3 +232,19 @@ class FreeCookieControllerTest < Test::Unit::TestCase
+     end
+   end
+ end
++
++class SessionOffControllerTest < Test::Unit::TestCase
++  def setup
++    @controller = SessionOffController.new
++    @request    = ActionController::TestRequest.new
++    @response   = ActionController::TestResponse.new
++    @token      = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::Digest.new('SHA1'), 'abc', '123')
++  end
++
++  def test_should_raise_correct_exception
++    @request.session = {} # session(:off) doesn't appear to work with controller tests
++    assert_raises(ActionController::InvalidAuthenticityToken) do
++      post :index, :authenticity_token => @token
++    end
++  end
++end
+-- 
+1.5.3.7
+

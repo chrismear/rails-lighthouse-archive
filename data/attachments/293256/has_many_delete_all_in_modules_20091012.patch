@@ -1,0 +1,268 @@
+From 05ed88edc24cdf83a5b145193e0570b8e5cc4dc9 Mon Sep 17 00:00:00 2001
+From: Brian Samson <brian@briansamson.com>
+Date: Mon, 12 Oct 2009 12:01:00 -0700
+Subject: [PATCH] update this patch so it applies cleanly to edge
+
+---
+ activerecord/lib/active_record/associations.rb     |   56 ++++----------------
+ .../associations/has_many_associations_test.rb     |   15 +++++-
+ activerecord/test/cases/associations_test.rb       |    3 +
+ activerecord/test/fixtures/asteroids.yml           |   14 +++++
+ activerecord/test/fixtures/planets.yml             |   14 +++++
+ activerecord/test/fixtures/solar_systems.yml       |    4 ++
+ activerecord/test/models/astronomy/asteroid.rb     |    5 ++
+ activerecord/test/models/astronomy/planet.rb       |    5 ++
+ activerecord/test/models/astronomy/solar_system.rb |    6 ++
+ activerecord/test/schema/schema.rb                 |   14 +++++
+ 10 files changed, 90 insertions(+), 46 deletions(-)
+ create mode 100644 activerecord/test/fixtures/asteroids.yml
+ create mode 100644 activerecord/test/fixtures/planets.yml
+ create mode 100644 activerecord/test/fixtures/solar_systems.yml
+ create mode 100644 activerecord/test/models/astronomy/asteroid.rb
+ create mode 100644 activerecord/test/models/astronomy/planet.rb
+ create mode 100644 activerecord/test/models/astronomy/solar_system.rb
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 497115e..23f7397 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1480,7 +1480,7 @@ module ActiveRecord
+           if reflection.options.include?(:dependent)
+             # Add polymorphic type if the :as option is present
+             dependent_conditions = []
+-            dependent_conditions << "#{reflection.primary_key_name} = \#{record.quoted_id}"
++            dependent_conditions << "#{reflection.primary_key_name} = \#{self.quoted_id}"
+             dependent_conditions << "#{reflection.options[:as]}_type = '#{base_class.name}'" if reflection.options[:as]
+             dependent_conditions << sanitize_sql(reflection.options[:conditions], reflection.quoted_table_name) if reflection.options[:conditions]
+             dependent_conditions << extra_conditions if extra_conditions
+@@ -1494,43 +1494,17 @@ module ActiveRecord
+                 end
+                 before_destroy method_name
+               when :delete_all
+-                # before_destroy do |record|
+-                #   self.class.send(:delete_all_has_many_dependencies,
+-                #     record,
+-                #     "posts",
+-                #     Post,
+-                #     %@...@) # this is a string literal like %(...)
+-                #   end
+-                # end
+-                module_eval <<-CALLBACK
+-                  before_destroy do |record|
+-                    self.class.send(:delete_all_has_many_dependencies,
+-                      record,
+-                      "#{reflection.name}",
+-                      #{reflection.class_name},
+-                      %@#{dependent_conditions}@)
+-                  end
+-                CALLBACK
++                method_name = "has_many_dependent_delete_all_for_#{reflection.name}".to_sym
++                define_method(method_name) do
++                  reflection.klass.delete_all( eval("\"" + dependent_conditions + "\"") )
++                end
++                before_destroy method_name
+               when :nullify
+-                # before_destroy do |record|
+-                #   self.class.send(:nullify_has_many_dependencies,
+-                #     record,
+-                #     "posts",
+-                #     Post,
+-                #     "user_id",
+-                #     %@...@) # this is a string literal like %(...)
+-                #   end
+-                # end
+-                module_eval <<-CALLBACK
+-                  before_destroy do |record|
+-                    self.class.send(:nullify_has_many_dependencies,
+-                      record,
+-                      "#{reflection.name}",
+-                      #{reflection.class_name},
+-                      "#{reflection.primary_key_name}",
+-                      %@#{dependent_conditions}@)
+-                  end
+-                CALLBACK
++                method_name = "has_many_dependent_nullify_for_#{reflection.name}".to_sym
++                define_method(method_name) do
++                  reflection.klass.update_all("#{reflection.primary_key_name} = NULL",  eval("\"" + dependent_conditions + "\"") )
++                end
++                before_destroy method_name
+               else
+                 raise ArgumentError, "The :dependent option expects either :destroy, :delete_all, or :nullify (#{reflection.options[:dependent].inspect})"
+             end
+@@ -1596,14 +1570,6 @@ module ActiveRecord
+           end
+         end
+ 
+-        def delete_all_has_many_dependencies(record, reflection_name, association_class, dependent_conditions)
+-          association_class.delete_all(dependent_conditions)
+-        end
+-
+-        def nullify_has_many_dependencies(record, reflection_name, association_class, primary_key_name, dependent_conditions)
+-          association_class.update_all("#{primary_key_name} = NULL", dependent_conditions)
+-        end
+-
+         mattr_accessor :valid_keys_for_has_many_association
+         @@valid_keys_for_has_many_association = [
+           :class_name, :table_name, :foreign_key, :primary_key,
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index b193f8d..150b1d3 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -11,11 +11,15 @@ require 'models/comment'
+ require 'models/person'
+ require 'models/reader'
+ require 'models/tagging'
++require 'models/astronomy/solar_system'
++require 'models/astronomy/planet'
++require 'models/astronomy/asteroid'
++
+ 
+ class HasManyAssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :categories, :companies, :developers, :projects,
+            :developers_projects, :topics, :authors, :comments, :author_addresses,
+-           :people, :posts, :readers, :taggings
++           :people, :posts, :readers, :taggings, :solar_systems, :planets, :asteroids
+ 
+   def setup
+     Client.destroyed_client_ids.clear
+@@ -1166,5 +1170,14 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     client = firm.clients_using_primary_key.create!(:name => 'test')
+     assert_equal firm.name, client.firm_name
+   end
++
++  def test_module_models_dependent_behavior
++     Astronomy::SolarSystem.find(:first).destroy
++     #this should have deleted all the planets
++     assert_equal( Astronomy::Planet.find(:all), [] )
++     #and nullified all the asteroids
++     assert_equal( Astronomy::Asteroid.find_all_by_solar_system_id(nil).size, 3 )
++  end
++
+ end
+ 
+diff --git a/activerecord/test/cases/associations_test.rb b/activerecord/test/cases/associations_test.rb
+index 056a294..6f534fc 100644
+--- a/activerecord/test/cases/associations_test.rb
++++ b/activerecord/test/cases/associations_test.rb
+@@ -259,4 +259,7 @@ class OverridingAssociationsTest < ActiveRecord::TestCase
+       DifferentPeopleList.reflect_on_association(:has_one)
+     )
+   end
++
+ end
++
++
+diff --git a/activerecord/test/fixtures/asteroids.yml b/activerecord/test/fixtures/asteroids.yml
+new file mode 100644
+index 0000000..87faee7
+--- /dev/null
++++ b/activerecord/test/fixtures/asteroids.yml
+@@ -0,0 +1,14 @@
++ceres:
++  id: 1
++  name: Ceres
++  solar_system_id: 1
++
++hermes:
++  id: 2
++  name: Hermes
++  solar_system_id: 1
++
++adonis:
++  id: 3
++  name: Adonis
++  solar_system_id: 1
+\ No newline at end of file
+diff --git a/activerecord/test/fixtures/planets.yml b/activerecord/test/fixtures/planets.yml
+new file mode 100644
+index 0000000..eed94cb
+--- /dev/null
++++ b/activerecord/test/fixtures/planets.yml
+@@ -0,0 +1,14 @@
++mercury:
++  id: 1
++  name: mercury
++  solar_system_id: 1
++
++venus: 
++  id: 2
++  name: venus
++  solar_system_id: 1
++
++earth:
++  id: 3
++  name: earth
++  solar_system_id: 1
+diff --git a/activerecord/test/fixtures/solar_systems.yml b/activerecord/test/fixtures/solar_systems.yml
+new file mode 100644
+index 0000000..ad777e6
+--- /dev/null
++++ b/activerecord/test/fixtures/solar_systems.yml
+@@ -0,0 +1,4 @@
++sol:
++  id: 1
++  star: The Sun
++  
+diff --git a/activerecord/test/models/astronomy/asteroid.rb b/activerecord/test/models/astronomy/asteroid.rb
+new file mode 100644
+index 0000000..8a9f8c5
+--- /dev/null
++++ b/activerecord/test/models/astronomy/asteroid.rb
+@@ -0,0 +1,5 @@
++module Astronomy
++  class Asteroid < ActiveRecord::Base
++    belongs_to :solar_system
++  end
++end
+diff --git a/activerecord/test/models/astronomy/planet.rb b/activerecord/test/models/astronomy/planet.rb
+new file mode 100644
+index 0000000..6e75236
+--- /dev/null
++++ b/activerecord/test/models/astronomy/planet.rb
+@@ -0,0 +1,5 @@
++module Astronomy
++  class Planet < ActiveRecord::Base
++    belongs_to :solar_system
++  end
++end
+diff --git a/activerecord/test/models/astronomy/solar_system.rb b/activerecord/test/models/astronomy/solar_system.rb
+new file mode 100644
+index 0000000..9de5699
+--- /dev/null
++++ b/activerecord/test/models/astronomy/solar_system.rb
+@@ -0,0 +1,6 @@
++module Astronomy
++  class SolarSystem < ActiveRecord::Base
++    has_many :planets, :dependent => :delete_all
++    has_many :asteroids, :dependent => :nullify
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 15e5e12..461d5de 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -532,6 +532,20 @@ ActiveRecord::Schema.define do
+     t.string :title
+   end
+ 
++  create_table :solar_systems, :force => true do |t|
++    t.string :star
++  end
++
++  create_table :planets, :force => true do |t|
++    t.string :name
++    t.references :solar_system
++  end
++
++  create_table :asteroids, :force => true do |t|
++    t.string :name
++    t.references :solar_system
++  end
++
+   except 'SQLite' do
+     # fk_test_has_fk should be before fk_test_has_pk
+     create_table :fk_test_has_fk, :force => true do |t|
+-- 
+1.6.2.2
+

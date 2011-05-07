@@ -1,0 +1,299 @@
+From bd46465a188e0f8dc927b07adc37dd5752088bac Mon Sep 17 00:00:00 2001
+From: David Dollar <ddollar@gmail.com>
+Date: Wed, 29 Apr 2009 01:22:54 -0400
+Subject: [PATCH] Attempt to deal with more cases of gems with native components.
+
+This commit adds a rudimentary check for 'unbuilt' gems, so that we can abort
+the application load if there are any gems that have native components that
+have not yet been built.
+
+The rake task gems:build has now only builds 'unbuilt' gems as a result.
+
+The rake task gems:build:force has been added to deal with cases of incomplete
+builds, or any case where you need to force the build of all of your gems.
+
+Changes the gems:build task to get its gem list by parsing directory entries
+in vendor/gems, which sidesteps the chicken/egg issues involved with having a
+gem unpacked into vendor/gems without before its native bits are compiled.
+---
+ railties/lib/initializer.rb                        |   21 ++++++++++
+ railties/lib/rails/gem_dependency.rb               |   21 ++++++++--
+ railties/lib/tasks/gems.rake                       |   18 ++++++++-
+ railties/test/gem_dependency_test.rb               |   21 ++++++++++
+ .../vendor/gems/dummy-gem-i-1.0.0/.specification   |   41 ++++++++++++++++++++
+ .../gems/dummy-gem-i-1.0.0/lib/dummy-gem-i.rb      |    1 +
+ .../vendor/gems/dummy-gem-j-1.0.0/.specification   |   41 ++++++++++++++++++++
+ .../gems/dummy-gem-j-1.0.0/lib/dummy-gem-j.rb      |    1 +
+ 8 files changed, 159 insertions(+), 6 deletions(-)
+ create mode 100644 railties/test/vendor/gems/dummy-gem-i-1.0.0/.specification
+ create mode 100644 railties/test/vendor/gems/dummy-gem-i-1.0.0/ext/dummy-gem-i/Makefile
+ create mode 100644 railties/test/vendor/gems/dummy-gem-i-1.0.0/lib/dummy-gem-i.rb
+ create mode 100644 railties/test/vendor/gems/dummy-gem-j-1.0.0/.specification
+ create mode 100644 railties/test/vendor/gems/dummy-gem-j-1.0.0/lib/dummy-gem-j.rb
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 1bd7bae..71366a4 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -156,6 +156,8 @@ module Rails
+ 
+       add_support_load_paths
+ 
++      check_for_unbuilt_gems
++
+       load_gems
+       load_plugins
+ 
+@@ -308,6 +310,25 @@ module Rails
+       end
+     end
+ 
++    def check_for_unbuilt_gems
++      unbuilt_gems = @configuration.gems.select(&:frozen?).reject(&:built?)
++      if unbuilt_gems.size > 0
++        # don't print if the gems:build rake tasks are being run
++        unless $gems_build_rake_task
++          abort <<-end_error
++The following gems have native components that need to be built
++  #{unbuilt_gems.map { |gem| "#{gem.name}  #{gem.requirement}" } * "\n  "}
++
++You're running:
++  ruby #{Gem.ruby_version} at #{Gem.ruby}
++  rubygems #{Gem::RubyGemsVersion} at #{Gem.path * ', '}
++
++Run `rake gems:build` to build the unbuilt gems.
++          end_error
++        end
++      end
++    end
++
+     def check_gem_dependencies
+       unloaded_gems = @configuration.gems.reject { |g| g.loaded? }
+       if unloaded_gems.size > 0
+diff --git a/railties/lib/rails/gem_dependency.rb b/railties/lib/rails/gem_dependency.rb
+index 3062a77..ee3d0d8 100644
+--- a/railties/lib/rails/gem_dependency.rb
++++ b/railties/lib/rails/gem_dependency.rb
+@@ -29,6 +29,15 @@ module Rails
+       end
+     end
+ 
++    def self.from_directory_name(directory_name)
++      directory_name_parts = File.basename(directory_name).split('-')
++      name    = directory_name_parts[0..-2].join('-')
++      version = directory_name_parts.last
++      self.new(name, :version => version)
++    rescue ArgumentError => e
++      raise "Unable to determine gem name and version from '#{directory_name}'"
++    end
++
+     def initialize(name, options = {})
+       require 'rubygems' unless Object.const_defined?(:Gem)
+ 
+@@ -101,8 +110,12 @@ module Rails
+     end
+ 
+     def built?
+-      # TODO: If Rubygems ever gives us a way to detect this, we should use it
+-      false
++      return false unless frozen?
++      specification.extensions.each do |ext|
++        makefile = File.join(unpacked_gem_directory, File.dirname(ext), 'Makefile')
++        return false unless File.exists?(makefile)
++      end
++      true
+     end
+ 
+     def framework_gem?
+@@ -155,9 +168,9 @@ module Rails
+       specification && File.exists?(unpacked_gem_directory)
+     end
+ 
+-    def build
++    def build(options={})
+       require 'rails/gem_builder'
+-      unless built?
++      if options[:force] || !built?
+         return unless File.exists?(unpacked_specification_filename)
+         spec = YAML::load_file(unpacked_specification_filename)
+         Rails::GemBuilder.new(spec, unpacked_gem_directory).build_extensions
+diff --git a/railties/lib/tasks/gems.rake b/railties/lib/tasks/gems.rake
+index ed07bf2..efadb1d 100644
+--- a/railties/lib/tasks/gems.rake
++++ b/railties/lib/tasks/gems.rake
+@@ -20,8 +20,16 @@ namespace :gems do
+   desc "Build any native extensions for unpacked gems"
+   task :build do
+     $gems_build_rake_task = true
+-    Rake::Task['gems:unpack'].invoke
+-    current_gems.each &:build
++    frozen_gems.each &:build
++  end
++
++  namespace :build do
++    desc "Force the build of all gems"
++    task :force do
++      $gems_build_rake_task = true
++      Rake::Task['gems:unpack'].invoke
++      current_gems.each { |gem| gem.build(:force => true) }
++    end
+   end
+ 
+   desc "Installs all required gems."
+@@ -53,6 +61,12 @@ def current_gems
+   gems
+ end
+ 
++def frozen_gems
++  Dir[File.join(RAILS_ROOT, 'vendor', 'gems', '*-*')].map do |gem_dir|
++    Rails::GemDependency.from_directory_name(gem_dir)
++  end
++end
++
+ def print_gem_status(gem, indent=1)
+   code = case
+     when gem.framework_gem? then 'R'
+diff --git a/railties/test/gem_dependency_test.rb b/railties/test/gem_dependency_test.rb
+index da7bda9..4ff4fe8 100644
+--- a/railties/test/gem_dependency_test.rb
++++ b/railties/test/gem_dependency_test.rb
+@@ -145,4 +145,25 @@ class GemDependencyTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_gem_from_directory_name
++    dummy_gem = Rails::GemDependency.from_directory_name('dummy-gem-1.1')
++    assert_equal 'dummy-gem', dummy_gem.name
++    assert_equal '= 1.1',     dummy_gem.version_requirements.to_s
++  end
++
++  def test_gem_from_invalid_directory_name
++    assert_raises RuntimeError do
++      dummy_gem = Rails::GemDependency.from_directory_name('dummy-gem')
++    end
++    assert_raises RuntimeError do
++      dummy_gem = Rails::GemDependency.from_directory_name('dummy')
++    end
++  end
++
++  def test_gem_determines_build_status
++    assert_equal true,  Rails::GemDependency.new("dummy-gem-a").built?
++    assert_equal true,  Rails::GemDependency.new("dummy-gem-i").built?
++    assert_equal false, Rails::GemDependency.new("dummy-gem-j").built?
++  end
++
+ end
+diff --git a/railties/test/vendor/gems/dummy-gem-i-1.0.0/.specification b/railties/test/vendor/gems/dummy-gem-i-1.0.0/.specification
+new file mode 100644
+index 0000000..4289ddd
+--- /dev/null
++++ b/railties/test/vendor/gems/dummy-gem-i-1.0.0/.specification
+@@ -0,0 +1,41 @@
++--- !ruby/object:Gem::Specification
++name: dummy-gem-i
++version: !ruby/object:Gem::Version
++  version: 1.3.0
++platform: ruby
++authors:
++- "Nobody"
++date: 2008-10-03 00:00:00 -04:00
++dependencies:
++- !ruby/object:Gem::Dependency
++  name: dummy-gem-i
++  type: :runtime
++  version_requirement:
++  version_requirements: !ruby/object:Gem::Requirement
++    requirements:
++    - - ">="
++      - !ruby/object:Gem::Version
++        version: 1.0.0
++    version:
++extensions: 
++- ext/dummy-gem-i/extconf.rb
++files:
++- lib
++- lib/dummy-gem-i.rb
++require_paths:
++- lib
++required_ruby_version: !ruby/object:Gem::Requirement
++  requirements:
++  - - ">="
++    - !ruby/object:Gem::Version
++      version: "0"
++  version:
++required_rubygems_version: !ruby/object:Gem::Requirement
++  requirements:
++  - - ">="
++    - !ruby/object:Gem::Version
++      version: "0"
++  version:
++requirements: []
++specification_version: 2
++summary: Dummy Gem G
+diff --git a/railties/test/vendor/gems/dummy-gem-i-1.0.0/ext/dummy-gem-i/Makefile b/railties/test/vendor/gems/dummy-gem-i-1.0.0/ext/dummy-gem-i/Makefile
+new file mode 100644
+index 0000000..e69de29
+diff --git a/railties/test/vendor/gems/dummy-gem-i-1.0.0/lib/dummy-gem-i.rb b/railties/test/vendor/gems/dummy-gem-i-1.0.0/lib/dummy-gem-i.rb
+new file mode 100644
+index 0000000..2f9a376
+--- /dev/null
++++ b/railties/test/vendor/gems/dummy-gem-i-1.0.0/lib/dummy-gem-i.rb
+@@ -0,0 +1 @@
++DUMMY_GEM_I_VERSION="1.0.0"
+diff --git a/railties/test/vendor/gems/dummy-gem-j-1.0.0/.specification b/railties/test/vendor/gems/dummy-gem-j-1.0.0/.specification
+new file mode 100644
+index 0000000..0bb2351
+--- /dev/null
++++ b/railties/test/vendor/gems/dummy-gem-j-1.0.0/.specification
+@@ -0,0 +1,41 @@
++--- !ruby/object:Gem::Specification
++name: dummy-gem-j
++version: !ruby/object:Gem::Version
++  version: 1.3.0
++platform: ruby
++authors:
++- "Nobody"
++date: 2008-10-03 00:00:00 -04:00
++dependencies:
++- !ruby/object:Gem::Dependency
++  name: dummy-gem-j
++  type: :runtime
++  version_requirement:
++  version_requirements: !ruby/object:Gem::Requirement
++    requirements:
++    - - ">="
++      - !ruby/object:Gem::Version
++        version: 1.0.0
++    version:
++extensions: 
++- ext/dummy-gem-j/extconf.rb
++files:
++- lib
++- lib/dummy-gem-j.rb
++require_paths:
++- lib
++required_ruby_version: !ruby/object:Gem::Requirement
++  requirements:
++  - - ">="
++    - !ruby/object:Gem::Version
++      version: "0"
++  version:
++required_rubygems_version: !ruby/object:Gem::Requirement
++  requirements:
++  - - ">="
++    - !ruby/object:Gem::Version
++      version: "0"
++  version:
++requirements: []
++specification_version: 2
++summary: Dummy Gem G
+diff --git a/railties/test/vendor/gems/dummy-gem-j-1.0.0/lib/dummy-gem-j.rb b/railties/test/vendor/gems/dummy-gem-j-1.0.0/lib/dummy-gem-j.rb
+new file mode 100644
+index 0000000..8ecd363
+--- /dev/null
++++ b/railties/test/vendor/gems/dummy-gem-j-1.0.0/lib/dummy-gem-j.rb
+@@ -0,0 +1 @@
++DUMMY_GEM_J_VERSION="1.0.0"
+-- 
+1.6.2.4
+

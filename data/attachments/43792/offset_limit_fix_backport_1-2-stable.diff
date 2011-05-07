@@ -1,0 +1,83 @@
+From b111db06d667c93bbdc5f9fe23eb97e31c71224d Mon Sep 17 00:00:00 2001
+From: Jon Leighton <j@jonathanleighton.com>
+Date: Thu, 4 Sep 2008 18:54:33 +0200
+Subject: [PATCH] Backport offset/limit SQL injection fix to 1-2-stable
+
+---
+ .../abstract/database_statements.rb                |    9 +++++++--
+ .../connection_adapters/mysql_adapter.rb           |    3 ++-
+ activerecord/test/adapter_test.rb                  |   20 ++++++++++++++++++++
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+index 7d7c22c..fa59053 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+@@ -92,11 +92,16 @@ module ActiveRecord
+       #  SELECT * FROM suppliers LIMIT 10 OFFSET 50
+       def add_limit_offset!(sql, options)
+         if limit = options[:limit]
+-          sql << " LIMIT #{limit}"
++          sql << " LIMIT #{sanitize_limit(limit)}"
+           if offset = options[:offset]
+-            sql << " OFFSET #{offset}"
++            sql << " OFFSET #{offset.to_i}"
+           end
+         end
++        sql
++      end
++      
++      def sanitize_limit(limit)
++        limit.to_s[/,/] ? limit.split(',').map{ |i| i.to_i }.join(',') : limit.to_i
+       end
+ 
+       # Appends a locking clause to a SQL statement. *Modifies the +sql+ parameter*.
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 842258f..d9815be 100755
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -280,10 +280,11 @@ module ActiveRecord
+ 
+       def add_limit_offset!(sql, options) #:nodoc:
+         if limit = options[:limit]
++          limit = sanitize_limit(limit)
+           unless offset = options[:offset]
+             sql << " LIMIT #{limit}"
+           else
+-            sql << " LIMIT #{offset}, #{limit}"
++            sql << " LIMIT #{offset.to_i}, #{limit}"
+           end
+         end
+       end
+diff --git a/activerecord/test/adapter_test.rb b/activerecord/test/adapter_test.rb
+index 0c12c4d..b02add5 100644
+--- a/activerecord/test/adapter_test.rb
++++ b/activerecord/test/adapter_test.rb
+@@ -84,4 +84,24 @@ class AdapterTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_add_limit_offset_should_sanitize_sql_injection_for_limit_without_comas
++    sql_inject = "1 select * from schema"
++      assert_equal " LIMIT 1", @connection.add_limit_offset!("", :limit=>sql_inject)
++    if current_adapter?(:MysqlAdapter)
++      assert_equal " LIMIT 7, 1", @connection.add_limit_offset!("", :limit=>sql_inject, :offset=>7)
++    else
++      assert_equal " LIMIT 1 OFFSET 7", @connection.add_limit_offset!("", :limit=>sql_inject, :offset=>7)
++    end
++  end
++
++  def test_add_limit_offset_should_sanitize_sql_injection_for_limit_with_comas
++    sql_inject = "1, 7 procedure help()"
++    if current_adapter?(:MysqlAdapter)
++      assert_equal " LIMIT 1,7", @connection.add_limit_offset!("", :limit=>sql_inject)
++      assert_equal " LIMIT 7, 1", @connection.add_limit_offset!("", :limit=> '1 ; DROP TABLE USERS', :offset=>7)
++    else
++      assert_equal " LIMIT 1,7", @connection.add_limit_offset!("", :limit=>sql_inject)
++      assert_equal " LIMIT 1,7 OFFSET 7", @connection.add_limit_offset!("", :limit=>sql_inject, :offset=>7)
++    end
++  end
+ end
+-- 
+1.5.4.3
+

@@ -1,0 +1,214 @@
+From 4fddaecdd13d762a4808a62c7195177996da5a95 Mon Sep 17 00:00:00 2001
+From: Cezary Baginski <cezary.baginski@gmail.com>
+Date: Fri, 7 May 2010 12:44:21 +0200
+Subject: [PATCH 1/2] Added rvm support for CI [#4549 state:committed]
+
+---
+ Rakefile         |    6 +++
+ ci/ci_build.rb   |   13 +++++--
+ ci/rvm_helper.rb |   94 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 109 insertions(+), 4 deletions(-)
+ create mode 100644 ci/rvm_helper.rb
+
+diff --git a/Rakefile b/Rakefile
+index 2fa1f75..f7e932e 100644
+--- a/Rakefile
++++ b/Rakefile
+@@ -122,6 +122,12 @@ task :pdoc => :rdoc do
+   end
+ end
+ 
++desc "target for CI (see rvm_helper for details)"
++task :ci do
++  require File.join(File.dirname(__FILE__), "ci", "rvm_helper")
++  Rvm::CiHelper.run_with(ENV['RVM_USE_RUBY'])
++end
++
+ task :update_versions do
+   require File.dirname(__FILE__) + "/version"
+ 
+diff --git a/ci/ci_build.rb b/ci/ci_build.rb
+index cd62381..d636524 100755
+--- a/ci/ci_build.rb
++++ b/ci/ci_build.rb
+@@ -2,13 +2,18 @@
+ require 'fileutils'
+ include FileUtils
+ 
++unless ARGV.include?('NO_CI_RERUN')
++	res = system("rake ci")
++	exit (res ? 0 : -1)
++end
++
+ def root_dir
+   @root_dir ||= File.expand_path('../..', __FILE__)
+ end
+ 
+ def rake(*tasks)
+   tasks.each do |task|
+-    cmd = "bundle exec rake #{task}"
++    cmd = "env CI=1 bundle exec rake #{task}"
+     puts "Running command: #{cmd}"
+     return false unless system(cmd)
+   end
+@@ -19,7 +24,7 @@ puts "[CruiseControl] Rails build"
+ build_results = {}
+ 
+ # Install required version of bundler.
+-bundler_install_cmd = "sudo gem install bundler --no-ri --no-rdoc"
++bundler_install_cmd = "gem install bundler --no-ri --no-rdoc"
+ puts "Running command: #{bundler_install_cmd}"
+ build_results[:install_bundler] = system bundler_install_cmd
+ 
+@@ -27,7 +32,7 @@ cd root_dir do
+   puts
+   puts "[CruiseControl] Bundling RubyGems"
+   puts
+-  build_results[:bundle] = system 'sudo rm -rf ~/.bundle; env CI=1 bundle install'
++  build_results[:bundle] = system 'rm -rf ~/.bundle; env CI=1 bundle install'
+ end
+ 
+ cd "#{root_dir}/activesupport" do
+@@ -114,7 +119,7 @@ puts "[CruiseControl]   #{`pg_config --version`}"
+ puts "[CruiseControl]   SQLite3: #{`sqlite3 -version`}"
+ `gem env`.each_line {|line| print "[CruiseControl]   #{line}"}
+ puts "[CruiseControl]   Bundled gems:"
+-`bundle show`.each_line {|line| print "[CruiseControl]     #{line}"}
++`env CI=1 bundle show`.each_line {|line| print "[CruiseControl]     #{line}"}
+ puts "[CruiseControl]   Local gems:"
+ `gem list`.each_line {|line| print "[CruiseControl]     #{line}"}
+ 
+diff --git a/ci/rvm_helper.rb b/ci/rvm_helper.rb
+new file mode 100644
+index 0000000..bbb33b6
+--- /dev/null
++++ b/ci/rvm_helper.rb
+@@ -0,0 +1,94 @@
++#!/bin/env ruby
++
++# Invoking:
++#
++# Use version string recognized by rvm:
++#
++#		rake ci RVM_USE_VERSION=1.9.1-head
++#
++#	Use current version as is:
++#
++#		rake ci RVM_USE_VERSION=current
++#
++#	Backward compatibility for old way of invoking CI:
++#
++#		ruby ci/ci_build.rb
++#
++# Old functionality:
++#
++#		ruby ci/ci_build.rb NO_CI_RERUN
++
++module Rvm
++  class RvmError < RuntimeError
++    def to_s
++      "Rvm: #{super}"
++    end
++  end
++
++  class Rvm
++    attr_reader :version
++
++    def initialize(version)
++      @version = version
++    end
++
++    def installed?
++      #hack to detect if installed
++      res1 = run("-e puts > /dev/null 2>&1")
++      res2 = run("-e raise > /dev/null 2>&1")
++      res1 ^ res2
++    end
++
++    def install!
++      unless Rvm.run(version, "install")
++        raise RvmError,"Could not install ruby #{version}"
++      end
++    end
++
++    def run(params)
++      Rvm.run(version, params)
++    end
++
++    class << self
++      def installed?
++        run(nil, "--version")
++      end
++
++      def install!
++        cmd = "bash < <( curl -s -S http://rvm.beginrescueend.com/releases/rvm-install-head )"
++        raise RvmError,"Failed to install rvm using curl!" unless bash(cmd)
++      end
++
++      def run(version, command)
++        bash("source ~/.rvm/scripts/rvm; rvm #{version} #{command}")
++      end
++
++      def bash(command)
++        system("bash -c \"#{command}\"")
++      end
++    end
++  end
++
++  class CiHelper
++    def self.run_with(ruby_version)
++      if ruby_version == "current"
++        puts "Selected ruby is: #{RUBY_VERSION}"
++        system "ruby ci/ci_build.rb NO_CI_RERUN"
++      else
++        Rvm.install! unless Rvm.installed?
++
++        ruby = Rvm.new(ruby_version || select_ruby(RUBY_VERSION))
++        ruby.install! unless ruby.installed?
++        puts "restarting rake ci with ruby: #{ruby.version}"
++        ruby.run("rake ci RVM_USE_RUBY=current")
++      end
++    end
++
++    def self.select_ruby(version)
++      return '1.8.7' if version < '1.9'
++      return '1.9.1-head' if version < '1.9.2'
++      puts "WARNING: unsupported ruby version: #{version}"
++      '1.9.2-head'
++    end
++  end
++end
+-- 
+1.7.1
+
+
+From 0a6703749cc02a0f6f702ae0f3a19acda7b4c5f9 Mon Sep 17 00:00:00 2001
+From: Cezary Baginski <cezary.baginski@gmail.com>
+Date: Fri, 7 May 2010 12:51:40 +0200
+Subject: [PATCH 2/2] CI/rvm: fixed wrong param in comments [#4549 state:comitted]
+
+---
+ ci/rvm_helper.rb |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ci/rvm_helper.rb b/ci/rvm_helper.rb
+index bbb33b6..b5a3067 100644
+--- a/ci/rvm_helper.rb
++++ b/ci/rvm_helper.rb
+@@ -4,11 +4,11 @@
+ #
+ # Use version string recognized by rvm:
+ #
+-#		rake ci RVM_USE_VERSION=1.9.1-head
++#		rake ci RVM_USE_RUBY=1.9.1-head
+ #
+ #	Use current version as is:
+ #
+-#		rake ci RVM_USE_VERSION=current
++#		rake ci RVM_USE_RUBY=current
+ #
+ #	Backward compatibility for old way of invoking CI:
+ #
+-- 
+1.7.1
+

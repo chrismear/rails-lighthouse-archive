@@ -1,0 +1,126 @@
+From 521bcb3db69ee7466910d231176250ca7ef665f2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Elomar=20Fran=C3=A7a?= <elomar@maisweb.org>
+Date: Tue, 22 Jun 2010 19:50:15 -0300
+Subject: [PATCH] Fix bug where ActiveResource::HttpMock would overwrite Accept/Content-Type header to application/xml
+
+---
+ activeresource/lib/active_resource/http_mock.rb |   16 +++++-
+ activeresource/test/cases/http_mock_test.rb     |   71 +++++++++++++++++++++++
+ 2 files changed, 85 insertions(+), 2 deletions(-)
+ create mode 100644 activeresource/test/cases/http_mock_test.rb
+
+diff --git a/activeresource/lib/active_resource/http_mock.rb b/activeresource/lib/active_resource/http_mock.rb
+index 1ed3804..f192c53 100644
+--- a/activeresource/lib/active_resource/http_mock.rb
++++ b/activeresource/lib/active_resource/http_mock.rb
+@@ -148,16 +148,28 @@ module ActiveResource
+     attr_accessor :path, :method, :body, :headers
+ 
+     def initialize(method, path, body = nil, headers = {})
+-      @method, @path, @body, @headers = method, path, body, headers.merge(ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES[method] => 'application/xml')
++      @method, @path, @body, @headers = method, path, body, headers
+     end
+ 
+     def ==(req)
+-      path == req.path && method == req.method && headers == req.headers
++      path == req.path && method == req.method && headers_match?(req)
+     end
+ 
+     def to_s
+       "<#{method.to_s.upcase}: #{path} [#{headers}] (#{body})>"
+     end
++
++    private
++
++    def headers_match?(req)
++      # Ignore format header on equality if it's not defined
++      format_header = ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES[method]
++      if headers[format_header].present? || req.headers[format_header].blank?
++        headers == req.headers
++      else
++        headers.dup.merge(format_header => req.headers[format_header]) == req.headers
++      end
++    end
+   end
+ 
+   class Response
+diff --git a/activeresource/test/cases/http_mock_test.rb b/activeresource/test/cases/http_mock_test.rb
+new file mode 100644
+index 0000000..5e032d0
+--- /dev/null
++++ b/activeresource/test/cases/http_mock_test.rb
+@@ -0,0 +1,71 @@
++require 'abstract_unit'
++
++class HttpMockTest < ActiveSupport::TestCase
++  setup do
++    @http = ActiveResource::HttpMock.new("http://example.com")
++  end
++
++  FORMAT_HEADER = ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES
++
++  [:post, :put, :get, :delete, :head].each do |method|
++    test "responds to simple #{method} request" do
++      ActiveResource::HttpMock.respond_to do |mock|
++        mock.send(method, "/people/1", {FORMAT_HEADER[method] => "application/xml"}, "Response")
++      end
++
++      assert_equal "Response", request(method, "/people/1", FORMAT_HEADER[method] => "application/xml").body
++    end
++
++    test "adds format header by default to #{method} request" do
++      ActiveResource::HttpMock.respond_to do |mock|
++        mock.send(method, "/people/1", {}, "Response")
++      end
++
++      assert_equal "Response", request(method, "/people/1", FORMAT_HEADER[method] => "application/xml").body
++    end
++
++    test "respond only when headers match header by default to #{method} request" do
++      ActiveResource::HttpMock.respond_to do |mock|
++        mock.send(method, "/people/1", {"X-Header" => "X"}, "Response")
++      end
++
++      assert_equal "Response", request(method, "/people/1", "X-Header" => "X").body
++      assert_raise(ActiveResource::InvalidRequestError) { request(method, "/people/1") }
++    end
++
++    test "does not overwrite format header to #{method} request" do
++      ActiveResource::HttpMock.respond_to do |mock|
++        mock.send(method, "/people/1", {FORMAT_HEADER[method] => "application/json"}, "Response")
++      end
++
++      assert_equal "Response", request(method, "/people/1", FORMAT_HEADER[method] => "application/json").body
++    end
++
++    test "ignores format header when there is only one response to same url in a #{method} request" do
++      ActiveResource::HttpMock.respond_to do |mock|
++        mock.send(method, "/people/1", {}, "Response")
++      end
++
++      assert_equal "Response", request(method, "/people/1", FORMAT_HEADER[method] => "application/json").body
++      assert_equal "Response", request(method, "/people/1", FORMAT_HEADER[method] => "application/xml").body
++    end
++
++    test "responds correctly when format header is given to #{method} request" do
++      ActiveResource::HttpMock.respond_to do |mock|
++        mock.send(method, "/people/1", {FORMAT_HEADER[method] => "application/xml"}, "XML")
++        mock.send(method, "/people/1", {FORMAT_HEADER[method] => "application/json"}, "Json")
++      end
++
++      assert_equal "XML", request(method, "/people/1", FORMAT_HEADER[method] => "application/xml").body
++      assert_equal "Json", request(method, "/people/1", FORMAT_HEADER[method] => "application/json").body
++    end
++  end
++
++  def request(method, path, headers = {}, body = nil)
++    if [:put, :post].include? method
++      @http.send(method, path, body, headers)
++    else
++      @http.send(method, path, headers)
++    end
++  end
++end
+-- 
+1.7.0
+

@@ -1,0 +1,296 @@
+From 38d5bbc474101b510feadfc0a03b161b4ba079a4 Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Tue, 10 Feb 2009 06:13:13 +0000
+Subject: [PATCH] Fix some edge cases when the same template is called with different local assigns
+
+---
+ actionpack/lib/action_view/renderable.rb           |   30 +++++++-
+ actionpack/lib/action_view/template.rb             |   20 ++---
+ .../test/template/compiled_templates_test.rb       |   86 ++++++++++++-------
+ railties/lib/initializer.rb                        |   12 ---
+ railties/test/initializer_test.rb                  |    4 +-
+ 5 files changed, 93 insertions(+), 59 deletions(-)
+
+diff --git a/actionpack/lib/action_view/renderable.rb b/actionpack/lib/action_view/renderable.rb
+index c127bb2..16cdd01 100644
+--- a/actionpack/lib/action_view/renderable.rb
++++ b/actionpack/lib/action_view/renderable.rb
+@@ -16,8 +16,18 @@ module ActionView
+     memoize :handler
+ 
+     def compiled_source
++      @compiled_at = Time.now
+       handler.call(self)
+     end
++    memoize :compiled_source
++
++    def compiled_at
++      @compiled_at
++    end
++
++    def defined_at
++      @defined_at ||= {}
++    end
+ 
+     def method_name_without_locals
+       ['_run', extension, method_segment].compact.join('_')
+@@ -61,8 +71,12 @@ module ActionView
+       def compile(local_assigns)
+         render_symbol = method_name(local_assigns)
+ 
+-        if !Base::CompiledTemplates.method_defined?(render_symbol) || recompile?
++        if self.is_a?(InlineTemplate)
+           compile!(render_symbol, local_assigns)
++        else
++          if !Base::CompiledTemplates.method_defined?(render_symbol) || recompile?(render_symbol)
++            recompile!(render_symbol, local_assigns)
++          end
+         end
+       end
+ 
+@@ -79,6 +93,7 @@ module ActionView
+ 
+         begin
+           ActionView::Base::CompiledTemplates.module_eval(source, filename, 0)
++          defined_at[render_symbol] = Time.now if respond_to?(:reloadable?) && reloadable?
+         rescue Errno::ENOENT => e
+           raise e # Missing template file, re-raise for Base to rescue
+         rescue Exception => e # errors from template code
+@@ -91,5 +106,18 @@ module ActionView
+           raise ActionView::TemplateError.new(self, {}, e)
+         end
+       end
++
++      def recompile?(render_symbol)
++        !cached? || redefine?(render_symbol) || stale?
++      end
++
++      def recompile!(render_symbol, local_assigns)
++        compiled_source(:reload) if compiled_at.nil? || compiled_at < mtime
++        compile!(render_symbol, local_assigns)
++      end
++
++      def redefine?(render_symbol)
++        compiled_at && defined_at[render_symbol] && compiled_at > defined_at[render_symbol]
++      end
+   end
+ end
+diff --git a/actionpack/lib/action_view/template.rb b/actionpack/lib/action_view/template.rb
+index ee1b9f2..babd321 100644
+--- a/actionpack/lib/action_view/template.rb
++++ b/actionpack/lib/action_view/template.rb
+@@ -197,26 +197,22 @@ module ActionView #:nodoc:
+     end
+ 
+     def stale?
+-      !frozen? && mtime < mtime(:reload)
++      reloadable? && (mtime < mtime(:reload))
+     end
+ 
+     def load!
+       reloadable? ? memoize_all : freeze
+     end
+ 
+-    private
+-      def cached?
+-        Base.cache_template_loading || ActionController::Base.allow_concurrency
+-      end
+-
+-      def reloadable?
+-        !cached?
+-      end
++    def reloadable?
++      !(Base.cache_template_loading || ActionController::Base.allow_concurrency)
++    end
+ 
+-      def recompile?
+-        reloadable? ? stale? : false
+-      end
++    def cached?
++      ActionController::Base.perform_caching || !reloadable?
++    end
+ 
++    private
+       def valid_extension?(extension)
+         !Template.registered_template_handler(extension).nil?
+       end
+diff --git a/actionpack/test/template/compiled_templates_test.rb b/actionpack/test/template/compiled_templates_test.rb
+index 2c32fde..55fa346 100644
+--- a/actionpack/test/template/compiled_templates_test.rb
++++ b/actionpack/test/template/compiled_templates_test.rb
+@@ -10,52 +10,64 @@ class CompiledTemplatesTest < Test::Unit::TestCase
+   end
+ 
+   def test_template_gets_compiled
+-    assert_equal 0, @compiled_templates.instance_methods.size
+-    assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+-    assert_equal 1, @compiled_templates.instance_methods.size
++    with_caching(true) do
++      assert_equal 0, @compiled_templates.instance_methods.size
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++      assert_equal 1, @compiled_templates.instance_methods.size
++    end
+   end
+ 
+   def test_template_gets_recompiled_when_using_different_keys_in_local_assigns
+-    assert_equal 0, @compiled_templates.instance_methods.size
+-    assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+-    assert_equal "Hello world!", render(:file => "test/hello_world.erb", :locals => {:foo => "bar"})
+-    assert_equal 2, @compiled_templates.instance_methods.size
++    with_caching(true) do
++      assert_equal 0, @compiled_templates.instance_methods.size
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb", :locals => {:foo => "bar"})
++      assert_equal 2, @compiled_templates.instance_methods.size
++    end
+   end
+ 
+   def test_compiled_template_will_not_be_recompiled_when_rendered_with_identical_local_assigns
+-    assert_equal 0, @compiled_templates.instance_methods.size
+-    assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+-    ActionView::Template.any_instance.expects(:compile!).never
+-    assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++    with_caching(true) do
++      assert_equal 0, @compiled_templates.instance_methods.size
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++      ActionView::Template.any_instance.expects(:compile!).never
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++    end
+   end
+ 
+   def test_compiled_template_will_always_be_recompiled_when_template_is_not_cached
+-    ActionView::Template.any_instance.expects(:recompile?).times(3).returns(true)
+-    assert_equal 0, @compiled_templates.instance_methods.size
+-    assert_equal "Hello world!", render(:file => "#{FIXTURE_LOAD_PATH}/test/hello_world.erb")
+-    ActionView::Template.any_instance.expects(:compile!).times(3)
+-    3.times { assert_equal "Hello world!", render(:file => "#{FIXTURE_LOAD_PATH}/test/hello_world.erb") }
+-    assert_equal 1, @compiled_templates.instance_methods.size
++    with_caching(false) do
++      ActionView::Template.any_instance.expects(:recompile?).times(3).returns(true)
++      assert_equal 0, @compiled_templates.instance_methods.size
++      assert_equal "Hello world!", render(:file => "#{FIXTURE_LOAD_PATH}/test/hello_world.erb")
++      ActionView::Template.any_instance.expects(:compile!).times(3)
++      3.times { assert_equal "Hello world!", render(:file => "#{FIXTURE_LOAD_PATH}/test/hello_world.erb") }
++      assert_equal 1, @compiled_templates.instance_methods.size
++    end
+   end
+ 
+-  def test_template_changes_are_not_reflected_with_cached_templates
++  def test_template_changes_are_not_reflected_with_cached_template_loading
+     with_caching(true) do
+-      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+-      modify_template "test/hello_world.erb", "Goodbye world!" do
++      with_reloading(false) do
++        assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++        modify_template "test/hello_world.erb", "Goodbye world!" do
++          assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++        end
+         assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+       end
+-      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+     end
+   end
+ 
+-  def test_template_changes_are_reflected_without_cached_templates
+-    with_caching(false) do
+-      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+-      modify_template "test/hello_world.erb", "Goodbye world!" do
+-        assert_equal "Goodbye world!", render(:file => "test/hello_world.erb")
+-        sleep(1) # Need to sleep so that the timestamp actually changes
++  def test_template_changes_are_reflected_without_cached_template_loading
++    with_caching(true) do
++      with_reloading(true) do
++        assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++        modify_template "test/hello_world.erb", "Goodbye world!" do
++          assert_equal "Goodbye world!", render(:file => "test/hello_world.erb")
++          sleep(1) # Need to sleep so that the timestamp actually changes
++        end
++        assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+       end
+-      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+     end
+   end
+ 
+@@ -77,13 +89,23 @@ class CompiledTemplatesTest < Test::Unit::TestCase
+       end
+     end
+ 
+-    def with_caching(caching_enabled)
+-      old_caching_enabled = ActionView::Base.cache_template_loading
++    def with_caching(perform_caching)
++      old_perform_caching = ActionController::Base.perform_caching
++      begin
++        ActionController::Base.perform_caching = perform_caching
++        yield
++      ensure
++        ActionController::Base.perform_caching = old_perform_caching
++      end
++    end
++
++    def with_reloading(reload_templates)
++      old_cache_template_loading = ActionView::Base.cache_template_loading
+       begin
+-        ActionView::Base.cache_template_loading = caching_enabled
++        ActionView::Base.cache_template_loading = !reload_templates
+         yield
+       ensure
+-        ActionView::Base.cache_template_loading = old_caching_enabled
++        ActionView::Base.cache_template_loading = old_cache_template_loading
+       end
+     end
+ end
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 11aa8a5..2cc0943 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -181,9 +181,6 @@ module Rails
+       # Observers are loaded after plugins in case Observers or observed models are modified by plugins.
+       load_observers
+ 
+-      # Load view path cache
+-      load_view_paths
+-
+       # Load application classes
+       load_application_classes
+ 
+@@ -367,15 +364,6 @@ Run `rake gems:install` to install the missing gems.
+       end
+     end
+ 
+-    def load_view_paths
+-      if configuration.frameworks.include?(:action_view)
+-        if configuration.cache_classes
+-          ActionController::Base.view_paths = configuration.view_path if configuration.frameworks.include?(:action_controller)
+-          ActionMailer::Base.template_root = view_path if configuration.frameworks.include?(:action_mailer)
+-        end
+-      end
+-    end
+-
+     # Eager load application classes
+     def load_application_classes
+       return if $rails_rake_task
+diff --git a/railties/test/initializer_test.rb b/railties/test/initializer_test.rb
+index 39372dc..618173c 100644
+--- a/railties/test/initializer_test.rb
++++ b/railties/test/initializer_test.rb
+@@ -156,7 +156,7 @@ class ConfigurationFrameworkPathsTests < Test::Unit::TestCase
+     initializer.send :require_frameworks
+ 
+     assert_nothing_raised NameError do
+-      initializer.send :load_view_paths
++      initializer.send :initialize_framework_views
+     end
+   end
+ 
+@@ -166,7 +166,7 @@ class ConfigurationFrameworkPathsTests < Test::Unit::TestCase
+     initializer.send :require_frameworks
+ 
+     assert_nothing_raised NameError do
+-      initializer.send :load_view_paths
++      initializer.send :initialize_framework_views
+     end
+   end
+ 
+-- 
+1.5.4.5
+

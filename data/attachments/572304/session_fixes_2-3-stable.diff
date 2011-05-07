@@ -1,0 +1,582 @@
+From 521601409b0b8149183b7015343753373a2bc776 Mon Sep 17 00:00:00 2001
+From: Michael Lovitt <michael@lovitt.net>
+Date: Thu, 24 Jun 2010 11:53:11 -0400
+Subject: [PATCH] Sessions should not be created until written to and session data should be destroyed on reset.
+
+---
+ actionpack/lib/action_controller/request.rb        |    4 +-
+ .../action_controller/session/abstract_store.rb    |  117 +++++++++++++++++---
+ .../lib/action_controller/session/cookie_store.rb  |   48 +++++++--
+ .../action_controller/session/mem_cache_store.rb   |    9 ++
+ .../test/activerecord/active_record_store_test.rb  |   79 ++++++++++---
+ .../test/controller/session/cookie_store_test.rb   |   17 +++
+ .../controller/session/mem_cache_store_test.rb     |   31 +++++-
+ activerecord/lib/active_record/session_store.rb    |   10 ++-
+ 8 files changed, 268 insertions(+), 47 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/request.rb b/actionpack/lib/action_controller/request.rb
+index 1c3c1c8..98c5e8c 100755
+--- a/actionpack/lib/action_controller/request.rb
++++ b/actionpack/lib/action_controller/request.rb
+@@ -446,8 +446,8 @@ EOM
+     end
+ 
+     def reset_session
+-      @env['rack.session.options'].delete(:id)
+-      @env['rack.session'] = {}
++      session.destroy if session
++      self.session = {}
+     end
+ 
+     def session_options
+diff --git a/actionpack/lib/action_controller/session/abstract_store.rb b/actionpack/lib/action_controller/session/abstract_store.rb
+index 7a20557..4699291 100644
+--- a/actionpack/lib/action_controller/session/abstract_store.rb
++++ b/actionpack/lib/action_controller/session/abstract_store.rb
+@@ -9,6 +9,37 @@ module ActionController
+       HTTP_COOKIE = 'HTTP_COOKIE'.freeze
+       SET_COOKIE = 'Set-Cookie'.freeze
+ 
++      # thin wrapper around Hash that allows us to lazily
++      # load session id into session_options
++      class OptionsHash < Hash
++        def initialize(by, env, default_options)
++          @by = by
++          @env = env
++          merge!(default_options)
++          @session_id_loaded = false
++        end
++
++        alias_method :get_without_session_load, :[]
++
++        def [](key)
++          if key == :id
++            load_session_id! unless has_session_id?
++          end
++          super(key)
++        end
++
++        private
++
++          def has_session_id?
++            get_without_session_load(:id).present? || @session_id_loaded
++          end
++
++          def load_session_id!
++            self[:id] = @by.send(:extract_session_id, @env)
++            @session_id_loaded = true
++          end
++      end
++
+       class SessionHash < Hash
+         def initialize(by, env)
+           super()
+@@ -25,21 +56,37 @@ module ActionController
+         end
+ 
+         def [](key)
+-          load! unless @loaded
++          load_for_read!
++          super
++        end
++
++        def has_key?(key)
++          load_for_read!
+           super
+         end
+ 
+         def []=(key, value)
+-          load! unless @loaded
++          load_for_write!
+           super
+         end
+ 
+         def to_hash
++          load_for_read!
+           h = {}.replace(self)
+           h.delete_if { |k,v| v.nil? }
+           h
+         end
+ 
++        def update(hash)
++          load_for_write!
++          super
++        end
++
++        def delete(key)
++          load_for_write!
++          super
++        end
++
+         def data
+          ActiveSupport::Deprecation.warn(
+            "ActionController::Session::AbstractStore::SessionHash#data " +
+@@ -48,19 +95,39 @@ module ActionController
+         end
+ 
+         def inspect
+-          load! unless @loaded
++          load_for_read!
+           super
+         end
+ 
++        def exists?
++          @by.send(:exists?, @env)
++        end
++
++        def loaded?
++          @loaded
++        end
++
++        def destroy
++          clear
++          @by.send(:destroy, @env) if @by
++          @env[ENV_SESSION_OPTIONS_KEY].delete(:id) if @env && @env[ENV_SESSION_OPTIONS_KEY]
++          @loaded = false
++        end
++
+         private
+-          def loaded?
+-            @loaded
++          
++          def load_for_read!
++            load! if !loaded? && exists?
++          end
++
++          def load_for_write!
++            load! unless loaded?
+           end
+ 
+           def load!
+             stale_session_check! do
+               id, session = @by.send(:load_session, @env)
+-              (@env[ENV_SESSION_OPTIONS_KEY] ||= {})[:id] = id
++              @env[ENV_SESSION_OPTIONS_KEY][:id] = id
+               replace(session)
+               @loaded = true
+             end
+@@ -120,11 +187,7 @@ module ActionController
+       end
+ 
+       def call(env)
+-        session = SessionHash.new(self, env)
+-
+-        env[ENV_SESSION_KEY] = session
+-        env[ENV_SESSION_OPTIONS_KEY] = @default_options.dup
+-
++        prepare!(env)
+         response = @app.call(env)
+ 
+         session_data = env[ENV_SESSION_KEY]
+@@ -161,19 +224,36 @@ module ActionController
+       end
+ 
+       private
++      
++        def prepare!(env)
++          env[ENV_SESSION_KEY] = SessionHash.new(self, env)
++          env[ENV_SESSION_OPTIONS_KEY] = OptionsHash.new(self, env, @default_options.dup)
++        end
++      
+         def generate_sid
+           ActiveSupport::SecureRandom.hex(16)
+         end
+ 
+         def load_session(env)
+-          request = Rack::Request.new(env)
+-          sid = request.cookies[@key]
+-          unless @cookie_only
+-            sid ||= request.params[@key]
+-          end
++          sid = current_session_id(env)
+           sid, session = get_session(env, sid)
+           [sid, session]
+         end
++        
++        def extract_session_id(env)
++          request = Rack::Request.new(env)
++          sid = request.cookies[@key]
++          sid ||= request.params[@key] unless @cookie_only
++          sid
++        end
++
++        def current_session_id(env)
++          env[ENV_SESSION_OPTIONS_KEY][:id]
++        end
++        
++        def exists?(env)
++          current_session_id(env).present?
++        end
+ 
+         def get_session(env, sid)
+           raise '#get_session needs to be implemented.'
+@@ -182,6 +262,11 @@ module ActionController
+         def set_session(env, sid, session_data)
+           raise '#set_session needs to be implemented.'
+         end
++        
++        def destroy(env)
++          raise '#destroy needs to be implemented.'
++        end
++        
+     end
+   end
+ end
+diff --git a/actionpack/lib/action_controller/session/cookie_store.rb b/actionpack/lib/action_controller/session/cookie_store.rb
+index 2fcee56..622097a 100644
+--- a/actionpack/lib/action_controller/session/cookie_store.rb
++++ b/actionpack/lib/action_controller/session/cookie_store.rb
+@@ -93,9 +93,8 @@ module ActionController
+       end
+ 
+       def call(env)
+-        env[ENV_SESSION_KEY] = AbstractStore::SessionHash.new(self, env)
+-        env[ENV_SESSION_OPTIONS_KEY] = @default_options.dup
+-
++        prepare!(env)
++        
+         status, headers, body = @app.call(env)
+ 
+         session_data = env[ENV_SESSION_KEY]
+@@ -103,10 +102,11 @@ module ActionController
+ 
+         if !session_data.is_a?(AbstractStore::SessionHash) || session_data.send(:loaded?) || options[:expire_after]
+           session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) && !session_data.send(:loaded?)
++
++          persistent_session_id!(session_data)
+           session_data = marshal(session_data.to_hash)
+ 
+           raise CookieOverflow if session_data.size > MAX
+-
+           cookie = Hash.new
+           cookie[:value] = session_data
+           unless options[:expire_after].nil?
+@@ -122,6 +122,12 @@ module ActionController
+       end
+ 
+       private
++      
++        def prepare!(env)
++          env[ENV_SESSION_KEY] = AbstractStore::SessionHash.new(self, env)
++          env[ENV_SESSION_OPTIONS_KEY] = AbstractStore::OptionsHash.new(self, env, @default_options.dup)
++        end
++      
+         # Should be in Rack::Utils soon
+         def build_cookie(key, value)
+           case value
+@@ -143,20 +149,42 @@ module ActionController
+         end
+ 
+         def load_session(env)
++          data = unpacked_cookie_data(env)
++          data = persistent_session_id!(data)
++          [data[:session_id], data]
++        end
++        
++        def extract_session_id(env)
++          if data = unpacked_cookie_data(env)
++            data = persistent_session_id!(data)
++            data[:session_id]
++          else
++            nil
++          end
++        end
++
++        def current_session_id(env)
++          env[ENV_SESSION_OPTIONS_KEY][:id]
++        end
++
++        def exists?(env)
++          current_session_id(env).present?
++        end
++
++        def unpacked_cookie_data(env)
+           request = Rack::Request.new(env)
+           session_data = request.cookies[@key]
+-          data = unmarshal(session_data) || persistent_session_id!({})
+-          [data[:session_id], data]
++          data = unmarshal(session_data)
+         end
+ 
+         # Marshal a session hash into safe cookie data. Include an integrity hash.
+         def marshal(session)
+-          @verifier.generate(persistent_session_id!(session))
++          @verifier.generate(session)
+         end
+ 
+         # Unmarshal cookie data to a hash and verify its integrity.
+         def unmarshal(cookie)
+-          persistent_session_id!(@verifier.verify(cookie)) if cookie
++          @verifier.verify(cookie) if cookie
+         rescue ActiveSupport::MessageVerifier::InvalidSignature
+           nil
+         end
+@@ -204,6 +232,10 @@ module ActionController
+           ActiveSupport::SecureRandom.hex(16)
+         end
+ 
++        def destroy(env)
++          # session data is stored on client; nothing to do here
++        end
++
+         def persistent_session_id!(data)
+           (data ||= {}).merge!(inject_persistent_session_id(data))
+         end
+diff --git a/actionpack/lib/action_controller/session/mem_cache_store.rb b/actionpack/lib/action_controller/session/mem_cache_store.rb
+index f745715..402681c 100644
+--- a/actionpack/lib/action_controller/session/mem_cache_store.rb
++++ b/actionpack/lib/action_controller/session/mem_cache_store.rb
+@@ -43,6 +43,15 @@ begin
+           rescue MemCache::MemCacheError, Errno::ECONNREFUSED
+             return false
+           end
++          
++          def destroy(env)
++            if sid = current_session_id(env)
++              @pool.delete(sid)
++            end
++          rescue MemCache::MemCacheError, Errno::ECONNREFUSED
++            false
++          end
++          
+       end
+     end
+   end
+diff --git a/actionpack/test/activerecord/active_record_store_test.rb b/actionpack/test/activerecord/active_record_store_test.rb
+index bde36eb..20958e6 100644
+--- a/actionpack/test/activerecord/active_record_store_test.rb
++++ b/actionpack/test/activerecord/active_record_store_test.rb
+@@ -22,7 +22,6 @@ class ActiveRecordStoreTest < ActionController::IntegrationTest
+     end
+ 
+     def get_session_id
+-      session[:foo]
+       render :text => "#{request.session_options[:id]}"
+     end
+ 
+@@ -45,23 +44,27 @@ class ActiveRecordStoreTest < ActionController::IntegrationTest
+     ActiveRecord::SessionStore.session_class.drop_table!
+   end
+ 
+-  def test_setting_and_getting_session_value
+-    with_test_route_set do
+-      get '/set_session_value'
+-      assert_response :success
+-      assert cookies['_session_id']
+-
+-      get '/get_session_value'
+-      assert_response :success
+-      assert_equal 'foo: "bar"', response.body
+-
+-      get '/set_session_value', :foo => "baz"
+-      assert_response :success
+-      assert cookies['_session_id']
+-
+-      get '/get_session_value'
+-      assert_response :success
+-      assert_equal 'foo: "baz"', response.body
++  %w{ session sql_bypass }.each do |class_name|
++    define_method("test_setting_and_getting_session_value_with_#{class_name}_store") do
++      with_store class_name do
++        with_test_route_set do
++          get '/set_session_value'
++          assert_response :success
++          assert cookies['_session_id']
++
++          get '/get_session_value'
++          assert_response :success
++          assert_equal 'foo: "bar"', response.body
++
++          get '/set_session_value', :foo => "baz"
++          assert_response :success
++          assert cookies['_session_id']
++
++          get '/get_session_value'
++          assert_response :success
++          assert_equal 'foo: "baz"', response.body
++        end
++      end
+     end
+   end
+ 
+@@ -107,6 +110,34 @@ class ActiveRecordStoreTest < ActionController::IntegrationTest
+     end
+   end
+ 
++  def test_getting_session_value_after_session_reset
++    with_test_route_set do
++      get '/set_session_value'
++      assert_response :success
++      assert cookies['_session_id']
++      session_id = cookies["_session_id"]
++
++      get '/call_reset_session'
++      assert_response :success
++      assert_not_equal [], headers['Set-Cookie']
++
++      cookies["_session_id"] = session_id # replace our new session_id with our old, pre-reset session_id
++
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body, "data for this session should have been obliterated from the database"
++    end
++  end
++
++  def test_getting_from_nonexistent_session
++    with_test_route_set do
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body
++      assert_nil cookies['_session_id'], "should only create session on write, not read"
++    end
++  end
++
+   def test_prevents_session_fixation
+     with_test_route_set do
+       get '/set_session_value'
+@@ -171,4 +202,16 @@ class ActiveRecordStoreTest < ActionController::IntegrationTest
+         yield
+       end
+     end
++
++    def with_store(class_name)
++      begin
++        session_class = ActiveRecord::SessionStore.session_class
++        ActiveRecord::SessionStore.session_class = "ActiveRecord::SessionStore::#{class_name.camelize}".constantize
++        yield
++      rescue
++        ActiveRecord::SessionStore.session_class = session_class
++        raise
++      end
++    end
++
+ end
+diff --git a/actionpack/test/controller/session/cookie_store_test.rb b/actionpack/test/controller/session/cookie_store_test.rb
+index 26d5689..e744adf 100644
+--- a/actionpack/test/controller/session/cookie_store_test.rb
++++ b/actionpack/test/controller/session/cookie_store_test.rb
+@@ -33,6 +33,10 @@ class CookieStoreTest < ActionController::IntegrationTest
+     def get_session_id
+       render :text => "foo: #{session[:foo].inspect}; id: #{request.session_options[:id]}"
+     end
++    
++    def get_session_id_only
++      render :text => "id: #{request.session_options[:id]}"      
++    end
+ 
+     def call_reset_session
+       reset_session
+@@ -127,6 +131,10 @@ class CookieStoreTest < ActionController::IntegrationTest
+       get '/get_session_id'
+       assert_response :success
+       assert_equal "foo: \"bar\"; id: #{session_id}", response.body
++      
++      get '/get_session_id_only'
++      assert_response :success
++      assert_equal "id: #{session_id}", response.body, "should be able to read session id without accessing the session hash"
+     end
+   end
+ 
+@@ -184,6 +192,15 @@ class CookieStoreTest < ActionController::IntegrationTest
+     end
+   end
+ 
++  def test_getting_from_nonexistent_session
++    with_test_route_set do
++      get '/get_session_value'
++      assert_response :success
++      assert_equal 'foo: nil', response.body
++      assert_nil headers['Set-Cookie'], "should only create session on write, not read"
++    end
++  end
++
+   def test_persistent_session_id
+     with_test_route_set do
+       cookies[SessionKey] = SignedBar
+diff --git a/actionpack/test/controller/session/mem_cache_store_test.rb b/actionpack/test/controller/session/mem_cache_store_test.rb
+index 2f80a3c..20ff2b0 100644
+--- a/actionpack/test/controller/session/mem_cache_store_test.rb
++++ b/actionpack/test/controller/session/mem_cache_store_test.rb
+@@ -17,7 +17,6 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+     end
+ 
+     def get_session_id
+-      session[:foo]
+       render :text => "#{request.session_options[:id]}"
+     end
+ 
+@@ -82,6 +81,34 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+       end
+     end
+ 
++    def test_getting_session_value_after_session_reset
++      with_test_route_set do
++        get '/set_session_value'
++        assert_response :success
++        assert cookies['_session_id']
++        session_id = cookies["_session_id"]
++
++        get '/call_reset_session'
++        assert_response :success
++        assert_not_equal [], headers['Set-Cookie']
++
++        cookies["_session_id"] = session_id # replace our new session_id with our old, pre-reset session_id
++
++        get '/get_session_value'
++        assert_response :success
++        assert_equal 'foo: nil', response.body, "data for this session should have been obliterated from memcached"
++      end
++    end
++
++    def test_getting_from_nonexistent_session
++      with_test_route_set do
++        get '/get_session_value'
++        assert_response :success
++        assert_equal 'foo: nil', response.body
++        assert_nil cookies['_session_id'], "should only create session on write, not read"
++      end
++    end
++
+     def test_getting_session_id
+       with_test_route_set do
+         get '/set_session_value'
+@@ -91,7 +118,7 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+ 
+         get '/get_session_id'
+         assert_response :success
+-        assert_equal session_id, response.body
++        assert_equal session_id, response.body, "should be able to read session id without accessing the session hash"
+       end
+     end
+ 
+diff --git a/activerecord/lib/active_record/session_store.rb b/activerecord/lib/active_record/session_store.rb
+index c91b943..d6d0c6e 100644
+--- a/activerecord/lib/active_record/session_store.rb
++++ b/activerecord/lib/active_record/session_store.rb
+@@ -184,7 +184,7 @@ module ActiveRecord
+ 
+         # Look up a session by id and unmarshal its data if found.
+         def find_by_session_id(session_id)
+-          if record = @@connection.select_one("SELECT * FROM #{@@table_name} WHERE #{@@session_id_column}=#{@@connection.quote(session_id)}")
++          if record = connection.select_one("SELECT * FROM #{@@table_name} WHERE #{@@session_id_column}=#{connection.quote(session_id)}")
+             new(:session_id => session_id, :marshaled_data => record['data'])
+           end
+         end
+@@ -310,6 +310,14 @@ module ActiveRecord
+         return true
+       end
+       
++      def destroy(env)
++        if sid = current_session_id(env)
++          Base.silence do
++            get_session_model(env, sid).destroy
++          end
++        end
++      end
++      
+       def get_session_model(env, sid)
+         if env[ENV_SESSION_OPTIONS_KEY][:id].nil?
+           env[SESSION_RECORD_KEY] = find_session(sid)
+-- 
+1.6.4.4
+

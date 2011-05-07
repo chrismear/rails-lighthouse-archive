@@ -1,0 +1,138 @@
+From db010f5cd9503927d807aa6dc83fa1e50a47e111 Mon Sep 17 00:00:00 2001
+From: mike groble <michael.groble@motorola.com>
+Date: Sun, 23 Jan 2011 18:26:47 -0600
+Subject: [PATCH] don't propagate only and except to includes for serializable_hash
+
+---
+ activerecord/lib/active_record/serialization.rb |    9 ++--
+ activerecord/test/cases/serialization_test.rb   |   57 ++++++++++++++++++++++-
+ 2 files changed, 61 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/serialization.rb b/activerecord/lib/active_record/serialization.rb
+index 2bde06f..592327f 100644
+--- a/activerecord/lib/active_record/serialization.rb
++++ b/activerecord/lib/active_record/serialization.rb
+@@ -31,12 +31,11 @@ module ActiveRecord #:nodoc:
+       def serializable_add_includes(options = {})
+         return unless include_associations = options.delete(:include)
+ 
+-        base_only_or_except = { :except => options[:except],
+-                                :only => options[:only] }
++        base_only = options.delete(:only)
++        base_except = options.delete(:except)
+ 
+         include_has_options = include_associations.is_a?(Hash)
+         associations = include_has_options ? include_associations.keys : Array.wrap(include_associations)
+-
+         for association in associations
+           records = case self.class.reflect_on_association(association).macro
+           when :has_many, :has_and_belongs_to_many
+@@ -46,13 +45,15 @@ module ActiveRecord #:nodoc:
+           end
+ 
+           if records
+-            association_options = include_has_options ? include_associations[association] : base_only_or_except
++            association_options = include_has_options ? include_associations[association] : {}
+             opts = options.merge(association_options)
+             yield(association, records, opts)
+           end
+         end
+ 
+         options[:include] = include_associations
++        options[:only] = base_only if base_only
++        options[:except] = base_except if base_except
+       end
+   end
+ end
+diff --git a/activerecord/test/cases/serialization_test.rb b/activerecord/test/cases/serialization_test.rb
+index 25dbcc9..456c1ca 100644
+--- a/activerecord/test/cases/serialization_test.rb
++++ b/activerecord/test/cases/serialization_test.rb
+@@ -4,11 +4,21 @@ require 'models/topic'
+ require 'models/reply'
+ require 'models/company'
+ 
++module ActiveRecord
++  module Serialization
++    alias_method :to_serializable_hash, :serializable_hash
++  end
++end
++
++Hash.define_singleton_method(:from_serializable_hash) {|x| x.with_indifferent_access}
++Hash.define_singleton_method(:from_json) {|json| ActiveSupport::JSON.decode(json)}
++
+ class SerializationTest < ActiveRecord::TestCase
+ 
+   fixtures :topics, :companies, :accounts
+ 
+   FORMATS = [ :xml, :json ]
++  INCLUDE_FORMATS = [ :serializable_hash, :xml, :json ]
+ 
+   def setup
+     @contact_attributes = {
+@@ -19,8 +29,17 @@ class SerializationTest < ActiveRecord::TestCase
+       :awesome     => false,
+       :preferences => { :gem => '<strong>ruby</strong>' }
+     }
+-
++    @alternative_attributes = {
++      :name        => 'machine man',
++      :age         => 25,
++      :avatar      => 'binarydata',
++      :created_at  => Time.utc(2010, 1, 23),
++      :awesome     => true,
++      :preferences => { :gem => '<strong>ruby</strong>' }
++    }
+     @contact = Contact.new(@contact_attributes)
++    @contact_with_alternative = Contact.new(@contact_attributes)
++    @contact_with_alternative.alternative = Contact.new(@alternative_attributes)
+   end
+ 
+   def test_to_xml
+@@ -178,7 +197,43 @@ class SerializationTest < ActiveRecord::TestCase
+       assert_equal @contact_attributes[:awesome], contact.awesome, "For #{format}"
+     end
+   end
++  
++  def test_serialize_should_allow_attribute_only_filtering_with_include
++    for format in INCLUDE_FORMATS
++      @serialized = @contact_with_alternative.send("to_#{format}", :only => [ :age, :name ], :include => [:alternative])
++      contact = Hash.send("from_#{format}", @serialized)
++      contact = contact["contact"] if contact["contact"]
++      assert_equal @contact_attributes[:name], contact["name"], "For #{format}"
++      assert_nil contact["avatar"], "For #{format}"
++      assert_equal @alternative_attributes[:avatar], contact["alternative"]["avatar"], "For #{format}"
++    end
++  end
++
++  def test_serialize_should_allow_attribute_except_filtering_with_include
++    for format in INCLUDE_FORMATS
++      @serialized = @contact_with_alternative.send("to_#{format}", :except => [ :age, :name ], :include => [:alternative])
++      contact = Hash.send("from_#{format}", @serialized)
++      contact = contact["contact"] if contact["contact"]
++      assert_nil contact["name"], "For #{format}"
++      assert_nil contact["age"], "For #{format}"
++      assert_equal @contact_attributes[:awesome], contact["awesome"], "For #{format}"
++      assert_equal @alternative_attributes[:name], contact["alternative"]["name"], "For #{format}"
++    end
++  end
+ 
++  def test_serialize_should_allow_attribute_except_filtering_in_include
++    for format in INCLUDE_FORMATS
++      @serialized = @contact_with_alternative.send("to_#{format}", :except => [ :age, :name ], :include => {:alternative => {:except => :created_at}})
++      contact = Hash.send("from_#{format}", @serialized)
++      contact = contact["contact"] if contact["contact"]
++      assert_nil contact["name"], "For #{format}"
++      assert_nil contact["age"], "For #{format}"
++      assert_equal @contact_attributes[:awesome], contact["awesome"], "For #{format}"
++      assert_equal @alternative_attributes[:name], contact["alternative"]["name"], "For #{format}"
++      assert_nil contact["alternative"]["created_at"], "For #{format}"
++    end
++  end
++  
+   def test_serialize_should_xml_skip_instruct_for_included_records
+     @contact.alternative = Contact.new(:name => 'Copa Cabana')
+     @serialized = @contact.to_xml(:include => [ :alternative ])
+-- 
+1.7.2.3
+

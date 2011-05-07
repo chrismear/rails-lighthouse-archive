@@ -1,0 +1,146 @@
+From 6e2b108beeff00176f054f903bced5e36805d1d1 Mon Sep 17 00:00:00 2001
+From: Diego Algorta <diego@oboxodo.com>
+Date: Sat, 15 May 2010 21:04:56 -0300
+Subject: [PATCH] Add support for postgresql boundary floats Infinity and NaN.
+
+Based on a monkey patch from Esben Mose Hansen in
+https://rails.lighthouseapp.com/projects/8994/tickets/2781
+---
+ .../abstract/schema_definitions.rb                 |   14 +++++-
+ .../connection_adapters/postgresql_adapter.rb      |    6 ++
+ .../test/cases/datatype_test_postgresql.rb         |   49 ++++++++++++++++++++
+ 3 files changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index 7d58bc2..be94faf 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -72,7 +72,7 @@ module ActiveRecord
+           when :string    then value
+           when :text      then value
+           when :integer   then value.to_i rescue value ? 1 : 0
+-          when :float     then value.to_f
++          when :float     then self.class.value_to_float(value)
+           when :decimal   then self.class.value_to_decimal(value)
+           when :datetime  then self.class.string_to_time(value)
+           when :timestamp then self.class.string_to_time(value)
+@@ -89,7 +89,7 @@ module ActiveRecord
+           when :string    then nil
+           when :text      then nil
+           when :integer   then "(#{var_name}.to_i rescue #{var_name} ? 1 : 0)"
+-          when :float     then "#{var_name}.to_f"
++          when :float     then "#{self.class.name}.value_to_float(#{var_name})"
+           when :decimal   then "#{self.class.name}.value_to_decimal(#{var_name})"
+           when :datetime  then "#{self.class.name}.string_to_time(#{var_name})"
+           when :timestamp then "#{self.class.name}.string_to_time(#{var_name})"
+@@ -168,6 +168,16 @@ module ActiveRecord
+           end
+         end
+ 
++        # convert something to a Float
++        def value_to_float(value)
++          case value
++          when 'Infinity'   then 1.0/0.0
++          when '-Infinity'  then -1.0/0.0
++          when 'NaN'        then 0.0/0.0
++          else              value.to_f
++          end
++        end
++
+         protected
+           # '0.123456' -> 123456
+           # '1.123456' -> 123456
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 6389094..36b6499 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -309,6 +309,12 @@ module ActiveRecord
+           "'#{escape_bytea(value)}'"
+         elsif value.kind_of?(String) && column && column.sql_type == 'xml'
+           "xml '#{quote_string(value)}'"
++        elsif value.kind_of?(Float) && (value.infinite? || value.nan?)
++          if value.nan?
++            "'NaN'"
++          elsif value.infinite?
++            value > 0 ? "'Infinity'" : "'-Infinity'"
++          end
+         elsif value.kind_of?(Numeric) && column && column.sql_type == 'money'
+           # Not truly string input, so doesn't require (or allow) escape string syntax.
+           "'#{value.to_s}'"
+diff --git a/activerecord/test/cases/datatype_test_postgresql.rb b/activerecord/test/cases/datatype_test_postgresql.rb
+index 3c2d9fb..6229365 100644
+--- a/activerecord/test/cases/datatype_test_postgresql.rb
++++ b/activerecord/test/cases/datatype_test_postgresql.rb
+@@ -42,6 +42,15 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     @connection.execute("INSERT INTO postgresql_numbers (single, double) VALUES (123.456, 123456.789)")
+     @first_number = PostgresqlNumber.find(1)
+ 
++    @connection.execute("INSERT INTO postgresql_numbers (single, double) VALUES ('Infinity', 'Infinity')")
++    @positive_infinity_number = PostgresqlNumber.find(2)
++
++    @connection.execute("INSERT INTO postgresql_numbers (single, double) VALUES ('-Infinity', '-Infinity')")
++    @negative_infinity_number = PostgresqlNumber.find(3)
++
++    @connection.execute("INSERT INTO postgresql_numbers (single, double) VALUES ('NaN', 'NaN')")
++    @nan_number = PostgresqlNumber.find(4)
++
+     @connection.execute("INSERT INTO postgresql_times (time_interval) VALUES ('1 year 2 days ago')")
+     @first_time = PostgresqlTime.find(1)
+ 
+@@ -105,6 +114,23 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     assert_equal 123456.789, @first_number.double
+   end
+ 
++  def test_infinity_values
++    positive_infinity = 1.0/0.0
++    assert positive_infinity.infinite?
++    assert_equal positive_infinity, @positive_infinity_number.single
++    assert_equal positive_infinity, @positive_infinity_number.double
++
++    negative_infinity = -1.0/0.0
++    assert negative_infinity.infinite?
++    assert_equal negative_infinity, @negative_infinity_number.single
++    assert_equal negative_infinity, @negative_infinity_number.double
++  end
++
++  def test_nan_values
++    assert @nan_number.single.nan?
++    assert @nan_number.double.nan?
++  end
++
+   def test_time_values
+     assert_equal '-1 years -2 days', @first_time.time_interval
+   end
+@@ -124,6 +150,29 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     assert_equal 1234, @first_oid.obj_id
+   end
+ 
++  def test_update_infinity
++    [1.0/0.0, -1.0/0.0].each do |infinit_value|
++      assert infinit_value.infinite?
++      assert @first_number.single = infinit_value
++      assert @first_number.double = infinit_value
++      assert @first_number.save
++      assert @first_number.reload
++      assert_equal infinit_value, @first_number.single
++      assert_equal infinit_value, @first_number.double
++    end
++  end
++
++  def test_update_nan
++    nan = 0.0/0.0
++    assert nan.nan?
++    assert @first_number.single = nan
++    assert @first_number.double = nan
++    assert @first_number.save
++    assert @first_number.reload
++    assert @first_number.single.nan?
++    assert @first_number.double.nan?
++  end
++
+   def test_update_integer_array
+     new_value = '{32800,95000,29350,17000}'
+     assert @first_array.commission_by_quarter = new_value
+-- 
+1.6.3.3
+

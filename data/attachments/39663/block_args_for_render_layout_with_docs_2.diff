@@ -1,0 +1,175 @@
+From 98cde8ad2621555af894f3bd200c17dab006a5cc Mon Sep 17 00:00:00 2001
+From: Ryan Bates <ryan@railscasts.com>
+Date: Sat, 16 Aug 2008 21:21:31 -0700
+Subject: [PATCH] pass yielded arguments to block for ActionView::Base#render with :layout
+
+---
+ actionpack/lib/action_view/base.rb                 |   15 +++++++-
+ actionpack/lib/action_view/partials.rb             |   38 ++++++++++++++++++-
+ actionpack/test/controller/layout_test.rb          |    1 -
+ actionpack/test/controller/new_render_test.rb      |    9 +++++
+ .../test/_layout_for_block_with_args.html.erb      |    3 ++
+ .../using_layout_around_block_with_args.html.erb   |    1 +
+ 6 files changed, 62 insertions(+), 5 deletions(-)
+ create mode 100644 actionpack/test/fixtures/test/_layout_for_block_with_args.html.erb
+ create mode 100644 actionpack/test/fixtures/test/using_layout_around_block_with_args.html.erb
+
+diff --git a/actionpack/lib/action_view/base.rb b/actionpack/lib/action_view/base.rb
+index ad59d92..1725902 100644
+--- a/actionpack/lib/action_view/base.rb
++++ b/actionpack/lib/action_view/base.rb
+@@ -246,7 +246,7 @@ module ActionView #:nodoc:
+ 
+         if partial_layout = options.delete(:layout)
+           if block_given?
+-            wrap_content_for_layout capture(&block) do
++            wrap_proc_for_layout block do
+               concat(render(options.merge(:partial => partial_layout)))
+             end
+           else
+@@ -374,6 +374,13 @@ module ActionView #:nodoc:
+         @content_for_layout = original_content_for_layout
+       end
+ 
++      def wrap_proc_for_layout(proc)
++        @_proc_for_layout = proc
++        yield
++      ensure
++        @_proc_for_layout = nil
++      end
++
+       # Evaluate the local assigns and pushes them to the view.
+       def evaluate_assigns
+         unless @assigns_added
+@@ -395,7 +402,11 @@ module ActionView #:nodoc:
+ 
+       def execute(method, local_assigns = {})
+         send(method, local_assigns) do |*names|
+-          instance_variable_get "@content_for_#{names.first || 'layout'}"
++          if @_proc_for_layout
++            capture(*names, &@_proc_for_layout)
++          else
++            instance_variable_get "@content_for_#{names.first || 'layout'}"
++          end
+         end
+       end
+   end
+diff --git a/actionpack/lib/action_view/partials.rb b/actionpack/lib/action_view/partials.rb
+index 894b885..b661a62 100644
+--- a/actionpack/lib/action_view/partials.rb
++++ b/actionpack/lib/action_view/partials.rb
+@@ -68,7 +68,7 @@ module ActionView
+   #
+   #   <%# app/views/users/_editor.html.erb &>
+   #   <div id="editor">
+-  #     Deadline: $<%= user.deadline %>
++  #     Deadline: <%= user.deadline %>
+   #     <%= yield %>
+   #   </div>
+   #
+@@ -82,7 +82,7 @@ module ActionView
+   #
+   #   Here's the editor:
+   #   <div id="editor">
+-  #     Deadline: $<%= user.deadline %>
++  #     Deadline: <%= user.deadline %>
+   #     Name: <%= user.name %>
+   #   </div>
+   #
+@@ -101,6 +101,40 @@ module ActionView
+   #   </div>
+   #
+   # As you can see, the <tt>:locals</tt> hash is shared between both the partial and its layout.
++  #
++  # If you pass arguments to "yield" then this will be passed to the block. One way to use this is to pass
++  # an array to layout and treat it as an enumerable.
++  #
++  #   <%# app/views/users/_user.html.erb &>
++  #   <div class="user">
++  #     Budget: $<%= user.budget %>
++  #     <%= yield user %>
++  #   </div>
++  #
++  #   <%# app/views/users/index.html.erb &>
++  #   <% render :layout => @users do |user| %>
++  #     Title: <%= user.title %>
++  #   <% end %>
++  #
++  # This will render the layout for each user and yield to the block, passing the user, each time.
++  #
++  # You can also yield multiple times in one layout and use block arguments to differentiate the sections.
++  #
++  #   <%# app/views/users/_user.html.erb &>
++  #   <div class="user">
++  #     <%= yield user, :header %>
++  #     Budget: $<%= user.budget %>
++  #     <%= yield user, :footer %>
++  #   </div>
++  #
++  #   <%# app/views/users/index.html.erb &>
++  #   <% render :layout => @users do |user, section| %>
++  #     <%- case section when :header -%>
++  #       Title: <%= user.title %>
++  #     <%- when :footer -%>
++  #       Deadline: <%= user.deadline %>
++  #     <%- end -%>
++  #   <% end %>
+   module Partials
+     extend ActiveSupport::Memoizable
+ 
+diff --git a/actionpack/test/controller/layout_test.rb b/actionpack/test/controller/layout_test.rb
+index 72c01a9..54f9e48 100644
+--- a/actionpack/test/controller/layout_test.rb
++++ b/actionpack/test/controller/layout_test.rb
+@@ -249,4 +249,3 @@ class LayoutSymlinkedIsRenderedTest < Test::Unit::TestCase
+     assert_equal "layouts/symlinked/symlinked_layout", @response.layout
+   end
+ end
+-    
+\ No newline at end of file
+diff --git a/actionpack/test/controller/new_render_test.rb b/actionpack/test/controller/new_render_test.rb
+index be99350..82919b7 100644
+--- a/actionpack/test/controller/new_render_test.rb
++++ b/actionpack/test/controller/new_render_test.rb
+@@ -435,6 +435,10 @@ class NewRenderTestController < ActionController::Base
+     render :action => "using_layout_around_block"
+   end
+ 
++  def render_using_layout_around_block_with_args
++    render :action => "using_layout_around_block_with_args"
++  end
++
+   def render_using_layout_around_block_in_main_layout_and_within_content_for_layout
+     render :action => "using_layout_around_block"
+   end
+@@ -969,4 +973,9 @@ EOS
+     get :render_using_layout_around_block_in_main_layout_and_within_content_for_layout
+     assert_equal "Before (Anthony)\nInside from first block in layout\nAfter\nBefore (David)\nInside from block\nAfter\nBefore (Ramm)\nInside from second block in layout\nAfter\n", @response.body
+   end
++
++  def test_using_layout_around_block_with_args
++    get :render_using_layout_around_block_with_args
++    assert_equal "Before\narg1arg2\nAfter", @response.body
++  end
+ end
+diff --git a/actionpack/test/fixtures/test/_layout_for_block_with_args.html.erb b/actionpack/test/fixtures/test/_layout_for_block_with_args.html.erb
+new file mode 100644
+index 0000000..3075332
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_layout_for_block_with_args.html.erb
+@@ -0,0 +1,3 @@
++Before
++<%= yield 'arg1', 'arg2' %>
++After
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/using_layout_around_block_with_args.html.erb b/actionpack/test/fixtures/test/using_layout_around_block_with_args.html.erb
+new file mode 100644
+index 0000000..71b1f30
+--- /dev/null
++++ b/actionpack/test/fixtures/test/using_layout_around_block_with_args.html.erb
+@@ -0,0 +1 @@
++<% render(:layout => "layout_for_block_with_args") do |*args| %><%= args.join %><% end %>
+\ No newline at end of file
+-- 
+1.5.5.1
+

@@ -1,0 +1,166 @@
+From f32b4b271b9f52bbd2693ba2864f3ec26bba1c81 Mon Sep 17 00:00:00 2001
+From: David Trasbo <me@dtrasbo.com>
+Date: Thu, 7 Oct 2010 19:50:18 +0200
+Subject: [PATCH] Greatly simplify ActionMailer::Base.respond_to? and .method_missing
+
+respond_to? with :create_nonexistent_method or :deliver_nonexistent_method now returns false as expected
+
+[#3431 state:committed]
+---
+ actionmailer/lib/action_mailer/base.rb |   15 +-----
+ actionmailer/test/mail_service_test.rb |   73 ++++++++++---------------------
+ 2 files changed, 27 insertions(+), 61 deletions(-)
+
+diff --git a/actionmailer/lib/action_mailer/base.rb b/actionmailer/lib/action_mailer/base.rb
+index f8a0a2b..3827b82 100644
+--- a/actionmailer/lib/action_mailer/base.rb
++++ b/actionmailer/lib/action_mailer/base.rb
+@@ -251,8 +251,6 @@ module ActionMailer #:nodoc:
+       include ActionController::Layout
+     end
+ 
+-    private_class_method :new #:nodoc:
+-
+     class_inheritable_accessor :view_paths
+     self.view_paths = []
+ 
+@@ -385,16 +383,15 @@ module ActionMailer #:nodoc:
+       alias_method :controller_path, :mailer_name
+ 
+       def respond_to?(method_symbol, include_private = false) #:nodoc:
+-        matches_dynamic_method?(method_symbol) || super
++        new.respond_to?(method_symbol.to_s.sub(/^(create|deliver)_(.*)/, "\\2")) || super
+       end
+ 
+       def method_missing(method_symbol, *parameters) #:nodoc:
+-        if match = matches_dynamic_method?(method_symbol)
++        if respond_to?(method_symbol)
++          match = /^(create|deliver)_(.*)/.match(method_symbol.to_s)
+           case match[1]
+             when 'create'  then new(match[2], *parameters).mail
+             when 'deliver' then new(match[2], *parameters).deliver!
+-            when 'new'     then nil
+-            else super
+           end
+         else
+           super
+@@ -436,12 +433,6 @@ module ActionMailer #:nodoc:
+       def template_root=(root)
+         self.view_paths = ActionView::Base.process_view_paths(root)
+       end
+-
+-      private
+-        def matches_dynamic_method?(method_name) #:nodoc:
+-          method_name = method_name.to_s
+-          /^(create|deliver)_([_a-z]\w*)/.match(method_name) || /^(new)$/.match(method_name)
+-        end
+     end
+ 
+     # Instantiate a new mailer object. If +method_name+ is not +nil+, the mailer
+diff --git a/actionmailer/test/mail_service_test.rb b/actionmailer/test/mail_service_test.rb
+index 3b464df..faea804 100644
+--- a/actionmailer/test/mail_service_test.rb
++++ b/actionmailer/test/mail_service_test.rb
+@@ -563,11 +563,6 @@ class ActionMailerTest < Test::Unit::TestCase
+     assert_equal expected.encoded, ActionMailer::Base.deliveries.first.encoded
+   end
+ 
+-  def test_instances_are_nil
+-    assert_nil ActionMailer::Base.new
+-    assert_nil TestMailer.new
+-  end
+-
+   def test_deliveries_array
+     assert_not_nil ActionMailer::Base.deliveries
+     assert_equal 0, ActionMailer::Base.deliveries.size
+@@ -1081,7 +1076,10 @@ class MethodNamingTest < Test::Unit::TestCase
+ end
+ 
+ class RespondToTest < Test::Unit::TestCase
+-  class RespondToMailer < ActionMailer::Base; end
++  class RespondToMailer < ActionMailer::Base
++    def existing_method
++    end
++  end
+ 
+   def setup
+     set_delivery_method :test
+@@ -1091,55 +1089,32 @@ class RespondToTest < Test::Unit::TestCase
+     restore_delivery_method
+   end
+ 
+-  def test_should_respond_to_new
+-    assert RespondToMailer.respond_to?(:new)
+-  end
+-
+-  def test_should_respond_to_create_with_template_suffix
+-    assert RespondToMailer.respond_to?(:create_any_old_template)
+-  end
+-
+-  def test_should_respond_to_deliver_with_template_suffix
+-    assert RespondToMailer.respond_to?(:deliver_any_old_template)
+-  end
+-
+-  def test_should_not_respond_to_new_with_template_suffix
+-    assert !RespondToMailer.respond_to?(:new_any_old_template)
+-  end
+-
+-  def test_should_not_respond_to_create_with_template_suffix_unless_it_is_separated_by_an_underscore
+-    assert !RespondToMailer.respond_to?(:createany_old_template)
++  def test_should_respond_to_create_if_instance_method_exists
++    assert RespondToMailer.respond_to?(:create_existing_method)
++    assert !RespondToMailer.respond_to?(:create_nonexistent_method)
+   end
+ 
+-  def test_should_not_respond_to_deliver_with_template_suffix_unless_it_is_separated_by_an_underscore
+-    assert !RespondToMailer.respond_to?(:deliverany_old_template)
++  def test_should_respond_to_deliver_if_instance_method_exists
++    assert RespondToMailer.respond_to?(:deliver_existing_method)
++    assert !RespondToMailer.respond_to?(:deliver_nonexistent_method)
+   end
+ 
+-  def test_should_not_respond_to_create_with_template_suffix_if_it_begins_with_a_uppercase_letter
+-    assert !RespondToMailer.respond_to?(:create_Any_old_template)
+-  end
+-
+-  def test_should_not_respond_to_deliver_with_template_suffix_if_it_begins_with_a_uppercase_letter
+-    assert !RespondToMailer.respond_to?(:deliver_Any_old_template)
+-  end
+-
+-  def test_should_not_respond_to_create_with_template_suffix_if_it_begins_with_a_digit
+-    assert !RespondToMailer.respond_to?(:create_1_template)
+-  end
+-
+-  def test_should_not_respond_to_deliver_with_template_suffix_if_it_begins_with_a_digit
+-    assert !RespondToMailer.respond_to?(:deliver_1_template)
+-  end
+-
+-  def test_should_not_respond_to_method_where_deliver_is_not_a_suffix
+-    assert !RespondToMailer.respond_to?(:foo_deliver_template)
++  def test_should_not_raise_no_method_error_if_instance_method_exists
++    [:create, :deliver].each do |prefix|
++      begin
++        RespondToMailer.send("#{prefix}_existing_method")
++      rescue StandardError => e
++        assert !e.kind_of?(NoMethodError)
++      end
++    end
+   end
+ 
+-  def test_should_still_raise_exception_with_expected_message_when_calling_an_undefined_method
+-    error = assert_raise NoMethodError do
+-      RespondToMailer.not_a_method
++  def test_should_raise_no_method_error_if_instance_method_is_missing
++    assert_raise NoMethodError do
++      RespondToMailer.create_nonexistent_method
++    end
++    assert_raise NoMethodError do
++      RespondToMailer.deliver_nonexistent_method
+     end
+-
+-    assert_match /undefined method.*not_a_method/, error.message
+   end
+ end
+-- 
+1.7.2.3
+

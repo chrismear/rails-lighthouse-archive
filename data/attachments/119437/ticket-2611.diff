@@ -1,0 +1,203 @@
+From 168b80e79a7521007146efa4c5bebefb89461f29 Mon Sep 17 00:00:00 2001
+From: Adam Hooper <adam@patch.com>
+Date: Wed, 6 May 2009 11:15:48 -0400
+Subject: [PATCH] Handle nil from Rack::Request.GET and POST
+
+See Ticket #2611.
+---
+ actionpack/lib/action_controller/request.rb |    4 +-
+ actionpack/test/controller/request_test.rb  |   39 +++++++++++++++++++++++++-
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/request.rb b/actionpack/lib/action_controller/request.rb
+index 1c3c1c8..9a16d0d 100755
+--- a/actionpack/lib/action_controller/request.rb
++++ b/actionpack/lib/action_controller/request.rb
+@@ -423,13 +423,13 @@ EOM
+ 
+     # Override Rack's GET method to support indifferent access
+     def GET
+-      @env["action_controller.request.query_parameters"] ||= normalize_parameters(super)
++      @env["action_controller.request.query_parameters"] ||= normalize_parameters(super || {})
+     end
+     alias_method :query_parameters, :GET
+ 
+     # Override Rack's POST method to support indifferent access
+     def POST
+-      @env["action_controller.request.request_parameters"] ||= normalize_parameters(super)
++      @env["action_controller.request.request_parameters"] ||= normalize_parameters(super || {})
+     end
+     alias_method :request_parameters, :POST
+ 
+diff --git a/actionpack/test/controller/request_test.rb b/actionpack/test/controller/request_test.rb
+index c4cc63e..fbadf22 100644
+--- a/actionpack/test/controller/request_test.rb
++++ b/actionpack/test/controller/request_test.rb
+@@ -382,8 +382,24 @@ class RequestTest < ActiveSupport::TestCase
+     request.stubs(:query_parameters).returns({ "bar" => 2 })
+ 
+     assert_equal({"foo" => 1, "bar" => 2}, request.parameters)
+-    assert_equal({"foo" => 1}, request.request_parameters)
+-    assert_equal({"bar" => 2}, request.query_parameters)
++  end
++
++  test "parameters with broken Rack GET" do
++    with_rack_GET_POST_returning_nil do
++      request = stub_request
++      request.stubs(:request_parameters).returns({ "foo" => "bar" })
++
++      assert_equal({ "foo" => "bar" }, request.parameters)
++    end
++  end
++
++  test "parameters with broken Rack POST" do
++    with_rack_GET_POST_returning_nil do
++      request = stub_request
++      request.stubs(:query_parameters).returns({ "foo" => "bar" })
++
++      assert_equal({ "foo" => "bar" }, request.parameters)
++    end
+   end
+ 
+ protected
+@@ -392,4 +408,23 @@ protected
+     ActionController::Request.new(env)
+   end
+ 
++  def with_rack_GET_POST_returning_nil(&block)
++    rack_GET = Rack::Request.instance_method(:GET)
++    rack_POST = Rack::Request.instance_method(:POST)
++
++    begin
++      Rack::Request.class_eval do
++        def GET; nil; end
++        def POST; nil; end
++      end
++
++      yield
++    ensure
++      Rack::Request.class_eval do
++        define_method(:GET, rack_GET)
++        define_method(:POST, rack_POST)
++      end
++    end
++  end
++
+ end
+-- 
+1.6.0.4
+
+
+From 428949c0300564c770a64ce42c1ebc8056fec4e4 Mon Sep 17 00:00:00 2001
+From: Adam Hooper <adam@patch.com>
+Date: Wed, 6 May 2009 11:59:05 -0400
+Subject: [PATCH] Handle TypeError from Rack::Request.GET and POST
+
+See Ticket #2611.
+---
+ actionpack/lib/action_controller/request.rb |   12 ++++++-
+ actionpack/test/controller/request_test.rb  |   41 +++++++++++++++++++++++++-
+ 2 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/request.rb b/actionpack/lib/action_controller/request.rb
+index 9a16d0d..ebf0ec3 100755
+--- a/actionpack/lib/action_controller/request.rb
++++ b/actionpack/lib/action_controller/request.rb
+@@ -423,13 +423,21 @@ EOM
+ 
+     # Override Rack's GET method to support indifferent access
+     def GET
+-      @env["action_controller.request.query_parameters"] ||= normalize_parameters(super || {})
++      @env["action_controller.request.query_parameters"] ||= begin
++        normalize_parameters(super || {})
++      rescue TypeError
++        {}
++      end
+     end
+     alias_method :query_parameters, :GET
+ 
+     # Override Rack's POST method to support indifferent access
+     def POST
+-      @env["action_controller.request.request_parameters"] ||= normalize_parameters(super || {})
++      @env["action_controller.request.request_parameters"] ||= begin
++        normalize_parameters(super || {})
++      rescue TypeError
++        {}
++      end
+     end
+     alias_method :request_parameters, :POST
+ 
+diff --git a/actionpack/test/controller/request_test.rb b/actionpack/test/controller/request_test.rb
+index fbadf22..72361dc 100644
+--- a/actionpack/test/controller/request_test.rb
++++ b/actionpack/test/controller/request_test.rb
+@@ -384,7 +384,7 @@ class RequestTest < ActiveSupport::TestCase
+     assert_equal({"foo" => 1, "bar" => 2}, request.parameters)
+   end
+ 
+-  test "parameters with broken Rack GET" do
++  test "parameters with Rack GET returning nil" do
+     with_rack_GET_POST_returning_nil do
+       request = stub_request
+       request.stubs(:request_parameters).returns({ "foo" => "bar" })
+@@ -393,7 +393,7 @@ class RequestTest < ActiveSupport::TestCase
+     end
+   end
+ 
+-  test "parameters with broken Rack POST" do
++  test "parameters with Rack POST returning nil" do
+     with_rack_GET_POST_returning_nil do
+       request = stub_request
+       request.stubs(:query_parameters).returns({ "foo" => "bar" })
+@@ -402,6 +402,24 @@ class RequestTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "parameters with Rack GET raising TypeError" do
++    with_rack_GET_POST_throwing_typeerror do
++      request = stub_request
++      request.stubs(:request_parameters).returns({ "foo" => "bar" })
++
++      assert_equal({ "foo" => "bar" }, request.parameters)
++    end
++  end
++
++  test "parameters with Rack POST raising TypeError" do
++    with_rack_GET_POST_throwing_typeerror do
++      request = stub_request
++      request.stubs(:query_parameters).returns({ "foo" => "bar" })
++
++      assert_equal({ "foo" => "bar" }, request.parameters)
++    end
++  end
++
+ protected
+ 
+   def stub_request(env={})
+@@ -427,4 +445,23 @@ protected
+     end
+   end
+ 
++  def with_rack_GET_POST_throwing_typeerror(&block)
++    rack_GET = Rack::Request.instance_method(:GET)
++    rack_POST = Rack::Request.instance_method(:POST)
++
++    begin
++      Rack::Request.class_eval do
++        def GET; raise TypeError.new("Yes, Rack really crashes here"); end
++        def POST; raise TypeError.new("Yes, Rack really crashes here"); end
++      end
++
++      yield
++    ensure
++      Rack::Request.class_eval do
++        define_method(:GET, rack_GET)
++        define_method(:POST, rack_POST)
++      end
++    end
++  end
++
+ end
+-- 
+1.6.0.4
+

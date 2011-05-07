@@ -1,0 +1,991 @@
+From a729cf37b93aadfa4822899cb631204620faec99 Mon Sep 17 00:00:00 2001
+From: Brian Landau <brianjlandau@gmail.com>
+Date: Tue, 17 Jun 2008 16:36:12 -0400
+Subject: [PATCH] Refactored ActionView::TestCase into ActionView::Helpers::TestCase. And added a new assertion for testing the presence of specific tags in helper output.
+
+---
+ actionpack/lib/action_view/assertions.rb           |   28 +++++
+ .../lib/action_view/assertions/tag_assertions.rb   |  121 ++++++++++++++++++++
+ actionpack/lib/action_view/helpers_test_case.rb    |   72 ++++++++++++
+ actionpack/test/abstract_unit.rb                   |    2 +-
+ .../test/template/active_record_helper_test.rb     |    2 +-
+ actionpack/test/template/asset_tag_helper_test.rb  |    4 +-
+ actionpack/test/template/benchmark_helper_test.rb  |    2 +-
+ actionpack/test/template/date_helper_test.rb       |    2 +-
+ actionpack/test/template/form_helper_test.rb       |    2 +-
+ .../test/template/form_options_helper_test.rb      |    2 +-
+ actionpack/test/template/form_tag_helper_test.rb   |    2 +-
+ actionpack/test/template/javascript_helper_test.rb |    2 +-
+ actionpack/test/template/number_helper_test.rb     |    2 +-
+ actionpack/test/template/prototype_helper_test.rb  |    2 +-
+ actionpack/test/template/record_tag_helper_test.rb |    2 +-
+ actionpack/test/template/sanitize_helper_test.rb   |    2 +-
+ .../test/template/scriptaculous_helper_test.rb     |    2 +-
+ actionpack/test/template/tag_helper_test.rb        |    2 +-
+ actionpack/test/template/test_test.rb              |    4 +-
+ actionpack/test/template/text_helper_test.rb       |    2 +-
+ actionpack/test/template/url_helper_test.rb        |    8 +-
+ railties/lib/test_help.rb                          |    1 +
+ 22 files changed, 245 insertions(+), 23 deletions(-)
+ create mode 100644 actionpack/lib/action_view/assertions.rb
+ create mode 100644 actionpack/lib/action_view/assertions/tag_assertions.rb
+ create mode 100644 actionpack/lib/action_view/helpers_test_case.rb
+
+diff --git a/actionpack/lib/action_view/assertions.rb b/actionpack/lib/action_view/assertions.rb
+new file mode 100644
+index 0000000..b634731
+--- /dev/null
++++ b/actionpack/lib/action_view/assertions.rb
+@@ -0,0 +1,28 @@
++require 'test/unit/assertions'
++
++module ActionView #:nodoc:
++  module Assertions
++    def self.included(klass)
++      %w(tag).each do |kind|
++        require "action_view/assertions/#{kind}_assertions"
++        klass.module_eval { include const_get("#{kind.camelize}Assertions") }
++      end
++    end
++
++    def clean_backtrace_view_assertions(&block)
++      yield
++    rescue Test::Unit::AssertionFailedError => error
++      framework_path = Regexp.new(File.expand_path("#{File.dirname(__FILE__)}/assertions"))
++      error.backtrace.reject! { |line| File.expand_path(line) =~ framework_path }
++      raise
++    end
++  end
++end
++
++module Test #:nodoc:
++  module Unit #:nodoc:
++    class TestCase #:nodoc:
++      include ActionView::Assertions
++    end
++  end
++end
+diff --git a/actionpack/lib/action_view/assertions/tag_assertions.rb b/actionpack/lib/action_view/assertions/tag_assertions.rb
+new file mode 100644
+index 0000000..d984443
+--- /dev/null
++++ b/actionpack/lib/action_view/assertions/tag_assertions.rb
+@@ -0,0 +1,121 @@
++require 'action_controller'
++require 'rexml/document'
++require 'html/document'
++
++module ActionView
++  module Assertions
++    # Pair of assertions to testing elements in the HTML of a target string.
++    module TagAssertions
++      # Asserts that there is a tag/node/element in the HTML of a target string
++      # that meets all of the given conditions. The +conditions+ parameter must
++      # be a hash of any of the following keys (all are optional):
++      #
++      # * <tt>:tag</tt>: the node type must match the corresponding value
++      # * <tt>:attributes</tt>: a hash. The node's attributes must match the
++      #   corresponding values in the hash.
++      # * <tt>:parent</tt>: a hash. The node's parent must match the
++      #   corresponding hash.
++      # * <tt>:child</tt>: a hash. At least one of the node's immediate children
++      #   must meet the criteria described by the hash.
++      # * <tt>:ancestor</tt>: a hash. At least one of the node's ancestors must
++      #   meet the criteria described by the hash.
++      # * <tt>:descendant</tt>: a hash. At least one of the node's descendants
++      #   must meet the criteria described by the hash.
++      # * <tt>:sibling</tt>: a hash. At least one of the node's siblings must
++      #   meet the criteria described by the hash.
++      # * <tt>:after</tt>: a hash. The node must be after any sibling meeting
++      #   the criteria described by the hash, and at least one sibling must match.
++      # * <tt>:before</tt>: a hash. The node must be before any sibling meeting
++      #   the criteria described by the hash, and at least one sibling must match.
++      # * <tt>:children</tt>: a hash, for counting children of a node. Accepts
++      #   the keys:
++      #   * <tt>:count</tt>: either a number or a range which must equal (or
++      #     include) the number of children that match.
++      #   * <tt>:less_than</tt>: the number of matching children must be less
++      #     than this number.
++      #   * <tt>:greater_than</tt>: the number of matching children must be
++      #     greater than this number.
++      #   * <tt>:only</tt>: another hash consisting of the keys to use
++      #     to match on the children, and only matching children will be
++      #     counted.
++      # * <tt>:content</tt>: the textual content of the node must match the
++      #   given value. This will not match HTML tags in the body of a
++      #   tag--only text.
++      #
++      # Conditions are matched using the following algorithm:
++      #
++      # * if the condition is a string, it must be a substring of the value.
++      # * if the condition is a regexp, it must match the value.
++      # * if the condition is a number, the value must match number.to_s.
++      # * if the condition is +true+, the value must not be +nil+.
++      # * if the condition is +false+ or +nil+, the value must be +nil+.
++      #
++      # === Examples
++      #
++      #   # Assert that there is a "span" tag
++      #   assert_tag_in "<span>My Tag</span>", :tag => "span"
++      #
++      #   # Assert that there is a "span" tag with id="x"
++      #   assert_tag_in '<span id="x">My Tag</span>', :tag => "span", :attributes => { :id => "x" }
++      #
++      #   # Assert that there is a "span" tag using the short-hand
++      #   assert_tag_in "<span>My Tag</span>", :span
++      #
++      #   # Assert that there is a "span" inside of a "div"
++      #   assert_tag_in "<div><span>My Tag</span></div>", :tag => "span", :parent => { :tag => "div" }
++      #
++      #   # Assert that there is a "span" with at least one "em" child
++      #   assert_tag_in "<span><em>My Tag</em></span>", :tag => "span", :child => { :tag => "em" }
++      #
++      #   # Assert that there is a "span" containing a (possibly nested)
++      #   # "strong" tag.
++      #   assert_tag_in helper_string, :tag => "span", :descendant => { :tag => "strong" }
++      #
++      #   # Assert that there is a "span" containing between 2 and 4 "em" tags
++      #   # as immediate children
++      #   assert_tag_in helper_string :tag => "span",
++      #                               :children => { :count => 2..4, :only => { :tag => "em" } } 
++      #
++      # <b>Please note</b>: +assert_tag_in+ and +assert_tag_not_in+ only work
++      # with well-formed XHTML. They recognize a few tags as implicitly self-closing
++      # (like br and hr and such) but will not work correctly with tags
++      # that allow optional closing tags (p, li, td). <em>You must explicitly
++      # close all of your tags to use these assertions.</em>
++      def assert_tag_in(*opts)
++        clean_backtrace_view_assertions do
++          target = opts.shift
++          tag_opts = find_tag_opts(opts)
++          assert !find_tag_in(target, tag_opts).nil?, "#{tag_opts.inspect} was not found in \n#{target.inspect}"
++        end
++      end
++      
++      # Identical to +assert_tag_in+, but asserts that a matching tag does _not_
++      # exist. (See +assert_tag_in+ for a full discussion of the syntax.)
++      def assert_tag_not_in(*opts)
++        clean_backtrace_view_assertions do
++          target = opts.shift
++          tag_opts = find_tag_opts(opts)
++          assert find_tag_in(target, tag_opts).nil?, "#{tag_opts.inspect} was found in \n#{target.inspect}"
++        end
++      end
++      
++      
++      private
++      
++        def find_tag_opts(opts)
++          if opts.size > 1
++            find_opts = opts.last.merge({ :tag => opts.first.to_s })
++          else
++            find_opts = opts.first.is_a?(Symbol) ? { :tag => opts.first.to_s } : opts.first
++          end
++          find_opts
++        end
++
++        def find_tag_in(target, opts = {})
++          target = ::HTML::Document.new(target, false, false)
++          target.find(opts)
++        end
++      
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/actionpack/lib/action_view/helpers_test_case.rb b/actionpack/lib/action_view/helpers_test_case.rb
+new file mode 100644
+index 0000000..7bd32d0
+--- /dev/null
++++ b/actionpack/lib/action_view/helpers_test_case.rb
+@@ -0,0 +1,72 @@
++require 'active_support/test_case'
++require 'action_view/assertions'
++
++module ActionView
++  module Helpers
++    # TestCase is a class to be inherited from in Helper tests. It allows
++    # helper methods to be called as you would in a view and test their output.
++    class TestCase < ActiveSupport::TestCase
++      class_inheritable_accessor :helper_class
++      class_inheritable_accessor :controller
++      @@helper_class = nil
++      @@controller = nil
++
++      class << self
++        def tests(helper_class)
++          self.helper_class = helper_class
++        end
++
++        def helper_class
++          if !read_inheritable_attribute(:helper_class).nil?
++            read_inheritable_attribute(:helper_class)
++          else
++            self.helper_class = determine_default_helper_class(name)
++          end
++        end
++
++        def determine_default_helper_class(name)
++          name.sub(/Test$/, '').constantize
++        rescue NameError
++          nil
++        end
++      end
++
++      ActionView::Base.helper_modules.each do |helper_module|
++        include helper_module
++      end
++      include ActionController::PolymorphicRoutes
++      include ActionController::RecordIdentifier
++
++      setup :setup_with_helper_class
++
++      def setup_with_helper_class
++        if helper_class && !self.class.ancestors.include?(helper_class)
++          self.class.send(:include, helper_class)
++        end
++
++        self.output_buffer = ''
++      end
++
++      class TestController < ActionController::Base
++        attr_accessor :request, :response
++
++        def initialize
++          @request = ActionController::TestRequest.new
++          @response = ActionController::TestResponse.new
++        end
++      end
++
++      protected
++        attr_accessor :output_buffer
++
++      private
++        def method_missing(selector, *args)
++          unless self.class.controller
++            self.class.controller = TestController.new
++          end
++          return controller.send!(selector, *args) if ActionController::Routing::Routes.named_routes.helpers.include?(selector)
++          super
++        end
++    end
++  end
++end
+diff --git a/actionpack/test/abstract_unit.rb b/actionpack/test/abstract_unit.rb
+index fa1c329..4e9d176 100644
+--- a/actionpack/test/abstract_unit.rb
++++ b/actionpack/test/abstract_unit.rb
+@@ -8,7 +8,7 @@ require 'test/unit'
+ require 'action_controller'
+ require 'action_controller/cgi_ext'
+ require 'action_controller/test_process'
+-require 'action_view/test_case'
++require 'action_view/helpers_test_case'
+ 
+ begin
+   require 'ruby-debug'
+diff --git a/actionpack/test/template/active_record_helper_test.rb b/actionpack/test/template/active_record_helper_test.rb
+index dfc30e6..19ea075 100644
+--- a/actionpack/test/template/active_record_helper_test.rb
++++ b/actionpack/test/template/active_record_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class ActiveRecordHelperTest < ActionView::TestCase
++class ActiveRecordHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::ActiveRecordHelper
+ 
+   silence_warnings do
+diff --git a/actionpack/test/template/asset_tag_helper_test.rb b/actionpack/test/template/asset_tag_helper_test.rb
+index 4a8117a..94b311b 100644
+--- a/actionpack/test/template/asset_tag_helper_test.rb
++++ b/actionpack/test/template/asset_tag_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class AssetTagHelperTest < ActionView::TestCase
++class AssetTagHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::AssetTagHelper
+ 
+   def setup
+@@ -443,7 +443,7 @@ class AssetTagHelperTest < ActionView::TestCase
+   end
+ end
+ 
+-class AssetTagHelperNonVhostTest < ActionView::TestCase
++class AssetTagHelperNonVhostTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::AssetTagHelper
+ 
+   def setup
+diff --git a/actionpack/test/template/benchmark_helper_test.rb b/actionpack/test/template/benchmark_helper_test.rb
+index 08d453c..822f5b7 100644
+--- a/actionpack/test/template/benchmark_helper_test.rb
++++ b/actionpack/test/template/benchmark_helper_test.rb
+@@ -1,7 +1,7 @@
+ require 'abstract_unit'
+ require 'action_view/helpers/benchmark_helper'
+ 
+-class BenchmarkHelperTest < ActionView::TestCase
++class BenchmarkHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::BenchmarkHelper
+ 
+   class MockLogger
+diff --git a/actionpack/test/template/date_helper_test.rb b/actionpack/test/template/date_helper_test.rb
+index 11b3bdb..2e50cf0 100755
+--- a/actionpack/test/template/date_helper_test.rb
++++ b/actionpack/test/template/date_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class DateHelperTest < ActionView::TestCase
++class DateHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::DateHelper
+ 
+   silence_warnings do
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 39649c3..ff82e72 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -31,7 +31,7 @@ end
+ class Comment::Nested < Comment; end
+ 
+ 
+-class FormHelperTest < ActionView::TestCase
++class FormHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::FormHelper
+ 
+   def setup
+diff --git a/actionpack/test/template/form_options_helper_test.rb b/actionpack/test/template/form_options_helper_test.rb
+index 3f89a5e..a9e4462 100644
+--- a/actionpack/test/template/form_options_helper_test.rb
++++ b/actionpack/test/template/form_options_helper_test.rb
+@@ -20,7 +20,7 @@ class MockTimeZone
+   end
+ end
+ 
+-class FormOptionsHelperTest < ActionView::TestCase
++class FormOptionsHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::FormOptionsHelper
+ 
+   silence_warnings do
+diff --git a/actionpack/test/template/form_tag_helper_test.rb b/actionpack/test/template/form_tag_helper_test.rb
+index 47b3605..ad34da7 100644
+--- a/actionpack/test/template/form_tag_helper_test.rb
++++ b/actionpack/test/template/form_tag_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class FormTagHelperTest < ActionView::TestCase
++class FormTagHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::FormTagHelper
+ 
+   def setup
+diff --git a/actionpack/test/template/javascript_helper_test.rb b/actionpack/test/template/javascript_helper_test.rb
+index 8c649ea..95cc581 100644
+--- a/actionpack/test/template/javascript_helper_test.rb
++++ b/actionpack/test/template/javascript_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class JavaScriptHelperTest < ActionView::TestCase
++class JavaScriptHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::JavaScriptHelper
+ 
+   def test_define_javascript_functions
+diff --git a/actionpack/test/template/number_helper_test.rb b/actionpack/test/template/number_helper_test.rb
+index 4a8d09b..c16ddaf 100644
+--- a/actionpack/test/template/number_helper_test.rb
++++ b/actionpack/test/template/number_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class NumberHelperTest < ActionView::TestCase
++class NumberHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::NumberHelper
+ 
+   def test_number_to_phone
+diff --git a/actionpack/test/template/prototype_helper_test.rb b/actionpack/test/template/prototype_helper_test.rb
+index a5be0d2..48409e0 100644
+--- a/actionpack/test/template/prototype_helper_test.rb
++++ b/actionpack/test/template/prototype_helper_test.rb
+@@ -24,7 +24,7 @@ end
+ class Author::Nested < Author; end
+ 
+ 
+-class PrototypeHelperBaseTest < ActionView::TestCase
++class PrototypeHelperBaseTest < ActionView::Helpers::TestCase
+   attr_accessor :template_format
+ 
+   def setup
+diff --git a/actionpack/test/template/record_tag_helper_test.rb b/actionpack/test/template/record_tag_helper_test.rb
+index 441dc6b..750c7a9 100644
+--- a/actionpack/test/template/record_tag_helper_test.rb
++++ b/actionpack/test/template/record_tag_helper_test.rb
+@@ -9,7 +9,7 @@ class Post
+   end
+ end
+ 
+-class RecordTagHelperTest < ActionView::TestCase
++class RecordTagHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::RecordTagHelper
+ 
+   def setup
+diff --git a/actionpack/test/template/sanitize_helper_test.rb b/actionpack/test/template/sanitize_helper_test.rb
+index e5427d9..55ed9ce 100644
+--- a/actionpack/test/template/sanitize_helper_test.rb
++++ b/actionpack/test/template/sanitize_helper_test.rb
+@@ -3,7 +3,7 @@ require 'testing_sandbox'
+ 
+ # The exhaustive tests are in test/controller/html/sanitizer_test.rb.
+ # This tests the that the helpers hook up correctly to the sanitizer classes.
+-class SanitizeHelperTest < ActionView::TestCase
++class SanitizeHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::SanitizeHelper
+   include TestingSandbox
+ 
+diff --git a/actionpack/test/template/scriptaculous_helper_test.rb b/actionpack/test/template/scriptaculous_helper_test.rb
+index 690a775..a16a7e6 100644
+--- a/actionpack/test/template/scriptaculous_helper_test.rb
++++ b/actionpack/test/template/scriptaculous_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class ScriptaculousHelperTest < ActionView::TestCase
++class ScriptaculousHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::ScriptaculousHelper
+ 
+   def setup
+diff --git a/actionpack/test/template/tag_helper_test.rb b/actionpack/test/template/tag_helper_test.rb
+index 2941dfe..113d303 100644
+--- a/actionpack/test/template/tag_helper_test.rb
++++ b/actionpack/test/template/tag_helper_test.rb
+@@ -1,6 +1,6 @@
+ require 'abstract_unit'
+ 
+-class TagHelperTest < ActionView::TestCase
++class TagHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::TagHelper
+ 
+   def test_tag
+diff --git a/actionpack/test/template/test_test.rb b/actionpack/test/template/test_test.rb
+index 660f51b..edeaf62 100644
+--- a/actionpack/test/template/test_test.rb
++++ b/actionpack/test/template/test_test.rb
+@@ -18,7 +18,7 @@ module PeopleHelper
+   end
+ end
+ 
+-class PeopleHelperTest < ActionView::TestCase
++class PeopleHelperTest < ActionView::Helpers::TestCase
+   def setup
+     ActionController::Routing::Routes.draw do |map|
+       map.people 'people', :controller => 'people', :action => 'index'
+@@ -47,7 +47,7 @@ class PeopleHelperTest < ActionView::TestCase
+   end
+ end
+ 
+-class CrazyHelperTest < ActionView::TestCase
++class CrazyHelperTest < ActionView::Helpers::TestCase
+   tests PeopleHelper
+ 
+   def test_helper_class_can_be_set_manually_not_just_inferred
+diff --git a/actionpack/test/template/text_helper_test.rb b/actionpack/test/template/text_helper_test.rb
+index cbb5c7e..0b3e129 100644
+--- a/actionpack/test/template/text_helper_test.rb
++++ b/actionpack/test/template/text_helper_test.rb
+@@ -1,7 +1,7 @@
+ require 'abstract_unit'
+ require 'testing_sandbox'
+ 
+-class TextHelperTest < ActionView::TestCase
++class TextHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::TextHelper
+   include TestingSandbox
+ 
+diff --git a/actionpack/test/template/url_helper_test.rb b/actionpack/test/template/url_helper_test.rb
+index d45ea08..2461faf 100644
+--- a/actionpack/test/template/url_helper_test.rb
++++ b/actionpack/test/template/url_helper_test.rb
+@@ -2,7 +2,7 @@ require 'abstract_unit'
+ 
+ RequestMock = Struct.new("Request", :request_uri, :protocol, :host_with_port, :env)
+ 
+-class UrlHelperTest < ActionView::TestCase
++class UrlHelperTest < ActionView::Helpers::TestCase
+   tests ActionView::Helpers::UrlHelper
+ 
+   def setup
+@@ -291,7 +291,7 @@ class UrlHelperTest < ActionView::TestCase
+   end
+ end
+ 
+-class UrlHelperWithControllerTest < ActionView::TestCase
++class UrlHelperWithControllerTest < ActionView::Helpers::TestCase
+   class UrlHelperController < ActionController::Base
+     self.view_paths = [ "#{File.dirname(__FILE__)}/../fixtures/" ]
+ 
+@@ -346,7 +346,7 @@ class UrlHelperWithControllerTest < ActionView::TestCase
+     end
+ end
+ 
+-class LinkToUnlessCurrentWithControllerTest < ActionView::TestCase
++class LinkToUnlessCurrentWithControllerTest < ActionView::Helpers::TestCase
+   class TasksController < ActionController::Base
+     self.view_paths = ["#{File.dirname(__FILE__)}/../fixtures/"]
+ 
+@@ -438,7 +438,7 @@ class Session
+   end
+ end
+ 
+-class PolymorphicControllerTest < ActionView::TestCase
++class PolymorphicControllerTest < ActionView::Helpers::TestCase
+   class WorkshopsController < ActionController::Base
+     self.view_paths = ["#{File.dirname(__FILE__)}/../fixtures/"]
+ 
+diff --git a/railties/lib/test_help.rb b/railties/lib/test_help.rb
+index 3cc61d7..b645f6c 100644
+--- a/railties/lib/test_help.rb
++++ b/railties/lib/test_help.rb
+@@ -9,6 +9,7 @@ require 'active_support/test_case'
+ require 'active_record/fixtures'
+ require 'action_controller/test_case'
+ require 'action_controller/integration'
++require 'action_view/helpers_test_case'
+ require 'action_mailer/test_case' if defined?(ActionMailer)
+ 
+ Test::Unit::TestCase.fixture_path = RAILS_ROOT + "/test/fixtures/"
+-- 
+1.5.6.2
+
+
+From 752359750ff80dd1d15f22008d0827469051ea36 Mon Sep 17 00:00:00 2001
+From: Brian Landau <brianjlandau@gmail.com>
+Date: Tue, 17 Jun 2008 16:37:00 -0400
+Subject: [PATCH] Finalize action_view/test_case name change to helpers_test_case
+
+---
+ actionpack/lib/action_view/test_case.rb |   63 -------------------------------
+ 1 files changed, 0 insertions(+), 63 deletions(-)
+ delete mode 100644 actionpack/lib/action_view/test_case.rb
+
+diff --git a/actionpack/lib/action_view/test_case.rb b/actionpack/lib/action_view/test_case.rb
+deleted file mode 100644
+index 1a3c93c..0000000
+--- a/actionpack/lib/action_view/test_case.rb
++++ /dev/null
+@@ -1,63 +0,0 @@
+-require 'active_support/test_case'
+-
+-module ActionView
+-  class TestCase < ActiveSupport::TestCase
+-    class_inheritable_accessor :helper_class
+-    @@helper_class = nil
+-
+-    class << self
+-      def tests(helper_class)
+-        self.helper_class = helper_class
+-      end
+-
+-      def helper_class
+-        if current_helper_class = read_inheritable_attribute(:helper_class)
+-          current_helper_class
+-        else
+-          self.helper_class = determine_default_helper_class(name)
+-        end
+-      end
+-
+-      def determine_default_helper_class(name)
+-        name.sub(/Test$/, '').constantize
+-      rescue NameError
+-        nil
+-      end
+-    end
+-
+-    ActionView::Base.helper_modules.each do |helper_module|
+-      include helper_module
+-    end
+-    include ActionController::PolymorphicRoutes
+-    include ActionController::RecordIdentifier
+-
+-    setup :setup_with_helper_class
+-
+-    def setup_with_helper_class
+-      if helper_class && !self.class.ancestors.include?(helper_class)
+-        self.class.send(:include, helper_class)
+-      end
+-
+-      self.output_buffer = ''
+-    end
+-
+-    class TestController < ActionController::Base
+-      attr_accessor :request, :response
+-
+-      def initialize
+-        @request = ActionController::TestRequest.new
+-        @response = ActionController::TestResponse.new
+-      end
+-    end
+-
+-    protected
+-      attr_accessor :output_buffer
+-
+-    private
+-      def method_missing(selector, *args)
+-        controller = TestController.new
+-        return controller.send!(selector, *args) if ActionController::Routing::Routes.named_routes.helpers.include?(selector)
+-        super
+-      end
+-  end
+-end
+-- 
+1.5.6.2
+
+
+From fd9c31a2fc73770d15529d57a76fc570c6db91c9 Mon Sep 17 00:00:00 2001
+From: Brian Landau <brianjlandau@gmail.com>
+Date: Fri, 20 Jun 2008 15:56:32 -0400
+Subject: [PATCH] Forgot to add tests
+
+---
+ actionpack/test/template/test_test.rb |   28 ++++++++++++++++++++++++++++
+ 1 files changed, 28 insertions(+), 0 deletions(-)
+
+diff --git a/actionpack/test/template/test_test.rb b/actionpack/test/template/test_test.rb
+index edeaf62..05ffb90 100644
+--- a/actionpack/test/template/test_test.rb
++++ b/actionpack/test/template/test_test.rb
+@@ -1,5 +1,33 @@
+ require 'abstract_unit'
+ 
++class AssertTagTest < ActiveSupport::TestCase
++  
++  def test_assert_tag_in_with_shorthand
++    html = '<p id="test">hello world</p>'
++    assert_tag_in html, :p
++    assert_tag_not_in html, :span
++  end
++  
++  def test_assert_tag_in_with_tag
++    html = '<p id="test">hello world</p>'
++    assert_tag_in html, :tag => 'p'
++    assert_tag_not_in html, :tag => 'span'
++  end
++  
++  def test_assert_tag_in_with_attributes
++    html = '<p id="test">hello world</p>'
++    assert_tag_in html, :p, :attributes => {:id => 'test'}
++    assert_tag_not_in html, :p, :attributes => {:class => 'test'}
++  end
++  
++  def test_assert_tag_in_with_child
++    html = '<p><span id="test">hello world</span></p>'
++    assert_tag_in html, :p, :child => { :tag => 'span', :attributes => {:id => 'test'} }
++    assert_tag_not_in html, :p, :child => {:tag => 'strong'}
++  end
++  
++end
++
+ module PeopleHelper
+   def title(text)
+     content_tag(:h1, text)
+-- 
+1.5.6.2
+
+
+From b24b33b3a223190085139b8fb14fdbf69f0e35b6 Mon Sep 17 00:00:00 2001
+From: Brian Landau <brianjlandau@gmail.com>
+Date: Fri, 11 Jul 2008 17:35:05 -0400
+Subject: [PATCH] Add assert_select_in method to ActionView::Assertions
+
+---
+ actionpack/lib/action_view/assertions.rb           |    2 +-
+ .../action_view/assertions/selector_assertions.rb  |  230 ++++++++++++++++++++
+ actionpack/test/template/test_test.rb              |   21 ++
+ 3 files changed, 252 insertions(+), 1 deletions(-)
+ create mode 100644 actionpack/lib/action_view/assertions/selector_assertions.rb
+
+diff --git a/actionpack/lib/action_view/assertions.rb b/actionpack/lib/action_view/assertions.rb
+index b634731..ab0cdae 100644
+--- a/actionpack/lib/action_view/assertions.rb
++++ b/actionpack/lib/action_view/assertions.rb
+@@ -3,7 +3,7 @@ require 'test/unit/assertions'
+ module ActionView #:nodoc:
+   module Assertions
+     def self.included(klass)
+-      %w(tag).each do |kind|
++      %w(tag selector).each do |kind|
+         require "action_view/assertions/#{kind}_assertions"
+         klass.module_eval { include const_get("#{kind.camelize}Assertions") }
+       end
+diff --git a/actionpack/lib/action_view/assertions/selector_assertions.rb b/actionpack/lib/action_view/assertions/selector_assertions.rb
+new file mode 100644
+index 0000000..0aeef87
+--- /dev/null
++++ b/actionpack/lib/action_view/assertions/selector_assertions.rb
+@@ -0,0 +1,230 @@
++require 'action_controller'
++require 'rexml/document'
++require 'html/document'
++
++module ActionView
++  module Assertions
++    # Adds the +assert_select_in+ method for use in Rails helper
++    # test cases, which can be used to make assertions on the HTML of a helper 
++    # method. You can also call +assert_select+ within another +assert_select+ to
++    # make assertions on elements selected by the enclosing assertion.
++    #
++    # Also see HTML::Selector to learn how to use selectors.
++    module SelectorAssertions
++      unless const_defined?(:NO_STRIP)
++        NO_STRIP = %w{pre script style textarea}
++      end
++      
++      # :call-seq:
++      #   assert_select(target, selector, equality?, message?) => array
++      #
++      # An assertion that selects elements and makes one or more equality tests.
++      #
++      # The first parameter specifies the target HTML to which the selector should match,
++      # the second paramter is the selector to match with.
++      # Returns an empty array if no match is found.
++      #
++      # ==== Example
++      #   assert_select_in html, "ol>li" do |elements|
++      #     elements.each do |element|
++      #       assert_select_in element, "li"
++      #     end
++      #   end
++      #
++      # Or for short:
++      #   assert_select_in html, "ol>li" do
++      #     assert_select_in "li"
++      #   end
++      #
++      # The selector may be a CSS selector expression (String), an expression
++      # with substitution values, or an HTML::Selector object.
++      #
++      # === Equality Tests
++      #
++      # The equality test may be one of the following:
++      # * <tt>true</tt> - Assertion is true if at least one element selected.
++      # * <tt>false</tt> - Assertion is true if no element selected.
++      # * <tt>String/Regexp</tt> - Assertion is true if the text value of at least
++      #   one element matches the string or regular expression.
++      # * <tt>Integer</tt> - Assertion is true if exactly that number of
++      #   elements are selected.
++      # * <tt>Range</tt> - Assertion is true if the number of selected
++      #   elements fit the range.
++      # If no equality test specified, the assertion is true if at least one
++      # element selected.
++      #
++      # To perform more than one equality tests, use a hash with the following keys:
++      # * <tt>:text</tt> - Narrow the selection to elements that have this text
++      #   value (string or regexp).
++      # * <tt>:html</tt> - Narrow the selection to elements that have this HTML
++      #   content (string or regexp).
++      # * <tt>:count</tt> - Assertion is true if the number of selected elements
++      #   is equal to this value.
++      # * <tt>:minimum</tt> - Assertion is true if the number of selected
++      #   elements is at least this value.
++      # * <tt>:maximum</tt> - Assertion is true if the number of selected
++      #   elements is at most this value.
++      #
++      # If the method is called with a block, once all equality tests are
++      # evaluated the block is called with an array of all matched elements.
++      #
++      # ==== Examples
++      #
++      #   # At least one form element
++      #   assert_select_in html, "form"
++      #
++      #   # Form element includes four input fields
++      #   assert_select_in html, "form input", 4
++      #
++      #   # Page title is "Welcome"
++      #   assert_select_in html, "title", "Welcome"
++      #
++      #   # Page title is "Welcome" and there is only one title element
++      #   assert_select_in html, "title", {:count=>1, :text=>"Welcome"},
++      #       "Wrong title or more than one title element"
++      #
++      #   # Page contains no forms
++      #   assert_select_in html, "form", false, "This page must contain no forms"
++      #
++      #   # Test the content and style
++      #   assert_select_in html, "body div.header ul.menu"
++      #
++      #   # Use substitution values
++      #   assert_select_in html, "ol>li#?", /item-\d+/
++      #
++      #   # All input fields in the form have a name
++      #   assert_select_in html, "form input" do
++      #     assert_select_in "[name=?]", /.+/  # Not empty
++      #   end
++      # 
++      def assert_select_in(*args, &block)
++        if @selected
++          root = HTML::Node.new(nil)
++          root.children.concat @selected
++        else
++          # Start with mandatory target.
++          target = args.shift
++          root = HTML::Document.new(target, false, false).root
++        end
++        
++        # Then get mandatory selector.
++        arg = args.shift
++        
++        # string and we pass all remaining arguments.
++        # Array and we pass the argument. Also accepts selector itself.
++        case arg
++          when String
++            selector = HTML::Selector.new(arg, args)
++          when Array
++            selector = HTML::Selector.new(*arg)
++          when HTML::Selector
++            selector = arg
++          else raise ArgumentError, "Expecting a selector as the first argument"
++        end
++        
++        # Next argument is used for equality tests.
++        equals = {}
++        case arg = args.shift
++          when Hash
++            equals = arg
++          when String, Regexp
++            equals[:text] = arg
++          when Integer
++            equals[:count] = arg
++          when Range
++            equals[:minimum] = arg.begin
++            equals[:maximum] = arg.end
++          when FalseClass
++            equals[:count] = 0
++          when NilClass, TrueClass
++            equals[:minimum] = 1
++          else raise ArgumentError, "I don't understand what you're trying to match"
++        end
++
++        # By default we're looking for at least one match.
++        if equals[:count]
++          equals[:minimum] = equals[:maximum] = equals[:count]
++        else
++          equals[:minimum] = 1 unless equals[:minimum]
++        end
++
++        # Last argument is the message we use if the assertion fails.
++        message = args.shift
++        #- message = "No match made with selector #{selector.inspect}" unless message
++        if args.shift
++          raise ArgumentError, "Not expecting that last argument, you either have too many arguments, or they're the wrong type"
++        end
++        
++        matches = selector.select(root)
++        
++        # If text/html, narrow down to those elements that match it.
++        content_mismatch = nil
++        if match_with = equals[:text]
++          matches.delete_if do |match|
++            text = ""
++            text.force_encoding(match_with.encoding) if text.respond_to?(:force_encoding)
++            stack = match.children.reverse
++            while node = stack.pop
++              if node.tag?
++                stack.concat node.children.reverse
++              else
++                content = node.content
++                content.force_encoding(match_with.encoding) if content.respond_to?(:force_encoding)
++                text << content
++              end
++            end
++            text.strip! unless NO_STRIP.include?(match.name)
++            unless match_with.is_a?(Regexp) ? (text =~ match_with) : (text == match_with.to_s)
++              content_mismatch ||= build_message(message, "<?> expected but was\n<?>.", match_with, text)
++              true
++            end
++          end
++        elsif match_with = equals[:html]
++          matches.delete_if do |match|
++            html = match.children.map(&:to_s).join
++            html.strip! unless NO_STRIP.include?(match.name)
++            unless match_with.is_a?(Regexp) ? (html =~ match_with) : (html == match_with.to_s)
++              content_mismatch ||= build_message(message, "<?> expected but was\n<?>.", match_with, html)
++              true
++            end
++          end
++        end
++        # Expecting foo found bar element only if found zero, not if
++        # found one but expecting two.
++        message ||= content_mismatch if matches.empty?
++        # Test minimum/maximum occurrence.
++        min, max = equals[:minimum], equals[:maximum]
++        message = message || %(Expected #{count_description(min, max)} matching "#{selector.to_s}", found #{matches.size}.)
++        assert matches.size >= min, message if min
++        assert matches.size <= max, message if max
++        
++        # If a block is given call that block. Set @selected to allow
++        # nested assert_select, which can be nested several levels deep.
++        if block_given? && !matches.empty?
++          begin
++            in_scope, @selected = @selected, matches
++            yield matches
++          ensure
++            @selected = in_scope
++          end
++        end
++
++        # Returns all matches elements.
++        matches
++      end
++      
++      private
++        def count_description(min, max) #:nodoc:
++          pluralize = lambda {|word, quantity| word << (quantity == 1 ? '' : 's')}
++
++          if min && max && (max != min)
++            "between #{min} and #{max} elements"
++          elsif min && !(min == 1 && max == 1)
++            "at least #{min} #{pluralize['element', min]}"
++          elsif max
++            "at most #{max} #{pluralize['element', max]}"
++          end
++        end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/actionpack/test/template/test_test.rb b/actionpack/test/template/test_test.rb
+index 05ffb90..983a14e 100644
+--- a/actionpack/test/template/test_test.rb
++++ b/actionpack/test/template/test_test.rb
+@@ -28,6 +28,27 @@ class AssertTagTest < ActiveSupport::TestCase
+   
+ end
+ 
++class SelectorAssertionsTest < ActiveSupport::TestCase
++  
++    def test_assert_select_in_with_tags
++      html = '<div><p id="test"><span>hello world</span></p></div>'
++      assert_select_in html, 'p#test span'
++    end
++    
++    def test_assert_select_in_with_equality_test
++      html = '<div><p id="test"><span>hello world</span></p></div>'
++      assert_select_in html, 'p#test span', 'hello world'
++    end
++    
++    def test_assert_select_in_with_nested_selector
++      html = '<div><ul id="list"><li>one</li><li>two</li></ul></div>'
++      assert_select_in html, 'ul#list' do
++        assert_select_in 'li', 'one'
++      end
++    end
++  
++end
++
+ module PeopleHelper
+   def title(text)
+     content_tag(:h1, text)
+-- 
+1.5.6.2
+

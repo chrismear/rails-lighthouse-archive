@@ -1,0 +1,95 @@
+From 630a55c8ece0fe1616e7785539e97f1a6da0816c Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Tue, 26 Apr 2011 10:12:07 +0100
+Subject: [PATCH 1/2] Calculate time spent in AR even if a redirect occurs or if it is after the render
+
+---
+ .../test/activerecord/controller_runtime_test.rb   |   29 +++++++++++++++++++-
+ .../active_record/railties/controller_runtime.rb   |   14 +++++----
+ 2 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/actionpack/test/activerecord/controller_runtime_test.rb b/actionpack/test/activerecord/controller_runtime_test.rb
+index 7931da3..55db5a5 100644
+--- a/actionpack/test/activerecord/controller_runtime_test.rb
++++ b/actionpack/test/activerecord/controller_runtime_test.rb
+@@ -11,6 +11,17 @@ class ControllerRuntimeLogSubscriberTest < ActionController::TestCase
+     def show
+       render :inline => "<%= Project.all %>"
+     end
++    
++    def redirect
++      Project.all
++      redirect_to :action => 'show'
++    end
++    
++    def db_after_render
++      render :inline => "Hello world"
++      Project.all
++      ActiveRecord::LogSubscriber.runtime += 100
++    end
+   end
+ 
+   include ActiveSupport::LogSubscriber::TestHelper
+@@ -37,6 +48,22 @@ class ControllerRuntimeLogSubscriberTest < ActionController::TestCase
+     wait
+ 
+     assert_equal 2, @logger.logged(:info).size
+-    assert_match(/\(Views: [\d.]+ms | ActiveRecord: [\d.]+ms\)/, @logger.logged(:info)[1])
++    assert_match(/\(Views: [\d.]+ms \| ActiveRecord: [\d.]+ms\)/, @logger.logged(:info)[1])
++  end
++
++  def test_log_with_active_record_when_redirecting
++    get :redirect
++    wait
++
++    assert_equal 3, @logger.logged(:info).size
++    assert_match(/\(ActiveRecord: [\d.]+ms\)/, @logger.logged(:info)[2])
++  end
++  
++  test "should include time query time after rendering" do
++    get :db_after_render
++    wait
++    
++    assert_equal 2, @logger.logged(:info).size
++    assert_match(/\(Views: [\d.]+ms \| ActiveRecord: ([1-9][\d.]+)ms\)/, @logger.logged(:info)[1])
+   end
+ end
+diff --git a/activerecord/lib/active_record/railties/controller_runtime.rb b/activerecord/lib/active_record/railties/controller_runtime.rb
+index bc6ca93..1381281 100644
+--- a/activerecord/lib/active_record/railties/controller_runtime.rb
++++ b/activerecord/lib/active_record/railties/controller_runtime.rb
+@@ -7,15 +7,15 @@ module ActiveRecord
+ 
+     protected
+ 
+-      attr_internal :db_runtime
++      attr_internal :db_before_render
++      attr_internal :db_during_render
+ 
+       def cleanup_view_runtime
+         if ActiveRecord::Base.connected?
+-          db_rt_before_render = ActiveRecord::LogSubscriber.reset_runtime
++          self.db_before_render = ActiveRecord::LogSubscriber.reset_runtime
+           runtime = super
+-          db_rt_after_render = ActiveRecord::LogSubscriber.reset_runtime
+-          self.db_runtime = db_rt_before_render + db_rt_after_render
+-          runtime - db_rt_after_render
++          self.db_during_render = ActiveRecord::LogSubscriber.reset_runtime
++          runtime - db_during_render
+         else
+           super
+         end
+@@ -23,7 +23,9 @@ module ActiveRecord
+ 
+       def append_info_to_payload(payload)
+         super
+-        payload[:db_runtime] = db_runtime
++        if ActiveRecord::Base.connected?
++          payload[:db_runtime] = (db_before_render || 0) + (db_during_render || 0) + ActiveRecord::LogSubscriber.reset_runtime
++        end
+       end
+ 
+       module ClassMethods
+-- 
+1.7.3.3
+

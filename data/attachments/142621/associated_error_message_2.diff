@@ -1,0 +1,253 @@
+From 42957fb097829635b013a9743293c5ca062863e9 Mon Sep 17 00:00:00 2001
+From: Akira Matsuda <ronnie@dio.jp>
+Date: Wed, 1 Jul 2009 21:19:20 +0900
+Subject: [PATCH] Fix validation on associations to process I18n aware error messages
+
+---
+ .../lib/active_record/autosave_association.rb      |    4 +-
+ activerecord/lib/active_record/validations.rb      |   18 ++++--
+ .../test/cases/autosave_association_test.rb        |   16 ++--
+ activerecord/test/cases/validations_i18n_test.rb   |   69 ++++++++++++++++++++
+ activerecord/test/schema/schema.rb                 |    2 +
+ 5 files changed, 94 insertions(+), 15 deletions(-)
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 9717ca3..661f3f3 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -250,7 +250,7 @@ module ActiveRecord
+         if reflection.options[:autosave]
+           unless association.marked_for_destruction?
+             association.errors.each do |attribute, message|
+-              attribute = "#{reflection.name}_#{attribute}"
++              attribute = "#{reflection.class_name}.#{attribute}"
+               errors.add(attribute, message) unless errors.on(attribute)
+             end
+           end
+@@ -350,4 +350,4 @@ module ActiveRecord
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index d2d12b8..5324de0 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -196,20 +196,28 @@ module ActiveRecord
+     def full_messages(options = {})
+       full_messages = []
+ 
+-      @errors.each_key do |attr|
+-        @errors[attr].each do |message|
++      @errors.each_key do |key|
++        @errors[key].each do |message|
+           next unless message
+ 
+-          if attr == "base"
++          model, attribute = if key.include? '.'
++            returning key.split('.') do |arr|
++              arr[0] = arr[0].singularize.classify.constantize
++            end
++          else
++            [@base.class, key]
++          end
++
++          if attribute == 'base'
+             full_messages << message
+           else
+-            attr_name = @base.class.human_attribute_name(attr)
++            attr_name = model.human_attribute_name(attribute)
+             full_messages << attr_name + I18n.t('activerecord.errors.format.separator', :default => ' ') + message
+           end
+         end
+       end
+       full_messages
+-    end 
++    end
+ 
+     # Returns true if no errors have been added.
+     def empty?
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 919b6f8..d82e118 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -646,14 +646,14 @@ class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @pirate.ship.name = ''
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
++    assert !@pirate.errors.on('ship.name').blank?
+   end
+ 
+   def test_should_merge_errors_on_the_associated_models_onto_the_parent_even_if_it_is_not_valid
+     @pirate.ship.name   = nil
+     @pirate.catchphrase = nil
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
++    assert !@pirate.errors.on('ship.name').blank?
+     assert !@pirate.errors.on(:catchphrase).blank?
+   end
+ 
+@@ -736,7 +736,7 @@ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @ship.pirate.catchphrase = ''
+     assert !@ship.valid?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert !@ship.errors.on('pirate.catchphrase').blank?
+   end
+ 
+   def test_should_merge_errors_on_the_associated_model_onto_the_parent_even_if_it_is_not_valid
+@@ -744,7 +744,7 @@ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+     @ship.pirate.catchphrase = nil
+     assert !@ship.valid?
+     assert !@ship.errors.on(:name).blank?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert !@ship.errors.on('pirate.catchphrase').blank?
+   end
+ 
+   def test_should_still_allow_to_bypass_validations_on_the_associated_model
+@@ -806,7 +806,7 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.send(@association_name).each { |child| child.name = '' }
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}.name")
+     assert @pirate.errors.on(@association_name).blank?
+   end
+ 
+@@ -814,7 +814,7 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.send(@association_name).build(:name => '')
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}.name")
+     assert @pirate.errors.on(@association_name).blank?
+   end
+ 
+@@ -823,7 +823,7 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.catchphrase = nil
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}.name")
+     assert !@pirate.errors.on(:catchphrase).blank?
+   end
+ 
+@@ -920,4 +920,4 @@ class TestAutosaveAssociationOnAHasAndBelongsToManyAssociation < ActiveRecord::T
+   end
+ 
+   include AutosaveAssociationOnACollectionAssociationTests
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/cases/validations_i18n_test.rb b/activerecord/test/cases/validations_i18n_test.rb
+index 6698234..5bb7022 100644
+--- a/activerecord/test/cases/validations_i18n_test.rb
++++ b/activerecord/test/cases/validations_i18n_test.rb
+@@ -1,6 +1,9 @@
+ require "cases/helper"
+ require 'models/topic'
+ require 'models/reply'
++require 'models/pirate'
++require 'models/ship'
++require 'models/ship_part'
+ 
+ class ActiveRecordValidationsI18nTests < ActiveSupport::TestCase
+   def setup
+@@ -911,5 +914,71 @@ class ActiveRecordValidationsGenerateMessageI18nTests < Test::Unit::TestCase
+   def test_generate_message_even_with_default_message
+     assert_equal "must be even", @topic.errors.generate_message(:title, :even, :default => nil, :value => 'title', :count => 10)
+   end
++end
++
++class ActiveRecordValidationsOnAutosaveAssociationOnI18nTests < ActiveRecord::TestCase
++  def setup
++    @old_load_path, @old_backend = I18n.load_path, I18n.backend
++    I18n.load_path.clear
++    I18n.backend = I18n::Backend::Simple.new
++    I18n.backend.store_translations('en', :activerecord => {
++      :errors => {:messages => {:blank => "can't be blank", :custom => nil}},
++      :attributes => {
++        :ship => {:weight => 'Weight'},
++        :ship_part => {:material => 'Material'}}})
++  end
++
++  def teardown
++    I18n.load_path.replace @old_load_path
++    I18n.backend = @old_backend
++  end
++
++  def test_validation_error_on_autosave_association_on_a_has_one_association_translates_model_name
++    repair_validations Ship do
++      Ship.validates_presence_of :weight
++
++      pirate = Pirate.new :catchphrase => "I'm Gonna Be King of the Pirates!"
++      ship = pirate.build_ship :name => 'Going Merry'
++      pirate.valid?
++      assert_equal ["Weight can't be blank"], pirate.errors.full_messages
++    end
++  end
++
++  def test_validation_error_on_autosave_association_on_a_has_many_association_translates_model_name
++    repair_validations ShipPart do
++      ShipPart.validates_presence_of :material
+ 
++      ship = Ship.new :name => 'Going Merry'
++      part = ship.parts.build :name => 'mast'
++      ship.valid?
++      assert_equal ["Material can't be blank"], ship.errors.full_messages
++    end
++  end
++
++  def test_validation_error_on_autosave_association_on_a_belongs_to_association_translates_model_name
++    ship = Ship.new :name => 'Thousand Sunny'
++    ship.build_pirate
++    ship.valid?
++    assert_equal ["Catchphrase can't be blank"], ship.errors.full_messages
++  end
++
++  def test_validation_error_on_autosave_association_on_a_belongs_to_association_translates_model_name_and_base_attribute
++    repair_validations Pirate do
++      begin
++        Pirate.class_eval do
++          def validate
++            errors.add :base, "Hey, there's something wrong with this pirate!"
++          end
++        end
++        ship = Ship.new :name => 'Thousand Sunny'
++        pirate = ship.build_pirate :catchphrase => "I'm Gonna Be King of the Pirates!"
++        ship.valid?
++        assert_equal ["Hey, there's something wrong with this pirate!"], ship.errors.full_messages
++      ensure
++        Pirate.class_eval do
++          def validate; end
++        end
++      end
++    end
++  end
+ end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 98e6d19..6e58498 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -373,6 +373,7 @@ ActiveRecord::Schema.define do
+ 
+   create_table :ships, :force => true do |t|
+     t.string :name
++    t.integer :weight
+     t.integer :pirate_id
+     t.datetime :created_at
+     t.datetime :created_on
+@@ -382,6 +383,7 @@ ActiveRecord::Schema.define do
+ 
+   create_table :ship_parts, :force => true do |t|
+     t.string :name
++    t.string :material
+     t.integer :ship_id
+   end
+ 
+-- 
+1.6.3.3
+

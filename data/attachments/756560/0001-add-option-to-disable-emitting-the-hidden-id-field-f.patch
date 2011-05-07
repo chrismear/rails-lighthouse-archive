@@ -1,0 +1,173 @@
+From 0bb3efae25ecfa4cc5c830903a5d7ea5ba1dea15 Mon Sep 17 00:00:00 2001
+From: Nico Rieck <nico.rieck@gmail.com>
+Date: Fri, 5 Nov 2010 22:50:52 +0100
+Subject: [PATCH] Add option to disable emitting the hidden id field for nested models.
+
+Adds an :emit_hidden_id option to #form_for and #fields_for that indicates
+whether a hidden id field is automatically appended.
+---
+ actionpack/lib/action_view/helpers/form_helper.rb |   43 ++++++++++++++++--
+ actionpack/test/template/form_helper_test.rb      |   48 +++++++++++++++++++++
+ 2 files changed, 86 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 80a8720..83f146e 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -150,6 +150,13 @@ module ActionView
+       #   fields you pass to +url_for+ or +link_to+. In particular you may pass
+       #   here a named route directly as well. Defaults to the current action.
+       # * <tt>:html</tt> - Optional HTML attributes for the form tag.
++      # * <tt>:emit_hidden_id</tt> - Indicates whether a hidden input field
++      #   is automatically emitted for the :id of nested models. This can be
++      #   skipped by setting this option to false, or by manually emitting a
++      #   hidden field for :id. The automatically emitted field will be appended
++      #   to the result of fields_for calls. Can be overidden for selected
++      #   nested models by specifying :emit_hidden_id when calling fields_for.
++      #   Defaults to true.
+       #
+       # Also note that +form_for+ doesn't create an exclusive scope. It's still
+       # possible to use both the stand-alone FormHelper methods and methods
+@@ -518,6 +525,31 @@ module ActionView
+       #       Delete: <%= project_fields.check_box :_destroy %>
+       #     <% end %>
+       #   <% end %>
++      #
++      # === Hidden id field
++      #
++      # field_for automatically appends a hidden input field for the nested
++      # model id. This can be skipped by setting the :emit_hidden_id option to
++      # false, or by manually emitting a hidden field for :id. This option can
++      # also be passed to form_for to affect all nested models. Defaults to true.
++      #
++      # The following form disables emitting for all nested models but
++      # reactivates it for tasks:
++      #
++      #   <%= form_for @person, :emit_hidden_id => false do |person_form| %>
++      #     <%= person_form.fields_for :projects do |project_fields| %>
++      #       <%= project_fields.hidden_field :id %>
++      #       Name: <%= project_fields.text_field :name %>
++      #     <% end %>
++      #
++      #     <%= person_form.fields_for :roles do |role_fields| %>
++      #       Role: <%= role_fields.text_field :name %>
++      #     <% end %>
++      #
++      #     <%= person_form.fields_for :tasks, :emit_hidden_id => true do |task_fields| %>
++      #       Task: <%= role_fields.text_field :name %>
++      #     <% end %>
++      #   <% end %>
+       def fields_for(record, record_object = nil, options = nil, &block)
+         capture(instantiate_builder(record, record_object, options, &block), &block)
+       end
+@@ -1130,6 +1162,7 @@ module ActionView
+         @nested_child_index = {}
+         @object_name, @object, @template, @options, @proc = object_name, object, template, options, proc
+         @parent_builder = options[:parent_builder]
++        @emit_hidden_id = options.has_key?(:emit_hidden_id) ? !!options[:emit_hidden_id] : true
+         @default_options = @options ? @options.slice(:index) : {}
+         if @object_name.to_s.match(/\[\]$/)
+           if object ||= @template.instance_variable_get("@#{Regexp.last_match.pre_match}") and object.respond_to?(:to_param)
+@@ -1165,6 +1198,7 @@ module ActionView
+ 
+         args << {} unless args.last.is_a?(Hash)
+         args.last[:builder] ||= options[:builder]
++        args.last[:emit_hidden_id] = @emit_hidden_id unless args.last.has_key?(:emit_hidden_id)
+         args.last[:parent_builder] = self
+ 
+         case record_or_name_or_array
+@@ -1197,7 +1231,7 @@ module ActionView
+       end
+ 
+       def hidden_field(method, options = {})
+-        @emitted_hidden_id = true if method == :id
++        @emit_hidden_id = false if method == :id
+         @template.hidden_field(@object_name, method, objectify_options(options))
+       end
+ 
+@@ -1238,8 +1272,8 @@ module ActionView
+         @template.submit_tag(value, options.reverse_merge(:id => "#{object_name}_submit"))
+       end
+ 
+-      def emitted_hidden_id?
+-        @emitted_hidden_id ||= nil
++      def emit_hidden_id?
++        @emit_hidden_id
+       end
+ 
+       private
+@@ -1295,11 +1329,10 @@ module ActionView
+ 
+         def fields_for_nested_model(name, object, options, block)
+           object = convert_to_model(object)
+-
+           if object.persisted?
+             @template.fields_for(name, object, options) do |builder|
+               block.call(builder)
+-              @template.concat builder.hidden_field(:id) unless builder.emitted_hidden_id?
++              @template.concat builder.hidden_field(:id) if builder.emit_hidden_id?
+             end
+           else
+             @template.fields_for(name, object, options, &block)
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index acb6e7a..1009903 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -1151,6 +1151,54 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_existing_records_on_a_nested_attributes_collection_association_with_disabled_hidden_field
++    @post.comments = Array.new(2) { |id| Comment.new(id + 1) }
++
++    form_for(@post) do |f|
++      concat f.text_field(:title)
++      @post.comments.each do |comment|
++        concat f.fields_for(:comments, comment, :emit_hidden_id => false) { |cf|
++          concat cf.text_field(:name)
++        }
++      end
++    end
++
++    expected = whole_form('/posts/123', 'edit_post_123', 'edit_post', :method => 'put') do
++      '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++      '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #1" />' +
++      '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="comment #2" />'
++    end
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_existing_records_on_a_nested_attributes_collection_association_with_inherited_disabled_hidden_field
++    @post.comments = Array.new(2) { |id| Comment.new(id + 1) }
++    @post.author = Author.new(321)
++
++    form_for(@post, :emit_hidden_id => false) do |f|
++      concat f.text_field(:title)
++      concat f.fields_for(:author, :emit_hidden_id => true) { |af|
++        concat af.text_field(:name)
++      }
++      @post.comments.each do |comment|
++        concat f.fields_for(:comments, comment) { |cf|
++          concat cf.text_field(:name)
++        }
++      end
++    end
++
++    expected = whole_form('/posts/123', 'edit_post_123', 'edit_post', :method => 'put') do
++     '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++     '<input id="post_author_attributes_name" name="post[author_attributes][name]" size="30" type="text" value="author #321" />' +
++     '<input id="post_author_attributes_id" name="post[author_attributes][id]" type="hidden" value="321" />' +
++     '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #1" />' +
++     '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="comment #2" />'
++    end
++
++    assert_dom_equal expected, output_buffer
++  end
++
+   def test_nested_fields_for_with_new_records_on_a_nested_attributes_collection_association
+     @post.comments = [Comment.new, Comment.new]
+ 
+-- 
+1.7.3.2
+

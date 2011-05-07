@@ -1,0 +1,363 @@
+From 51c4eda74b3468ab0dda57f653d1b4388e92bcc3 Mon Sep 17 00:00:00 2001
+From: Jeff Dean <jeff@zilkey.com>
+Date: Sat, 9 May 2009 19:07:27 -0700
+Subject: [PATCH] Added a validates_with method
+
+---
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/validations.rb      |   60 ++++++++++-
+ activerecord/lib/active_record/validator.rb        |   68 +++++++++++
+ activerecord/test/cases/validations_test.rb        |  119 ++++++++++++++++++++
+ .../activerecord_validations_callbacks.textile     |   41 +++++++
+ 5 files changed, 288 insertions(+), 1 deletions(-)
+ create mode 100644 activerecord/lib/active_record/validator.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 06d6c87..a42f51d 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -63,6 +63,7 @@ module ActiveRecord
+   autoload :TestCase, 'active_record/test_case'
+   autoload :Timestamp, 'active_record/timestamp'
+   autoload :Transactions, 'active_record/transactions'
++  autoload :Validator, 'active_record/validator'
+   autoload :Validations, 'active_record/validations'
+ 
+   module Locking
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index e6b61e0..eb7eb75 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -402,7 +402,7 @@ module ActiveRecord
+           end
+         end
+       end
+-
++      
+       # Encapsulates the pattern of wanting to validate a password or email address field with a confirmation. Example:
+       #
+       #   Model:
+@@ -521,6 +521,64 @@ module ActiveRecord
+         end
+       end
+ 
++      # Passes the record off to the class or classes specified and allows them to add errors based on more complex conditions.
++      #
++      #   class Person < ActiveRecord::Base
++      #     validates_with MyValidator
++      #   end
++      #
++      #   class MyValidator < ActiveRecord::Validator
++      #     def validate
++      #       if some_complex_logic
++      #         record.errors.add_to_base("This record is invalid")
++      #       end
++      #     end
++      #     
++      #     private
++      #       def some_complex_logic
++      #         # ...
++      #       end
++      #   end
++      # 
++      # You may also pass it multiple classes, like so:
++      # 
++      #   class Person < ActiveRecord::Base
++      #     validates_with MyValidator, MyOtherValidator, :on => :create
++      #   end
++      #
++      # Configuration options:
++      # * <tt>on</tt> - Specifies when this validation is active (default is <tt>:save</tt>, other options <tt>:create</tt>, 
++      #   <tt>:update</tt>).
++      # * <tt>if</tt> - Specifies a method, proc or string to call to determine if the validation should
++      #   occur (e.g. <tt>:if => :allow_validation</tt>, or <tt>:if => Proc.new { |user| user.signup_step > 2 }</tt>).
++      #   The method, proc or string should return or evaluate to a true or false value.
++      # * <tt>unless</tt> - Specifies a method, proc or string to call to determine if the validation should
++      #   not occur (e.g. <tt>:unless => :skip_validation</tt>, or <tt>:unless => Proc.new { |user| user.signup_step <= 2 }</tt>).
++      #   The method, proc or string should return or evaluate to a true or false value.
++      #
++      # If you pass any additional configuration options, they will be passed to the class and available as <tt>options</tt>:
++      #
++      #   class Person < ActiveRecord::Base
++      #     validates_with MyValidator, :my_custom_key => "my custom value"
++      #   end
++      #
++      #   class MyValidator < ActiveRecord::Validator
++      #     def validate
++      #       options[:my_custom_key] # => "my custom value"
++      #     end
++      #   end
++      # 
++      def validates_with(*args)
++        configuration = { :on => :save }
++        configuration.update(args.extract_options!)
++
++        send(validation_method(configuration[:on]), configuration) do |record|
++          args.each do |klass|
++            klass.new(record, configuration.except(:on, :if, :unless)).validate
++          end
++        end
++      end
++
+       # Validates that the specified attribute matches the length restrictions supplied. Only one option can be used at a time:
+       #
+       #   class Person < ActiveRecord::Base
+diff --git a/activerecord/lib/active_record/validator.rb b/activerecord/lib/active_record/validator.rb
+new file mode 100644
+index 0000000..ac57cb7
+--- /dev/null
++++ b/activerecord/lib/active_record/validator.rb
+@@ -0,0 +1,68 @@
++module ActiveRecord #:nodoc:
++
++  # A simple base class that can be used along with ActiveRecord::Base.validates_with
++  #
++  #   class Person < ActiveRecord::Base
++  #     validates_with MyValidator
++  #   end
++  #
++  #   class MyValidator < ActiveRecord::Validator
++  #     def validate
++  #       if some_complex_logic
++  #         record.errors.add_to_base("This record is invalid")
++  #       end
++  #     end
++  #     
++  #     private
++  #       def some_complex_logic
++  #         # ...
++  #       end
++  #   end
++  # 
++  # Any class that inherits from ActiveRecord::Validator will have access to <tt>record</tt>, 
++  # which is an instance of the record being validated, and must implement a method called <tt>validate</tt>.
++  #
++  #   class Person < ActiveRecord::Base
++  #     validates_with MyValidator
++  #   end
++  #
++  #   class MyValidator < ActiveRecord::Validator
++  #     def validate
++  #       record # => The person instance being validated
++  #       options # => Any non-standard options passed to validates_with
++  #     end
++  #   end
++  # 
++  # To cause a validation error, you must add to the <tt>record<tt>'s errors directly
++  # from within the validators message
++  #
++  #   class MyValidator < ActiveRecord::Validator
++  #     def validate
++  #       record.errors.add_to_base("This is some custom error message")
++  #       record.errors.add(:first_name, "This is some complex validation")
++  #       # etc...
++  #     end
++  #   end
++  # 
++  # To add behavior to the initialize method, use the following signature:
++  # 
++  #   class MyValidator < ActiveRecord::Validator
++  #     def initialize(record, options)
++  #       super
++  #       @my_custom_field = options[:field_name] || :first_name
++  #     end
++  #   end
++  # 
++  class Validator
++    attr_reader :record, :options
++
++    def initialize(record, options)
++      @record = record
++      @options = options
++    end
++
++    def validate
++      raise "You must override this method"
++    end
++  end
++end
+diff --git a/activerecord/test/cases/validations_test.rb b/activerecord/test/cases/validations_test.rb
+index c20f5ae..be07348 100644
+--- a/activerecord/test/cases/validations_test.rb
++++ b/activerecord/test/cases/validations_test.rb
+@@ -1464,6 +1464,125 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ end
+ 
++class ValidatesWithTest < ActiveRecord::TestCase
++
++  ERROR_MESSAGE = "Validation error from validator"
++  OTHER_ERROR_MESSAGE = "Validation error from other validator"
++
++  fixtures :topics
++  repair_validations(Topic)
++  
++  class ValidatorThatAddsErrors < ActiveRecord::Validator
++    def validate() record.errors.add_to_base(ERROR_MESSAGE) end
++  end
++
++  class OtherValidatorThatAddsErrors < ActiveRecord::Validator
++    def validate() record.errors.add_to_base(OTHER_ERROR_MESSAGE) end
++  end
++
++  class ValidatorThatDoesNotAddErrors < ActiveRecord::Validator
++    def validate() end
++  end
++
++  test "vaidation with class that adds errors" do
++    Topic.validates_with(ValidatorThatAddsErrors)
++    topic = Topic.new
++    assert !topic.valid?, "A class that adds errors causes the record to be invalid"
++    assert topic.errors.on(:base).include?(ERROR_MESSAGE)
++  end
++
++  test "with a class that returns valid" do
++    Topic.validates_with(ValidatorThatDoesNotAddErrors)
++    topic = Topic.new
++    assert topic.valid?, "A class that does not add errors does not cause the record to be invalid"
++  end
++
++  test "with a class that adds errors on update and a new record" do
++    Topic.validates_with(ValidatorThatAddsErrors, :on => :update)
++    topic = Topic.new
++    assert topic.valid?, "Validation doesn't run on create if 'on' is set to update"
++  end
++
++  test "with a class that adds errors on update and an existing record" do
++    Topic.validates_with(ValidatorThatAddsErrors, :on => :update)
++    topic = topics(:first)
++    assert !topic.valid?, "Validation does run on update if 'on' is set to update"
++    assert topic.errors.on(:base).include?(ERROR_MESSAGE)
++  end
++
++  test "with a class that adds errors on create and a new record" do
++    Topic.validates_with(ValidatorThatAddsErrors, :on => :create)
++    topic = Topic.new
++    assert !topic.valid?, "Validation does run on create if 'on' is set to create"
++    assert topic.errors.on(:base).include?(ERROR_MESSAGE)
++  end
++
++  test "with a class that adds errors on create and an existing record" do
++    Topic.validates_with(ValidatorThatAddsErrors, :on => :create)
++    topic = topics(:first)
++    assert topic.valid?, "Validation does not run on update if 'on' is set to create"
++  end
++
++  test "with multiple classes" do
++    Topic.validates_with(ValidatorThatAddsErrors, OtherValidatorThatAddsErrors)
++    topic = Topic.new
++    assert !topic.valid?
++    assert topic.errors.on(:base).include?(ERROR_MESSAGE)
++    assert topic.errors.on(:base).include?(OTHER_ERROR_MESSAGE)
++  end
++
++  test "with if statements that return false" do
++    Topic.validates_with(ValidatorThatAddsErrors, :if => "1 == 2")
++    topic = Topic.new
++    assert topic.valid?
++  end
++
++  test "with if statements that return true" do
++    Topic.validates_with(ValidatorThatAddsErrors, :if => "1 == 1")
++    topic = Topic.new
++    assert !topic.valid?
++    assert topic.errors.on(:base).include?(ERROR_MESSAGE)
++  end
++
++  test "with unless statements that return true" do
++    Topic.validates_with(ValidatorThatAddsErrors, :unless => "1 == 1")
++    topic = Topic.new
++    assert topic.valid?
++  end
++
++  test "with unless statements that returns false" do
++    Topic.validates_with(ValidatorThatAddsErrors, :unless => "1 == 2")
++    topic = Topic.new
++    assert !topic.valid?
++    assert topic.errors.on(:base).include?(ERROR_MESSAGE)
++  end
++
++  test "passes all non-standard configuration options to the validator class" do
++    topic = Topic.new
++    validator = mock()
++    validator.expects(:new).with(topic, {:foo => :bar}).returns(validator)
++    validator.expects(:validate)
++    
++    Topic.validates_with(validator, :if => "1 == 1", :foo => :bar)
++    assert topic.valid?
++  end
++
++  class ValidatorThatValidatesOptions < ActiveRecord::Validator
++    def validate() 
++      if options[:field] == :first_name
++        record.errors.add_to_base(ERROR_MESSAGE)
++      end
++    end
++  end
++
++  test "validates_with with options" do
++    Topic.validates_with(ValidatorThatValidatesOptions, :field => :first_name)
++    topic = Topic.new
++    assert !topic.valid?
++    assert topic.errors.on(:base).include?(ERROR_MESSAGE)
++  end
++
++end
+ 
+ class ValidatesNumericalityTest < ActiveRecord::TestCase
+   NIL = [nil]
+diff --git a/railties/guides/source/activerecord_validations_callbacks.textile b/railties/guides/source/activerecord_validations_callbacks.textile
+index 5ae4884..9a9c359 100644
+--- a/railties/guides/source/activerecord_validations_callbacks.textile
++++ b/railties/guides/source/activerecord_validations_callbacks.textile
+@@ -403,6 +403,47 @@ WARNING. Note that some databases are configured to perform case-insensitive sea
+ 
+ The default error message for +validates_uniqueness_of+ is "_has already been taken_".
+ 
++h4. +validates_with+
++
++This helper passes the record to a separate class for validation.
++
++<ruby>
++class Person < ActiveRecord::Base
++  validates_with GoodnessValidator
++end
++
++class GoodnessValidator < ActiveRecord::Validator
++  def validate
++    if record.first_name == "Evil"
++      record.errors.add_to_base("This person is evil")
++    end
++  end
++end
++</ruby>
++
++The +validates_with+ helper takes a class, or a list of classes to use for validation.  There is no default error message for +validates_with+.  You must manually add errors to the record's errors collection in the validator class.
++
++The validator class has two attributes by default:
++
++* +record+ - the record to be validated
++* +options+ - the extra options that were passed to +validates_with+
++
++Like all other validations, +validates_with+ takes the +:if+, +:unless+ and +:on+ options.  If you pass any other options, it will send those options to the validator class as +options+:
++
++<ruby>
++class Person < ActiveRecord::Base
++  validates_with GoodnessValidator, :fields => [:first_name, :last_name]
++end
++
++class GoodnessValidator < ActiveRecord::Validator
++  def validate
++    if options[:fields].any?{|field| record.send(field) == "Evil" }
++      record.errors.add_to_base("This person is evil")
++    end
++  end
++end
++</ruby>
++
+ h4. +validates_each+
+ 
+ This helper validates attributes against a block. It doesn't have a predefined validation function. You should create one using a block, and every attribute passed to +validates_each+ will be tested against it. In the following example, we don't want names and surnames to begin with lower case.
+-- 
+1.6.0.2
+

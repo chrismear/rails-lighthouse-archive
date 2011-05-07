@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>assets/b36f22342fd79f50f5f33e274a2c1309b9d9077f/bm.rb</Key><RequestId>FFFD9FB4C228A8EA</RequestId><HostId>s/9eOSWsd0OWJIgD1/ZeJTlXNP1A8J7tW9qMbhd9XJ4ESEXnc4Dz9/XPA67ySra/</HostId></Error>

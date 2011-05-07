@@ -1,0 +1,137 @@
+From 712f6bcb3863c48d0876519458ed44698976db25 Mon Sep 17 00:00:00 2001
+From: Matt Jones <al2o3cr@gmail.com>
+Date: Mon, 23 Feb 2009 06:15:04 -0500
+Subject: [PATCH] correctly handle layouts for AJAX requests and regular js files
+
+---
+ actionpack/lib/action_controller/layout.rb    |   21 ++++++++++++++-------
+ actionpack/lib/action_view/paths.rb           |    6 +++---
+ actionpack/test/controller/render_test.rb     |    9 +++++----
+ actionpack/test/fixtures/layouts/xhr.html.erb |    2 ++
+ 4 files changed, 24 insertions(+), 14 deletions(-)
+ create mode 100644 actionpack/test/fixtures/layouts/xhr.html.erb
+
+diff --git a/actionpack/lib/action_controller/layout.rb b/actionpack/lib/action_controller/layout.rb
+index a0db7ac..ccd9605 100644
+--- a/actionpack/lib/action_controller/layout.rb
++++ b/actionpack/lib/action_controller/layout.rb
+@@ -207,21 +207,23 @@ module ActionController #:nodoc:
+         when Proc   then layout.call(self)
+         else layout
+       end
+-      
+-      find_layout(active_layout, @template.template_format) if active_layout
++
++      find_layout(active_layout, default_template_format) if active_layout
+     end
+ 
+     private
+       def default_layout #:nodoc:
+-        layout = self.class.read_inheritable_attribute(:layout) unless default_template_format == :js
++        layout = self.class.read_inheritable_attribute(:layout)
+         return layout unless self.class.read_inheritable_attribute(:auto_layout)
+         find_layout(layout, default_template_format)
+       rescue ActionView::MissingTemplate
+         nil
+       end
+ 
+-      def find_layout(layout, *formats) #:nodoc:
+-        view_paths.find_template(layout.to_s =~ /layouts\// ? layout : "layouts/#{layout}", *formats)
++      def find_layout(layout, format) #:nodoc:
++        view_paths.find_template(layout.to_s =~ /layouts\// ? layout : "layouts/#{layout}", format, false)
++      rescue ActionView::MissingTemplate
++        raise if Mime::Type.lookup_by_extension(format.to_s).html?
+       end
+ 
+       def pick_layout(options)
+@@ -258,7 +260,12 @@ module ActionController #:nodoc:
+         template = options[:template] || default_template(options[:action])
+         if options.values_at(:text, :xml, :json, :file, :inline, :partial, :nothing, :update).compact.empty?
+           begin
+-            !self.view_paths.find_template(template, default_template_format).exempt_from_layout?
++            template_object = self.view_paths.find_template(template, default_template_format)
++            # this restores the behavior from 2.2.2, where response.template.template_format was reset
++            # to :html for :js requests with a matching html template.
++            # see v2.2.2, ActionView::Base, lines 328-330
++            @real_format = :html if response.template.template_format == :js && template_object.format == "html"
++            !template_object.exempt_from_layout?
+           rescue ActionView::MissingTemplate
+             true
+           end
+@@ -268,7 +275,7 @@ module ActionController #:nodoc:
+       end
+ 
+       def default_template_format
+-        response.template.template_format
++        @real_format || response.template.template_format
+       end
+   end
+ end
+diff --git a/actionpack/lib/action_view/paths.rb b/actionpack/lib/action_view/paths.rb
+index 41f9f48..37d96b2 100644
+--- a/actionpack/lib/action_view/paths.rb
++++ b/actionpack/lib/action_view/paths.rb
+@@ -40,7 +40,7 @@ module ActionView #:nodoc:
+       each(&:load!)
+     end
+ 
+-    def find_template(original_template_path, format = nil)
++    def find_template(original_template_path, format = nil, html_fallback = true)
+       return original_template_path if original_template_path.respond_to?(:render)
+       template_path = original_template_path.sub(/^\//, '')
+ 
+@@ -54,9 +54,9 @@ module ActionView #:nodoc:
+         elsif template = load_path[template_path]
+           return template
+         # Try to find html version if the format is javascript
+-        elsif format == :js && template = load_path["#{template_path}.#{I18n.locale}.html"]
++        elsif format == :js && html_fallback && template = load_path["#{template_path}.#{I18n.locale}.html"]
+           return template
+-        elsif format == :js && template = load_path["#{template_path}.html"]
++        elsif format == :js && html_fallback && template = load_path["#{template_path}.html"]
+           return template
+         end
+       end
+diff --git a/actionpack/test/controller/render_test.rb b/actionpack/test/controller/render_test.rb
+index e131a73..70e5e62 100644
+--- a/actionpack/test/controller/render_test.rb
++++ b/actionpack/test/controller/render_test.rb
+@@ -684,12 +684,13 @@ class TestController < ActionController::Base
+              "render_with_explicit_string_template",
+              "render_js_with_explicit_template",
+              "render_js_with_explicit_action_template",
+-             "delete_with_js", "update_page", "update_page_with_instance_variables",
+-             "render_implicit_js_template_without_layout"
++             "delete_with_js", "update_page", "update_page_with_instance_variables"
+ 
+           "layouts/standard"
+         when "action_talk_to_layout", "layout_overriding_layout"
+           "layouts/talk_from_action"
++        when "render_implicit_html_template_from_xhr_request"
++          (request.xhr? ? 'layouts/xhr' : 'layouts/standard')
+       end
+     end
+ end
+@@ -1018,8 +1019,8 @@ class RenderTest < ActionController::TestCase
+   end
+ 
+   def test_should_implicitly_render_html_template_from_xhr_request
+-    get :render_implicit_html_template_from_xhr_request, :format => :js
+-    assert_equal "Hello HTML!", @response.body
++    xhr :get, :render_implicit_html_template_from_xhr_request
++    assert_equal "XHR!\nHello HTML!", @response.body
+   end
+ 
+   def test_should_implicitly_render_js_template_without_layout
+diff --git a/actionpack/test/fixtures/layouts/xhr.html.erb b/actionpack/test/fixtures/layouts/xhr.html.erb
+new file mode 100644
+index 0000000..8528532
+--- /dev/null
++++ b/actionpack/test/fixtures/layouts/xhr.html.erb
+@@ -0,0 +1,2 @@
++XHR!
++<%= yield %>
+\ No newline at end of file
+-- 
+1.5.3.1
+

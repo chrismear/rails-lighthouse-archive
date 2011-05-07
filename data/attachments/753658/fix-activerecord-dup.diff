@@ -1,0 +1,268 @@
+From 984ddef607c5abcce493979525793598c62eb314 Mon Sep 17 00:00:00 2001
+From: James MacAulay <james@shopify.com>
+Date: Thu, 4 Nov 2010 12:17:39 -0400
+Subject: [PATCH] Fix ActiveRecord::Base#dup to maintain new_record and dirty tracking states [#5917 state:resolved]
+
+---
+ activerecord/lib/active_record/base.rb |   60 +++++++++----
+ activerecord/test/cases/base_test.rb   |  149 +++++++++++++++++++++++++++++++-
+ 2 files changed, 186 insertions(+), 23 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 06a388c..e3666c7 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1385,28 +1385,57 @@ MSG
+         result
+       end
+ 
+-      # Cloned objects have no id assigned and are treated as new records. Note that this is a "shallow" clone
+-      # as it copies the object's attributes only, not its associations. The extent of a "deep" clone is
+-      # application specific and is therefore left to the application to implement according to its need.
+       def initialize_copy(other)
+         _run_after_initialize_callbacks if respond_to?(:_run_after_initialize_callbacks)
+-        cloned_attributes = other.clone_attributes(:read_attribute_before_type_cast)
+-        cloned_attributes.delete(self.class.primary_key)
++        @attributes = other.clone_attributes(:read_attribute_before_type_cast)
+ 
+-        @attributes = cloned_attributes
++        clear_aggregation_cache
++        clear_association_cache
++        @attributes_cache = {}
++        ensure_proper_type
++        populate_with_current_scope_attributes
++      end
+ 
++      # Cloned objects have no id assigned and are treated as new records. The clone's dirty tracking is set
++      # so that all attributes with non-default values are treated as if they had been changed from the
++      # defaults. The clone of a frozen record will not retain the original's frozen state. Note that this is
++      # a "shallow" clone as it copies the object's attributes only, not its associations. The extent of a
++      # "deep" clone is application specific and is therefore left to the application to implement according
++      # to its need.
++      def initialize_clone(other)
++        initialize_copy(other) unless RUBY_VERSION < '1.9'
++
++        @attributes.delete(self.class.primary_key)
++        @new_record = true
++
++        @previously_changed = {}
+         @changed_attributes = {}
+         attributes_from_column_definition.each do |attr, orig_value|
+           @changed_attributes[attr] = orig_value if field_changed?(attr, orig_value, @attributes[attr])
+         end
++      end
+ 
+-        clear_aggregation_cache
+-        clear_association_cache
+-        @attributes_cache = {}
+-        @new_record = true
+-        ensure_proper_type
++      # For Active Record objects, <tt>dup</tt> is a truer copy of the original than <tt>clone</tt>; it
++      # preserves the primary key, new_record flag, and dirty tracking of the original.
++      def initialize_dup(other)
++        initialize_copy(other) unless RUBY_VERSION < '1.9'
+ 
+-        populate_with_current_scope_attributes
++        @changed_attributes = other.instance_variable_get('@changed_attributes').dup
++        @previously_changed = other.instance_variable_get('@previously_changed').dup
++      end
++
++      if RUBY_VERSION < '1.9'
++        def clone
++          obj = super
++          obj.initialize_clone(self)
++          obj
++        end
++
++        def dup
++          obj = super
++          obj.initialize_dup(self)
++          obj
++        end
+       end
+ 
+       # Initialize an empty model object from +coder+.  +coder+ must contain
+@@ -1609,13 +1638,6 @@ MSG
+         @attributes.frozen?
+       end
+ 
+-      # Returns duplicated record with unfreezed attributes.
+-      def dup
+-        obj = super
+-        obj.instance_variable_set('@attributes', @attributes.dup)
+-        obj
+-      end
+-
+       # Returns +true+ if the record is read only. Records loaded through joins with piggy-back
+       # attributes will be marked as read only since they cannot be saved.
+       def readonly?
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index ceb1272..e6b16e8 100644
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -776,6 +776,151 @@ class BasicsTest < ActiveRecord::TestCase
+     assert !cloned_developer.salary_changed?  # ... BUT salary has non-nil default which should be threated as not changed on cloned instance
+   end
+ 
++  def test_clone_not_frozen
++    assert !Minimalistic.new.freeze.clone.frozen?
++  end
++
++  def test_clone_clears_previous_changes
++    developer = Developer.new :name => 'Bjorn'
++    assert_equal nil, developer.previous_changes['name']
++    developer.save!
++    assert_equal [nil, 'Bjorn'], developer.previous_changes['name']
++
++    assert_equal nil, developer.clone.previous_changes['name']
++  end
++
++  def test_dup
++    topic = Topic.find(1)
++    duped_topic = nil
++    assert_nothing_raised { duped_topic = topic.dup }
++    assert_equal topic.title, duped_topic.title
++
++    # test if the attributes have been duped
++    topic.title = "a"
++    duped_topic.title = "b"
++    assert_equal "a", topic.title
++    assert_equal "b", duped_topic.title
++
++    # test if the attribute values have been duped
++    topic.title = {"a" => "b"}
++    duped_topic = topic.dup
++    duped_topic.title["a"] = "c"
++    assert_equal "b", topic.title["a"]
++
++    # test if attributes set as part of after_initialize are duped correctly
++    assert_equal topic.author_email_address, duped_topic.author_email_address
++
++    assert duped_topic.save
++    assert_equal duped_topic.id, topic.id
++
++    duped_topic.reload
++    # FIXME: I think this is poor behavior, and will fix it with #5686
++    assert_equal({'a' => 'c'}.to_s, duped_topic.title)
++  end
++
++  def test_dup_with_aggregate_of_same_name_as_attribute
++    dev = DeveloperWithAggregate.find(1)
++    assert_kind_of DeveloperSalary, dev.salary
++
++    dup = nil
++    assert_nothing_raised { dup = dev.dup }
++    assert_kind_of DeveloperSalary, dup.salary
++    assert_equal dev.salary.amount, dup.salary.amount
++
++    # test if the attributes have been dupd
++    original_amount = dup.salary.amount
++    dev.salary.amount = 1
++    assert_equal original_amount, dup.salary.amount
++
++    assert dup.save
++    assert_equal dup.id, dev.id
++  end
++
++  def test_dup_dupes_associations_but_clears_their_targets
++    author = authors(:david)
++    author.posts.reload
++    assert author.posts.loaded?
++
++    author_dup = author.dup
++    assert !author_dup.posts.loaded?
++    assert_equal author.posts, author_dup.posts
++  end
++
++  def test_dup_preserves_subtype
++    dup = nil
++    assert_nothing_raised { dup = Company.find(3).dup }
++    assert_kind_of Client, dup
++  end
++
++  def test_dup_of_new_object_with_defaults
++    developer = Developer.new
++    assert !developer.name_changed?
++    assert !developer.salary_changed?
++
++    duped_developer = developer.dup
++    assert !duped_developer.name_changed?
++    assert !duped_developer.salary_changed?
++  end
++
++  def test_dup_of_new_object_marks_attributes_as_dirty
++    developer = Developer.new :name => 'Bjorn', :salary => 100000
++    assert developer.name_changed?
++    assert developer.salary_changed?
++
++    duped_developer = developer.dup
++    assert duped_developer.name_changed?
++    assert duped_developer.salary_changed?
++  end
++
++  def test_dup_of_new_object_marks_as_dirty_only_changed_attributes
++    developer = Developer.new :name => 'Bjorn'
++    assert developer.name_changed?            # obviously
++    assert !developer.salary_changed?         # attribute has non-nil default value, so treated as not changed
++
++    duped_developer = developer.dup
++    assert duped_developer.name_changed?
++    assert !duped_developer.salary_changed?  # ... and duped instance should behave same
++  end
++
++  def test_dup_of_saved_object_has_no_dirty_attributes
++    developer = Developer.create! :name => 'Bjorn', :salary => 100000
++    assert !developer.name_changed?
++    assert !developer.salary_changed?
++
++    duped_developer = developer.dup
++    assert !duped_developer.name_changed?
++    assert !duped_developer.salary_changed?
++  end
++
++  def test_dup_not_frozen
++    assert !Minimalistic.new.freeze.dup.frozen?
++  end
++
++  def test_dup_retains_previous_changes
++    developer = Developer.create! :name => 'Bjorn'
++    assert_equal [nil, 'Bjorn'], developer.dup.previous_changes['name']
++  end
++
++  def test_dup_dupes_previous_changes_and_changed_attributes
++    developer = Developer.new :name => 'Bjorn'
++    duped_developer = developer.dup
++    assert_not_equal developer.changed_attributes.object_id, duped_developer.changed_attributes.object_id
++    assert_not_equal developer.previous_changes.object_id, duped_developer.previous_changes.object_id
++
++    developer.save!
++    duped_developer.save!
++    duped_developer.name = 'Betty'
++
++    assert duped_developer.name_changed?
++    assert !developer.name_changed?
++  end
++
++  def test_dup_allows_saving_of_record
++    duped_developer = Developer.create!(:name => 'Bjorn').dup
++    duped_developer.name = 'Betty'
++    assert_nothing_raised { duped_developer.save! }
++  end
++
+   def test_bignum
+     company = Company.find(1)
+     company.rating = 2147483647
+@@ -1435,10 +1580,6 @@ class BasicsTest < ActiveRecord::TestCase
+     ActiveRecord::Base.logger = original_logger
+   end
+ 
+-  def test_dup
+-    assert !Minimalistic.new.freeze.dup.frozen?
+-  end
+-
+   def test_compute_type_success
+     assert_equal Author, ActiveRecord::Base.send(:compute_type, 'Author')
+   end
+-- 
+1.7.1
+

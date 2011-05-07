@@ -1,0 +1,431 @@
+From a30c1db3db0050f4ec039ff73d095d7d967ba1a7 Mon Sep 17 00:00:00 2001
+From: Paul Gillard <paulmgillard@gmail.com>
+Date: Mon, 3 Aug 2009 22:35:11 +0100
+Subject: [PATCH] Add attribute_method_affix
+
+Modified ActiveRecord::AttributeMethods to allow classes to specify attribute method prefixes and/or suffixes. Previously only suffixes were allowed.
+---
+ .../lib/active_record/attribute_methods.rb         |  154 +++++++++++++++-----
+ .../lib/active_record/attribute_methods/read.rb    |    2 +-
+ .../attribute_methods/time_zone_conversion.rb      |    4 +-
+ .../lib/active_record/attribute_methods/write.rb   |    2 +-
+ activerecord/test/cases/attribute_methods_test.rb  |   90 ++++++++++--
+ 5 files changed, 198 insertions(+), 54 deletions(-)
+
+diff --git a/activerecord/lib/active_record/attribute_methods.rb b/activerecord/lib/active_record/attribute_methods.rb
+index 211b77f..89a92cd 100644
+--- a/activerecord/lib/active_record/attribute_methods.rb
++++ b/activerecord/lib/active_record/attribute_methods.rb
+@@ -4,10 +4,62 @@ module ActiveRecord
+   module AttributeMethods #:nodoc:
+     extend ActiveSupport::Concern
+ 
++    class AttributeMethodMatcher
++      attr_reader :prefix, :suffix
++      
++      AttributeMethodMatch = Struct.new(:prefix, :base, :suffix)
++
++      def initialize(options = {})
++        options.symbolize_keys!
++        @prefix, @suffix = options[:prefix] || '', options[:suffix] || ''
++        @regex = /^(#{Regexp.escape(@prefix)})(.+?)(#{Regexp.escape(@suffix)})$/
++      end
++
++      def match(method_name)
++        if matchdata = @regex.match(method_name)
++          AttributeMethodMatch.new(matchdata[1], matchdata[2], matchdata[3])
++        else
++          nil
++        end
++      end
++    end
++
+     # Declare and check for suffixed attribute methods.
+     module ClassMethods
++      # Declares a method available for all attributes with the given prefix.
++      # Uses +method_missing+ and <tt>respond_to?</tt> to rewrite the method.
++      #
++      #   #{prefix}#{attr}(*args, &block)
++      #
++      # to
++      #
++      #   #{prefix}attribute(#{attr}, *args, &block)
++      #
++      # An <tt>#{prefix}attribute</tt> instance method must exist and accept at least
++      # the +attr+ argument.
++      #
++      # For example:
++      #
++      #   class Person < ActiveRecord::Base
++      #     attribute_method_prefix 'clear_'
++      #
++      #     private
++      #       def clear_attribute(attr)
++      #         ...
++      #       end
++      #   end
++      #
++      #   person = Person.find(1)
++      #   person.name          # => 'Gem'
++      #   person.clear_name
++      #   person.name          # => ''
++      def attribute_method_prefix(*prefixes)
++        attribute_method_matchers.concat(prefixes.map { |prefix| AttributeMethodMatcher.new :prefix => prefix })
++        undefine_attribute_methods
++      end
++
+       # Declares a method available for all attributes with the given suffix.
+-      # Uses +method_missing+ and <tt>respond_to?</tt> to rewrite the method
++      # Uses +method_missing+ and <tt>respond_to?</tt> to rewrite the method.
+       #
+       #   #{attr}#{suffix}(*args, &block)
+       #
+@@ -21,24 +73,59 @@ module ActiveRecord
+       # For example:
+       #
+       #   class Person < ActiveRecord::Base
+-      #     attribute_method_suffix '_changed?'
++      #     attribute_method_suffix '_short?'
+       #
+       #     private
+-      #       def attribute_changed?(attr)
++      #       def attribute_short?(attr)
+       #         ...
+       #       end
+       #   end
+       #
+       #   person = Person.find(1)
+-      #   person.name_changed?    # => false
+-      #   person.name = 'Hubert'
+-      #   person.name_changed?    # => true
++      #   person.name           # => 'Gem'
++      #   person.name_short?    # => true
+       def attribute_method_suffix(*suffixes)
+-        attribute_method_suffixes.concat(suffixes)
+-        rebuild_attribute_method_regexp
++        attribute_method_matchers.concat(suffixes.map { |suffix| AttributeMethodMatcher.new :suffix => suffix })
+         undefine_attribute_methods
+       end
+ 
++      # Declares a method available for all attributes with the given prefix
++      # and suffix. Uses +method_missing+ and <tt>respond_to?</tt> to rewrite
++      # the method.
++      #
++      #   #{prefix}#{attr}#{suffix}(*args, &block)
++      #
++      # to
++      #
++      #   #{prefix}attribute#{suffix}(#{attr}, *args, &block)
++      #
++      # An <tt>#{prefix}attribute#{suffix}</tt> instance method must exist and
++      # accept at least the +attr+ argument.
++      #
++      # For example:
++      #
++      #   class Person < ActiveRecord::Base
++      #     attribute_method_affix :prefix => 'reset_', :suffix => '_to_default!'
++      #
++      #     private
++      #       def reset_attribute_to_default!(attr)
++      #         ...
++      #       end
++      #   end
++      #
++      #   person = Person.find(1)
++      #   person.name                         # => 'Gem'
++      #   person.reset_name_to_default!
++      #   person.name                         # => 'Gemma'
++      def attribute_method_affix(*affixes)
++        attribute_method_matchers.concat(affixes.map { |affix| AttributeMethodMatcher.new :prefix => affix[:prefix], :suffix => affix[:suffix] })
++        undefine_attribute_methods
++      end
++      
++      def matching_attribute_methods(method_name)
++        attribute_method_matchers.collect { |method| method.match(method_name) }.compact
++      end
++      
+       # Defines an "attribute" method (like +inheritance_column+ or
+       # +table_name+). A new (class) method will be created with the
+       # given name. If a value is specified, the new method will
+@@ -69,12 +156,6 @@ module ActiveRecord
+         end
+       end
+ 
+-      # Returns MatchData if method_name is an attribute method.
+-      def match_attribute_method?(method_name)
+-        rebuild_attribute_method_regexp unless defined?(@@attribute_method_regexp) && @@attribute_method_regexp
+-        @@attribute_method_regexp.match(method_name)
+-      end
+-
+       def generated_methods #:nodoc:
+         @generated_methods ||= begin
+           mod = Module.new
+@@ -88,14 +169,15 @@ module ActiveRecord
+       def define_attribute_methods
+         return unless generated_methods.instance_methods.empty?
+         columns_hash.keys.each do |name|
+-          attribute_method_suffixes.each do |suffix|
+-            method_name = "#{name}#{suffix}"
++          attribute_method_matchers.each do |method|
++            method_name = "#{method.prefix}#{name}#{method.suffix}"
+             unless instance_method_already_implemented?(method_name)
+-              generate_method = "define_attribute_method#{suffix}"
++              generate_method = "define_method_#{method.prefix}attribute#{method.suffix}"
++              
+               if respond_to?(generate_method)
+                 send(generate_method, name)
+               else
+-                generated_methods.module_eval("def #{method_name}(*args); send(:attribute#{suffix}, '#{name}', *args); end", __FILE__, __LINE__)
++                generated_methods.module_eval("def #{method_name}(*args); send(:#{method.prefix}attribute#{method.suffix}, '#{name}', *args); end", __FILE__, __LINE__)
+               end
+             end
+           end
+@@ -120,17 +202,20 @@ module ActiveRecord
+       end
+ 
+       private
+-        # Suffixes a, ?, c become regexp /(a|\?|c)$/
+-        def rebuild_attribute_method_regexp
+-          suffixes = attribute_method_suffixes.map { |s| Regexp.escape(s) }
+-          @@attribute_method_regexp = /(#{suffixes.join('|')})$/.freeze
+-        end
+-
+-        def attribute_method_suffixes
+-          @@attribute_method_suffixes ||= []
++        # Default to *=, *? and *_before_type_cast
++        def attribute_method_matchers
++          @@attribute_method_matchers ||= []
+         end
+     end
+ 
++    # Returns a struct representing the matching attribute method.
++    # The struct's attributes are prefix, base and suffix.
++    def match_attribute_method?(method_name)
++      self.class.matching_attribute_methods(method_name).find do |match|
++        match.base == 'id' || @attributes.include?(match.base)
++      end
++    end
++    
+     # Allows access to the object attributes, which are held in the <tt>@attributes</tt> hash, as though they
+     # were first-class methods. So a Person class with a name attribute can use Person#name and
+     # Person#name= and never directly use the attributes hash -- except for multiple assigns with
+@@ -152,12 +237,9 @@ module ActiveRecord
+         end
+       end
+ 
+-      if md = self.class.match_attribute_method?(method_name)
+-        attribute_name, method_type = md.pre_match, md.to_s
+-        if attribute_name == 'id' || @attributes.include?(attribute_name)
+-          guard_private_attribute_method!(method_name, args)
+-          return __send__("attribute#{method_type}", attribute_name, *args, &block)
+-        end
++      if match = match_attribute_method?(method_name)
++        guard_private_attribute_method!(method_name, args)
++        return __send__("#{match.prefix}attribute#{match.suffix}", match.base, *args, &block)
+       end
+       super
+     end
+@@ -171,7 +253,7 @@ module ActiveRecord
+       if super
+         return true
+       elsif !include_private_methods && super(method, true)
+-        # If we're here than we haven't found among non-private methods
++        # If we're here then we haven't found among non-private methods
+         # but found among all methods. Which means that given method is private.
+         return false
+       elsif self.class.generated_methods.instance_methods.empty?
+@@ -179,10 +261,8 @@ module ActiveRecord
+         if self.class.generated_methods.instance_methods.include?(method_name)
+           return true
+         end
+-      end
+-
+-      if md = self.class.match_attribute_method?(method_name)
+-        return true if md.pre_match == 'id' || @attributes.include?(md.pre_match)
++      elsif match_attribute_method?(method_name)
++        return true
+       end
+       super
+     end
+diff --git a/activerecord/lib/active_record/attribute_methods/read.rb b/activerecord/lib/active_record/attribute_methods/read.rb
+index 6c0bf07..90acb76 100644
+--- a/activerecord/lib/active_record/attribute_methods/read.rb
++++ b/activerecord/lib/active_record/attribute_methods/read.rb
+@@ -36,7 +36,7 @@ module ActiveRecord
+         end
+ 
+         protected
+-          def define_attribute_method(attr_name)
++          def define_method_attribute(attr_name)
+             if self.serialized_attributes[attr_name]
+               define_read_method_for_serialized_attribute(attr_name)
+             else
+diff --git a/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb b/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
+index 4438c75..b9cfe59 100644
+--- a/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
++++ b/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
+@@ -15,7 +15,7 @@ module ActiveRecord
+         protected
+           # Defined for all +datetime+ and +timestamp+ attributes when +time_zone_aware_attributes+ are enabled.
+           # This enhanced read method automatically converts the UTC time stored in the database to the time zone stored in Time.zone.
+-          def define_attribute_method(attr_name)
++          def define_method_attribute(attr_name)
+             if create_time_zone_conversion_attribute?(attr_name, columns_hash[attr_name])
+               method_body = <<-EOV
+                 def #{attr_name}(reload = false)
+@@ -33,7 +33,7 @@ module ActiveRecord
+ 
+           # Defined for all +datetime+ and +timestamp+ attributes when +time_zone_aware_attributes+ are enabled.
+           # This enhanced write method will automatically convert the time passed to it to the zone stored in Time.zone.
+-          def define_attribute_method=(attr_name)
++          def define_method_attribute=(attr_name)
+             if create_time_zone_conversion_attribute?(attr_name, columns_hash[attr_name])
+               method_body = <<-EOV
+                 def #{attr_name}=(time)
+diff --git a/activerecord/lib/active_record/attribute_methods/write.rb b/activerecord/lib/active_record/attribute_methods/write.rb
+index c75745c..7911885 100644
+--- a/activerecord/lib/active_record/attribute_methods/write.rb
++++ b/activerecord/lib/active_record/attribute_methods/write.rb
+@@ -9,7 +9,7 @@ module ActiveRecord
+ 
+       module ClassMethods
+         protected
+-          def define_attribute_method=(attr_name)
++          def define_method_attribute=(attr_name)
+             generated_methods.module_eval("def #{attr_name}=(new_value); write_attribute('#{attr_name}', new_value); end", __FILE__, __LINE__)
+           end
+       end
+diff --git a/activerecord/test/cases/attribute_methods_test.rb b/activerecord/test/cases/attribute_methods_test.rb
+index 168b617..a5f4a67 100644
+--- a/activerecord/test/cases/attribute_methods_test.rb
++++ b/activerecord/test/cases/attribute_methods_test.rb
+@@ -4,40 +4,90 @@ require 'models/minimalistic'
+ 
+ class AttributeMethodsTest < ActiveRecord::TestCase
+   fixtures :topics
++  
+   def setup
+-    @old_suffixes = ActiveRecord::Base.send(:attribute_method_suffixes).dup
++    @old_matchers = ActiveRecord::Base.send(:attribute_method_matchers).dup
+     @target = Class.new(ActiveRecord::Base)
+     @target.table_name = 'topics'
+   end
+ 
+   def teardown
+-    ActiveRecord::Base.send(:attribute_method_suffixes).clear
+-    ActiveRecord::Base.attribute_method_suffix *@old_suffixes
++    ActiveRecord::Base.send(:attribute_method_matchers).clear
++    ActiveRecord::Base.send(:attribute_method_matchers).concat(@old_matchers)
+   end
+ 
+-  def test_match_attribute_method_query_returns_match_data
+-    assert_not_nil md = @target.match_attribute_method?('title=')
+-    assert_equal 'title', md.pre_match
+-    assert_equal ['='], md.captures
+-
+-    %w(_hello_world ist! _maybe?).each do |suffix|
++  def test_match_attribute_method_query_returns_default_match_data
++    topic = @target.new(:title => 'Budget')
++    assert_not_nil match = topic.match_attribute_method?('title=')
++    assert_equal '', match.prefix
++    assert_equal 'title', match.base
++    assert_equal '=', match.suffix
++  end
++  
++  def test_match_attribute_method_query_returns_match_data_for_prefixes
++    topic = @target.new(:title => 'Budget')
++    %w(default_ title_).each do |prefix|
++      @target.class_eval "def #{prefix}attribute(*args) args end"
++      @target.attribute_method_prefix prefix
++
++      assert_not_nil match = topic.match_attribute_method?("#{prefix}title")
++      assert_equal prefix, match.prefix
++      assert_equal 'title', match.base
++      assert_equal '', match.suffix
++    end
++  end
++  
++  def test_match_attribute_method_query_returns_match_data_for_suffixes
++    topic = @target.new(:title => 'Budget')
++    %w(_default _title_default it! _candidate=  _maybe?).each do |suffix|
+       @target.class_eval "def attribute#{suffix}(*args) args end"
+       @target.attribute_method_suffix suffix
+ 
+-      assert_not_nil md = @target.match_attribute_method?("title#{suffix}")
+-      assert_equal 'title', md.pre_match
+-      assert_equal [suffix], md.captures
++      assert_not_nil match = topic.match_attribute_method?("title#{suffix}")
++      assert_equal '', match.prefix
++      assert_equal 'title', match.base
++      assert_equal suffix, match.suffix
+     end
+   end
+-
+-  def test_declared_attribute_method_affects_respond_to_and_method_missing
++  
++  def test_match_attribute_method_query_returns_match_data_for_affixes
++    topic = @target.new(:title => 'Budget')
++    [['mark_', '_for_update'], ['reset_', '!'], ['default_', '_value?']].each do |prefix, suffix|
++      @target.class_eval "def #{prefix}attribute#{suffix}(*args) args end"
++      @target.attribute_method_affix({ :prefix => prefix, :suffix => suffix })
++
++      assert_not_nil match = topic.match_attribute_method?("#{prefix}title#{suffix}")
++      assert_equal prefix, match.prefix
++      assert_equal 'title', match.base
++      assert_equal suffix, match.suffix
++    end
++  end
++  
++  def test_undeclared_attribute_method_does_not_affect_respond_to_and_method_missing
+     topic = @target.new(:title => 'Budget')
+     assert topic.respond_to?('title')
+     assert_equal 'Budget', topic.title
+     assert !topic.respond_to?('title_hello_world')
+     assert_raise(NoMethodError) { topic.title_hello_world }
++  end
+ 
+-    %w(_hello_world _it! _candidate= able?).each do |suffix|
++  def test_declared_prefixed_attribute_method_affects_respond_to_and_method_missing
++    topic = @target.new(:title => 'Budget')
++    %w(default_ title_).each do |prefix|
++      @target.class_eval "def #{prefix}attribute(*args) args end"
++      @target.attribute_method_prefix prefix
++
++      meth = "#{prefix}title"
++      assert topic.respond_to?(meth)
++      assert_equal ['title'], topic.send(meth)
++      assert_equal ['title', 'a'], topic.send(meth, 'a')
++      assert_equal ['title', 1, 2, 3], topic.send(meth, 1, 2, 3)
++    end
++  end
++
++  def test_declared_suffixed_attribute_method_affects_respond_to_and_method_missing
++    topic = @target.new(:title => 'Budget')
++    %w(_default _title_default _it! _candidate= able?).each do |suffix|
+       @target.class_eval "def attribute#{suffix}(*args) args end"
+       @target.attribute_method_suffix suffix
+ 
+@@ -49,6 +99,20 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_declared_affixed_attribute_method_affects_respond_to_and_method_missing
++    topic = @target.new(:title => 'Budget')
++    [['mark_', '_for_update'], ['reset_', '!'], ['default_', '_value?']].each do |prefix, suffix|
++      @target.class_eval "def #{prefix}attribute#{suffix}(*args) args end"
++      @target.attribute_method_affix({ :prefix => prefix, :suffix => suffix })
++
++      meth = "#{prefix}title#{suffix}"
++      assert topic.respond_to?(meth)
++      assert_equal ['title'], topic.send(meth)
++      assert_equal ['title', 'a'], topic.send(meth, 'a')
++      assert_equal ['title', 1, 2, 3], topic.send(meth, 1, 2, 3)
++    end
++  end
++
+   def test_should_unserialize_attributes_for_frozen_records
+     myobj = {:value1 => :value2}
+     topic = Topic.create("content" => myobj)
+-- 
+1.6.0.5
+

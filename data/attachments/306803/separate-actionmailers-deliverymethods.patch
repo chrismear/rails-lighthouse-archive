@@ -1,0 +1,461 @@
+From 231cbb7da8a995594eaeca5e034634d3b39d12f4 Mon Sep 17 00:00:00 2001
+From: Matthew Rudy Jacobs <MatthewRudyJacobs@gmail.com>
+Date: Wed, 28 Oct 2009 09:17:59 +0000
+Subject: [PATCH] abstract all of the ActionMailer delivery methods into their own classes.
+  thereby the following are equivalent
+
+  ActionMailer::Base.delivery_method = :smtp
+  ActionMailer::Base.delivery_method = ActionMailer::DeliveryMethod::Smtp
+
+we could equally set our own custom object
+as long as it provides the instance method :perform_delivery(mail)
+
+eg.
+
+  class MySmsDeliveryMethod
+    def perform_delivery(mail)
+      Sms.send(mail['to'], mail['body'])
+    end
+  end
+
+  MySmsMailer.delivery_method = MySmsDeliveryMethod.new
+---
+ actionmailer/Rakefile                              |    1 +
+ actionmailer/lib/action_mailer.rb                  |    1 +
+ actionmailer/lib/action_mailer/base.rb             |   75 ++++----------------
+ actionmailer/lib/action_mailer/delivery_method.rb  |   58 +++++++++++++++
+ .../lib/action_mailer/delivery_method/file.rb      |   21 ++++++
+ .../lib/action_mailer/delivery_method/sendmail.rb  |   22 ++++++
+ .../lib/action_mailer/delivery_method/smtp.rb      |   31 ++++++++
+ .../lib/action_mailer/delivery_method/test.rb      |   12 +++
+ actionmailer/test/delivery_method_test.rb          |   36 ++++++++-
+ actionmailer/test/mail_service_test.rb             |    2 +-
+ actionmailer/test/test_helper_test.rb              |    2 +-
+ 11 files changed, 193 insertions(+), 68 deletions(-)
+ create mode 100644 actionmailer/lib/action_mailer/delivery_method.rb
+ create mode 100644 actionmailer/lib/action_mailer/delivery_method/file.rb
+ create mode 100644 actionmailer/lib/action_mailer/delivery_method/sendmail.rb
+ create mode 100644 actionmailer/lib/action_mailer/delivery_method/smtp.rb
+ create mode 100644 actionmailer/lib/action_mailer/delivery_method/test.rb
+
+diff --git a/actionmailer/Rakefile b/actionmailer/Rakefile
+index 8a86370..96c84b9 100644
+--- a/actionmailer/Rakefile
++++ b/actionmailer/Rakefile
+@@ -44,6 +44,7 @@ Rake::RDocTask.new { |rdoc|
+   rdoc.rdoc_files.include('README', 'CHANGELOG')
+   rdoc.rdoc_files.include('lib/action_mailer.rb')
+   rdoc.rdoc_files.include('lib/action_mailer/*.rb')
++  rdoc.rdoc_files.include('lib/action_mailer/delivery_method/*.rb')
+ }
+ 
+ spec = eval(File.read('actionmailer.gemspec'))
+diff --git a/actionmailer/lib/action_mailer.rb b/actionmailer/lib/action_mailer.rb
+index a427376..71dc1c6 100644
+--- a/actionmailer/lib/action_mailer.rb
++++ b/actionmailer/lib/action_mailer.rb
+@@ -33,6 +33,7 @@ module ActionMailer
+ 
+   autoload :AdvAttrAccessor, 'action_mailer/adv_attr_accessor'
+   autoload :Base, 'action_mailer/base'
++  autoload :DeliveryMethod, 'action_mailer/delivery_method'
+   autoload :Helpers, 'action_mailer/helpers'
+   autoload :Part, 'action_mailer/part'
+   autoload :PartContainer, 'action_mailer/part_container'
+diff --git a/actionmailer/lib/action_mailer/base.rb b/actionmailer/lib/action_mailer/base.rb
+index df3bfb3..8983560 100644
+--- a/actionmailer/lib/action_mailer/base.rb
++++ b/actionmailer/lib/action_mailer/base.rb
+@@ -1,5 +1,3 @@
+-require 'tmpdir'
+-
+ require "active_support/core_ext/class"
+ # Use the old layouts until actionmailer gets refactored
+ require "action_controller/legacy/layout"
+@@ -232,7 +230,7 @@ module ActionMailer #:nodoc:
+   # * <tt>raise_delivery_errors</tt> - Whether or not errors should be raised if the email fails to be delivered.
+   #
+   # * <tt>delivery_method</tt> - Defines a delivery method. Possible values are <tt>:smtp</tt> (default), <tt>:sendmail</tt>, <tt>:test</tt>,
+-  #   and <tt>:file</tt>.
++  #   and <tt>:file</tt>. Or you may provide a custom delivery method object eg. MyOwnDeliveryMethodClass.new
+   #
+   # * <tt>perform_deliveries</tt> - Determines whether <tt>deliver_*</tt> methods are actually carried out. By default they are,
+   #   but this can be turned off to help functional testing.
+@@ -270,35 +268,21 @@ module ActionMailer #:nodoc:
+ 
+     cattr_accessor :logger
+ 
+-    @@smtp_settings = {
+-      :address              => "localhost",
+-      :port                 => 25,
+-      :domain               => 'localhost.localdomain',
+-      :user_name            => nil,
+-      :password             => nil,
+-      :authentication       => nil,
+-      :enable_starttls_auto => true,
+-    }
+-    cattr_accessor :smtp_settings
+-
+-    @@sendmail_settings = {
+-      :location       => '/usr/sbin/sendmail',
+-      :arguments      => '-i -t'
+-    }
+-    cattr_accessor :sendmail_settings
+-
+-    @@file_settings = {
+-      :location       => defined?(Rails) ? "#{Rails.root}/tmp/mails" : "#{Dir.tmpdir}/mails"
+-    }
+-
+-    cattr_accessor :file_settings
++    class << self
++      delegate :settings, :settings=, :to => ActionMailer::DeliveryMethod::File, :prefix => :file
++      delegate :settings, :settings=, :to => ActionMailer::DeliveryMethod::Sendmail, :prefix => :sendmail
++      delegate :settings, :settings=, :to => ActionMailer::DeliveryMethod::Smtp, :prefix => :smtp
++
++      def delivery_method=(method_name)
++        @delivery_method = ActionMailer::DeliveryMethod.lookup_method(method_name)
++      end
++    end
++    self.delivery_method = :smtp
++    superclass_delegating_reader :delivery_method
+ 
+     @@raise_delivery_errors = true
+     cattr_accessor :raise_delivery_errors
+ 
+-    superclass_delegating_accessor :delivery_method
+-    self.delivery_method = :smtp
+-
+     @@perform_deliveries = true
+     cattr_accessor :perform_deliveries
+ 
+@@ -552,7 +536,7 @@ module ActionMailer #:nodoc:
+ 
+       ActiveSupport::Notifications.instrument(:deliver_mail, :mail => @mail) do
+         begin
+-          __send__("perform_delivery_#{delivery_method}", mail) if perform_deliveries
++          self.delivery_method.perform_delivery(mail) if perform_deliveries
+         rescue Exception => e # Net::SMTP errors or sendmail pipe errors
+           raise e if raise_delivery_errors
+         end
+@@ -720,39 +704,6 @@ module ActionMailer #:nodoc:
+         @mail = m
+       end
+ 
+-      def perform_delivery_smtp(mail)
+-        destinations = mail.destinations
+-        mail.ready_to_send
+-        sender = (mail['return-path'] && mail['return-path'].spec) || mail['from']
+-
+-        smtp = Net::SMTP.new(smtp_settings[:address], smtp_settings[:port])
+-        smtp.enable_starttls_auto if smtp_settings[:enable_starttls_auto] && smtp.respond_to?(:enable_starttls_auto)
+-        smtp.start(smtp_settings[:domain], smtp_settings[:user_name], smtp_settings[:password],
+-                   smtp_settings[:authentication]) do |smtp|
+-          smtp.sendmail(mail.encoded, sender, destinations)
+-        end
+-      end
+-
+-      def perform_delivery_sendmail(mail)
+-        sendmail_args = sendmail_settings[:arguments]
+-        sendmail_args += " -f \"#{mail['return-path']}\"" if mail['return-path']
+-        IO.popen("#{sendmail_settings[:location]} #{sendmail_args}","w+") do |sm|
+-          sm.print(mail.encoded.gsub(/\r/, ''))
+-          sm.flush
+-        end
+-      end
+-
+-      def perform_delivery_test(mail)
+-        deliveries << mail
+-      end
+-
+-      def perform_delivery_file(mail)
+-        FileUtils.mkdir_p file_settings[:location]
+-
+-        (mail.to + mail.cc + mail.bcc).uniq.each do |to|
+-          File.open(File.join(file_settings[:location], to), 'a') { |f| f.write(mail) }
+-        end
+-      end
+   end
+ 
+   Base.class_eval do
+diff --git a/actionmailer/lib/action_mailer/delivery_method.rb b/actionmailer/lib/action_mailer/delivery_method.rb
+new file mode 100644
+index 0000000..ffba3c4
+--- /dev/null
++++ b/actionmailer/lib/action_mailer/delivery_method.rb
+@@ -0,0 +1,58 @@
++require "active_support/core_ext/class"
++module ActionMailer
++  module DeliveryMethod
++
++    autoload :File, 'action_mailer/delivery_method/file'
++    autoload :Sendmail, 'action_mailer/delivery_method/sendmail'
++    autoload :Smtp, 'action_mailer/delivery_method/smtp'
++    autoload :Test, 'action_mailer/delivery_method/test'
++
++    # Creates a new DeliveryMethod object according to the given options.
++    #
++    # If no arguments are passed to this method, then a new
++    # ActionMailer::DeliveryMethod::Stmp object will be returned.
++    #
++    # If you pass a Symbol as the first argument, then a corresponding
++    # delivery method class under the ActionMailer::DeliveryMethod namespace
++    # will be created.
++    # For example:
++    #
++    #   ActionMailer::DeliveryMethod.lookup_method(:sendmail)
++    #   # => returns a new ActionMailer::DeliveryMethod::Sendmail object
++    #
++    # If the first argument is not a Symbol, then it will simply be returned:
++    #
++    #   ActionMailer::DeliveryMethod.lookup_method(MyOwnDeliveryMethod.new)
++    #   # => returns MyOwnDeliveryMethod.new
++    def self.lookup_method(delivery_method)
++      case delivery_method
++      when Symbol
++        method_name = delivery_method.to_s.camelize
++        method_class = ActionMailer::DeliveryMethod.const_get(method_name)
++        method_class.new()
++      when nil
++        Smtp.new
++      else
++        delivery_method
++      end
++    end
++
++    # An abstract delivery method class. There are multiple delivery method
++    # classes, documented under
++    # See the classes under the ActionMailer::DeliveryMethod, e.g.
++    # ActionMailer::DeliveryMethod::Smtp.
++    # Smtp is the default delivery method for production
++    # while Test is used in testing.
++    #
++    # each delivery method exposes just one method
++    #
++    #   delivery_method = ActionMailer::DeliveryMethod::Smtp.new
++    #
++    #   delivery_method.perform_delivery(mail) # send the mail via smtp
++    class Method
++      superclass_delegating_accessor :settings
++      self.settings = {}
++    end
++    
++  end
++end
+diff --git a/actionmailer/lib/action_mailer/delivery_method/file.rb b/actionmailer/lib/action_mailer/delivery_method/file.rb
+new file mode 100644
+index 0000000..8807a05
+--- /dev/null
++++ b/actionmailer/lib/action_mailer/delivery_method/file.rb
+@@ -0,0 +1,21 @@
++require 'tmpdir'
++module ActionMailer
++  module DeliveryMethod
++
++    # A delivery method implementation which writes all mails to a file.
++    class File < Method
++
++      self.settings = {
++        :location       => defined?(Rails) ? "#{Rails.root}/tmp/mails" : "#{Dir.tmpdir}/mails"
++      }
++
++      def perform_delivery(mail)
++        FileUtils.mkdir_p settings[:location]
++
++        (mail.to + mail.cc + mail.bcc).uniq.each do |to|
++          ::File.open(::File.join(settings[:location], to), 'a') { |f| f.write(mail) }
++        end
++      end
++    end
++  end
++end
+diff --git a/actionmailer/lib/action_mailer/delivery_method/sendmail.rb b/actionmailer/lib/action_mailer/delivery_method/sendmail.rb
+new file mode 100644
+index 0000000..34e03b8
+--- /dev/null
++++ b/actionmailer/lib/action_mailer/delivery_method/sendmail.rb
+@@ -0,0 +1,22 @@
++module ActionMailer
++  module DeliveryMethod
++
++    # A delivery method implementation which sends via sendmail.
++    class Sendmail < Method
++
++      self.settings = {
++        :location       => '/usr/sbin/sendmail',
++        :arguments      => '-i -t'
++      }
++
++      def perform_delivery(mail)
++        sendmail_args = settings[:arguments]
++        sendmail_args += " -f \"#{mail['return-path']}\"" if mail['return-path']
++        IO.popen("#{settings[:location]} #{sendmail_args}","w+") do |sm|
++          sm.print(mail.encoded.gsub(/\r/, ''))
++          sm.flush
++        end
++      end
++    end
++  end
++end
+diff --git a/actionmailer/lib/action_mailer/delivery_method/smtp.rb b/actionmailer/lib/action_mailer/delivery_method/smtp.rb
+new file mode 100644
+index 0000000..e39f973
+--- /dev/null
++++ b/actionmailer/lib/action_mailer/delivery_method/smtp.rb
+@@ -0,0 +1,31 @@
++module ActionMailer
++  module DeliveryMethod
++    
++    # A delivery method implementation which sends via smtp.
++    class Smtp < Method
++
++      self.settings = {
++        :address              => "localhost",
++        :port                 => 25,
++        :domain               => 'localhost.localdomain',
++        :user_name            => nil,
++        :password             => nil,
++        :authentication       => nil,
++        :enable_starttls_auto => true,
++      }
++
++      def perform_delivery(mail)
++        destinations = mail.destinations
++        mail.ready_to_send
++        sender = (mail['return-path'] && mail['return-path'].spec) || mail['from']
++
++        smtp = Net::SMTP.new(settings[:address], settings[:port])
++        smtp.enable_starttls_auto if settings[:enable_starttls_auto] && smtp.respond_to?(:enable_starttls_auto)
++        smtp.start(settings[:domain], settings[:user_name], settings[:password],
++                   settings[:authentication]) do |smtp|
++          smtp.sendmail(mail.encoded, sender, destinations)
++        end
++      end
++    end
++  end
++end
+diff --git a/actionmailer/lib/action_mailer/delivery_method/test.rb b/actionmailer/lib/action_mailer/delivery_method/test.rb
+new file mode 100644
+index 0000000..e63e0ab
+--- /dev/null
++++ b/actionmailer/lib/action_mailer/delivery_method/test.rb
+@@ -0,0 +1,12 @@
++module ActionMailer
++  module DeliveryMethod
++
++    # A delivery method implementation designed for testing, which just appends each record to the :deliveries array
++    class Test < Method
++
++      def perform_delivery(mail)
++        ActionMailer::Base.deliveries << mail
++      end
++    end
++  end
++end
+diff --git a/actionmailer/test/delivery_method_test.rb b/actionmailer/test/delivery_method_test.rb
+index 1b8c3ba..8f8c6b0 100644
+--- a/actionmailer/test/delivery_method_test.rb
++++ b/actionmailer/test/delivery_method_test.rb
+@@ -11,6 +11,21 @@ class FileDeliveryMethodMailer < ActionMailer::Base
+   self.delivery_method = :file
+ end
+ 
++class CustomDeliveryMethod
++  attr_accessor :custom_deliveries
++  def initialize()
++    @customer_deliveries = []
++  end
++
++  def self.perform_delivery(mail)
++    self.custom_deliveries << mail
++  end
++end
++
++class CustomerDeliveryMailer < ActionMailer::Base
++  self.delivery_method = CustomDeliveryMethod.new
++end
++
+ class ActionMailerBase_delivery_method_Test < Test::Unit::TestCase
+   def setup
+     set_delivery_method :smtp
+@@ -21,7 +36,7 @@ class ActionMailerBase_delivery_method_Test < Test::Unit::TestCase
+   end
+ 
+   def test_should_be_the_default_smtp
+-    assert_equal :smtp, ActionMailer::Base.delivery_method
++    assert_instance_of ActionMailer::DeliveryMethod::Smtp, ActionMailer::Base.delivery_method
+   end
+ end
+ 
+@@ -35,7 +50,7 @@ class DefaultDeliveryMethodMailer_delivery_method_Test < Test::Unit::TestCase
+   end
+   
+   def test_should_be_the_default_smtp
+-    assert_equal :smtp, DefaultDeliveryMethodMailer.delivery_method
++    assert_instance_of ActionMailer::DeliveryMethod::Smtp, DefaultDeliveryMethodMailer.delivery_method
+   end
+ end
+ 
+@@ -49,7 +64,7 @@ class NonDefaultDeliveryMethodMailer_delivery_method_Test < Test::Unit::TestCase
+   end
+ 
+   def test_should_be_the_set_delivery_method
+-    assert_equal :sendmail, NonDefaultDeliveryMethodMailer.delivery_method
++    assert_instance_of ActionMailer::DeliveryMethod::Sendmail, NonDefaultDeliveryMethodMailer.delivery_method
+   end
+ end
+ 
+@@ -63,7 +78,7 @@ class FileDeliveryMethodMailer_delivery_method_Test < Test::Unit::TestCase
+   end
+ 
+   def test_should_be_the_set_delivery_method
+-    assert_equal :file, FileDeliveryMethodMailer.delivery_method
++    assert_instance_of ActionMailer::DeliveryMethod::File, FileDeliveryMethodMailer.delivery_method
+   end
+ 
+   def test_should_default_location_to_the_tmpdir
+@@ -71,3 +86,16 @@ class FileDeliveryMethodMailer_delivery_method_Test < Test::Unit::TestCase
+   end
+ end
+ 
++class CustomDeliveryMethodMailer_delivery_method_Test < Test::Unit::TestCase
++  def setup
++    set_delivery_method :smtp
++  end
++
++  def teardown
++    restore_delivery_method
++  end
++
++  def test_should_be_the_set_delivery_method
++    assert_instance_of CustomDeliveryMethod, CustomerDeliveryMailer.delivery_method
++  end
++end
+diff --git a/actionmailer/test/mail_service_test.rb b/actionmailer/test/mail_service_test.rb
+index 5584afa..802c2b3 100644
+--- a/actionmailer/test/mail_service_test.rb
++++ b/actionmailer/test/mail_service_test.rb
+@@ -554,7 +554,7 @@ class ActionMailerTest < Test::Unit::TestCase
+ 
+   def test_doesnt_raise_errors_when_raise_delivery_errors_is_false
+     ActionMailer::Base.raise_delivery_errors = false
+-    TestMailer.any_instance.expects(:perform_delivery_test).raises(Exception)
++    TestMailer.delivery_method.expects(:perform_delivery).raises(Exception)
+     assert_nothing_raised { TestMailer.deliver_signed_up(@recipient) }
+   end
+ 
+diff --git a/actionmailer/test/test_helper_test.rb b/actionmailer/test/test_helper_test.rb
+index 65b07a7..a9f83f5 100644
+--- a/actionmailer/test/test_helper_test.rb
++++ b/actionmailer/test/test_helper_test.rb
+@@ -10,7 +10,7 @@ end
+ 
+ class TestHelperMailerTest < ActionMailer::TestCase
+   def test_setup_sets_right_action_mailer_options
+-    assert_equal :test, ActionMailer::Base.delivery_method
++    assert_instance_of ActionMailer::DeliveryMethod::Test, ActionMailer::Base.delivery_method
+     assert ActionMailer::Base.perform_deliveries
+     assert_equal [], ActionMailer::Base.deliveries
+   end
+-- 
+1.6.5.1
+

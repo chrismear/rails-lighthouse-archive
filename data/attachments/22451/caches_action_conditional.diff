@@ -1,0 +1,179 @@
+diff --git a/actionpack/lib/action_controller/caching/actions.rb b/actionpack/lib/action_controller/caching/actions.rb
+index 7b0551c..ac7d47f 100644
+--- a/actionpack/lib/action_controller/caching/actions.rb
++++ b/actionpack/lib/action_controller/caching/actions.rb
+@@ -9,7 +9,7 @@ module ActionController #:nodoc:
+     #   class ListsController < ApplicationController
+     #     before_filter :authenticate, :except => :public
+     #     caches_page   :public
+-    #     caches_action :show, :feed
++    #     caches_action :index, :show, :feed
+     #   end
+     #
+     # In this example, the public action doesn't require authentication, so it's possible to use the faster page caching method. But both the
+@@ -27,15 +27,19 @@ module ActionController #:nodoc:
+     # You can set modify the default action cache path by passing a :cache_path option.  This will be passed directly to ActionCachePath.path_for.  This is handy
+     # for actions with multiple possible routes that should be cached differently.  If a block is given, it is called with the current controller instance.
+     #
++    # And you can also use :if to pass a Proc that specifies when the action should be cached. 
++    #
+     #   class ListsController < ApplicationController
+     #     before_filter :authenticate, :except => :public
+     #     caches_page   :public
++    #     caches_action :index, :if => Proc.new { |c| !c.request.format.json? } # cache if is not a JSON request
+     #     caches_action :show, :cache_path => { :project => 1 }
+-    #     caches_action :show, :cache_path => Proc.new { |controller| 
++    #     caches_action :feed, :cache_path => Proc.new { |controller| 
+     #       controller.params[:user_id] ? 
+     #         controller.send(:user_list_url, c.params[:user_id], c.params[:id]) :
+     #         controller.send(:list_url, c.params[:id]) }
+     #   end
++    #
+     module Actions
+       def self.included(base) #:nodoc:
+         base.extend(ClassMethods)
+@@ -49,7 +53,8 @@ module ActionController #:nodoc:
+         # See ActionController::Caching::Actions for details.
+         def caches_action(*actions)
+           return unless cache_configured?
+-          around_filter(ActionCacheFilter.new(*actions))
++          options = actions.extract_options!
++          around_filter(ActionCacheFilter.new(:cache_path => options.delete(:cache_path)), {:only => actions}.merge(options))
+         end
+       end
+ 
+@@ -67,16 +72,12 @@ module ActionController #:nodoc:
+         end
+ 
+       class ActionCacheFilter #:nodoc:
+-        def initialize(*actions, &block)
+-          @options = actions.extract_options!
+-          @actions = Set.new(actions)
++        def initialize(options, &block)
++          @options = options
+         end
+ 
+         def before(controller)
+-          return unless @actions.include?(controller.action_name.intern)
+-
+           cache_path = ActionCachePath.new(controller, path_options_for(controller, @options))
+-
+           if cache = controller.read_fragment(cache_path.path)
+             controller.rendered_action_cache = true
+             set_content_type!(controller, cache_path.extension)
+@@ -88,7 +89,7 @@ module ActionController #:nodoc:
+         end
+ 
+         def after(controller)
+-          return if !@actions.include?(controller.action_name.intern) || controller.rendered_action_cache || !caching_allowed(controller)
++          return if controller.rendered_action_cache || !caching_allowed(controller)
+           controller.write_fragment(controller.action_cache_path.path, controller.response.body)
+         end
+ 
+diff --git a/actionpack/test/controller/caching_test.rb b/actionpack/test/controller/caching_test.rb
+index ddc1c68..3556727 100644
+--- a/actionpack/test/controller/caching_test.rb
++++ b/actionpack/test/controller/caching_test.rb
+@@ -6,6 +6,7 @@ CACHE_DIR = 'test_cache'
+ FILE_STORE_PATH = File.join(File.dirname(__FILE__), '/../temp/', CACHE_DIR)
+ ActionController::Base.page_cache_directory = FILE_STORE_PATH
+ ActionController::Base.cache_store = :file_store, FILE_STORE_PATH
++ActionController::Base.view_paths = [ File.dirname(__FILE__) + '/../fixtures/' ]
+ 
+ class PageCachingTestController < ActionController::Base
+   caches_page :ok, :no_content, :if => Proc.new { |c| !c.request.format.json? }
+@@ -151,9 +152,12 @@ end
+ 
+ 
+ class ActionCachingTestController < ActionController::Base
+-  caches_action :index, :redirected, :forbidden
++  caches_action :index, :redirected, :forbidden, :if => Proc.new { |c| !c.request.format.json? }
+   caches_action :show, :cache_path => 'http://test.host/custom/show'
+   caches_action :edit, :cache_path => Proc.new { |c| c.params[:id] ? "http://test.host/#{c.params[:id]};edit" : "http://test.host/edit" }
++  caches_action :with_layout
++  
++  layout 'talk_from_action.erb'
+ 
+   def index
+     @cache_this = Time.now.to_f.to_s
+@@ -168,9 +172,15 @@ class ActionCachingTestController < ActionController::Base
+     render :text => "Forbidden"
+     headers["Status"] = "403 Forbidden"
+   end
++  
++  def with_layout
++    @cache_this = Time.now.to_f.to_s
++    render :text => @cache_this, :layout => true
++  end
+ 
+   alias_method :show, :index
+   alias_method :edit, :index
++  alias_method :destroy, :index
+ 
+   def expire
+     expire_action :controller => 'action_caching_test', :action => 'index'
+@@ -223,6 +233,36 @@ class ActionCacheTest < Test::Unit::TestCase
+     assert_equal cached_time, @response.body
+   end
+ 
++  def test_simple_action_not_cached
++    get :destroy
++    cached_time = content_to_cache
++    assert_equal cached_time, @response.body
++    assert_cache_does_not_exist 'hostname.com/action_caching_test/destroy'
++    reset!
++
++    get :destroy
++    assert_not_equal cached_time, @response.body
++  end
++
++  def test_action_cache_with_layout
++    get :with_layout
++    cached_time = content_to_cache
++    assert_not_equal cached_time, @response.body
++    assert_cache_exists 'hostname.com/action_caching_test/with_layout'
++    reset!
++
++    get :with_layout
++    assert_not_equal cached_time, @response.body
++
++    assert_equal @response.body, read_fragment('hostname.com/action_caching_test/with_layout')
++  end
++
++  def test_action_cache_conditional_options
++    @request.env['HTTP_ACCEPT'] = 'application/json'
++    get :index
++    assert_cache_does_not_exist 'hostname.com/action_caching_test'
++  end
++
+   def test_action_cache_with_custom_cache_path
+     get :show
+     cached_time = content_to_cache
+@@ -347,12 +387,26 @@ class ActionCacheTest < Test::Unit::TestCase
+       @response   = ActionController::TestResponse.new
+       @controller = ActionCachingTestController.new
+       @request.host = 'hostname.com'
++      sleep(0.01) # otherwise we can't assure that Time.now will be different
+     end
+ 
+     def assert_cache_exists(path)
+-      full_path = File.join(FILE_STORE_PATH, "views", path + '.cache')
++      full_path = cache_path(path)
+       assert File.exist?(full_path), "#{full_path.inspect} does not exist."
+     end
++
++    def assert_cache_does_not_exist(path)
++      full_path = cache_path(path)
++      assert !File.exist?(full_path), "#{full_path.inspect} should not exist."
++    end
++
++    def cache_path(path)
++      File.join(FILE_STORE_PATH, 'views', path + '.cache')
++    end
++
++    def read_fragment(path)
++      @controller.read_fragment(path)
++    end
+ end
+ 
+ class FragmentCachingTestController < ActionController::Base

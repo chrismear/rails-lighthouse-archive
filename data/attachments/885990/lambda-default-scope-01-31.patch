@@ -1,0 +1,568 @@
+From 9cc16e26fb0052578e274e9680b2e1e98da38ba0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Adam=20Wro=CC=81bel?= <adam@fluxinc.ca>
+Date: Thu, 20 Jan 2011 01:11:17 +0100
+Subject: [PATCH 1/5] Allow default_scope to accept lambdas.
+
+Previous implementation was throwing exceptions when default_scope was called
+multiple times for the same model. This fix uses the old finder merging for
+non-lambda arguments and recursive lambdas when necessary.
+
+More info in ticket #1812 on lighthouse.
+---
+ activerecord/lib/active_record/base.rb |   15 ++++++++++++++-
+ 1 files changed, 14 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 47dc2d4..c94c0c9 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1140,8 +1140,21 @@ MSG
+         #   Article.create.published # => true
+         def default_scope(options = {})
+           reset_scoped_methods
++
+           default_scoping = self.default_scoping.dup
+-          self.default_scoping = default_scoping << construct_finder_arel(options, default_scoping.pop)
++          previous = default_scoping.pop
++
++          if previous.kind_of?(Proc) or options.kind_of?(Proc)
++            new_default_scope = lambda do
++              sane_options = options.kind_of?(Proc) ? options.call : options
++              sane_previous = previous.kind_of?(Proc) ? previous.call : previous
++              construct_finder_arel sane_options, sane_previous
++            end
++          else
++            new_default_scope = construct_finder_arel options, previous
++          end
++
++          self.default_scoping = default_scoping << new_default_scope
+         end
+ 
+         def current_scoped_methods #:nodoc:
+-- 
+1.7.3.5
+
+
+From dbab2a4b667c5e53cdacbb424c5768dca8483dcc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Adam=20Wro=CC=81bel?= <adam@fluxinc.ca>
+Date: Thu, 20 Jan 2011 18:13:52 +0100
+Subject: [PATCH 2/5] Use respond_to?(:call) instead of kind_of?(Proc).
+
+---
+ activerecord/lib/active_record/base.rb |    6 +++---
+ 1 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index c94c0c9..6a62823 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1144,10 +1144,10 @@ MSG
+           default_scoping = self.default_scoping.dup
+           previous = default_scoping.pop
+ 
+-          if previous.kind_of?(Proc) or options.kind_of?(Proc)
++          if previous.respond_to?(:call) or options.respond_to?(:call)
+             new_default_scope = lambda do
+-              sane_options = options.kind_of?(Proc) ? options.call : options
+-              sane_previous = previous.kind_of?(Proc) ? previous.call : previous
++              sane_options = options.respond_to?(:call) ? options.call : options
++              sane_previous = previous.respond_to?(:call) ? previous.call : previous
+               construct_finder_arel sane_options, sane_previous
+             end
+           else
+-- 
+1.7.3.5
+
+
+From e7b2dbab743708c4bd22a0f6457071e77ac1f684 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Adam=20Wro=CC=81bel?= <adam@fluxinc.ca>
+Date: Mon, 31 Jan 2011 06:00:33 +0100
+Subject: [PATCH 3/5] Add more tests for default_scopes with lambdas.
+
+Also includes one test for named scopes, checking that
+Post.approved != Post.unscoped.approved.
+
+Until now this could be found in the documentation, but I consider it a bug.
+It's not only unintuitive, but it also has a side effect. Since every named
+scope contains declarations from default scope merged into it, calling:
+
+Post.approved.last_two_weeks.by_author("Mike")
+
+would cause the final query to be polluted with multiple default_scope
+statements. They would be merged into the query with each named scope.
+
+It was an aesthetic thing until we allowed default_scope to contain lambdas. Now it means that varying calculations can be merged into a single query.
+---
+ activerecord/test/cases/named_scope_test.rb      |    8 +++-
+ activerecord/test/cases/relation_scoping_test.rb |   47 +++++++++++++++++++++-
+ activerecord/test/fixtures/notes.yml             |   23 +++++++++++
+ activerecord/test/models/note.rb                 |    4 ++
+ activerecord/test/schema/schema.rb               |    7 +++
+ 5 files changed, 87 insertions(+), 2 deletions(-)
+ create mode 100644 activerecord/test/fixtures/notes.yml
+ create mode 100644 activerecord/test/models/note.rb
+
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index ed5e1e0..d3baaa0 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -6,9 +6,10 @@ require 'models/comment'
+ require 'models/reply'
+ require 'models/author'
+ require 'models/developer'
++require 'models/note'
+ 
+ class NamedScopeTest < ActiveRecord::TestCase
+-  fixtures :posts, :authors, :topics, :comments, :author_addresses
++  fixtures :posts, :authors, :topics, :comments, :author_addresses, :notes
+ 
+   def test_implements_enumerable
+     assert !Topic.find(:all).empty?
+@@ -458,6 +459,11 @@ class NamedScopeTest < ActiveRecord::TestCase
+       require "models/without_table"
+     end
+   end
++
++  def test_named_scopes_dont_force_default_scopes
++    assert_equal 3, Note.english.count
++    assert_equal 4, Note.unscoped.english.count
++  end
+ end
+ 
+ class DynamicScopeMatchTest < ActiveRecord::TestCase
+diff --git a/activerecord/test/cases/relation_scoping_test.rb b/activerecord/test/cases/relation_scoping_test.rb
+index 1bdf313..86919bb 100644
+--- a/activerecord/test/cases/relation_scoping_test.rb
++++ b/activerecord/test/cases/relation_scoping_test.rb
+@@ -302,7 +302,7 @@ class HasAndBelongsToManyScopingTest< ActiveRecord::TestCase
+ end
+ 
+ class DefaultScopingTest < ActiveRecord::TestCase
+-  fixtures :developers, :posts
++  fixtures :developers, :posts, :notes
+ 
+   def test_default_scope
+     expected = Developer.find(:all, :order => 'salary DESC').collect { |dev| dev.salary }
+@@ -321,6 +321,51 @@ class DefaultScopingTest < ActiveRecord::TestCase
+     assert_equal expected, received
+   end
+ 
++  def test_lambda_default_scopes_can_be_combined
++    user_language = 'en'
++    date_holder = Date.new(2011,1,1)
++
++    klass = Class.new(ActiveRecord::Base) do
++      set_table_name 'notes'
++      default_scope lambda { where("due_date > ?", date_holder.to_s ) }
++      default_scope lambda { where(:language => user_language) }
++    end
++
++    assert_equal 1, klass.scoped.count
++    date_holder -= 2*365
++    assert_equal 2, klass.scoped.count
++    user_language = 'pl'
++    assert_equal 1, klass.scoped.count
++  end
++
++  def test_relation_default_scopes_dont_overwrite_lambdas
++    date_holder = Date.new(2011,1,1)
++
++    klass = Class.new(ActiveRecord::Base) do
++      set_table_name 'notes'
++      default_scope lambda { where("due_date > ?", date_holder.to_s ) }
++      default_scope where(:deleted => 0)
++    end
++
++    assert_equal 1, klass.scoped.count
++    date_holder -= 365
++    assert_equal 2, klass.scoped.count
++  end
++
++  def test_relation_named_scopes_dont_overwrite_lambda_default_scopes
++    date_holder = Date.new(2011,1,1)
++
++    klass = Class.new(ActiveRecord::Base) do
++      set_table_name 'notes'
++      default_scope lambda { where("due_date > ?", date_holder.to_s ) }
++      scope :active, where(:deleted => 0)
++    end
++
++    assert_equal 1, klass.active.count
++    date_holder -= 365
++    assert_equal 2, klass.active.count
++  end
++
+   def test_default_scope_with_thing_that_responds_to_call
+     klass = Class.new(ActiveRecord::Base) do
+       self.table_name = 'posts'
+diff --git a/activerecord/test/fixtures/notes.yml b/activerecord/test/fixtures/notes.yml
+new file mode 100644
+index 0000000..9fba26a
+--- /dev/null
++++ b/activerecord/test/fixtures/notes.yml
+@@ -0,0 +1,23 @@
++first:
++  deleted: 0
++  content: First note
++  language: en
++second:
++  deleted: 0
++  content: Second note
++  language: pl
++  due_date: "2009-10-10"
++deleted_note:
++  deleted: 1
++  content: deleted_note
++  language: en
++a_todo:
++  deleted: 0
++  content: a_todo
++  language: en
++  due_date: "2011-11-10"
++an_old_todo:
++  deleted: 0
++  content: an_old_todo
++  language: en
++  due_date: "2010-10-10"
+diff --git a/activerecord/test/models/note.rb b/activerecord/test/models/note.rb
+new file mode 100644
+index 0000000..d643c16
+--- /dev/null
++++ b/activerecord/test/models/note.rb
+@@ -0,0 +1,4 @@
++class Note < ActiveRecord::Base
++  default_scope where(:deleted => 0)
++  scope :english, where(:language => 'en')
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 5f9bb7e..643051b 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -366,6 +366,13 @@ ActiveRecord::Schema.define do
+     end
+   end
+ 
++  create_table :notes, :force => true do |t|
++    t.boolean :deleted, :default => 0
++    t.string  :content
++    t.string  :language
++    t.datetime :due_date, :default => nil
++  end
++
+   create_table :orders, :force => true do |t|
+     t.string  :name
+     t.integer :billing_customer_id
+-- 
+1.7.3.5
+
+
+From 82a390162dbea9d2b8739cde4ab9ddcdc8329a7a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Adam=20Wro=CC=81bel?= <adam@fluxinc.ca>
+Date: Sun, 30 Jan 2011 22:06:53 +0100
+Subject: [PATCH 4/5] Keep a without_default (scope) clone for every ActiveRecord::Relation.
+
+default_scope and named scopes use that thinner clone to get rid of old
+results of default_scope lambdas. Also this allows us to use named scopes
+like this:
+
+Post.unscoped.published
+---
+ activerecord/lib/active_record/base.rb             |   11 +++++++--
+ activerecord/lib/active_record/named_scope.rb      |    6 ++++-
+ activerecord/lib/active_record/relation.rb         |   15 +++++++++++++-
+ .../lib/active_record/relation/query_methods.rb    |   21 +++++++++++++++++++-
+ .../lib/active_record/relation/spawn_methods.rb    |    7 ++++++
+ 5 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 6a62823..db56456 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1146,12 +1146,17 @@ MSG
+ 
+           if previous.respond_to?(:call) or options.respond_to?(:call)
+             new_default_scope = lambda do
+-              sane_options = options.respond_to?(:call) ? options.call : options
+-              sane_previous = previous.respond_to?(:call) ? previous.call : previous
+-              construct_finder_arel sane_options, sane_previous
++              sane_options = options.respond_to?(:call) ? relation.scoping{ options.call } : options
++              sane_options = sane_options.without_default if sane_options.respond_to? :without_default
++              sane_previous = previous.respond_to?(:call) ? relation.scoping{ previous.call } : previous
++
++              new_scope = construct_finder_arel sane_options, sane_previous
++              new_scope.without_default = relation
++              new_scope
+             end
+           else
+             new_default_scope = construct_finder_arel options, previous
++            new_default_scope.without_default = relation
+           end
+ 
+           self.default_scoping = default_scoping << new_default_scope
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 0f42156..96cbd1a 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -111,7 +111,11 @@ module ActiveRecord
+           relation = if options.is_a?(Hash)
+             scoped.apply_finder_options(options)
+           elsif options
+-            scoped.merge(options)
++            if options.respond_to? :without_default
++              scoped.merge(options.without_default)
++            else
++              scoped.merge(options)
++            end
+           else
+             scoped
+           end
+diff --git a/activerecord/lib/active_record/relation.rb b/activerecord/lib/active_record/relation.rb
+index 1441e97..97f936a 100644
+--- a/activerecord/lib/active_record/relation.rb
++++ b/activerecord/lib/active_record/relation.rb
+@@ -370,13 +370,26 @@ module ActiveRecord
+       to_a.inspect
+     end
+ 
++    def without_default?
++      defined?(@without_default) and !!@without_default
++    end
++
++    def without_default= clean
++      @without_default = clean
++    end
++
++    def without_default
++      return @without_default if defined? @without_default
++      self
++    end
++
+     protected
+ 
+     def method_missing(method, *args, &block)
+       if Array.method_defined?(method)
+         to_a.send(method, *args, &block)
+       elsif @klass.scopes[method]
+-        merge(@klass.send(method, *args, &block))
++        scoping { merge(@klass.send(method, *args, &block)) }
+       elsif @klass.respond_to?(method)
+         scoping { @klass.send(method, *args, &block) }
+       elsif arel.respond_to?(method)
+diff --git a/activerecord/lib/active_record/relation/query_methods.rb b/activerecord/lib/active_record/relation/query_methods.rb
+index 2cbb103..ce87cf5 100644
+--- a/activerecord/lib/active_record/relation/query_methods.rb
++++ b/activerecord/lib/active_record/relation/query_methods.rb
+@@ -17,6 +17,7 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.includes_values = (relation.includes_values + args).flatten.uniq
++      relation.without_default = without_default.includes(*args) if without_default?
+       relation
+     end
+ 
+@@ -25,6 +26,7 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.eager_load_values += args
++      relation.without_default = without_default.eager_load(*args) if without_default?
+       relation
+     end
+ 
+@@ -33,6 +35,7 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.preload_values += args
++      relation.without_default = without_default.preload(*args) if without_default?
+       relation
+     end
+ 
+@@ -42,6 +45,7 @@ module ActiveRecord
+       else
+         relation = clone
+         relation.select_values += Array.wrap(value)
++        relation.without_default = without_default.select(value) if without_default?
+         relation
+       end
+     end
+@@ -51,6 +55,7 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.group_values += args.flatten
++      relation.without_default = without_default.group(*args) if without_default?
+       relation
+     end
+ 
+@@ -59,6 +64,7 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.order_values += args.flatten
++      relation.without_default = without_default.order(*args) if without_default?
+       relation
+     end
+ 
+@@ -70,12 +76,14 @@ module ActiveRecord
+       args.flatten!
+       relation.joins_values += args
+ 
++      relation.without_default = without_default.joins(*args) if without_default?
+       relation
+     end
+ 
+     def bind(value)
+       relation = clone
+       relation.bind_values += [value]
++      relation.without_default = without_default.bind(value) if without_default?
+       relation
+     end
+ 
+@@ -84,6 +92,7 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.where_values += build_where(opts, rest)
++      relation.without_default = without_default.where(opts, *rest) if without_default?
+       relation
+     end
+ 
+@@ -92,18 +101,21 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.having_values += build_where(*args)
++      relation.without_default = without_default.having(*args) if without_default?
+       relation
+     end
+ 
+     def limit(value)
+       relation = clone
+       relation.limit_value = value
++      relation.without_default = without_default.limit(value) if without_default?
+       relation
+     end
+ 
+     def offset(value)
+       relation = clone
+       relation.offset_value = value
++      relation.without_default = without_default.offset(value) if without_default?
+       relation
+     end
+ 
+@@ -117,24 +129,28 @@ module ActiveRecord
+         relation.lock_value = false
+       end
+ 
++      relation.without_default = without_default.lock(locks) if without_default?
+       relation
+     end
+ 
+     def readonly(value = true)
+       relation = clone
+       relation.readonly_value = value
++      relation.without_default = without_default.readonly(value) if without_default?
+       relation
+     end
+ 
+     def create_with(value)
+       relation = clone
+       relation.create_with_value = value && (@create_with_value || {}).merge(value)
++      relation.without_default = without_default.create_with(value) if without_default?
+       relation
+     end
+ 
+     def from(value)
+       relation = clone
+       relation.from_value = value
++      relation.without_default = without_default.from(value) if without_default?
+       relation
+     end
+ 
+@@ -145,6 +161,7 @@ module ActiveRecord
+ 
+       relation = clone
+       relation.send(:apply_modules, modules.flatten)
++      relation.without_default = without_default.extending(*modules) if without_default?
+       relation
+     end
+ 
+@@ -155,7 +172,9 @@ module ActiveRecord
+         "#{table_name}.#{primary_key} DESC" :
+         reverse_sql_order(order_clause).join(', ')
+ 
+-      except(:order).order(Arel.sql(order))
++      relation = except(:order).order(Arel.sql(order))
++      relation.without_default = without_default.reverse_order if without_default?
++      relation
+     end
+ 
+     def arel
+diff --git a/activerecord/lib/active_record/relation/spawn_methods.rb b/activerecord/lib/active_record/relation/spawn_methods.rb
+index db5f1af..451fc89 100644
+--- a/activerecord/lib/active_record/relation/spawn_methods.rb
++++ b/activerecord/lib/active_record/relation/spawn_methods.rb
+@@ -58,6 +58,10 @@ module ActiveRecord
+       # Apply scope extension modules
+       merged_relation.send :apply_modules, r.extensions
+ 
++      if without_default? or r.without_default?
++        merged_relation.without_default = without_default.merge r.without_default
++      end
++
+       merged_relation
+     end
+ 
+@@ -74,6 +78,7 @@ module ActiveRecord
+         result.send(:"#{method}_value=", send(:"#{method}_value"))
+       end
+ 
++      result.without_default = without_default.except(*skips) if without_default?
+       result
+     end
+ 
+@@ -88,6 +93,7 @@ module ActiveRecord
+         result.send(:"#{method}_value=", send(:"#{method}_value"))
+       end
+ 
++      result.without_default = without_default.only(*onlies) if without_default?
+       result
+     end
+ 
+@@ -110,6 +116,7 @@ module ActiveRecord
+       relation = relation.includes(finders[:include]) if options.has_key?(:include)
+       relation = relation.extending(finders[:extend]) if options.has_key?(:extend)
+ 
++      relation.without_default = without_default.apply_finder_options(options) if without_default?
+       relation
+     end
+ 
+-- 
+1.7.3.5
+
+
+From 6090ad2e5efd912b2948add2ac64e6ef160ca651 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Adam=20Wro=CC=81bel?= <adam@fluxinc.ca>
+Date: Mon, 31 Jan 2011 06:15:04 +0100
+Subject: [PATCH 5/5] Update the documentation.
+
+Remove the part about Post.unscoped.published and Post.published being the
+same thing.
+---
+ activerecord/lib/active_record/base.rb |    5 -----
+ 1 files changed, 0 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index db56456..db4fd5c 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -852,11 +852,6 @@ module ActiveRecord #:nodoc:
+       #     limit(10) # Fires "SELECT * FROM posts LIMIT 10"
+       #   }
+       #
+-      # It is recommended to use block form of unscoped because chaining unscoped with <tt>scope</tt>
+-      # does not work. Assuming that <tt>published</tt> is a <tt>scope</tt> following two statements are same.
+-      #
+-      # Post.unscoped.published
+-      # Post.published
+       def unscoped #:nodoc:
+         block_given? ? relation.scoping { yield } : relation
+       end
+-- 
+1.7.3.5
+

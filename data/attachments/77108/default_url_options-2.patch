@@ -1,0 +1,266 @@
+From 236b64c0b1f9758b8ccc87e2b6fe7e2055f3f64a Mon Sep 17 00:00:00 2001
+From: Iain Hecker <github@iain.nl>
+Date: Sat, 10 Jan 2009 02:18:33 +0100
+Subject: [PATCH 1/2] Don't fill routing segments filled by default_url_options with nameless route parameters
+
+---
+ .../lib/action_controller/routing/route_set.rb     |   59 +++++++++++---------
+ actionpack/test/controller/base_test.rb            |   32 +++++++++++
+ 2 files changed, 64 insertions(+), 27 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index 044ace7..1d66ea4 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -173,33 +173,38 @@ module ActionController
+             #   foo_url(bar, baz, bang, :sort_by => 'baz')
+             #
+             named_helper_module_eval <<-end_eval # We use module_eval to avoid leaks
+-              def #{selector}(*args)                                                        # def users_url(*args)
+-                                                                                            #
+-                #{generate_optimisation_block(route, kind)}                                 #   #{generate_optimisation_block(route, kind)}
+-                                                                                            #
+-                opts = if args.empty? || Hash === args.first                                #   opts = if args.empty? || Hash === args.first
+-                  args.first || {}                                                          #     args.first || {}
+-                else                                                                        #   else
+-                  options = args.extract_options!                                           #     options = args.extract_options!
+-                  args = args.zip(#{route.segment_keys.inspect}).inject({}) do |h, (v, k)|  #     args = args.zip([]).inject({}) do |h, (v, k)|
+-                    h[k] = v                                                                #       h[k] = v
+-                    h                                                                       #       h
+-                  end                                                                       #     end
+-                  options.merge(args)                                                       #     options.merge(args)
+-                end                                                                         #   end
+-                                                                                            #
+-                url_for(#{hash_access_method}(opts))                                        #   url_for(hash_for_users_url(opts))
+-                                                                                            #
+-              end                                                                           # end
+-              #Add an alias to support the now deprecated formatted_* URL.                  # #Add an alias to support the now deprecated formatted_* URL.
+-              def formatted_#{selector}(*args)                                              # def formatted_users_url(*args)
+-                ActiveSupport::Deprecation.warn(                                            #   ActiveSupport::Deprecation.warn(
+-                  "formatted_#{selector}() has been deprecated. " +                         #     "formatted_users_url() has been deprecated. " +
+-                  "Please pass format to the standard " +                                   #     "Please pass format to the standard " +
+-                  "#{selector} method instead.", caller)                                    #     "users_url method instead.", caller)
+-                #{selector}(*args)                                                          #   users_url(*args)
+-              end                                                                           # end
+-              protected :#{selector}                                                        # protected :users_url
++              def #{selector}(*args)                                            # def users_url(*args)
++                                                                                #
++                #{generate_optimisation_block(route, kind)}                     #   #{generate_optimisation_block(route, kind)}
++                                                                                #
++                opts = if args.empty? || Hash === args.first                    #   opts = if args.empty? || Hash === args.first
++                  args.first || {}                                              #     args.first || {}
++                else                                                            #   else
++                  options = args.extract_options!                               #     options = args.extract_options!
++                  route_segments = #{route.segment_keys.inspect}                #     route_segments = []
++                  if respond_to?(:default_url_options) &&                       #     if respond_to?(:default_url_options) &&
++                      default_url_options.respond_to?(:symbolize_keys)          #         default_url_options.respond_to?(:symbolize_keys)
++                    route_segments -= default_url_options.symbolize_keys.keys   #       route_segments -= default_url_options.symbolize_keys.keys
++                  end                                                           #     end
++                  args = args.zip(route_segments).inject({}) do |h, (v, k)|     #     args = args.zip([]).inject({}) do |h, (v, k)|
++                    h[k] = v                                                    #       h[k] = v
++                    h                                                           #       h
++                  end                                                           #     end
++                  options.merge(args)                                           #     options.merge(args)
++                end                                                             #   end
++                                                                                #
++                url_for(#{hash_access_method}(opts))                            #   url_for(hash_for_users_url(opts))
++                                                                                #
++              end                                                               # end
++              #Add an alias to support the now deprecated formatted_* URL.      # #Add an alias to support the now deprecated formatted_* URL.
++              def formatted_#{selector}(*args)                                  # def formatted_users_url(*args)
++                ActiveSupport::Deprecation.warn(                                #   ActiveSupport::Deprecation.warn(
++                  "formatted_#{selector}() has been deprecated. " +             #     "formatted_users_url() has been deprecated. " +
++                  "Please pass format to the standard " +                       #     "Please pass format to the standard " +
++                  "#{selector} method instead.", caller)                        #     "users_url method instead.", caller)
++                #{selector}(*args)                                              #   users_url(*args)
++              end                                                               # end
++              protected :#{selector}                                            # protected :users_url
+             end_eval
+             helpers << selector
+           end
+diff --git a/actionpack/test/controller/base_test.rb b/actionpack/test/controller/base_test.rb
+index 9523189..8ffc1ff 100644
+--- a/actionpack/test/controller/base_test.rb
++++ b/actionpack/test/controller/base_test.rb
+@@ -58,6 +58,14 @@ class DefaultUrlOptionsController < ActionController::Base
+   end
+ end
+ 
++class DefaultUrlOptionsResourcesController < ActionController::Base
++  def index; end
++  def show; end
++  def default_url_options(options = nil)
++    { 'locale' => :en }
++  end
++end
++
+ class ControllerClassTests < Test::Unit::TestCase
+   def test_controller_path
+     assert_equal 'empty', EmptyController.controller_path
+@@ -166,6 +174,30 @@ class PerformActionTest < ActionController::TestCase
+   end
+ end
+ 
++class DefaultUrlOptionsResourcesControllerTest < ActionController::TestCase
++  tests DefaultUrlOptionsResourcesController
++
++  def setup
++    @request.host = 'www.example.com'
++    rescue_action_in_public!
++  end
++
++  def test_assigned_route_segments_are_filled_before_filling_is_done_from_left_to_right
++    ActionController::Routing::Routes.draw do |map|
++      map.resources :default_url_options_resources, :path_prefix => '/:locale'
++    end
++    get :index # Make a dummy request so that the controller is initialized properly.
++    assert_equal 'http://www.example.com/en/default_url_options_resources', @controller.send(:default_url_options_resources_url)
++    assert_equal 'http://www.example.com/en/default_url_options_resources/1337', @controller.send(:default_url_options_resource_url, 1337)
++    assert_equal 'http://www.example.com/en/default_url_options_resources/1337', @controller.send(:default_url_options_resource_url, :id => 1337)
++    assert_equal 'http://www.example.com/de/default_url_options_resources/1337', @controller.send(:default_url_options_resource_url, 1337, :locale => :de)
++    assert_equal 'http://www.example.com/en/default_url_options_resources/1337/edit', @controller.send(:edit_default_url_options_resource_url, 1337)
++  ensure
++    ActionController::Routing::Routes.load!
++  end
++
++end
++
+ class DefaultUrlOptionsTest < ActionController::TestCase
+   tests DefaultUrlOptionsController
+ 
+-- 
+1.6.1
+
+
+From d16b60fc05c31b850cf2b7ea0f23d92292fbbe50 Mon Sep 17 00:00:00 2001
+From: Iain Hecker <github@iain.nl>
+Date: Sat, 10 Jan 2009 16:37:46 +0100
+Subject: [PATCH 2/2] default_url_options are fetched from the controller when in views and options are passed to it, if the method is defined with options parameter
+
+---
+ .../lib/action_controller/routing/route_set.rb     |   85 ++++++++++++--------
+ actionpack/test/controller/base_test.rb            |    4 +-
+ 2 files changed, 55 insertions(+), 34 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index 1d66ea4..75f1148 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -172,39 +172,60 @@ module ActionController
+             #
+             #   foo_url(bar, baz, bang, :sort_by => 'baz')
+             #
++            # Also removes any options provided by default_url_options so
++            # they don't get filled by
++            #
++            #   foo_url(bar, baz, bang)
++            #
++            # When a option before bar should be filled by default_url_options.
++            #
+             named_helper_module_eval <<-end_eval # We use module_eval to avoid leaks
+-              def #{selector}(*args)                                            # def users_url(*args)
+-                                                                                #
+-                #{generate_optimisation_block(route, kind)}                     #   #{generate_optimisation_block(route, kind)}
+-                                                                                #
+-                opts = if args.empty? || Hash === args.first                    #   opts = if args.empty? || Hash === args.first
+-                  args.first || {}                                              #     args.first || {}
+-                else                                                            #   else
+-                  options = args.extract_options!                               #     options = args.extract_options!
+-                  route_segments = #{route.segment_keys.inspect}                #     route_segments = []
+-                  if respond_to?(:default_url_options) &&                       #     if respond_to?(:default_url_options) &&
+-                      default_url_options.respond_to?(:symbolize_keys)          #         default_url_options.respond_to?(:symbolize_keys)
+-                    route_segments -= default_url_options.symbolize_keys.keys   #       route_segments -= default_url_options.symbolize_keys.keys
+-                  end                                                           #     end
+-                  args = args.zip(route_segments).inject({}) do |h, (v, k)|     #     args = args.zip([]).inject({}) do |h, (v, k)|
+-                    h[k] = v                                                    #       h[k] = v
+-                    h                                                           #       h
+-                  end                                                           #     end
+-                  options.merge(args)                                           #     options.merge(args)
+-                end                                                             #   end
+-                                                                                #
+-                url_for(#{hash_access_method}(opts))                            #   url_for(hash_for_users_url(opts))
+-                                                                                #
+-              end                                                               # end
+-              #Add an alias to support the now deprecated formatted_* URL.      # #Add an alias to support the now deprecated formatted_* URL.
+-              def formatted_#{selector}(*args)                                  # def formatted_users_url(*args)
+-                ActiveSupport::Deprecation.warn(                                #   ActiveSupport::Deprecation.warn(
+-                  "formatted_#{selector}() has been deprecated. " +             #     "formatted_users_url() has been deprecated. " +
+-                  "Please pass format to the standard " +                       #     "Please pass format to the standard " +
+-                  "#{selector} method instead.", caller)                        #     "users_url method instead.", caller)
+-                #{selector}(*args)                                              #   users_url(*args)
+-              end                                                               # end
+-              protected :#{selector}                                            # protected :users_url
++              def #{selector}(*args)                                                            # def users_url(*args)
++                                                                                                #
++                #{generate_optimisation_block(route, kind)}                                     #   #{generate_optimisation_block(route, kind)}
++                                                                                                #
++                opts = if args.empty? || Hash === args.first                                    #   opts = if args.empty? || Hash === args.first
++                  args.first || {}                                                              #     args.first || {}
++                else                                                                            #   else
++                  options = args.extract_options!                                               #     options = args.extract_options!
++                  route_segments = #{route.segment_keys.inspect}                                #     route_segments = []
++                  kontroller = if respond_to?(:default_url_options)                             #   kontroller = if respond_to?(:default_url_options)
++                    self                                                                        #     self
++                  else                                                                          #   else
++                    if respond_to?(:controller) &&                                              #     if respond_to?(:controller) &&
++                        controller.respond_to?(:default_url_options)                            #         controller.respond_to?(:default_url_options)
++                      controller                                                                #       controller
++                    end                                                                         #     end
++                  end                                                                           #   end
++                  if kontroller                                                                 #   if kontroller
++                    default_segments = if kontroller.method(:default_url_options).arity.zero?   #     default_segments = if kontroller.method(:default_url_options).arity.zero?
++                      kontroller.send(:default_url_options)                                     #       kontroller.send(:default_url_options)
++                    else                                                                        #     else
++                      kontroller.send(:default_url_options, options)                            #       kontroller.send(:default_url_options, options)
++                    end                                                                         #     end
++                    if default_segments.respond_to?(:symbolize_keys)                            #     if default_segments.respond_to?(:symbolize_keys)
++                      route_segments -= default_segments.symbolize_keys.keys                    #       route_segments -= default_segments.symbolize_keys.keys
++                    end                                                                         #     end
++                  end                                                                           #   end
++                  args = args.zip(route_segments).inject({}) do |h, (v, k)|                     #     args = args.zip([]).inject({}) do |h, (v, k)|
++                    h[k] = v                                                                    #       h[k] = v
++                    h                                                                           #       h
++                  end                                                                           #     end
++                  options.merge(args)                                                           #     options.merge(args)
++                end                                                                             #   end
++                                                                                                #
++                url_for(#{hash_access_method}(opts))                                            #   url_for(hash_for_users_url(opts))
++                                                                                                #
++              end                                                                               # end
++              #Add an alias to support the now deprecated formatted_* URL.                      # #Add an alias to support the now deprecated formatted_* URL.
++              def formatted_#{selector}(*args)                                                  # def formatted_users_url(*args)
++                ActiveSupport::Deprecation.warn(                                                #   ActiveSupport::Deprecation.warn(
++                  "formatted_#{selector}() has been deprecated. " +                             #     "formatted_users_url() has been deprecated. " +
++                  "Please pass format to the standard " +                                       #     "Please pass format to the standard " +
++                  "#{selector} method instead.", caller)                                        #     "users_url method instead.", caller)
++                #{selector}(*args)                                                              #   users_url(*args)
++              end                                                                               # end
++              protected :#{selector}                                                            # protected :users_url
+             end_eval
+             helpers << selector
+           end
+diff --git a/actionpack/test/controller/base_test.rb b/actionpack/test/controller/base_test.rb
+index 8ffc1ff..2a1115f 100644
+--- a/actionpack/test/controller/base_test.rb
++++ b/actionpack/test/controller/base_test.rb
+@@ -62,7 +62,7 @@ class DefaultUrlOptionsResourcesController < ActionController::Base
+   def index; end
+   def show; end
+   def default_url_options(options = nil)
+-    { 'locale' => :en }
++    { :locale => :en }
+   end
+ end
+ 
+@@ -190,7 +190,7 @@ class DefaultUrlOptionsResourcesControllerTest < ActionController::TestCase
+     assert_equal 'http://www.example.com/en/default_url_options_resources', @controller.send(:default_url_options_resources_url)
+     assert_equal 'http://www.example.com/en/default_url_options_resources/1337', @controller.send(:default_url_options_resource_url, 1337)
+     assert_equal 'http://www.example.com/en/default_url_options_resources/1337', @controller.send(:default_url_options_resource_url, :id => 1337)
+-    assert_equal 'http://www.example.com/de/default_url_options_resources/1337', @controller.send(:default_url_options_resource_url, 1337, :locale => :de)
++    assert_equal 'http://www.example.com/de/default_url_options_resources/1337', @controller.send(:default_url_options_resource_url, 1337, :locale => :de), "Override the default_url_options has failed!"
+     assert_equal 'http://www.example.com/en/default_url_options_resources/1337/edit', @controller.send(:edit_default_url_options_resource_url, 1337)
+   ensure
+     ActionController::Routing::Routes.load!
+-- 
+1.6.1
+

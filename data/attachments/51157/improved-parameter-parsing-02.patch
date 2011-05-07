@@ -1,0 +1,204 @@
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index 976bd98..56f946c 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -5,6 +5,7 @@ require 'action_controller/routing'
+ require 'action_controller/resources'
+ require 'action_controller/url_rewriter'
+ require 'action_controller/status_codes'
++require 'action_controller/url_encoded_pair_parser'
+ require 'action_view'
+ require 'drb'
+ require 'set'
+@@ -363,6 +364,19 @@ module ActionController #:nodoc:
+     class_inheritable_accessor :allow_forgery_protection
+     self.allow_forgery_protection = true
+ 
++    # If your application relies on earlier versions of the
++    # <tt>UrlEncodedPairParser</tt> code, you can use this configuration
++    # setting to specify which parser implementation you want to use.
++    # This defaults to
++    # <tt>ActionController::UrlEncodedPairParser</tt>, which is the new
++    # implementation. The old parser is
++    # <tt>ActionController::AbstractRequest::LegacyUrlEncodedPairParser</tt>.
++    cattr_writer :pair_parser
++
++    def self.pair_parser
++      @@pair_parser || ActionController::UrlEncodedPairParser
++    end
++
+     # If you are deploying to a subdirectory, you will need to set
+     # <tt>config.action_controller.relative_url_root</tt>
+     # This defaults to ENV['RAILS_RELATIVE_URL_ROOT']
+diff --git a/actionpack/lib/action_controller/request.rb b/actionpack/lib/action_controller/request.rb
+index 5e492e3..f22738a 100755
+--- a/actionpack/lib/action_controller/request.rb
++++ b/actionpack/lib/action_controller/request.rb
+@@ -538,11 +538,11 @@ EOM
+           [ CGI.unescape(key), value ]
+         end.compact
+ 
+-        UrlEncodedPairParser.new(pairs).result
++        new_parser(pairs).result
+       end
+ 
+       def parse_request_parameters(params)
+-        parser = UrlEncodedPairParser.new
++        parser = new_parser
+ 
+         params = params.dup
+         until params.empty?
+@@ -589,6 +589,10 @@ EOM
+ 
+ 
+       private
++        def new_parser(params=[])
++          ActionController::Base.pair_parser.new(params)
++        end
++
+         def get_typed_value(value)
+           case value
+             when String
+@@ -729,7 +733,7 @@ EOM
+     end
+   end
+ 
+-  class UrlEncodedPairParser < StringScanner #:nodoc:
++  class LegacyUrlEncodedPairParser < StringScanner #:nodoc:
+     attr_reader :top, :parent, :result
+ 
+     def initialize(pairs = [])
+diff --git a/actionpack/lib/action_controller/url_encoded_pair_parser.rb b/actionpack/lib/action_controller/url_encoded_pair_parser.rb
+new file mode 100644
+index 0000000..b75856e
+--- /dev/null
++++ b/actionpack/lib/action_controller/url_encoded_pair_parser.rb
+@@ -0,0 +1,61 @@
++require 'strscan'
++
++module ActionController
++  # This implementation of UrlEncodedPairParser supersedes the previous
++  # implementation in <tt>ActionController::AbstractRequest</tt>, providing
++  # better support for complex and nested forms in Rails.
++  class UrlEncodedPairParser
++    attr_reader :result
++
++    def initialize(params=[])
++      @result = {}
++      params.each { |key, value| parse(key, value) }
++    end
++
++    ROOT_REGEX = /[^\[]+/
++    ARRAY_REGEX = /\[([0-9]*)\]/
++    HASH_REGEX = /\[([^\]]+)\]/
++
++    # Parse a single key/value pair into the internal parameter hash.
++    def parse(key, value)
++      lex = StringScanner.new(key)
++      current = lex.scan(ROOT_REGEX) or return
++      ref = result
++
++      until lex.eos?
++        if lex.scan(ARRAY_REGEX)
++          ref[current] ||= []
++          check_type(Array, ref, current)
++          if lex[1].empty?
++            key = ref[current].length
++          else
++            key = lex[1].to_i
++          end
++        elsif lex.scan(HASH_REGEX)
++          ref[current] ||= {}.with_indifferent_access
++          check_type(Hash, ref, current)
++          key = lex[1]
++        else
++          break
++        end
++        ref = ref[current]
++        current = key
++      end
++
++      ref[current] = value
++      result
++    end
++
++    # If we receive parameters indicating a key being treated as both an
++    # Array and a Hash, we complain about it.
++    def check_type(expected, actual, key)
++      if !actual[key].kind_of?(expected)
++        raise TypeError,
++          "Ambiguous type encountered while parsing parameters: expected " +
++          "#{expected} but got #{actual[key].class} for key #{key} in " +
++          "#{actual.inspect}"
++      end
++    end
++  end
++end
++
+diff --git a/actionpack/test/controller/request_test.rb b/actionpack/test/controller/request_test.rb
+index e79a0ea..f397176 100644
+--- a/actionpack/test/controller/request_test.rb
++++ b/actionpack/test/controller/request_test.rb
+@@ -434,7 +434,7 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_deep_query_string_with_array_of_hash
+     assert_equal({'x' => {'y' => [{'z' => '10'}]}}, ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10'))
+-    assert_equal({'x' => {'y' => [{'z' => '10', 'w' => '10'}]}}, ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10&x[y][][w]=10'))
++    assert_equal({'x' => {'y' => [{'z' => '10'}, {'w' => '10'}]}}, ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10&x[y][][w]=10'))
+   end
+ 
+   def test_deep_query_string_with_array_of_hashes_with_one_pair
+@@ -445,7 +445,7 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_deep_query_string_with_array_of_hashes_with_multiple_pairs
+     assert_equal(
+-      {'x' => {'y' => [{'z' => '10', 'w' => 'a'}, {'z' => '20', 'w' => 'b'}]}},
++      {'x' => {'y' => [{'z' => '10'}, {'w' => 'a'}, {'z' => '20'}, {'w' => 'b'}]}},
+       ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10&x[y][][w]=a&x[y][][z]=20&x[y][][w]=b')
+     )
+   end
+@@ -513,10 +513,11 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_request_hash_parsing
+     query = {
+-      "note[viewers][viewer][][type]" => ["User", "Group"],
+-      "note[viewers][viewer][][id]"   => ["1", "2"]
++      "note[viewers][viewer][0][type]" => ["User"],
++      "note[viewers][viewer][0][id]"   => ["1"],
++      "note[viewers][viewer][1][type]" => ["Group"],
++      "note[viewers][viewer][1][id]"   => ["2"],
+     }
+-
+     expected = { "note" => { "viewers"=>{"viewer"=>[{ "id"=>"1", "type"=>"User"}, {"type"=>"Group", "id"=>"2"} ]} } }
+ 
+     assert_equal(expected, ActionController::AbstractRequest.parse_request_parameters(query))
+@@ -663,25 +664,25 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_parse_params_with_single_brackets_in_middle
+     input     = { "a/b[c]d" =>  %w(e) }
+-    expected  = { "a/b" => {} }
++    expected  = { "a/b" => { "c" => "e" } }
+     assert_equal expected, ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 
+   def test_parse_params_with_separated_brackets
+     input     = { "a/b@[c]d[e]" =>  %w(f) }
+-    expected  = { "a/b@" => { }}
++    expected  = { "a/b@" => { "c" => "f" }}
+     assert_equal expected, ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 
+   def test_parse_params_with_separated_brackets_and_array
+     input     = { "a/b@[c]d[e][]" =>  %w(f) }
+-    expected  = { "a/b@" => { }}
++    expected  = { "a/b@" => { "c" => "f" }}
+     assert_equal expected , ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 
+   def test_parse_params_with_unmatched_brackets_and_array
+     input     = { "a/b@[c][d[e][]" =>  %w(f) }
+-    expected  = { "a/b@" => { "c" => { }}}
++    expected  = { "a/b@" => { "c" => { "d[e" => ["f"] }}}
+     assert_equal expected, ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 

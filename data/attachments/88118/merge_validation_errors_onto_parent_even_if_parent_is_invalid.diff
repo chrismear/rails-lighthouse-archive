@@ -1,0 +1,192 @@
+From 69066718c475d52a7b36d3e704adcbb2401a4632 Mon Sep 17 00:00:00 2001
+From: Gaspard Bucher <gaspard@teti.ch>
+Date: Tue, 10 Feb 2009 17:43:51 +0100
+Subject: [PATCH] Autosave should check the validity of the associations even if the master record is not valid so that the end user has all errors (consistent with has_many et al. validations).
+
+---
+ .../lib/active_record/autosave_association.rb      |   21 ++++++++-----------
+ .../test/cases/autosave_association_test.rb        |   14 +++++++++++++
+ 2 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 680b415..75aea87 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -175,21 +175,18 @@ module ActiveRecord
+ 
+     # Returns whether or not the parent, <tt>self</tt>, and any loaded autosave associations are valid.
+     def valid_with_autosave_associations?
+-      if valid_without_autosave_associations?
+-        self.class.reflect_on_all_autosave_associations.all? do |reflection|
+-          if (association = association_instance_get(reflection.name)) && association.loaded?
+-            if association.is_a?(Array)
+-              association.proxy_target.all? { |child| autosave_association_valid?(reflection, child) }
+-            else
+-              autosave_association_valid?(reflection, association)
+-            end
++      record_valid = valid_without_autosave_associations?
++      self.class.reflect_on_all_autosave_associations.all? do |reflection|
++        if (association = association_instance_get(reflection.name)) && association.loaded?
++          if association.is_a?(Array)
++            association.proxy_target.all? { |child| autosave_association_valid?(reflection, child) }
+           else
+-            true # association not loaded yet, so it should be valid
++            autosave_association_valid?(reflection, association)
+           end
++        else
++          true # association not loaded yet, so it should be valid
+         end
+-      else
+-        false # self was not valid
+-      end
++      end && record_valid
+     end
+ 
+     # Returns whether or not the association is valid and applies any errors to the parent, <tt>self</tt>, if it wasn't.
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 381249c..3d64727 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -228,6 +228,20 @@ class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_not_load_the_associated_model
+     assert_queries(1) { @pirate.catchphrase = 'Arr'; @pirate.save! }
+   end
++  
++  def test_should_merge_errors_in_the_associated_model
++    @pirate.ship.name = nil
++    assert !@pirate.save
++    assert_equal "can't be blank", @pirate.errors['ship_name']
++  end
++  
++  def test_should_merge_errors_in_the_associated_model_even_if_master_is_not_valid
++    @pirate.ship.name = nil
++    @pirate.catchphrase = nil
++    assert !@pirate.save
++    assert_equal "can't be blank", @pirate.errors['ship_name']
++    assert_equal "can't be blank", @pirate.errors['catchphrase']
++  end
+ end
+ 
+ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+-- 
+1.5.5.3
+
+
+From 5136fbe8d032c72aa1bc8935e7e9f59de07eb242 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Thu, 12 Feb 2009 13:27:12 +0100
+Subject: [PATCH] Added tests to verify that validations are ran on collection associations as well and that their error messages are merged onto the parent.
+
+---
+ .../lib/active_record/autosave_association.rb      |    4 +-
+ .../test/cases/autosave_association_test.rb        |   43 ++++++++++++++++---
+ 2 files changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 75aea87..8f38209 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -175,7 +175,7 @@ module ActiveRecord
+ 
+     # Returns whether or not the parent, <tt>self</tt>, and any loaded autosave associations are valid.
+     def valid_with_autosave_associations?
+-      record_valid = valid_without_autosave_associations?
++      parent_valid = valid_without_autosave_associations?
+       self.class.reflect_on_all_autosave_associations.all? do |reflection|
+         if (association = association_instance_get(reflection.name)) && association.loaded?
+           if association.is_a?(Array)
+@@ -186,7 +186,7 @@ module ActiveRecord
+         else
+           true # association not loaded yet, so it should be valid
+         end
+-      end && record_valid
++      end && parent_valid
+     end
+ 
+     # Returns whether or not the association is valid and applies any errors to the parent, <tt>self</tt>, if it wasn't.
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 3d64727..576466f 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -228,14 +228,15 @@ class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_not_load_the_associated_model
+     assert_queries(1) { @pirate.catchphrase = 'Arr'; @pirate.save! }
+   end
+-  
+-  def test_should_merge_errors_in_the_associated_model
++
++  def test_should_merge_errors_of_the_associated_model_onto_the_parent
+     @pirate.ship.name = nil
+     assert !@pirate.save
+     assert_equal "can't be blank", @pirate.errors['ship_name']
++    assert @pirate.errors.on(:ship).blank?
+   end
+-  
+-  def test_should_merge_errors_in_the_associated_model_even_if_master_is_not_valid
++
++  def test_should_merge_errors_of_the_associated_model_onto_the_parent_even_if_it_is_not_valid
+     @pirate.ship.name = nil
+     @pirate.catchphrase = nil
+     assert !@pirate.save
+@@ -306,13 +307,27 @@ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+     end
+ 
+     assert_raise(RuntimeError) { assert !@ship.save }
+-    # TODO: Why does using reload on @ship looses the associated pirate?
+     assert_equal before, [@ship.pirate.reload.catchphrase, @ship.reload.name]
+   end
+ 
+   def test_should_not_load_the_associated_model
+     assert_queries(1) { @ship.name = 'The Vile Insanity'; @ship.save! }
+   end
++
++  def test_should_merge_errors_of_the_associated_model_onto_the_parent
++    @ship.pirate.catchphrase = nil
++    assert !@ship.save
++    assert_equal "can't be blank", @ship.errors['pirate_catchphrase']
++    assert @ship.errors.on(:pirate).blank?
++  end
++
++  def test_should_merge_errors_of_the_associated_model_onto_the_parent_even_if_it_is_not_valid
++    @ship.pirate.catchphrase = nil
++    @ship.name = nil
++    assert !@ship.save
++    assert_equal "can't be blank", @ship.errors['name']
++    assert_equal "can't be blank", @ship.errors['pirate_catchphrase']
++  end
+ end
+ 
+ module AutosaveAssociationOnACollectionAssociationTests
+@@ -333,13 +348,27 @@ module AutosaveAssociationOnACollectionAssociationTests
+   end
+ 
+   def test_should_automatically_validate_the_associated_models
+-    @pirate.send(@association_name).each { |child| child.name = '' }
+-
++    @pirate.send(@association_name).each { |child| child.name = nil }
+     assert !@pirate.valid?
++  end
++
++  def test_should_merge_errors_of_the_associated_models_onto_the_parent
++    @pirate.send(@association_name).each { |child| child.name = nil }
++
++    assert !@pirate.save
+     assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
+     assert @pirate.errors.on(@association_name).blank?
+   end
+ 
++  def test_should_merge_errors_of_the_associated_models_onto_the_parent_even_if_it_is_not_valid
++    @pirate.send(@association_name).each { |child| child.name = nil }
++    @pirate.catchphrase = nil
++
++    assert !@pirate.save
++    assert_equal "can't be blank", @pirate.errors.on("catchphrase")
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++  end
++
+   def test_should_still_allow_to_bypass_validations_on_the_associated_models
+     @pirate.catchphrase = ''
+     @pirate.send(@association_name).each { |child| child.name = '' }
+-- 
+1.5.5.3
+

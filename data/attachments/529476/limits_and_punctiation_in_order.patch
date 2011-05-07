@@ -1,0 +1,110 @@
+From 2a614339d83a65478f8d5152cac715550487a394 Mon Sep 17 00:00:00 2001
+From: Santiago Pastorino <santiago@wyeworks.com>
+Date: Fri, 21 May 2010 00:46:02 -0300
+Subject: [PATCH] Fixes queries using limits and punctuation in order, removes order("col1, col2") usage ht: Adam Keys
+
+[#4597 state:committed]
+---
+ .../connection_adapters/postgresql_adapter.rb      |    6 +++---
+ .../lib/active_record/relation/finder_methods.rb   |    2 +-
+ .../associations/cascaded_eager_loading_test.rb    |    2 +-
+ activerecord/test/cases/associations/eager_test.rb |    4 ++--
+ activerecord/test/cases/relations_test.rb          |   14 +++++++++++++-
+ 5 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 34aaff2..6c66f04 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -845,12 +845,12 @@ module ActiveRecord
+       # requires that the ORDER BY include the distinct column.
+       #
+       #   distinct("posts.id", "posts.created_at desc")
+-      def distinct(columns, order_by) #:nodoc:
+-        return "DISTINCT #{columns}" if order_by.blank?
++      def distinct(columns, orders) #:nodoc:
++        return "DISTINCT #{columns}" if orders.empty?
+ 
+         # Construct a clean list of column names from the ORDER BY clause, removing
+         # any ASC/DESC modifiers
+-        order_columns = order_by.split(',').collect { |s| s.split.first }
++        order_columns = orders.collect { |s| s.split.first }
+         order_columns.delete_if(&:blank?)
+         order_columns = order_columns.zip((0...order_columns.size).to_a).map { |s,i| "#{s} AS alias_#{i}" }
+ 
+diff --git a/activerecord/lib/active_record/relation/finder_methods.rb b/activerecord/lib/active_record/relation/finder_methods.rb
+index 7a0c9dc..ad88648 100644
+--- a/activerecord/lib/active_record/relation/finder_methods.rb
++++ b/activerecord/lib/active_record/relation/finder_methods.rb
+@@ -215,7 +215,7 @@ module ActiveRecord
+     end
+ 
+     def construct_limited_ids_condition(relation)
+-      orders = relation.order_values.join(", ")
++      orders = relation.order_values
+       values = @klass.connection.distinct("#{@klass.connection.quote_table_name @klass.table_name}.#{@klass.primary_key}", orders)
+ 
+       ids_array = relation.select(values).collect {|row| row[@klass.primary_key]}
+diff --git a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+index fe558f9..23abb00 100644
+--- a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
++++ b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+@@ -97,7 +97,7 @@ class CascadedEagerLoadingTest < ActiveRecord::TestCase
+   end
+ 
+   def test_eager_association_loading_with_multiple_stis_and_order
+-    author = Author.find(:first, :include => { :posts => [ :special_comments , :very_special_comment ] }, :order => 'authors.name, comments.body, very_special_comments_posts.body', :conditions => 'posts.id = 4')
++    author = Author.find(:first, :include => { :posts => [ :special_comments , :very_special_comment ] }, :order => ['authors.name', 'comments.body', 'very_special_comments_posts.body'], :conditions => 'posts.id = 4')
+     assert_equal authors(:david), author
+     assert_no_queries do
+       author.posts.first.special_comments
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 445e688..3ddc6d5 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -578,8 +578,8 @@ class EagerAssociationTest < ActiveRecord::TestCase
+   end
+ 
+   def test_limited_eager_with_multiple_order_columns
+-    assert_equal posts(:thinking, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => 'UPPER(posts.title), posts.id', :limit => 2, :offset => 1)
+-    assert_equal posts(:sti_post_and_comments, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => 'UPPER(posts.title) DESC, posts.id', :limit => 2, :offset => 1)
++    assert_equal posts(:thinking, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => ['UPPER(posts.title)', 'posts.id'], :limit => 2, :offset => 1)
++    assert_equal posts(:sti_post_and_comments, :sti_comments), Post.find(:all, :include => [:author, :comments], :conditions => "authors.name = 'David'", :order => ['UPPER(posts.title) DESC', 'posts.id'], :limit => 2, :offset => 1)
+   end
+ 
+   def test_limited_eager_with_numeric_in_association
+diff --git a/activerecord/test/cases/relations_test.rb b/activerecord/test/cases/relations_test.rb
+index b6815af..e7493ff 100644
+--- a/activerecord/test/cases/relations_test.rb
++++ b/activerecord/test/cases/relations_test.rb
+@@ -14,7 +14,7 @@ require 'models/bird'
+ 
+ class RelationTest < ActiveRecord::TestCase
+   fixtures :authors, :topics, :entrants, :developers, :companies, :developers_projects, :accounts, :categories, :categorizations, :posts, :comments,
+-    :taggings
++    :tags, :taggings
+ 
+   def test_scoped
+     topics = Topic.scoped
+@@ -95,6 +95,18 @@ class RelationTest < ActiveRecord::TestCase
+     assert_equal entrants(:first).name, entrants.first.name
+   end
+ 
++  def test_finding_with_complex_order_and_limit
++    tags = Tag.includes(:taggings).order("LEAST(1,COS(1)*COS(-1)*COS(RADIANS(taggings.super_tag_id)))").limit(1).to_a
++
++    assert_equal 1, tags.length
++  end
++
++  def test_finding_with_complex_order
++    tags = Tag.includes(:taggings).order("LEAST(1,COS(1)*COS(-1)*COS(RADIANS(taggings.super_tag_id)))").to_a
++
++    assert_equal 2, tags.length
++  end
++
+   def test_finding_with_order_limit_and_offset
+     entrants = Entrant.order("id ASC").limit(2).offset(1)
+ 
+-- 
+1.7.1
+

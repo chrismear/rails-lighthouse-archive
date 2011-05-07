@@ -1,0 +1,134 @@
+From 58f233341d22a388a276ca5ed3992a9abf762259 Mon Sep 17 00:00:00 2001
+From: Szymon Nowak <szimek@gmail.com>
+Date: Thu, 13 Aug 2009 20:02:25 +0200
+Subject: [PATCH] Fix has_many through with primary_key option on belongs_to
+
+---
+ .../associations/has_many_through_association.rb   |    6 ++-
+ .../has_many_through_associations_test.rb          |   32 +++++++++++++++++++-
+ activerecord/test/models/author.rb                 |    1 +
+ activerecord/test/models/categorization.rb         |    3 +-
+ activerecord/test/schema/schema.rb                 |    7 ++--
+ 5 files changed, 42 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 6af14a5..f398b37 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -107,7 +107,9 @@ module ActiveRecord
+         def construct_join_attributes(associate)
+           # TODO: revist this to allow it for deletion, supposing dependent option is supported
+           raise ActiveRecord::HasManyThroughCantAssociateThroughHasOneOrManyReflection.new(@owner, @reflection) if [:has_one, :has_many].include?(@reflection.source_reflection.macro)
+-          join_attributes = construct_owner_attributes(@reflection.through_reflection).merge(@reflection.source_reflection.primary_key_name => associate.id)
++
++          associate_id = @reflection.source_reflection.options[:primary_key] ? associate.send(@reflection.source_reflection.options[:primary_key]) : associate.id
++          join_attributes = construct_owner_attributes(@reflection.through_reflection).merge(@reflection.source_reflection.primary_key_name => associate_id)
+           if @reflection.options[:source_type]
+             join_attributes.merge!(@reflection.source_reflection.options[:foreign_type] => associate.class.base_class.name.to_s)
+           end
+@@ -150,7 +152,7 @@ module ActiveRecord
+         def construct_joins(custom_joins = nil)
+           polymorphic_join = nil
+           if @reflection.source_reflection.macro == :belongs_to
+-            reflection_primary_key = @reflection.klass.primary_key
++            reflection_primary_key = @reflection.source_reflection.options[:primary_key] || @reflection.klass.primary_key
+             source_primary_key     = @reflection.source_reflection.primary_key_name
+             if @reflection.options[:source_type]
+               polymorphic_join = "AND %s.%s = %s" % [
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index a43f876..7260626 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -14,10 +14,12 @@ require 'models/toy'
+ require 'models/contract'
+ require 'models/company'
+ require 'models/developer'
++require 'models/category'
++require 'models/categorization'
+ 
+ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+   fixtures :posts, :readers, :people, :comments, :authors, :owners, :pets, :toys,
+-           :companies
++           :companies, :categories
+ 
+   def test_associate_existing
+     assert_queries(2) { posts(:thinking);people(:david) }
+@@ -321,4 +323,32 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+       lambda { authors(:david).very_special_comments.delete(authors(:david).very_special_comments.first) },
+     ].each {|block| assert_raise(ActiveRecord::HasManyThroughCantAssociateThroughHasOneOrManyReflection, &block) }
+   end
++
++  def test_associate_existing_with_nonstandard_primary_key_on_belongs_to
++    Categorization.create(:author => authors(:mary), :named_category_name => categories(:general).name)
++    assert_equal categories(:general), authors(:mary).named_categories.first
++  end
++
++  def test_collection_build_with_nonstandard_primary_key_on_belongs_to
++    author   = authors(:mary)
++    category = author.named_categories.build(:name => "Primary")
++    author.save
++    assert Categorization.exists?(:author_id => author.id, :named_category_name => category.name)
++    assert author.named_categories(true).include?(category)
++  end
++
++  def test_collection_create_with_nonstandard_primary_key_on_belongs_to
++    author   = authors(:mary)
++    category = author.named_categories.create(:name => "Primary")
++    assert Categorization.exists?(:author_id => author.id, :named_category_name => category.name)
++    assert author.named_categories(true).include?(category)
++  end
++
++  def test_collection_delete_with_nonstandard_primary_key_on_belongs_to
++    author   = authors(:mary)
++    category = author.named_categories.create(:name => "Primary")
++    author.named_categories.delete(category)
++    assert !Categorization.exists?(:author_id => author.id, :named_category_name => category.name)
++    assert author.named_categories(true).empty?
++  end
+ end
+diff --git a/activerecord/test/models/author.rb b/activerecord/test/models/author.rb
+index f264f98..1666d30 100644
+--- a/activerecord/test/models/author.rb
++++ b/activerecord/test/models/author.rb
+@@ -72,6 +72,7 @@ class Author < ActiveRecord::Base
+ 
+   has_many :categorizations
+   has_many :categories, :through => :categorizations
++  has_many :named_categories, :through => :categorizations
+ 
+   has_many :categories_like_general, :through => :categorizations, :source => :category, :class_name => 'Category', :conditions => { :name => 'General' }
+ 
+diff --git a/activerecord/test/models/categorization.rb b/activerecord/test/models/categorization.rb
+index 1059432..95e95f8 100644
+--- a/activerecord/test/models/categorization.rb
++++ b/activerecord/test/models/categorization.rb
+@@ -1,5 +1,6 @@
+ class Categorization < ActiveRecord::Base
+   belongs_to :post
+   belongs_to :category
++  belongs_to :named_category, :class_name => 'Category', :foreign_key => :named_category_name, :primary_key => :name
+   belongs_to :author
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 87fad0e..a8e1af5 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -84,9 +84,10 @@ ActiveRecord::Schema.define do
+   end
+ 
+   create_table :categorizations, :force => true do |t|
+-    t.column :category_id, :integer
+-    t.column :post_id, :integer
+-    t.column :author_id, :integer
++    t.integer :category_id
++    t.string  :named_category_name
++    t.integer :post_id
++    t.integer :author_id
+   end
+ 
+   create_table :citations, :force => true do |t|
+-- 
+1.6.4
+

@@ -1,0 +1,135 @@
+From 0d4bf06800ebea025005cdf27a48abc9e4625ba4 Mon Sep 17 00:00:00 2001
+From: Richard Hulse <richard.hulse@radionz.co.nz>
+Date: Sat, 24 Jul 2010 16:27:39 +1200
+Subject: [PATCH] Enhance capabilites of config.action_controller.asset_path
+
+Adds the ability to use asset_id in a proc that
+modifies the asset_path
+---
+ .../lib/action_view/helpers/asset_tag_helper.rb    |   44 +++++++++++++++----
+ actionpack/test/template/asset_tag_helper_test.rb  |   14 +++++-
+ 2 files changed, 46 insertions(+), 12 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/asset_tag_helper.rb b/actionpack/lib/action_view/helpers/asset_tag_helper.rb
+index a3c43d3..dc9f1c2 100644
+--- a/actionpack/lib/action_view/helpers/asset_tag_helper.rb
++++ b/actionpack/lib/action_view/helpers/asset_tag_helper.rb
+@@ -144,7 +144,9 @@ module ActionView
+     # Altering the asset paths that Rails generates can be done in two ways.
+     # The easiest is to define the RAILS_ASSET_ID environment variable. The
+     # contents of this variable will always be used in preference to
+-    # calculated timestamps. A more complex but flexible way is to set
++    # calculated timestamps.
++		#
++    # A more complex but flexible way is to set
+     # <tt>ActionController::Base.config.asset_path</tt> to a proc
+     # that takes the unmodified asset path and returns the path needed for
+     # your asset caching to work. Typically you'd do something like this in
+@@ -152,7 +154,7 @@ module ActionView
+     #
+     #   # Normally you'd calculate RELEASE_NUMBER at startup.
+     #   RELEASE_NUMBER = 12345
+-    #   config.action_controller.asset_path_template = proc { |asset_path|
++    #   config.action_controller.asset_path = proc { |asset_path|
+     #     "/release-#{RELEASE_NUMBER}#{asset_path}"
+     #   }
+     #
+@@ -164,10 +166,23 @@ module ActionView
+     #   stylesheet_link_tag("application")
+     #   # => <link href="/release-12345/stylesheets/application.css?1232285206" media="screen" rel="stylesheet" type="text/css" />
+     #
+-    # Changing the asset_path does require that your web servers have
+-    # knowledge of the asset template paths that you rewrite to so it's not
+-    # suitable for out-of-the-box use. To use the example given above you
+-    # could use something like this in your Apache VirtualHost configuration:
++    # The downside of this approach is that all assets will get a new
++    # ID for every deployment, and this will force all assets to be refetched
++    # by the client browser or intermediate caches.
++    #
++    # The best approach on a single server is to use the second param that
++    # is passed in to the proc - asset_id. The asset_id is the modification
++    # time of the asset as an integer.
++    #
++    #   config.action_controller.asset_path = proc { |asset_path, asset_id|
++    #     asset_path.clone.insert(-(File.extname(asset_path).length+1),"-#{asset_id}")
++    #   }
++    #
++    # Changing the asset_path by RELEASE_NUMBER or asset_id does require that
++    # your web servers have knowledge of the asset template paths that you
++    # rewrite to so it's NOT suitable for out-of-the-box use. To use the examples
++    # given above you could use something like this in your Apache VirtualHost
++    # configuration:
+     #
+     #   <LocationMatch "^/release-\d+/(images|javascripts|stylesheets)/.*$">
+     #     # Some browsers still send conditional-GET requests if there's a
+@@ -191,8 +206,15 @@ module ActionView
+     #   # request. The actual asset filenames are still the same though so we
+     #   # need to rewrite the location from the cache-busting location to the
+     #   # real asset location so that we can serve it.
+-    #   RewriteEngine On
+-    #   RewriteRule ^/release-\d+/(images|javascripts|stylesheets)/(.*)$ /$1/$2 [L]
++		#
++    # 	For release based schemes use this:
++    #   # RewriteEngine On
++    #   # RewriteRule ^/release-\d+/(images|javascripts|stylesheets)/(.*)$ /$1/$2 [L]
++    #
++    #   For asset_id scheme use this:
++    #   # RewriteEngine On
++    #   # RewriteRule ^/(images|javascripts|stylesheets)/(.*)-\d+\.(.*)$ $1.$2 [L]
++
+     module AssetTagHelper
+       mattr_reader :javascript_expansions
+       @@javascript_expansions = { }
+@@ -792,13 +814,15 @@ module ActionView
+         # Break out the asset path rewrite in case plugins wish to put the asset id
+         # someplace other than the query string.
+         def rewrite_asset_path(source, path = nil)
++
++          asset_id = rails_asset_id(source)
++
+           if path && path.respond_to?(:call)
+-            return path.call(source)
++            return path.call(source, asset_id)
+           elsif path && path.is_a?(String)
+             return path % [source]
+           end
+ 
+-          asset_id = rails_asset_id(source)
+           if asset_id.blank?
+             source
+           else
+diff --git a/actionpack/test/template/asset_tag_helper_test.rb b/actionpack/test/template/asset_tag_helper_test.rb
+index 6d5e489..efbfa33 100644
+--- a/actionpack/test/template/asset_tag_helper_test.rb
++++ b/actionpack/test/template/asset_tag_helper_test.rb
+@@ -387,8 +387,8 @@ class AssetTagHelperTest < ActionView::TestCase
+     assert_equal %(<img alt="Rails" src="#{expected_path}" />), image_tag("rails.png")
+   end
+ 
+-  def test_proc_asset_id
+-    @controller.config.asset_path = Proc.new do |asset_path|
++  def test_proc_asset_path
++    @controller.config.asset_path = Proc.new do |asset_path, asset_id|
+       "/assets.v12345#{asset_path}"
+     end
+ 
+@@ -396,6 +396,16 @@ class AssetTagHelperTest < ActionView::TestCase
+     assert_equal %(<img alt="Rails" src="#{expected_path}" />), image_tag("rails.png")
+   end
+ 
++  def test_proc_asset_path_and_asset_id
++    expected_time = File.stat(File.expand_path(File.dirname(__FILE__) + "/../fixtures/public/images/rails.png")).mtime.to_i.to_s
++    @controller.config.asset_path = Proc.new do |asset_path, asset_id|
++			asset_path.clone.insert(-(File.extname(asset_path).length+1),"-#{asset_id}")
++    end
++
++    expected_path = "/images/rails-#{expected_time}.png"
++    assert_equal %(<img alt="Rails-#{expected_time}" src="#{expected_path}" />), image_tag("rails.png")
++  end
++
+   def test_image_tag_interpreting_email_cid_correctly
+     # An inline image has no need for an alt tag to be automatically generated from the cid:
+     assert_equal '<img src="cid:thi%25%25sis@acontentid" />', image_tag("cid:thi%25%25sis@acontentid")
+-- 
+1.6.6.GIT
+

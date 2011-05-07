@@ -1,0 +1,369 @@
+From c37f2f59a568e7a850dd3a0c8c1af15beec93960 Mon Sep 17 00:00:00 2001
+From: Mike Perham <mperham@gmail.com>
+Date: Wed, 15 Sep 2010 21:30:29 -0700
+Subject: [PATCH] Deprecate :mem_cache_store when used with memcache-client.
+ Add new support for :dalli_store.
+
+---
+ Gemfile                                            |    1 +
+ activesupport/lib/active_support/cache.rb          |    1 +
+ .../lib/active_support/cache/dalli_store.rb        |  177 ++++++++++++++++++++
+ .../lib/active_support/cache/mem_cache_store.rb    |    1 +
+ activesupport/test/abstract_unit.rb                |    5 +-
+ activesupport/test/caching_test.rb                 |   70 +++++++-
+ 6 files changed, 243 insertions(+), 12 deletions(-)
+ create mode 100644 activesupport/lib/active_support/cache/dalli_store.rb
+
+diff --git a/Gemfile b/Gemfile
+index d9f089f..d9b839e 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -20,6 +20,7 @@ gem "addressable"
+ 
+ # AS
+ gem "memcache-client", ">= 1.8.5"
++gem 'dalli', '>= 0.9.6'
+ 
+ # AM
+ gem "text-format", "~> 1.0.0"
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index df35540..dbcd18b 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -16,6 +16,7 @@ module ActiveSupport
+     autoload :FileStore, 'active_support/cache/file_store'
+     autoload :MemoryStore, 'active_support/cache/memory_store'
+     autoload :MemCacheStore, 'active_support/cache/mem_cache_store'
++    autoload :DalliStore, 'active_support/cache/dalli_store'
+     autoload :SynchronizedMemoryStore, 'active_support/cache/synchronized_memory_store'
+     autoload :CompressedMemCacheStore, 'active_support/cache/compressed_mem_cache_store'
+ 
+diff --git a/activesupport/lib/active_support/cache/dalli_store.rb b/activesupport/lib/active_support/cache/dalli_store.rb
+new file mode 100644
+index 0000000..01252d9
+--- /dev/null
++++ b/activesupport/lib/active_support/cache/dalli_store.rb
+@@ -0,0 +1,177 @@
++# encoding: ascii
++begin
++  require 'dalli'
++rescue LoadError => e
++  $stderr.puts "You don't have dalli installed in your application. Please add it to your Gemfile and run bundle install"
++  raise e
++end
++require 'digest/md5'
++
++module ActiveSupport
++  module Cache
++    # A cache store implementation which stores data in Memcached:
++    # http://www.danga.com/memcached/
++    #
++    # DalliStore implements the Strategy::LocalCache strategy which implements
++    # an in memory cache inside of a block.
++    class DalliStore < Store
++
++      ESCAPE_KEY_CHARS = /[\x00-\x20%\x7F-\xFF]/
++
++      def self.build_mem_cache(*addresses)
++        addresses = addresses.flatten
++        options = addresses.extract_options!
++        addresses = ["localhost:11211"] if addresses.empty?
++        Dalli::Client.new(addresses, options)
++      end
++
++      # Creates a new DalliStore object, with the given memcached server
++      # addresses. Each address is either a host name, or a host-with-port string
++      # in the form of "host_name:port". For example:
++      #
++      #   ActiveSupport::Cache::DalliStore.new("localhost", "server-downstairs.localnetwork:8229")
++      #
++      # If no addresses are specified, then DalliStore will connect to
++      # localhost port 11211 (the default memcached port).
++      #
++      def initialize(*addresses)
++        addresses = addresses.flatten
++        options = addresses.extract_options!
++        super(options)
++
++        mem_cache_options = options.dup
++        UNIVERSAL_OPTIONS.each{|name| mem_cache_options.delete(name)}
++        @data = self.class.build_mem_cache(*(addresses + [mem_cache_options]))
++
++        extend Strategy::LocalCache
++        extend LocalCacheWithRaw
++      end
++
++      # Reads multiple keys from the cache using a single call to the
++      # servers for all keys. Options can be passed in the last argument.
++      def read_multi(*names)
++        options = names.extract_options!
++        options = merged_options(options)
++        keys_to_names = names.inject({}){|map, name| map[escape_key(namespaced_key(name, options))] = name; map}
++        raw_values = @data.get_multi(keys_to_names.keys, options)
++        values = {}
++        raw_values.each do |key, value|
++          entry = deserialize_entry(value)
++          values[keys_to_names[key]] = entry.value unless entry.expired?
++        end
++        values
++      end
++
++      # Increment a cached value. This method uses the memcached incr atomic
++      # operator and can only be used on values written with the :raw option.
++      # Calling it on a value not stored with :raw will fail.
++      # :initial defaults to the amount passed in, as if the counter was initially zero.
++      # memcached counters cannot hold negative values.
++      def increment(name, amount = 1, options = nil) # :nodoc:
++        options = merged_options(options)
++        initial = options[:initial] || amount
++        expires_in = options[:expires_in].to_i
++        response = instrument(:increment, name, :amount => amount) do
++          @data.incr(escape_key(namespaced_key(name, options)), amount, expires_in, initial)
++        end
++      rescue Dalli::DalliError => e
++        logger.error("DalliError (#{e}): #{e.message}") if logger
++        nil
++      end
++
++      # Decrement a cached value. This method uses the memcached decr atomic
++      # operator and can only be used on values written with the :raw option.
++      # Calling it on a value not stored with :raw will fail.
++      # :initial defaults to zero, as if the counter was initially zero.
++      # memcached counters cannot hold negative values.
++      def decrement(name, amount = 1, options = nil) # :nodoc:
++        options = merged_options(options)
++        initial = options[:initial] || 0
++        expires_in = options[:expires_in].to_i
++        response = instrument(:decrement, name, :amount => amount) do
++          @data.decr(escape_key(namespaced_key(name, options)), amount, expires_in, initial)
++        end
++      rescue Dalli::DalliError => e
++        logger.error("DalliError (#{e}): #{e.message}") if logger
++        nil
++      end
++
++      # Clear the entire cache on all memcached servers. This method should
++      # be used with care when using a shared cache.
++      def clear(options = nil)
++        @data.flush_all
++      end
++
++      # Get the statistics from the memcached servers.
++      def stats
++        @data.stats
++      end
++
++      def reset
++        @data.reset
++      end
++
++      protected
++        # Read an entry from the cache.
++        def read_entry(key, options) # :nodoc:
++          deserialize_entry(@data.get(escape_key(key), :raw => true))
++        rescue Dalli::DalliError => e
++          logger.error("DalliError (#{e}): #{e.message}") if logger
++          nil
++        end
++
++        # Write an entry to the cache.
++        def write_entry(key, entry, options) # :nodoc:
++          method = options && options[:unless_exist] ? :add : :set
++          value = options[:raw] ? entry.value.to_s : entry
++          expires_in = options[:expires_in].to_i
++          if expires_in > 0 && !options[:raw]
++            # Set the memcache expire a few minutes in the future to support race condition ttls on read
++            expires_in += 5.minutes
++          end
++          @data.send(method, escape_key(key), value, expires_in, options)
++        rescue Dalli::DalliError => e
++          logger.error("DalliError (#{e}): #{e.message}") if logger
++          false
++        end
++
++        # Delete an entry from the cache.
++        def delete_entry(key, options) # :nodoc:
++          @data.delete(escape_key(key))
++        rescue Dalli::DalliError => e
++          logger.error("DalliError (#{e}): #{e.message}") if logger
++          false
++        end
++
++      private
++        def escape_key(key)
++          key = key.to_s.gsub(ESCAPE_KEY_CHARS){|match| "%#{match.getbyte(0).to_s(16).upcase}"}
++          key = "#{key[0, 213]}:md5:#{Digest::MD5.hexdigest(key)}" if key.size > 250
++          key
++        end
++
++        def deserialize_entry(raw_value)
++          if raw_value
++            entry = Marshal.load(raw_value) rescue raw_value
++            entry.is_a?(Entry) ? entry : Entry.new(entry)
++          else
++            nil
++          end
++        end
++
++      # Provide support for raw values in the local cache strategy.
++      module LocalCacheWithRaw # :nodoc:
++        protected
++          def write_entry(key, entry, options) # :nodoc:
++            retval = super
++            if options[:raw] && local_cache && retval
++              raw_entry = Entry.new(entry.value.to_s)
++              raw_entry.expires_at = entry.expires_at
++              local_cache.write_entry(key, raw_entry, options)
++            end
++            retval
++          end
++      end
++    end
++  end
++end
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index f32b562..f8350e1 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -35,6 +35,7 @@ module ActiveSupport
+         addresses = addresses.flatten
+         options = addresses.extract_options!
+         addresses = ["localhost:11211"] if addresses.empty?
++        ActiveSupport::Deprecation.warn ":mem_cache_store is deprecated, please use :dalli_store instead"
+         MemCache.new(addresses, options)
+       end
+ 
+diff --git a/activesupport/test/abstract_unit.rb b/activesupport/test/abstract_unit.rb
+index 0382739..4584a93 100644
+--- a/activesupport/test/abstract_unit.rb
++++ b/activesupport/test/abstract_unit.rb
+@@ -34,11 +34,12 @@ require 'active_support'
+ require 'active_support/ruby/shim' if RUBY_VERSION < '1.8.7'
+ 
+ def uses_memcached(test_name)
++  require 'dalli'
+   require 'memcache'
+   begin
+-    MemCache.new('localhost:11211').stats
++    Dalli::Client.new('localhost:11211').stats
+     yield
+-  rescue MemCache::MemCacheError
++  rescue Dalli::DalliError
+     $stderr.puts "Skipping #{test_name} tests. Start memcached and try again."
+   end
+ end
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index 28ef695..f52e8d2 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -61,8 +61,10 @@ class CacheStoreSettingTest < ActiveSupport::TestCase
+ 
+   def test_mem_cache_fragment_cache_store
+     MemCache.expects(:new).with(%w[localhost], {})
+-    store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost"
+-    assert_kind_of(ActiveSupport::Cache::MemCacheStore, store)
++    ActiveSupport::Deprecation.silence do
++      store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost"
++      assert_kind_of(ActiveSupport::Cache::MemCacheStore, store)
++    end
+   end
+ 
+   def test_mem_cache_fragment_cache_store_with_given_mem_cache
+@@ -82,14 +84,25 @@ class CacheStoreSettingTest < ActiveSupport::TestCase
+ 
+   def test_mem_cache_fragment_cache_store_with_multiple_servers
+     MemCache.expects(:new).with(%w[localhost 192.168.1.1], {})
+-    store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost", '192.168.1.1'
+-    assert_kind_of(ActiveSupport::Cache::MemCacheStore, store)
++    ActiveSupport::Deprecation.silence do
++      store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost", '192.168.1.1'
++      assert_kind_of(ActiveSupport::Cache::MemCacheStore, store)
++    end
+   end
+ 
+   def test_mem_cache_fragment_cache_store_with_options
+     MemCache.expects(:new).with(%w[localhost 192.168.1.1], { :timeout => 10 })
+-    store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost", '192.168.1.1', :namespace => 'foo', :timeout => 10
+-    assert_kind_of(ActiveSupport::Cache::MemCacheStore, store)
++    ActiveSupport::Deprecation.silence do
++      store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost", '192.168.1.1', :namespace => 'foo', :timeout => 10
++      assert_kind_of(ActiveSupport::Cache::MemCacheStore, store)
++      assert_equal 'foo', store.options[:namespace]
++    end
++  end
++
++  def test_dalli_fragment_cache_store_with_options
++    Dalli::Client.expects(:new).with(%w[localhost 192.168.1.1], { :marshal => false })
++    store = ActiveSupport::Cache.lookup_store :dalli_store, "localhost", '192.168.1.1', :namespace => 'foo', :marshal => false
++    assert_kind_of(ActiveSupport::Cache::DalliStore, store)
+     assert_equal 'foo', store.options[:namespace]
+   end
+ 
+@@ -597,8 +610,45 @@ end
+ uses_memcached 'memcached backed store' do
+   class MemCacheStoreTest < ActiveSupport::TestCase
+     def setup
+-      @cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :expires_in => 60)
+-      @peek = ActiveSupport::Cache.lookup_store(:mem_cache_store)
++      ActiveSupport::Deprecation.silence do
++        @cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :expires_in => 60)
++        @peek = ActiveSupport::Cache.lookup_store(:mem_cache_store)
++      end
++      @data = @cache.instance_variable_get(:@data)
++      @cache.clear
++      @cache.silence!
++      @cache.logger = Logger.new("/dev/null")
++    end
++
++    include CacheStoreBehavior
++    include LocalCacheBehavior
++    include CacheIncrementDecrementBehavior
++
++    def test_raw_values
++      ActiveSupport::Deprecation.silence do
++        cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :raw => true)
++        cache.clear
++        cache.write("foo", 2)
++        assert_equal "2", cache.read("foo")
++      end
++    end
++
++    def test_local_cache_raw_values
++      ActiveSupport::Deprecation.silence do
++        cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :raw => true)
++        cache.clear
++        cache.with_local_cache do
++          cache.write("foo", 2)
++          assert_equal "2", cache.read("foo")
++        end
++      end
++    end
++  end
++
++  class DalliStoreTest < ActiveSupport::TestCase
++    def setup
++      @cache = ActiveSupport::Cache.lookup_store(:dalli_store, :expires_in => 60)
++      @peek = ActiveSupport::Cache.lookup_store(:dalli_store)
+       @data = @cache.instance_variable_get(:@data)
+       @cache.clear
+       @cache.silence!
+@@ -610,14 +660,14 @@ uses_memcached 'memcached backed store' do
+     include CacheIncrementDecrementBehavior
+ 
+     def test_raw_values
+-      cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :raw => true)
++      cache = ActiveSupport::Cache.lookup_store(:dalli_store, :raw => true)
+       cache.clear
+       cache.write("foo", 2)
+       assert_equal "2", cache.read("foo")
+     end
+ 
+     def test_local_cache_raw_values
+-      cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :raw => true)
++      cache = ActiveSupport::Cache.lookup_store(:dalli_store, :raw => true)
+       cache.clear
+       cache.with_local_cache do
+         cache.write("foo", 2)
+-- 
+1.7.1
+

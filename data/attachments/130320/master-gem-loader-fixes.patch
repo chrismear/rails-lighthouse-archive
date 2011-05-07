@@ -1,0 +1,172 @@
+From d6aca5e785867816ba8e1a34d785b8eab148a15b Mon Sep 17 00:00:00 2001
+From: Matt Jones <al2o3cr@gmail.com>
+Date: Sat, 6 Jun 2009 17:59:33 -0400
+Subject: [PATCH] Fix several issues with the 2.3.2 gem loader.
+
+Incorporates the following:
+
+- migrates back small change to gems:build:force from bfc1609a501fc3ed442685819de5bcdb5fbada1c to finish closing #2266.
+
+- unrolls to_proc calls in gems.rake, to match the change in master.
+
+- fixes #2722 by passing the options hash to dependencies during build. (includes a test)
+
+- fixes #2721 by loading the specification directly in from_directory_name. Adds an option to opt-out of specification loading when needed (in gems:refresh_specs, for instance). Includes tests.
+
+- fixes #2679 by refreshing specs for all frozen gems rather than just gems loaded from the environment.
+
+- fixes #2678 by passing the options hash to dependencies during unpack.
+---
+ railties/lib/rails/gem_dependency.rb |   20 ++++++++++++++++----
+ railties/lib/tasks/gems.rake         |   14 +++++++-------
+ railties/test/gem_dependency_test.rb |   16 +++++++++++++++-
+ 3 files changed, 38 insertions(+), 12 deletions(-)
+
+diff --git a/railties/lib/rails/gem_dependency.rb b/railties/lib/rails/gem_dependency.rb
+index ee3d0d8..3a82202 100644
+--- a/railties/lib/rails/gem_dependency.rb
++++ b/railties/lib/rails/gem_dependency.rb
+@@ -29,11 +29,18 @@ module Rails
+       end
+     end
+ 
+-    def self.from_directory_name(directory_name)
++    def self.from_directory_name(directory_name, load_spec=true)
+       directory_name_parts = File.basename(directory_name).split('-')
+       name    = directory_name_parts[0..-2].join('-')
+       version = directory_name_parts.last
+-      self.new(name, :version => version)
++      result = self.new(name, :version => version)
++      spec_filename = File.join(unpacked_path, directory_name, '.specification')
++      if load_spec
++        raise "Missing specification file in #{File.dirname(spec_filename)}. Perhaps you need to do a 'rake gems:refresh_specs'?" unless File.exists?(spec_filename)
++        spec = YAML::load_file(spec_filename)
++        result.specification = spec
++      end
++      result
+     rescue ArgumentError => e
+       raise "Unable to determine gem name and version from '#{directory_name}'"
+     end
+@@ -104,6 +111,10 @@ module Rails
+       end
+     end
+ 
++    def specification=(s)
++      @spec = s
++    end
++
+     def requirement
+       r = version_requirements
+       (r == Gem::Requirement.default) ? nil : r
+@@ -170,13 +181,14 @@ module Rails
+ 
+     def build(options={})
+       require 'rails/gem_builder'
++      return if specification.nil?
+       if options[:force] || !built?
+         return unless File.exists?(unpacked_specification_filename)
+         spec = YAML::load_file(unpacked_specification_filename)
+         Rails::GemBuilder.new(spec, unpacked_gem_directory).build_extensions
+         puts "Built gem: '#{unpacked_gem_directory}'"
+       end
+-      dependencies.each { |dep| dep.build }
++      dependencies.each { |dep| dep.build(options) }
+     end
+ 
+     def install
+@@ -236,7 +248,7 @@ module Rails
+         real_spec = Gem::Specification.load(specification.loaded_from)
+         write_specification(real_spec)
+       end
+-      dependencies.each { |dep| dep.unpack } if options[:recursive]
++      dependencies.each { |dep| dep.unpack(options) } if options[:recursive]
+     end
+ 
+     def write_specification(spec)
+diff --git a/railties/lib/tasks/gems.rake b/railties/lib/tasks/gems.rake
+index e496e1a..f1c34c7 100644
+--- a/railties/lib/tasks/gems.rake
++++ b/railties/lib/tasks/gems.rake
+@@ -20,7 +20,7 @@ namespace :gems do
+   desc "Build any native extensions for unpacked gems"
+   task :build do
+     $gems_build_rake_task = true
+-    frozen_gems.each {|gem| gem.build }
++    frozen_gems.each { |gem| gem.build }
+   end
+ 
+   namespace :build do
+@@ -33,12 +33,12 @@ namespace :gems do
+ 
+   desc "Installs all required gems."
+   task :install => :base do
+-    current_gems.each {|gem| gem.install }
++    current_gems.each { |gem| gem.install }
+   end
+ 
+   desc "Unpacks all required gems into vendor/gems."
+   task :unpack => :install do
+-    current_gems.each {|gem| gem.unpack }
++    current_gems.each { |gem| gem.unpack }
+   end
+ 
+   namespace :unpack do
+@@ -49,8 +49,8 @@ namespace :gems do
+   end
+ 
+   desc "Regenerate gem specifications in correct format."
+-  task :refresh_specs => :base do
+-    current_gems.each {|gem| gem.refresh }
++  task :refresh_specs do
++    frozen_gems(false).each { |gem| gem.refresh }
+   end
+ end
+ 
+@@ -60,9 +60,9 @@ def current_gems
+   gems
+ end
+ 
+-def frozen_gems
++def frozen_gems(load_specs=true)
+   Dir[File.join(RAILS_ROOT, 'vendor', 'gems', '*-*')].map do |gem_dir|
+-    Rails::GemDependency.from_directory_name(gem_dir)
++    Rails::GemDependency.from_directory_name(gem_dir, load_specs)
+   end
+ end
+ 
+diff --git a/railties/test/gem_dependency_test.rb b/railties/test/gem_dependency_test.rb
+index ff27af5..195494a 100644
+--- a/railties/test/gem_dependency_test.rb
++++ b/railties/test/gem_dependency_test.rb
+@@ -166,8 +166,14 @@ class GemDependencyTest < Test::Unit::TestCase
+     dummy_gem.unpack
+   end
+ 
++  def test_gem_from_directory_name_attempts_to_load_specification
++    assert_raises RuntimeError do
++      dummy_gem = Rails::GemDependency.from_directory_name('dummy-gem-1.1')
++    end
++  end
++
+   def test_gem_from_directory_name
+-    dummy_gem = Rails::GemDependency.from_directory_name('dummy-gem-1.1')
++    dummy_gem = Rails::GemDependency.from_directory_name('dummy-gem-1.1', false)
+     assert_equal 'dummy-gem', dummy_gem.name
+     assert_equal '= 1.1',     dummy_gem.version_requirements.to_s
+   end
+@@ -187,4 +193,12 @@ class GemDependencyTest < Test::Unit::TestCase
+     assert_equal false, Rails::GemDependency.new("dummy-gem-j").built?
+   end
+ 
++  def test_gem_build_passes_options_to_dependencies
++    start_gem = Rails::GemDependency.new("dummy-gem-g")
++    dep_gem = Rails::GemDependency.new("dummy-gem-f")
++    start_gem.stubs(:dependencies).returns([dep_gem])
++    dep_gem.expects(:build).with({ :force => true }).once
++    start_gem.build(:force => true)
++  end
++
+ end
+-- 
+1.5.3.1
+

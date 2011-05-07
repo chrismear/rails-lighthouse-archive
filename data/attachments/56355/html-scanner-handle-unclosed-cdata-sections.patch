@@ -1,0 +1,95 @@
+From 71eb248ffea488987ac23ce8bc5ae889cfeebbdb Mon Sep 17 00:00:00 2001
+From: Jeffrey Hardy <packagethief@gmail.com>
+Date: Wed, 22 Oct 2008 16:03:21 -0400
+Subject: [PATCH] Fix that HTML::Node.parse would blow up on unclosed CDATA sections.
+
+If an unclosed CDATA section is encountered and parsing is strict, an
+exception will be raised. Otherwise, we consider the remainder of the line to
+be the section contents. This is consistent with HTML::Tokenizer#scan_tag.
+---
+ .../vendor/html-scanner/html/node.rb               |    9 +++++++-
+ .../test/controller/html-scanner/node_test.rb      |   21 ++++++++++++++++++++
+ .../test/controller/html-scanner/sanitizer_test.rb |   10 +++++++++
+ 3 files changed, 39 insertions(+), 1 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/vendor/html-scanner/html/node.rb b/actionpack/lib/action_controller/vendor/html-scanner/html/node.rb
+index a277ddb..6c03316 100644
+--- a/actionpack/lib/action_controller/vendor/html-scanner/html/node.rb
++++ b/actionpack/lib/action_controller/vendor/html-scanner/html/node.rb
+@@ -150,7 +150,14 @@ module HTML #:nodoc:
+           end
+ 
+           if scanner.skip(/!\[CDATA\[/)
+-            scanner.scan_until(/\]\]>/)
++            unless scanner.skip_until(/\]\]>/)
++              if strict
++                raise "expected ]]> (got #{scanner.rest.inspect} for #{content})"
++              else
++                scanner.skip_until(/\Z/)
++              end
++            end
++
+             return CDATA.new(parent, line, pos, scanner.pre_match.gsub(/<!\[CDATA\[/, ''))
+           end
+           
+diff --git a/actionpack/test/controller/html-scanner/node_test.rb b/actionpack/test/controller/html-scanner/node_test.rb
+index 240f01a..b0df368 100644
+--- a/actionpack/test/controller/html-scanner/node_test.rb
++++ b/actionpack/test/controller/html-scanner/node_test.rb
+@@ -65,4 +65,25 @@ class NodeTest < Test::Unit::TestCase
+     assert_nothing_raised { node = HTML::Node.parse(nil,0,0,s,false) }
+     assert node.attributes.has_key?("onmouseover")
+   end
++
++  def test_parse_with_valid_cdata_section
++    s = "<![CDATA[<span>contents</span>]]>"
++    node = nil
++    assert_nothing_raised { node = HTML::Node.parse(nil,0,0,s,false) }
++    assert_kind_of HTML::CDATA, node
++    assert_equal '<span>contents</span>', node.content
++  end
++
++  def test_parse_strict_with_unterminated_cdata_section
++    s = "<![CDATA[neverending..."
++    assert_raise(RuntimeError) { HTML::Node.parse(nil,0,0,s) }
++  end
++
++  def test_parse_relaxed_with_unterminated_cdata_section
++    s = "<![CDATA[neverending..."
++    node = nil
++    assert_nothing_raised { node = HTML::Node.parse(nil,0,0,s,false) }
++    assert_kind_of HTML::CDATA, node
++    assert_equal 'neverending...', node.content
++  end
+ end
+diff --git a/actionpack/test/controller/html-scanner/sanitizer_test.rb b/actionpack/test/controller/html-scanner/sanitizer_test.rb
+index db142f0..a9e8447 100644
+--- a/actionpack/test/controller/html-scanner/sanitizer_test.rb
++++ b/actionpack/test/controller/html-scanner/sanitizer_test.rb
+@@ -17,6 +17,8 @@ class SanitizerTest < Test::Unit::TestCase
+     %{This is a test.\n\n\nIt no longer contains any HTML.\n}, sanitizer.sanitize(
+     %{<title>This is <b>a <a href="" target="_blank">test</a></b>.</title>\n\n<!-- it has a comment -->\n\n<p>It no <b>longer <strong>contains <em>any <strike>HTML</strike></em>.</strong></b></p>\n}))
+     assert_equal "This has a  here.", sanitizer.sanitize("This has a <!-- comment --> here.")
++    assert_equal "This has a  here.", sanitizer.sanitize("This has a <![CDATA[<section>]]> here.")
++    assert_equal "This has an unclosed ", sanitizer.sanitize("This has an unclosed <![CDATA[<section>]] here...")
+     [nil, '', '   '].each { |blank| assert_equal blank, sanitizer.sanitize(blank) }
+   end
+ 
+@@ -243,6 +245,14 @@ class SanitizerTest < Test::Unit::TestCase
+     assert_sanitized %(<img src='vbscript:msgbox("XSS")' />), '<img />'
+   end
+ 
++  def test_should_sanitize_cdata_section
++    assert_sanitized "<![CDATA[<span>section</span>]]>", "&lt;![CDATA[&lt;span>section&lt;/span>]]>"
++  end
++
++  def test_should_sanitize_unterminated_cdata_section
++    assert_sanitized "<![CDATA[<span>neverending...", "&lt;![CDATA[&lt;span>neverending...]]>"
++  end
++
+ protected
+   def assert_sanitized(input, expected = nil)
+     @sanitizer ||= HTML::WhiteListSanitizer.new
+-- 
+1.5.5.1
+

@@ -1,0 +1,262 @@
+From cc0e32a5931ca706ff1414e37dd1be7411c88413 Mon Sep 17 00:00:00 2001
+From: Sean O'Brien <sean.obrien56@yahoo.com>
+Date: Thu, 11 Dec 2008 21:21:51 -0800
+Subject: [PATCH] added support for before_add, before_remove, after_add, and after_remove to belongs_to associations
+
+---
+ activerecord/lib/active_record/associations.rb     |    3 +-
+ .../associations/association_collection.rb         |   11 ---
+ .../associations/association_proxy.rb              |   11 +++
+ .../associations/belongs_to_association.rb         |    8 ++-
+ .../test/cases/associations/callbacks_test.rb      |   79 +++++++++++++++++++-
+ activerecord/test/models/comment.rb                |   33 ++++++++
+ 6 files changed, 131 insertions(+), 14 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 3fbbea4..a802dda 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1016,6 +1016,7 @@ module ActiveRecord
+           association_accessor_methods(reflection, BelongsToAssociation)
+           association_constructor_method(:build,  reflection, BelongsToAssociation)
+           association_constructor_method(:create, reflection, BelongsToAssociation)
++          add_association_callbacks(reflection.name, reflection.options)
+ 
+           method_name = "belongs_to_before_save_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+@@ -1596,7 +1597,7 @@ module ActiveRecord
+         @@valid_keys_for_belongs_to_association = [
+           :class_name, :foreign_key, :foreign_type, :remote, :select, :conditions,
+           :include, :dependent, :counter_cache, :extend, :polymorphic, :readonly,
+-          :validate
++          :validate, :before_add, :after_add, :before_remove, :after_remove
+         ]
+ 
+         def create_belongs_to_reflection(association_id, options)
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0ff91fb..03cb493 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -426,17 +426,6 @@ module ActiveRecord
+           callback(:after_add, record)
+           record
+         end
+-
+-        def callback(method, record)
+-          callbacks_for(method).each do |callback|
+-            ActiveSupport::Callbacks::Callback.new(method, callback, record).call(@owner, record)
+-          end
+-        end
+-
+-        def callbacks_for(callback_name)
+-          full_callback_name = "#{callback_name}_for_#{@reflection.name}"
+-          @owner.class.read_inheritable_attribute(full_callback_name.to_sym) || []
+-        end   
+         
+         def ensure_owner_is_not_new
+           if @owner.new_record?
+diff --git a/activerecord/lib/active_record/associations/association_proxy.rb b/activerecord/lib/active_record/associations/association_proxy.rb
+index 59f1d3b..f88a6e5 100644
+--- a/activerecord/lib/active_record/associations/association_proxy.rb
++++ b/activerecord/lib/active_record/associations/association_proxy.rb
+@@ -251,6 +251,17 @@ module ActiveRecord
+           false
+         end
+ 
++        def callback(method, record)
++          callbacks_for(method).each do |callback|
++            ActiveSupport::Callbacks::Callback.new(method, callback, record).call(@owner, record)
++          end
++        end
++
++        def callbacks_for(callback_name)
++          full_callback_name = "#{callback_name}_for_#{@reflection.name}"
++          @owner.class.read_inheritable_attribute(full_callback_name.to_sym) || []
++        end
++        
+         # Raises ActiveRecord::AssociationTypeMismatch unless +record+ is of
+         # the kind of the class of the associated objects. Meant to be used as
+         # a sanity check when you are about to assign an associated record.
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index f05c6be..ef49f9e 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -13,22 +13,28 @@ module ActiveRecord
+         counter_cache_name = @reflection.counter_cache_column
+ 
+         if record.nil?
++          callback(:before_remove, @owner.send(@reflection.name))
+           if counter_cache_name && !@owner.new_record?
+             @reflection.klass.decrement_counter(counter_cache_name, @owner[@reflection.primary_key_name]) if @owner[@reflection.primary_key_name]
+           end
+ 
+           @target = @owner[@reflection.primary_key_name] = nil
++          callback(:after_remove, @owner.send(@reflection.name))
+         else
+           raise_on_type_mismatch(record)
++          callback(:before_remove, @owner.send(@reflection.name)) unless @owner.send(@reflection.name).nil?
++          callback(:before_add, record)
+ 
+           if counter_cache_name && !@owner.new_record?
+             @reflection.klass.increment_counter(counter_cache_name, record.id)
+             @reflection.klass.decrement_counter(counter_cache_name, @owner[@reflection.primary_key_name]) if @owner[@reflection.primary_key_name]
+           end
+-
++          
++          callback(:after_remove, @owner.send(@reflection.name)) unless @owner.send(@reflection.name).nil?
+           @target = (AssociationProxy === record ? record.target : record)
+           @owner[@reflection.primary_key_name] = record.id unless record.new_record?
+           @updated = true
++          callback(:after_add, record)
+         end
+ 
+         loaded
+diff --git a/activerecord/test/cases/associations/callbacks_test.rb b/activerecord/test/cases/associations/callbacks_test.rb
+index 91b1af1..64a29c2 100644
+--- a/activerecord/test/cases/associations/callbacks_test.rb
++++ b/activerecord/test/cases/associations/callbacks_test.rb
+@@ -108,7 +108,6 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+     assert_equal "after_adding<new>", ar.developers_log.last
+   end
+ 
+-
+   def test_has_and_belongs_to_many_remove_callback
+     david = developers(:david)
+     jamis = developers(:jamis)
+@@ -159,3 +158,81 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+     assert !@david.unchangable_posts.include?(@authorless)
+   end
+ end
++
++class BelongsToAssociationCallbacksTest < ActiveRecord::TestCase
++  fixtures :posts, :comments
++  
++  def setup
++    @thinking = posts(:thinking)
++    @authorless = posts(:authorless)
++    @comment = Comment.new
++  end
++  
++  def test_should_add_regular_post_like_normal
++    @comment.post = @thinking
++    @comment.save
++    assert_equal @thinking.id, @comment.post_id
++  end
++  
++  def test_adding_with_macro_callbacks
++    assert @comment.post_log.empty?
++    @comment.post_with_macro_callbacks = @thinking
++    @comment.save
++    assert_equal @thinking.id, @comment.post_id
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @comment.post_log
++  end
++  
++  def test_adding_with_proc_callbacks
++    assert @comment.post_log.empty?
++    @comment.post_with_proc_callbacks = @thinking
++    @comment.save
++    assert_equal @thinking.id, @comment.post_id
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @comment.post_log
++  end
++  
++  def test_removing_with_macro_callbacks
++    assert @comment.post_log.empty?
++    @comment.post_with_macro_callbacks = @thinking
++    @comment.save
++    assert_equal @thinking.id, @comment.post_id
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @comment.post_log
++    @comment.post_with_macro_callbacks = nil
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}", "before_removing#{@thinking.id}", 
++                  "after_removing#{@thinking.id}"], @comment.post_log
++  end
++  
++  def test_replacing_with_macro_callbacks
++    assert @comment.post_log.empty?
++    @comment.post_with_macro_callbacks = @thinking
++    @comment.save
++    assert_equal @thinking.id, @comment.post_id
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @comment.post_log
++    @comment.post_with_macro_callbacks = @authorless
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}", "before_removing#{@thinking.id}",
++                  "before_adding#{@authorless.id}", "after_removing#{@thinking.id}", 
++                  "after_adding#{@authorless.id}"], @comment.post_log
++  end
++  
++  def test_replacing_with_proc_callbacks
++    assert @comment.post_log.empty?
++    @comment.post_with_proc_callbacks = @thinking
++    @comment.save
++    assert_equal @thinking.id, @comment.post_id
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @comment.post_log
++    @comment.post_with_proc_callbacks = @authorless
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}", "before_removing#{@thinking.id}",
++                  "before_adding#{@authorless.id}", "after_removing#{@thinking.id}",
++                  "after_adding#{@authorless.id}"], @comment.post_log
++  end
++  
++  def test_removing_with_proc_callbacks
++    assert @comment.post_log.empty?
++    @comment.post_with_proc_callbacks = @thinking
++    @comment.save
++    assert_equal @thinking.id, @comment.post_id
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}"], @comment.post_log
++    @comment.post_with_proc_callbacks = nil
++    assert_equal ["before_adding#{@thinking.id}", "after_adding#{@thinking.id}", "before_removing#{@thinking.id}",
++                  "after_removing#{@thinking.id}"], @comment.post_log
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/models/comment.rb b/activerecord/test/models/comment.rb
+index f7f07c1..cf3ff28 100644
+--- a/activerecord/test/models/comment.rb
++++ b/activerecord/test/models/comment.rb
+@@ -2,6 +2,16 @@ class Comment < ActiveRecord::Base
+   named_scope :containing_the_letter_e, :conditions => "comments.body LIKE '%e%'"
+   
+   belongs_to :post, :counter_cache => true
++  belongs_to :post_with_macro_callbacks, :class_name => "Post", :foreign_key => "post_id",
++    :before_add     => :log_before_adding,
++    :after_add      => :log_after_adding,
++    :before_remove  => :log_before_removing,
++    :after_remove   => :log_after_removing
++  belongs_to :post_with_proc_callbacks, :class_name => "Post", :foreign_key => "post_id",
++    :before_add     => Proc.new {|o, r| o.post_log << "before_adding#{r.id || '<new>'}"},
++    :after_add      => Proc.new {|o, r| o.post_log << "after_adding#{r.id || '<new>'}"},
++    :before_remove  => Proc.new {|o, r| o.post_log << "before_removing#{r.id || '<new>'}"},
++    :after_remove   => Proc.new {|o, r| o.post_log << "after_removing#{r.id || '<new>'}"}
+ 
+   def self.what_are_you
+     'a comment...'
+@@ -10,6 +20,29 @@ class Comment < ActiveRecord::Base
+   def self.search_by_type(q)
+     self.find(:all, :conditions => ["#{QUOTED_TYPE} = ?", q])
+   end
++  
++  attr_accessor :post_log
++  
++  def after_initialize
++    @post_log = []
++  end
++  
++  private
++    def log_before_adding(object)
++      @post_log << "before_adding#{object.id}"
++    end
++    
++    def log_after_adding(object)
++      @post_log << "after_adding#{object.id}"
++    end
++    
++    def log_before_removing(object)
++      @post_log << "before_removing#{object.id}"
++    end
++    
++    def log_after_removing(object)
++      @post_log << "after_removing#{object.id}"
++    end
+ end
+ 
+ class SpecialComment < Comment
+-- 
+1.6.0.5
+

@@ -1,0 +1,182 @@
+From 13a33f7f0d92baffb0886b7b04e90f4b92b0b86b Mon Sep 17 00:00:00 2001
+From: James A. Rosen <james@zendesk.com>
+Date: Fri, 29 Oct 2010 10:08:27 -0700
+Subject: [PATCH] backported #5412 to 2-3-stable
+
+---
+ railties/lib/tasks/databases.rake |   62 ++++++++++++++++++++++++++-----------
+ 1 files changed, 44 insertions(+), 18 deletions(-)
+
+diff --git a/railties/lib/tasks/databases.rake b/railties/lib/tasks/databases.rake
+index 1cf2434..2021825 100644
+--- a/railties/lib/tasks/databases.rake
++++ b/railties/lib/tasks/databases.rake
+@@ -106,11 +106,12 @@ namespace :db do
+   end
+ 
+ 
+-  desc "Migrate the database through scripts in db/migrate and update db/schema.rb by invoking db:schema:dump. Target specific version with VERSION=x. Turn off output with VERBOSE=false."
++  desc "Migrate the database through scripts in db/migrate and update db/schema.rb by invoking db:schema:dump (or db/schema.sql by invoking db:structure:dump). Target specific version with VERSION=x. Turn off output with VERBOSE=false."
+   task :migrate => :environment do
+     ActiveRecord::Migration.verbose = ENV["VERBOSE"] ? ENV["VERBOSE"] == "true" : true
+     ActiveRecord::Migrator.migrate("db/migrate/", ENV["VERSION"] ? ENV["VERSION"].to_i : nil)
+     Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
++    Rake::Task["db:structure:dump"].invoke if ActiveRecord::Base.schema_format == :sql
+   end
+ 
+   namespace :migrate do
+@@ -134,6 +135,7 @@ namespace :db do
+       raise "VERSION is required" unless version
+       ActiveRecord::Migrator.run(:up, "db/migrate/", version)
+       Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
++      Rake::Task["db:structure:dump"].invoke if ActiveRecord::Base.schema_format == :sql
+     end
+ 
+     desc 'Runs the "down" for a given migration VERSION.'
+@@ -142,6 +144,7 @@ namespace :db do
+       raise "VERSION is required" unless version
+       ActiveRecord::Migrator.run(:down, "db/migrate/", version)
+       Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
++      Rake::Task["db:structure:dump"].invoke if ActiveRecord::Base.schema_format == :sql
+     end
+   end
+ 
+@@ -150,6 +153,7 @@ namespace :db do
+     step = ENV['STEP'] ? ENV['STEP'].to_i : 1
+     ActiveRecord::Migrator.rollback('db/migrate/', step)
+     Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
++    Rake::Task["db:structure:dump"].invoke if ActiveRecord::Base.schema_format == :sql
+   end
+ 
+   desc 'Drops and recreates the database from db/schema.rb for the current environment and loads the seeds.'
+@@ -203,7 +207,12 @@ namespace :db do
+   end
+ 
+   desc 'Create the database, load the schema, and initialize with the seed data'
+-  task :setup => [ 'db:create', 'db:schema:load', 'db:seed' ]
++  task :setup do
++    Rake::Task['db:create'].invoke
++    Rake::Task['db:schema:load'].invoke if ActiveRecord::Base.schema_format == :ruby
++    Rake::Task['db:structure:load'].invoke if ActiveRecord::Base.schema_format == :sql
++    Rake::Task['db:seed'].invoke
++  end
+ 
+   desc 'Load the seed data from db/seeds.rb'
+   task :seed => :environment do
+@@ -276,31 +285,43 @@ namespace :db do
+       case abcs[RAILS_ENV]["adapter"]
+       when /^mysql/, "oci", "oracle"
+         ActiveRecord::Base.establish_connection(abcs[RAILS_ENV])
+-        File.open("#{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql", "w+") { |f| f << ActiveRecord::Base.connection.structure_dump }
++        File.open("#{RAILS_ROOT}/db/structure.sql", "w+") { |f| f << ActiveRecord::Base.connection.structure_dump }
+       when "postgresql"
+         ENV['PGHOST']     = abcs[RAILS_ENV]["host"] if abcs[RAILS_ENV]["host"]
+         ENV['PGPORT']     = abcs[RAILS_ENV]["port"].to_s if abcs[RAILS_ENV]["port"]
+         ENV['PGPASSWORD'] = abcs[RAILS_ENV]["password"].to_s if abcs[RAILS_ENV]["password"]
+         search_path = abcs[RAILS_ENV]["schema_search_path"]
+         search_path = "--schema=#{search_path}" if search_path
+-        `pg_dump -i -U "#{abcs[RAILS_ENV]["username"]}" -s -x -O -f db/#{RAILS_ENV}_structure.sql #{search_path} #{abcs[RAILS_ENV]["database"]}`
++        `pg_dump -i -U "#{abcs[RAILS_ENV]["username"]}" -s -x -O -f db/structure.sql #{search_path} #{abcs[RAILS_ENV]["database"]}`
+         raise "Error dumping database" if $?.exitstatus == 1
+       when "sqlite", "sqlite3"
+         dbfile = abcs[RAILS_ENV]["database"] || abcs[RAILS_ENV]["dbfile"]
+-        `#{abcs[RAILS_ENV]["adapter"]} #{dbfile} .schema > db/#{RAILS_ENV}_structure.sql`
++        `#{abcs[RAILS_ENV]["adapter"]} #{dbfile} .schema > db/structure.sql`
+       when "sqlserver"
+-        `scptxfr /s #{abcs[RAILS_ENV]["host"]} /d #{abcs[RAILS_ENV]["database"]} /I /f db\\#{RAILS_ENV}_structure.sql /q /A /r`
++        `scptxfr /s #{abcs[RAILS_ENV]["host"]} /d #{abcs[RAILS_ENV]["database"]} /I /f db\\structure.sql /q /A /r`
+         `scptxfr /s #{abcs[RAILS_ENV]["host"]} /d #{abcs[RAILS_ENV]["database"]} /I /F db\ /q /A /r`
+       when "firebird"
+         set_firebird_env(abcs[RAILS_ENV])
+         db_string = firebird_db_string(abcs[RAILS_ENV])
+-        sh "isql -a #{db_string} > #{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql"
++        sh "isql -a #{db_string} > #{RAILS_ROOT}/db/structure.sql"
+       else
+         raise "Task not supported by '#{abcs["test"]["adapter"]}'"
+       end
+ 
+       if ActiveRecord::Base.connection.supports_migrations?
+-        File.open("#{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql", "a") { |f| f << ActiveRecord::Base.connection.dump_schema_information }
++        File.open("#{RAILS_ROOT}/db/structure.sql", "a") { |f| f << ActiveRecord::Base.connection.dump_schema_information }
++      end
++    end
++
++    desc "Load the database structure from an SQL file"
++    task :load => :environment do
++      file = File.join(Rails.root, 'db', 'structure.sql')
++      if File.exists?(file)
++        IO.readlines(file).join.split("\n\n").each do |sql_statement|
++          ActiveRecord::Base.connection.execute(sql_statement)
++        end
++      else
++        abort %{#{file} doesn't exist yet. Run "rake db:migrate" to create it then try again. If you do not intend to use a database, you should instead alter #{Rails.root}/config/boot.rb to limit the frameworks that will be loaded}
+       end
+     end
+   end
+@@ -310,41 +331,46 @@ namespace :db do
+     task :load => 'db:test:purge' do
+       ActiveRecord::Base.establish_connection(ActiveRecord::Base.configurations['test'])
+       ActiveRecord::Schema.verbose = false
+-      Rake::Task["db:schema:load"].invoke
++      Rake::Task["db:schema:load"].invoke if ActiveRecord::Base.schema_format == :ruby
++      Rake::Task["db:structure:load"].invoke if ActiveRecord::Base.schema_format == :sql
+     end
+ 
+     desc "Recreate the test database from the current environment's database schema"
+-    task :clone => %w(db:schema:dump db:test:load)
++    task :clone do
++      Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
++      Rake::Task["db:structure:dump"].invoke if ActiveRecord::Base.schema_format == :sql
++      Rake::Task["db:test:load"].invoke
++    end
+ 
+-    desc "Recreate the test databases from the development structure"
++    desc "Recreate the test databases from the database structure"
+     task :clone_structure => [ "db:structure:dump", "db:test:purge" ] do
+       abcs = ActiveRecord::Base.configurations
+       case abcs["test"]["adapter"]
+       when /^mysql/
+         ActiveRecord::Base.establish_connection(:test)
+         ActiveRecord::Base.connection.execute('SET foreign_key_checks = 0')
+-        IO.readlines("#{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql").join.split("\n\n").each do |table|
++        IO.readlines("#{RAILS_ROOT}/db/structure.sql").join.split("\n\n").each do |table|
+           ActiveRecord::Base.connection.execute(table)
+         end
+       when "postgresql"
+         ENV['PGHOST']     = abcs["test"]["host"] if abcs["test"]["host"]
+         ENV['PGPORT']     = abcs["test"]["port"].to_s if abcs["test"]["port"]
+         ENV['PGPASSWORD'] = abcs["test"]["password"].to_s if abcs["test"]["password"]
+-        `psql -U "#{abcs["test"]["username"]}" -f #{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql #{abcs["test"]["database"]}`
++        `psql -U "#{abcs["test"]["username"]}" -f #{RAILS_ROOT}/db/structure.sql #{abcs["test"]["database"]}`
+       when "sqlite", "sqlite3"
+         dbfile = abcs["test"]["database"] || abcs["test"]["dbfile"]
+-        `#{abcs["test"]["adapter"]} #{dbfile} < #{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql`
++        `#{abcs["test"]["adapter"]} #{dbfile} < #{RAILS_ROOT}/db/structure.sql`
+       when "sqlserver"
+-        `osql -E -S #{abcs["test"]["host"]} -d #{abcs["test"]["database"]} -i db\\#{RAILS_ENV}_structure.sql`
++        `osql -E -S #{abcs["test"]["host"]} -d #{abcs["test"]["database"]} -i db\\structure.sql`
+       when "oci", "oracle"
+         ActiveRecord::Base.establish_connection(:test)
+-        IO.readlines("#{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql").join.split(";\n\n").each do |ddl|
++        IO.readlines("#{RAILS_ROOT}/db/structure.sql").join.split(";\n\n").each do |ddl|
+           ActiveRecord::Base.connection.execute(ddl)
+         end
+       when "firebird"
+         set_firebird_env(abcs["test"])
+         db_string = firebird_db_string(abcs["test"])
+-        sh "isql -i #{RAILS_ROOT}/db/#{RAILS_ENV}_structure.sql #{db_string}"
++        sh "isql -i #{RAILS_ROOT}/db/structure.sql #{db_string}"
+       else
+         raise "Task not supported by '#{abcs["test"]["adapter"]}'"
+       end
+@@ -367,7 +393,7 @@ namespace :db do
+       when "sqlserver"
+         dropfkscript = "#{abcs["test"]["host"]}.#{abcs["test"]["database"]}.DP1".gsub(/\\/,'-')
+         `osql -E -S #{abcs["test"]["host"]} -d #{abcs["test"]["database"]} -i db\\#{dropfkscript}`
+-        `osql -E -S #{abcs["test"]["host"]} -d #{abcs["test"]["database"]} -i db\\#{RAILS_ENV}_structure.sql`
++        `osql -E -S #{abcs["test"]["host"]} -d #{abcs["test"]["database"]} -i db\\structure.sql`
+       when "oci", "oracle"
+         ActiveRecord::Base.establish_connection(:test)
+         ActiveRecord::Base.connection.structure_drop.split(";\n\n").each do |ddl|
+-- 
+1.7.1.1

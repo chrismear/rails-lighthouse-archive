@@ -1,0 +1,482 @@
+From e8a412cd93a62fdc7c716c7acd059fc1dbbbb8e7 Mon Sep 17 00:00:00 2001
+From: thedarkone <nobody>
+Date: Thu, 19 Feb 2009 20:02:47 +0100
+Subject: [PATCH] Fix regressions that have popped up.
+
+---
+ actionpack/lib/action_view/base.rb                 |    4 +-
+ actionpack/lib/action_view/reloadable_template.rb  |   77 ++++++------
+ actionpack/lib/action_view/template.rb             |   24 ++--
+ actionpack/test/controller/view_paths_test.rb      |   26 ++---
+ .../test/template/compiled_templates_test.rb       |  128 ++++++++++++++++----
+ railties/test/plugin_loader_test.rb                |    2 +-
+ 6 files changed, 164 insertions(+), 97 deletions(-)
+
+diff --git a/actionpack/lib/action_view/base.rb b/actionpack/lib/action_view/base.rb
+index 4198725..65b2062 100644
+--- a/actionpack/lib/action_view/base.rb
++++ b/actionpack/lib/action_view/base.rb
+@@ -254,8 +254,8 @@ module ActionView #:nodoc:
+         if options[:layout]
+           _render_with_layout(options, local_assigns, &block)
+         elsif options[:file]
+-          tempalte = self.view_paths.find_template(options[:file], template_format)
+-          tempalte.render_template(self, options[:locals])
++          template = self.view_paths.find_template(options[:file], template_format)
++          template.render_template(self, options[:locals])
+         elsif options[:partial]
+           render_partial(options)
+         elsif options[:inline]
+diff --git a/actionpack/lib/action_view/reloadable_template.rb b/actionpack/lib/action_view/reloadable_template.rb
+index 3081be6..5ef833d 100644
+--- a/actionpack/lib/action_view/reloadable_template.rb
++++ b/actionpack/lib/action_view/reloadable_template.rb
+@@ -27,49 +27,50 @@ module ActionView #:nodoc:
+           end
+         else
+           load_all_templates_from_dir(templates_dir_from_path(path))
+-          @paths[path]
++          # don't ever hand out a template without running a stale check
++          (new_template = @paths[path]) && new_template.reset_cache_if_stale!
+         end
+       end
+ 
+-      def register_template_from_file(template_file_path)
+-        if !@paths[template_relative_path = template_file_path.split("#{@path}/").last] && File.file?(template_file_path)
+-          register_template(ReloadableTemplate.new(template_relative_path, self))
++      private
++        def register_template_from_file(template_full_file_path)
++          if !@paths[relative_path = relative_path_for_template_file(template_full_file_path)] && File.file?(template_full_file_path)
++            register_template(ReloadableTemplate.new(relative_path, self))
++          end
+         end
+-      end
+ 
+-      def register_template(template)
+-        template.accessible_paths.each do |path|
+-          @paths[path] = template
++        def register_template(template)
++          template.accessible_paths.each do |path|
++            @paths[path] = template
++          end
+         end
+-      end
+ 
+-      # remove (probably deleted) template from cache
+-      def unregister_template(template)
+-        template.accessible_paths.each do |template_path|
+-          @paths.delete(template_path) if @paths[template_path] == template
+-        end
+-        # fill in any newly created gaps
+-        @paths.values.uniq.each do |template|
+-          template.accessible_paths.each {|path| @paths[path] ||= template}
++        # remove (probably deleted) template from cache
++        def unregister_template(template)
++          template.accessible_paths.each do |template_path|
++            @paths.delete(template_path) if @paths[template_path] == template
++          end
++          # fill in any newly created gaps
++          @paths.values.uniq.each do |template|
++            template.accessible_paths.each {|path| @paths[path] ||= template}
++          end
+         end
+-      end
+-
+-      # load all templates from the directory of the requested template
+-      def load_all_templates_from_dir(dir)
+-        # hit disk only once per template-dir/request
+-        @disk_cache[dir] ||= template_files_from_dir(dir).each {|template_file| register_template_from_file(template_file)}
+-      end
+ 
+-      def templates_dir_from_path(path)
+-        dirname = File.dirname(path)
+-        File.join(@path, dirname == '.' ? '' : dirname)
+-      end
++        # load all templates from the directory of the requested template
++        def load_all_templates_from_dir(dir)
++          # hit disk only once per template-dir/request
++          @disk_cache[dir] ||= template_files_from_dir(dir).each {|template_file| register_template_from_file(template_file)}
++        end
+ 
+-      # get all the template filenames from the dir
+-      def template_files_from_dir(dir)
+-        Dir.glob(File.join(dir, '*'))
+-      end
++        def templates_dir_from_path(path)
++          dirname = File.dirname(path)
++          File.join(@path, dirname == '.' ? '' : dirname)
++        end
+ 
++        # get all the template filenames from the dir
++        def template_files_from_dir(dir)
++          Dir.glob(File.join(dir, '*'))
++        end
+     end
+ 
+     module Unfreezable
+@@ -78,7 +79,6 @@ module ActionView #:nodoc:
+ 
+     def initialize(*args)
+       super
+-      @compiled_methods = []
+       
+       # we don't ever want to get frozen
+       extend Unfreezable
+@@ -106,14 +106,11 @@ module ActionView #:nodoc:
+       self
+     end
+ 
++    # remove any compiled methods that look like they might belong to me
+     def undef_my_compiled_methods!
+-      @compiled_methods.each {|comp_method| ActionView::Base::CompiledTemplates.send(:remove_method, comp_method)}
+-      @compiled_methods.clear
+-    end
+-
+-    def compile!(render_symbol, local_assigns)
+-      super
+-      @compiled_methods << render_symbol
++      ActionView::Base::CompiledTemplates.public_instance_methods.grep(/#{Regexp.escape(method_name_without_locals)}(?:_locals_)?/).each do |m|
++        ActionView::Base::CompiledTemplates.send(:remove_method, m)
++      end
+     end
+ 
+   end
+diff --git a/actionpack/lib/action_view/template.rb b/actionpack/lib/action_view/template.rb
+index b8e2165..ea838b9 100644
+--- a/actionpack/lib/action_view/template.rb
++++ b/actionpack/lib/action_view/template.rb
+@@ -6,12 +6,7 @@ module ActionView #:nodoc:
+ 
+       def initialize(path)
+         raise ArgumentError, "path already is a Path class" if path.is_a?(Path)
+-        @path = expand_path(path).freeze
+-      end
+-
+-      def expand_path(path)
+-        # collapse any directory dots in path ('.' or '..')
+-        path.starts_with?('/') ? File.expand_path(path) : File.expand_path(path, '/').from(1)
++        @path = (path.ends_with?(File::SEPARATOR) ? path.to(-2) : path).freeze
+       end
+ 
+       def to_s
+@@ -45,22 +40,23 @@ module ActionView #:nodoc:
+       # will never match +hello/index.html.erb+.
+       def [](path)
+       end
+-      
++
+       def load!
+       end
+-      
++
+       def self.new_and_loaded(path)
+         returning new(path) do |path|
+           path.load!
+         end
+       end
++
++      private
++        def relative_path_for_template_file(full_file_path)
++          full_file_path.split("#{@path}/").last
++        end
+     end
+ 
+     class EagerPath < Path
+-      def initialize(path)
+-        super
+-      end
+-
+       def load!
+         return if @loaded
+         
+@@ -79,7 +75,7 @@ module ActionView #:nodoc:
+         load! unless @loaded
+         @paths[path]
+       end
+-      
++
+       private
+         def templates_in_path
+           (Dir.glob("#{@path}/**/*/**") | Dir.glob("#{@path}/**")).each do |file|
+@@ -88,7 +84,7 @@ module ActionView #:nodoc:
+         end
+ 
+         def create_template(file)
+-          Template.new(file.split("#{self}/").last, self)
++          Template.new(relative_path_for_template_file(file), self)
+         end
+     end
+ 
+diff --git a/actionpack/test/controller/view_paths_test.rb b/actionpack/test/controller/view_paths_test.rb
+index 6468283..8ea13fb 100644
+--- a/actionpack/test/controller/view_paths_test.rb
++++ b/actionpack/test/controller/view_paths_test.rb
+@@ -42,34 +42,30 @@ class ViewLoadPathsTest < ActionController::TestCase
+     ActiveSupport::Deprecation.behavior = @old_behavior
+   end
+   
+-  def assert_view_path_strings_are_equal(expected, actual)
+-    assert_equal(expected.map {|path| path.sub(/\.\//, '')}, actual)
+-  end
+-
+   def test_template_load_path_was_set_correctly
+-    assert_view_path_strings_are_equal [FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
++    assert_equal [FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
+   end
+ 
+   def test_controller_appends_view_path_correctly
+     @controller.append_view_path 'foo'
+-    assert_view_path_strings_are_equal [FIXTURE_LOAD_PATH, 'foo'], @controller.view_paths.map(&:to_s)
++    assert_equal [FIXTURE_LOAD_PATH, 'foo'], @controller.view_paths.map(&:to_s)
+ 
+     @controller.append_view_path(%w(bar baz))
+-    assert_view_path_strings_are_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz'], @controller.view_paths.map(&:to_s)
++    assert_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz'], @controller.view_paths.map(&:to_s)
+ 
+     @controller.append_view_path(FIXTURE_LOAD_PATH)
+-    assert_view_path_strings_are_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
++    assert_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
+   end
+ 
+   def test_controller_prepends_view_path_correctly
+     @controller.prepend_view_path 'baz'
+-    assert_view_path_strings_are_equal ['baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
++    assert_equal ['baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
+ 
+     @controller.prepend_view_path(%w(foo bar))
+-    assert_view_path_strings_are_equal ['foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
++    assert_equal ['foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
+ 
+     @controller.prepend_view_path(FIXTURE_LOAD_PATH)
+-    assert_view_path_strings_are_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
++    assert_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
+   end
+ 
+   def test_template_appends_view_path_correctly
+@@ -77,10 +73,10 @@ class ViewLoadPathsTest < ActionController::TestCase
+     class_view_paths = TestController.view_paths
+ 
+     @controller.append_view_path 'foo'
+-    assert_view_path_strings_are_equal [FIXTURE_LOAD_PATH, 'foo'], @controller.view_paths.map(&:to_s)
++    assert_equal [FIXTURE_LOAD_PATH, 'foo'], @controller.view_paths.map(&:to_s)
+ 
+     @controller.append_view_path(%w(bar baz))
+-    assert_view_path_strings_are_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz'], @controller.view_paths.map(&:to_s)
++    assert_equal [FIXTURE_LOAD_PATH, 'foo', 'bar', 'baz'], @controller.view_paths.map(&:to_s)
+     assert_equal class_view_paths, TestController.view_paths
+   end
+ 
+@@ -89,10 +85,10 @@ class ViewLoadPathsTest < ActionController::TestCase
+     class_view_paths = TestController.view_paths
+ 
+     @controller.prepend_view_path 'baz'
+-    assert_view_path_strings_are_equal ['baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
++    assert_equal ['baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
+ 
+     @controller.prepend_view_path(%w(foo bar))
+-    assert_view_path_strings_are_equal ['foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
++    assert_equal ['foo', 'bar', 'baz', FIXTURE_LOAD_PATH], @controller.view_paths.map(&:to_s)
+     assert_equal class_view_paths, TestController.view_paths
+   end
+ 
+diff --git a/actionpack/test/template/compiled_templates_test.rb b/actionpack/test/template/compiled_templates_test.rb
+index a8f8455..7d1d763 100644
+--- a/actionpack/test/template/compiled_templates_test.rb
++++ b/actionpack/test/template/compiled_templates_test.rb
+@@ -5,18 +5,6 @@ class CompiledTemplatesTest < Test::Unit::TestCase
+   
+   def setup
+     @compiled_templates = ActionView::Base::CompiledTemplates
+-
+-    # first, if we are running the whole test suite with ReloadableTemplates
+-    # try to undef all the methods through ReloadableTemplate's interfaces
+-    unless ActionView::Base.cache_template_loading?
+-      ActionController::Base.view_paths.each do |view_path|
+-        view_path.paths.values.uniq!.each do |reloadable_template|
+-          reloadable_template.undef_my_compiled_methods!
+-        end
+-      end
+-    end
+-
+-    # just purge anything that's left
+     @compiled_templates.instance_methods.each do |m|
+       @compiled_templates.send(:remove_method, m) if m =~ /^_run_/
+     end
+@@ -65,38 +53,124 @@ class CompiledTemplatesTest < Test::Unit::TestCase
+       with_reloading(true) do
+         assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+         modify_template "test/hello_world.erb", "Goodbye world!" do
+-          reset_mtime_of('test/hello_world.erb')
+           assert_equal "Goodbye world!", render(:file => "test/hello_world.erb")
+         end
+-        reset_mtime_of('test/hello_world.erb')
+         assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+       end
+     end
+   end
+ 
++  def test_template_becomes_missing_if_deleted_without_cached_template_loading
++    with_reloading(true) do
++      assert_equal 'Hello world!', render(:file => 'test/hello_world.erb')
++      delete_template 'test/hello_world.erb' do
++        assert_raise(ActionView::MissingTemplate) { render(:file => 'test/hello_world.erb') }
++      end
++      assert_equal 'Hello world!', render(:file => 'test/hello_world.erb')
++    end
++  end
++
++  def test_swapping_template_handler_is_working_without_cached_template_loading
++    with_reloading(true) do
++      assert_equal 'Hello world!', render(:file => 'test/hello_world')
++      delete_template 'test/hello_world.erb' do
++        rename_template 'test/hello_world_from_rxml.builder', 'test/hello_world.builder' do
++          assert_equal "<html>\n  <p>Hello</p>\n</html>\n", render(:file => 'test/hello_world')
++        end
++      end
++      assert_equal 'Hello world!', render(:file => 'test/hello_world')
++    end
++  end
++
++  def test_adding_localized_template_will_take_precedence_without_cached_template_loading
++    with_reloading(true) do
++      assert_equal 'Hello world!', render(:file => 'test/hello_world')
++      rename_template 'test/hello_world.da.html.erb', 'test/hello_world.en.html.erb' do
++        assert_equal 'Hey verden', render(:file => 'test/hello_world')
++      end
++    end
++  end
++
++  def test_deleting_localized_template_will_fall_back_to_non_localized_template_without_cached_template_loading
++    with_reloading(true) do
++      rename_template 'test/hello_world.da.html.erb', 'test/hello_world.en.html.erb' do
++        assert_equal 'Hey verden', render(:file => 'test/hello_world')
++        delete_template 'test/hello_world.en.html.erb' do
++          assert_equal 'Hello world!', render(:file => 'test/hello_world')
++        end
++        assert_equal 'Hey verden', render(:file => 'test/hello_world')
++      end
++    end
++  end
++
++  def test_parallel_reloadable_view_paths_are_working
++    with_reloading(true) do
++      view_paths_copy = new_reloadable_view_paths
++      assert_equal 'Hello world!', render(:file => 'test/hello_world')
++      with_view_paths(view_paths_copy, new_reloadable_view_paths) do
++        assert_equal 'Hello world!', render(:file => 'test/hello_world')
++      end
++      modify_template 'test/hello_world.erb', 'Goodbye world!' do
++        assert_equal 'Goodbye world!', render(:file => 'test/hello_world')
++        modify_template 'test/hello_world.erb', 'So long, world!' do
++          with_view_paths(view_paths_copy, new_reloadable_view_paths) do
++            assert_equal 'So long, world!', render(:file => 'test/hello_world')
++          end
++          assert_equal 'So long, world!', render(:file => 'test/hello_world')
++        end
++      end
++    end
++  end
++
+   private
+     def render(*args)
+-      view_paths = ActionController::Base.view_paths
++      view_paths = @explicit_view_paths || ActionController::Base.view_paths
+       ActionView::Base.new(view_paths, {}).render(*args)
+     end
+ 
+-    def reset_mtime_of(template_name)
+-      unless ActionView::Base.cache_template_loading?
+-        ActionController::Base.view_paths.find_template(template_name).previously_last_modified = 10.seconds.ago 
++    def with_view_paths(*args)
++      args.each do |view_paths|
++        begin
++          @explicit_view_paths = view_paths
++          yield
++        ensure
++          @explicit_view_paths = nil
++        end
+       end
+     end
+ 
+-    def modify_template(template, content)
+-      filename = "#{FIXTURE_LOAD_PATH}/#{template}"
++    def reset_mtime_of(template_name, view_paths_to_use)
++      view_paths_to_use.find_template(template_name).previously_last_modified = 10.seconds.ago unless ActionView::Base.cache_template_loading?
++    end
++
++    def modify_template(template, content, view_paths_to_use = ActionController::Base.view_paths)
++      filename = filename_for(template)
+       old_content = File.read(filename)
+       begin
+         File.open(filename, "wb+") { |f| f.write(content) }
++        reset_mtime_of(template, view_paths_to_use)
+         yield
+       ensure
+         File.open(filename, "wb+") { |f| f.write(old_content) }
++        reset_mtime_of(template, view_paths_to_use)
+       end
+     end
+ 
++    def filename_for(template)
++      File.join(FIXTURE_LOAD_PATH, template)
++    end
++
++    def rename_template(old_name, new_name)
++      File.rename(filename_for(old_name), filename_for(new_name))
++      yield
++    ensure
++      File.rename(filename_for(new_name), filename_for(old_name))
++    end
++
++    def delete_template(template, &block)
++      rename_template(template, File.join(File.dirname(template), "__#{File.basename(template)}"), &block)
++    end
++
+     def with_caching(perform_caching)
+       old_perform_caching = ActionController::Base.perform_caching
+       begin
+@@ -107,19 +181,23 @@ class CompiledTemplatesTest < Test::Unit::TestCase
+       end
+     end
+ 
+-    def with_reloading(reload_templates)
+-      old_view_paths, old_cache_templates = ActionController::Base.view_paths, ActionView::Base.cache_template_loading
++    def with_reloading(reload_templates, view_paths_owner = ActionController::Base)
++      old_view_paths, old_cache_templates = view_paths_owner.view_paths, ActionView::Base.cache_template_loading
+       begin
+         ActionView::Base.cache_template_loading = !reload_templates
+-        ActionController::Base.view_paths = view_paths_for(reload_templates)
++        view_paths_owner.view_paths = view_paths_for(reload_templates)
+         yield
+       ensure
+-        ActionController::Base.view_paths, ActionView::Base.cache_template_loading = old_view_paths, old_cache_templates
++        view_paths_owner.view_paths, ActionView::Base.cache_template_loading = old_view_paths, old_cache_templates
+       end
+     end
+ 
++    def new_reloadable_view_paths
++      ActionView::PathSet.new(CACHED_VIEW_PATHS.map(&:to_s))
++    end
++
+     def view_paths_for(reload_templates)
+       # reloadable paths are cheap to create
+-      reload_templates ? ActionView::PathSet.new(CACHED_VIEW_PATHS.map(&:to_s)) : CACHED_VIEW_PATHS
++      reload_templates ? new_reloadable_view_paths : CACHED_VIEW_PATHS
+     end
+ end
+diff --git a/railties/test/plugin_loader_test.rb b/railties/test/plugin_loader_test.rb
+index 59491fe..23b81dd 100644
+--- a/railties/test/plugin_loader_test.rb
++++ b/railties/test/plugin_loader_test.rb
+@@ -130,7 +130,7 @@ class TestPluginLoader < Test::Unit::TestCase
+ 
+     @loader.send :add_engine_view_paths
+     
+-    assert_equal [ File.join(plugin_fixture_path('engines/engine'), 'app', 'views').sub(/\A\.\//, '') ], ActionController::Base.view_paths
++    assert_equal [ File.join(plugin_fixture_path('engines/engine'), 'app', 'views') ], ActionController::Base.view_paths
+   end
+ 
+   def test_should_add_plugin_load_paths_to_Dependencies_load_once_paths
+-- 
+1.6.0.1
+

@@ -1,0 +1,338 @@
+From 8b8991ed2abe5fc6ad2470be13994d1982d3e43c Mon Sep 17 00:00:00 2001
+From: Adam Cooper <adam.cooper@gmail.com>
+Date: Mon, 29 Dec 2008 22:27:38 -0800
+Subject: [PATCH] Adding a :counter_cache attribute to the has_many association to use custom cache column
+
+---
+ activerecord/lib/active_record/associations.rb     |   10 +++++++---
+ .../associations/has_many_association.rb           |    2 +-
+ .../associations/has_many_through_association.rb   |    2 +-
+ .../associations/belongs_to_associations_test.rb   |   14 ++++++++++++++
+ .../test/cases/associations/join_model_test.rb     |   15 +++++++++++++++
+ activerecord/test/cases/base_test.rb               |    2 +-
+ activerecord/test/cases/reflection_test.rb         |    6 +++---
+ activerecord/test/fixtures/taggings.yml            |    5 +++++
+ activerecord/test/models/author.rb                 |    1 +
+ activerecord/test/models/post.rb                   |    2 ++
+ activerecord/test/models/reply.rb                  |    5 +++++
+ activerecord/test/models/tagging.rb                |    4 ++++
+ activerecord/test/schema/schema.rb                 |   14 ++++++++++----
+ 13 files changed, 69 insertions(+), 13 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 86616ab..b4760ae 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -752,6 +752,9 @@ module ActiveRecord
+       #   If true, all the associated objects are readonly through the association.
+       # [:validate]
+       #   If false, don't validate the associated objects when saving the parent object. true by default.
++      # [:counter_cache]
++      #   Specifies the name of a custom counter cache column.  Defaults to <tt>#{association_name}_count</tt> if omitted.
++      #   Note: This does not setup the counter cache and requires a corresponding <tt>belongs_to</tt> with the <tt>:counter_cache</tt>.
+       # Option examples:
+       #   has_many :comments, :order => "posted_on"
+       #   has_many :comments, :include => :author
+@@ -968,6 +971,7 @@ module ActiveRecord
+       #   destroyed. This requires that a column named <tt>#{table_name}_count</tt> (such as +comments_count+ for a belonging Comment class)
+       #   is used on the associate class (such as a Post class). You can also specify a custom counter cache column by providing
+       #   a column name instead of a +true+/+false+ value to this option (e.g., <tt>:counter_cache => :my_custom_counter</tt>.)
++      #   If a custom counter cache column is specified then the corresponding <tt>has_many</tt> association may require updating. (See <tt>has_many :counter_cache</tt> options)
+       #   Note: Specifying a counter cache will add it to that model's list of readonly attributes using +attr_readonly+.
+       # [:include]
+       #   Specify second-order associations that should be eager loaded when this object is loaded.
+@@ -1555,7 +1559,7 @@ module ActiveRecord
+ 
+         mattr_accessor :valid_keys_for_has_many_association
+         @@valid_keys_for_has_many_association = [
+-          :class_name, :table_name, :foreign_key, :primary_key,
++          :class_name, :table_name, :foreign_key, :primary_key, :counter_cache,
+           :dependent,
+           :select, :conditions, :include, :order, :group, :having, :limit, :offset,
+           :as, :through, :source, :source_type,
+@@ -1576,7 +1580,7 @@ module ActiveRecord
+         mattr_accessor :valid_keys_for_has_one_association
+         @@valid_keys_for_has_one_association = [
+           :class_name, :foreign_key, :remote, :select, :conditions, :order,
+-          :include, :dependent, :counter_cache, :extend, :as, :readonly,
++          :include, :dependent, :extend, :as, :readonly,
+           :validate, :primary_key
+         ]
+ 
+@@ -1587,7 +1591,7 @@ module ActiveRecord
+ 
+         def create_has_one_through_reflection(association_id, options)
+           options.assert_valid_keys(
+-            :class_name, :foreign_key, :remote, :select, :conditions, :order, :include, :dependent, :counter_cache, :extend, :as, :through, :source, :source_type, :validate
++            :class_name, :foreign_key, :remote, :select, :conditions, :order, :include, :dependent, :extend, :as, :through, :source, :source_type, :validate
+           )
+           create_reflection(:has_one, association_id, options, self)
+         end
+diff --git a/activerecord/lib/active_record/associations/has_many_association.rb b/activerecord/lib/active_record/associations/has_many_association.rb
+index 3348079..8c16fcb 100644
+--- a/activerecord/lib/active_record/associations/has_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_association.rb
+@@ -53,7 +53,7 @@ module ActiveRecord
+         end
+ 
+         def cached_counter_attribute_name
+-          "#{@reflection.name}_count"
++          @reflection.counter_cache_column || "#{@reflection.name}_count"
+         end
+ 
+         def insert_record(record)
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 2eeeb28..8d76284 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -249,7 +249,7 @@ module ActiveRecord
+         end
+ 
+         def cached_counter_attribute_name
+-          "#{@reflection.name}_count"
++          @reflection.counter_cache_column || "#{@reflection.name}_count"
+         end
+     end
+   end
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 40a8503..4bac86e 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -273,6 +273,20 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     reply[:replies_count] = 17
+     assert_equal 17, reply.replies.size
+   end
++  
++  def test_custom_counter_cache_with_non_default_name
++    reply = Reply.create(:title => "re: zoom", :content => "speedy quick!")
++    assert_equal 0, reply[:custom_count]
++
++    custom = CustomReply.create(:title => "gaga", :content => "boo-boo")
++    custom.reply = reply
++
++    assert_equal 1, reply.reload[:custom_count]
++    assert_equal 1, reply.custom_replies.size
++
++    reply[:custom_count] = 17
++    assert_equal 17, reply.custom_replies.size
++  end
+ 
+   def test_store_two_association_with_one_save
+     num_orders = Order.count
+diff --git a/activerecord/test/cases/associations/join_model_test.rb b/activerecord/test/cases/associations/join_model_test.rb
+index 7a0427a..9c9fa66 100644
+--- a/activerecord/test/cases/associations/join_model_test.rb
++++ b/activerecord/test/cases/associations/join_model_test.rb
+@@ -323,6 +323,13 @@ class AssociationsJoinModelTest < ActiveRecord::TestCase
+     tagging.destroy
+     assert posts(:welcome, :reload)[:taggings_count].zero?
+   end
++  def test_belongs_to_polymorphic_with_custom_counter_cache
++    assert_equal 0, posts(:welcome)[:custom_count]
++    tagging = posts(:welcome).custom_taggings.create(:tag => tags(:general))
++    assert_equal 1, posts(:welcome, :reload)[:custom_count]
++    tagging.destroy
++    assert posts(:welcome, :reload)[:custom_count].zero?
++  end
+ 
+   def test_unavailable_through_reflection
+     assert_raise(ActiveRecord::HasManyThroughAssociationNotFoundError) { authors(:david).nothings }
+@@ -518,6 +525,14 @@ class AssociationsJoinModelTest < ActiveRecord::TestCase
+       assert !author.comments.loaded?
+     end
+   end
++  uses_mocha('has_many_through_collection_size_uses_custom_counter_cache') do
++    def test_has_many_through_collection_size_uses_custom_counter_cache
++      author = authors(:david)
++      author.stubs(:read_attribute).with('custom_count').returns(100)
++      assert_equal 100, author.custom_comments.size
++      assert !author.custom_comments.loaded?
++    end
++  end
+ 
+   def test_adding_junk_to_has_many_through_should_raise_type_mismatch
+     assert_raise(ActiveRecord::AssociationTypeMismatch) { posts(:thinking).tags << "Uhh what now?" }
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 0f03dae..8139ff3 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1995,7 +1995,7 @@ class BasicsTest < ActiveRecord::TestCase
+ 
+   def test_inspect_instance
+     topic = topics(:first)
+-    assert_equal %(#<Topic id: 1, title: "The First Topic", author_name: "David", author_email_address: "david@loudthinking.com", written_on: "#{topic.written_on.to_s(:db)}", bonus_time: "#{topic.bonus_time.to_s(:db)}", last_read: "#{topic.last_read.to_s(:db)}", content: "Have a nice day", approved: false, replies_count: 1, parent_id: nil, type: nil>), topic.inspect
++    assert_equal %(#<Topic id: 1, title: "The First Topic", author_name: "David", author_email_address: "david@loudthinking.com", written_on: "#{topic.written_on.to_s(:db)}", bonus_time: "#{topic.bonus_time.to_s(:db)}", last_read: "#{topic.last_read.to_s(:db)}", content: "Have a nice day", approved: false, replies_count: 1, custom_count: 0, parent_id: nil, type: nil>), topic.inspect
+   end
+ 
+   def test_inspect_new_instance
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index e0ed3e5..2aaf537 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -20,18 +20,18 @@ class ReflectionTest < ActiveRecord::TestCase
+ 
+   def test_read_attribute_names
+     assert_equal(
+-      %w( id title author_name author_email_address bonus_time written_on last_read content approved replies_count parent_id type ).sort,
++      %w( id title author_name author_email_address bonus_time written_on last_read content approved replies_count custom_count parent_id type ).sort,
+       @first.attribute_names
+     )
+   end
+ 
+   def test_columns
+-    assert_equal 12, Topic.columns.length
++    assert_equal 13, Topic.columns.length
+   end
+ 
+   def test_columns_are_returned_in_the_order_they_were_declared
+     column_names = Topic.columns.map { |column| column.name }
+-    assert_equal %w(id title author_name author_email_address written_on bonus_time last_read content approved replies_count parent_id type), column_names
++    assert_equal %w(id title author_name author_email_address written_on bonus_time last_read content approved replies_count custom_count parent_id type), column_names
+   end
+ 
+   def test_content_columns
+diff --git a/activerecord/test/fixtures/taggings.yml b/activerecord/test/fixtures/taggings.yml
+index 1e3d596..5ed79c5 100644
+--- a/activerecord/test/fixtures/taggings.yml
++++ b/activerecord/test/fixtures/taggings.yml
+@@ -1,5 +1,6 @@
+ welcome_general:
+   id: 1
++  type: Tagging
+   tag_id: 1
+   super_tag_id: 2
+   taggable_id: 1
+@@ -7,22 +8,26 @@ welcome_general:
+ 
+ thinking_general:
+   id: 2
++  type: Tagging
+   tag_id: 1
+   taggable_id: 2
+   taggable_type: Post
+ 
+ fake: 
+   id: 3
++  type: Tagging
+   tag_id: 1
+   taggable_id: 1
+   taggable_type: FakeModel
+ 
+ godfather:
+   id: 4
++  type: Tagging
+   tag_id: 1
+   taggable_id: 1
+   taggable_type: Item
+ 
+ orphaned:
+   id: 5
++  type: Tagging
+   tag_id: 1
+diff --git a/activerecord/test/models/author.rb b/activerecord/test/models/author.rb
+index 4ffac4f..45bcb3f 100644
+--- a/activerecord/test/models/author.rb
++++ b/activerecord/test/models/author.rb
+@@ -24,6 +24,7 @@ class Author < ActiveRecord::Base
+   has_many :comments_containing_the_letter_e, :through => :posts, :source => :comments
+   has_many :comments_with_order_and_conditions, :through => :posts, :source => :comments, :order => 'comments.body', :conditions => "comments.body like 'Thank%'"
+   has_many :comments_with_include, :through => :posts, :source => :comments, :include => :post
++  has_many :custom_comments, :through => :posts, :source => :comments, :counter_cache => 'custom_count'
+ 
+ 
+   has_many :comments_desc, :through => :posts, :source => :comments, :order => 'comments.id DESC'
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index e0d8be6..50d2aac 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -43,6 +43,8 @@ class Post < ActiveRecord::Base
+         :joins => 'left outer join posts on taggings.taggable_id = posts.id left outer join authors on posts.author_id = authors.id'
+     end
+   end
++  has_many :custom_taggings, :as => :custom_taggable
++  has_many :custom_tags, :through => :custom_taggings, :source => :tag
+ 
+   has_many :funky_tags, :through => :taggings, :source => :tag
+   has_many :super_tags, :through => :taggings
+diff --git a/activerecord/test/models/reply.rb b/activerecord/test/models/reply.rb
+index 812bc1f..31748ba 100644
+--- a/activerecord/test/models/reply.rb
++++ b/activerecord/test/models/reply.rb
+@@ -5,6 +5,7 @@ class Reply < Topic
+ 
+   belongs_to :topic, :foreign_key => "parent_id", :counter_cache => true
+   has_many :replies, :class_name => "SillyReply", :dependent => :destroy, :foreign_key => "parent_id"
++  has_many :custom_replies, :class_name => "CustomReply", :dependent => :destroy, :foreign_key => "parent_id", :counter_cache => 'custom_count'
+ 
+   validate :errors_on_empty_content
+   validate_on_create :title_is_wrong_create
+@@ -37,3 +38,7 @@ end
+ class SillyReply < Reply
+   belongs_to :reply, :foreign_key => "parent_id", :counter_cache => :replies_count
+ end
++
++class CustomReply < Reply
++  belongs_to :reply, :foreign_key => "parent_id", :counter_cache => :custom_count
++end
+\ No newline at end of file
+diff --git a/activerecord/test/models/tagging.rb b/activerecord/test/models/tagging.rb
+index a1fa1a9..99a5789 100644
+--- a/activerecord/test/models/tagging.rb
++++ b/activerecord/test/models/tagging.rb
+@@ -7,4 +7,8 @@ class Tagging < ActiveRecord::Base
+   belongs_to :super_tag,   :class_name => 'Tag', :foreign_key => 'super_tag_id'
+   belongs_to :invalid_tag, :class_name => 'Tag', :foreign_key => 'tag_id'
+   belongs_to :taggable, :polymorphic => true, :counter_cache => true
++end
++
++class CustomTagging < Tagging
++  belongs_to :custom_taggable, :polymorphic => true, :counter_cache => 'custom_count'
+ end
+\ No newline at end of file
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 8199cb8..b268227 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -94,6 +94,7 @@ ActiveRecord::Schema.define do
+   end
+ 
+   create_table :comments, :force => true do |t|
++    t.string  :type
+     t.integer :post_id, :null => false
+     t.text    :body, :null => false
+     t.string  :type
+@@ -323,6 +324,7 @@ ActiveRecord::Schema.define do
+     t.string  :type
+     t.integer :comments_count, :default => 0
+     t.integer :taggings_count, :default => 0
++    t.integer :custom_count, :default => 0
+   end
+ 
+   create_table :price_estimates, :force => true do |t|
+@@ -388,15 +390,19 @@ ActiveRecord::Schema.define do
+     t.text     :content
+     t.boolean  :approved, :default => true
+     t.integer  :replies_count, :default => 0
++    t.integer  :custom_count, :default => 0
+     t.integer  :parent_id
+     t.string   :type
+   end
+ 
+   create_table :taggings, :force => true do |t|
+-    t.column :tag_id, :integer
+-    t.column :super_tag_id, :integer
+-    t.column :taggable_type, :string
+-    t.column :taggable_id, :integer
++    t.string  :type
++    t.integer :tag_id
++    t.integer :super_tag_id
++    t.string :taggable_type
++    t.integer :taggable_id
++    t.string :custom_taggable_type
++    t.integer :custom_taggable_id
+   end
+ 
+   create_table :tags, :force => true do |t|
+-- 
+1.5.6.2
+

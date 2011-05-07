@@ -1,0 +1,896 @@
+From fe88c976dac50fb5c46a60076a50f09285c82b1c Mon Sep 17 00:00:00 2001
+From: Lance Ivy <lance@cainlevy.net>
+Date: Fri, 6 Feb 2009 16:55:26 -0800
+Subject: [PATCH] move nested attribute ids inside the attributes hash, so has_one/belongs_to associations can be replaced or modified, as needed
+
+---
+ .../lib/active_record/nested_attributes.rb         |  205 ++++++++++-------
+ activerecord/test/cases/nested_attributes_test.rb  |  240 +++++++++++++-------
+ activerecord/test/models/pirate.rb                 |    2 +-
+ activerecord/test/models/ship.rb                   |    4 +-
+ 4 files changed, 281 insertions(+), 170 deletions(-)
+
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index 5778223..91e3658 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -41,13 +41,13 @@ module ActiveRecord
+     # Enabling nested attributes on a one-to-one association allows you to
+     # create the member and avatar in one go:
+     #
+-    #   params = { 'member' => { 'name' => 'Jack', 'avatar_attributes' => { 'icon' => 'smiling' } } }
++    #   params = { :member => { :name => 'Jack', :avatar_attributes => { :icon => 'smiling' } } }
+     #   member = Member.create(params)
+     #   member.avatar.icon #=> 'smiling'
+     #
+     # It also allows you to update the avatar through the member:
+     #
+-    #   params = { 'member' => { 'avatar_attributes' => { 'icon' => 'sad' } } }
++    #   params = { :member' => { :avatar_attributes => { :id => '2', :icon => 'sad' } } }
+     #   member.update_attributes params['member']
+     #   member.avatar.icon #=> 'sad'
+     #
+@@ -64,7 +64,7 @@ module ActiveRecord
+     # Now, when you add the <tt>_delete</tt> key to the attributes hash, with a
+     # value that evaluates to +true+, you will destroy the associated model:
+     #
+-    #   member.avatar_attributes = { '_delete' => '1' }
++    #   member.avatar_attributes = { :id => '2', :_delete => '1' }
+     #   member.avatar.marked_for_destruction? # => true
+     #   member.save
+     #   member.avatar #=> nil
+@@ -77,23 +77,21 @@ module ActiveRecord
+     #
+     #   class Member < ActiveRecord::Base
+     #     has_many :posts
+-    #     accepts_nested_attributes_for :posts, :reject_if => proc { |attributes| attributes['title'].blank? }
++    #     accepts_nested_attributes_for :posts
+     #   end
+     #
+     # You can now set or update attributes on an associated post model through
+     # the attribute hash.
+     #
+-    # For each key in the hash that starts with the string 'new' a new model
+-    # will be instantiated. When the proc given with the <tt>:reject_if</tt>
+-    # option evaluates to +false+ for a certain attribute hash no record will
+-    # be built for that hash. (Rejecting new records can alternatively be done
+-    # by utilizing the <tt>'_delete'</tt> key. Scroll down for more info.)
+-    #
+-    #   params = { 'member' => {
+-    #     'name' => 'joe', 'posts_attributes' => {
+-    #       'new_12345' => { 'title' => 'Kari, the awesome Ruby documentation browser!' },
+-    #       'new_54321' => { 'title' => 'The egalitarian assumption of the modern citizen' },
+-    #       'new_67890' => { 'title' => '' } # This one matches the :reject_if proc and will not be instantiated.
++    # For each hash that does not have an <tt>id</tt> key a new record will be
++    # instantiated, unless the hash also contains a <tt>_delete</tt> key that
++    # evaluates to +true+.
++    #
++    #   params = { :member => {
++    #     :name => 'joe', :posts_attributes => {
++    #       '0' => { :title => 'Kari, the awesome Ruby documentation browser!' },
++    #       '1' => { :title => 'The egalitarian assumption of the modern citizen' },
++    #       '2' => { :title => '', :_delete => '1' } # this will be ignored
+     #     }
+     #   }}
+     #
+@@ -102,33 +100,52 @@ module ActiveRecord
+     #   member.posts.first.title #=> 'Kari, the awesome Ruby documentation browser!'
+     #   member.posts.second.title #=> 'The egalitarian assumption of the modern citizen'
+     #
+-    # When the key for post attributes is an integer, the associated post with
+-    # that ID will be updated:
++    # You may also set a :reject_if proc to silently ignore any new record hashes
++    # if they fail to pass your criteria. For example, the previous example could be
++    # rewritten as:
++    #
++    #    class Member < ActiveRecord::Base
++    #      has_many :posts
++    #      accepts_nested_attributes_for :posts, :reject_if => proc { |attributes| attributes['title'].blank? }
++    #    end
++    #
++    #   params = { :member => {
++    #     :name => 'joe', :posts_attributes => {
++    #       '0' => { :title => 'Kari, the awesome Ruby documentation browser!' },
++    #       '1' => { :title => 'The egalitarian assumption of the modern citizen' },
++    #       '2' => { :title => '' } # this will be ignored because of reject_if
++    #     }
++    #   }}
++    #
++    #   member = Member.create(params['member'])
++    #   member.posts.length #=> 2
++    #   member.posts.first.title #=> 'Kari, the awesome Ruby documentation browser!'
++    #   member.posts.second.title #=> 'The egalitarian assumption of the modern citizen'    #
++    #
++    # But if the hash contains a <tt>id</tt> key that matches an already-associated
++    # record, the matching record will be modified.
+     #
+     #   member.attributes = {
+-    #     'name' => 'Joe',
+-    #     'posts_attributes' => {
+-    #       '1' => { 'title' => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!' },
+-    #       '2' => { 'title' => '[UPDATED] other post' }
++    #     :name => 'Joe',
++    #     :posts_attributes => {
++    #       '0' => { :title => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!' },
++    #       '1' => { :title => '[UPDATED] other post' }
+     #     }
+     #   }
+     #
+-    # By default the associated models are protected from being destroyed. If
+-    # you want to destroy any of the associated models through the attributes
++    # By default the associated records are protected from being destroyed. If
++    # you want to destroy any of the associated records through the attributes
+     # hash, you have to enable it first using the <tt>:allow_destroy</tt>
+-    # option.
+-    #
+-    # This will allow you to specify which models to destroy in the attributes
+-    # hash by setting the '_delete' attribute to a value that evaluates to
+-    # +true+:
++    # option. This will allow you to also use the <tt>_delete</tt> key to
++    # destroy existing records:
+     #
+     #   class Member < ActiveRecord::Base
+     #     has_many :posts
+     #     accepts_nested_attributes_for :posts, :allow_destroy => true
+     #   end
+     #
+-    #   params = {'member' => { 'name' => 'joe', 'posts_attributes' => {
+-    #     '2' => { '_delete' => '1' }
++    #   params = {:member => { :name => 'joe', :posts_attributes => {
++    #     '0' => { :id => '2', :_delete => '1' }
+     #   }}}
+     #   member.attributes = params['member']
+     #   member.posts.detect { |p| p.id == 2 }.marked_for_destruction? # => true
+@@ -143,7 +160,9 @@ module ActiveRecord
+     # the parent model is saved. This happens inside the transaction initiated
+     # by the parents save method. See ActiveRecord::AutosaveAssociation.
+     module ClassMethods
+-      # Defines an attributes writer for the specified association(s).
++      # Defines an attributes writer for the specified association(s). If you are using
++      # <tt>attr_protected</tt> or <tt>attr_accessible</tt>, then you will need to add
++      # the attribute writer to the allowed list.
+       #
+       # Supported options:
+       # [:allow_destroy]
+@@ -154,13 +173,14 @@ module ActiveRecord
+       #   Allows you to specify a Proc that checks whether a record should be
+       #   built for a certain attribute hash. The hash is passed to the Proc
+       #   and the Proc should return either +true+ or +false+. When no Proc
+-      #   is specified a record will be built for all attribute hashes.
++      #   is specified a record will be built for all attribute hashes that
++      #   do not have a <tt>_delete</tt> that evaluates to true.
+       #
+       # Examples:
++      #   # creates avatar_attributes=
+       #   accepts_nested_attributes_for :avatar
+-      #   accepts_nested_attributes_for :avatar, :allow_destroy => true
+-      #   accepts_nested_attributes_for :avatar, :reject_if => proc { ... }
+-      #   accepts_nested_attributes_for :avatar, :posts, :allow_destroy => true, :reject_if => proc { ... }
++      #   # creates avatar_attributes= and posts_attributes=
++      #   accepts_nested_attributes_for :avatar, :posts, :allow_destroy => true
+       def accepts_nested_attributes_for(*attr_names)
+         options = { :allow_destroy => false }
+         options.update(attr_names.extract_options!)
+@@ -204,80 +224,93 @@ module ActiveRecord
+ 
+     private
+ 
+-    # Assigns the given attributes to the association. An association will be
+-    # build if it doesn't exist yet.
++    # Assigns the given attributes to the association.
++    #
++    # If the given attributes include an <tt>:id</tt> that matches the existing record's id,
++    # then the existing record will be modified. Otherwise a new record will be
++    # built.
++    #
++    # If the given attributes include a matching <tt>:id</tt> attribute and a <tt>:_delete</tt>
++    # key set to a truthy value, then the existing record will be marked for destruction.
+     def assign_nested_attributes_for_one_to_one_association(association_name, attributes, allow_destroy)
+-      if should_destroy_nested_attributes_record?(allow_destroy, attributes)
+-        send(association_name).mark_for_destruction
++      if id_from(attributes).blank?
++        # create new, or replace existing
++        unless has_delete_flag?(attributes) or reject_new_record?(association_name, attributes)
++          send("build_#{association_name}", attributes.except(*unassignable_keys))
++        end
+       else
+-        (send(association_name) || send("build_#{association_name}")).attributes = attributes
++        existing_record = send(association_name)
++        # modify or delete existing
++        if existing_record and existing_record.id == id_from(attributes).to_i
++          if has_delete_flag?(attributes) and allow_destroy
++            existing_record.mark_for_destruction
++          else
++            existing_record.attributes = attributes.except(*unassignable_keys)
++          end
++        end
+       end
+     end
+ 
+     # Assigns the given attributes to the collection association.
+     #
+-    # Keys containing an ID for an associated record will update that record.
+-    # Keys starting with <tt>new</tt> will instantiate a new record for that
+-    # association.
++    # Hashes with an <tt>:id</tt> value matching an existing associated record will update that record.
++    # Hashes without an <tt>:id</tt> value will build a new record for the association.
++    # Hashes with a matching <tt>:id</tt> value and a <tt>:_delete</tt> key set to a truthy
++    # value will mark the matched record for destruction.
+     #
+     # For example:
+     #
+     #   assign_nested_attributes_for_collection_association(:people, {
+-    #     '1' => { 'name' => 'Peter' },
+-    #     'new_43' => { 'name' => 'John' }
++    #     '1' => { :id => '1', :name => 'Peter' },
++    #     '2' => { :name => 'John' },
++    #     '3' => { :id => '2', :_delete => true }
+     #   })
+     #
+-    # Will update the name of the Person with ID 1 and create a new associated
+-    # person with the name 'John'.
+-    def assign_nested_attributes_for_collection_association(association_name, attributes, allow_destroy)
+-      unless attributes.is_a?(Hash)
+-        raise ArgumentError, "Hash expected, got #{attributes.class.name} (#{attributes.inspect})"
++    # Will update the name of the Person with ID 1, build a new associated person with
++    # the name 'John', and mark the associatied Person with ID 2 for destruction.
++    def assign_nested_attributes_for_collection_association(association_name, attributes_collection, allow_destroy)
++      unless attributes_collection.is_a?(Hash)
++        raise ArgumentError, "Hash expected, got #{attributes_collection.class.name} (#{attributes_collection.inspect})"
+       end
+ 
+-      # Make sure any new records sorted by their id before they're build.
+-      sorted_by_id = attributes.sort_by { |id, _| id.is_a?(String) ? id.sub(/^new_/, '').to_i : id }
++      sorted_attributes = attributes_collection.to_a.sort_by {|i| i[0].to_i}.collect {|i| i[1]}
+ 
+-      sorted_by_id.each do |id, record_attributes|
+-        if id.acts_like?(:string) && id.starts_with?('new_')
+-          build_new_nested_attributes_record(association_name, record_attributes)
++      sorted_attributes.each do |attributes|
++        if id_from(attributes).blank?
++          unless has_delete_flag?(attributes) or reject_new_record?(association_name, attributes)
++            send(association_name).build(attributes.except(*unassignable_keys))
++          end
+         else
+-          assign_to_or_destroy_nested_attributes_record(association_name, id, record_attributes, allow_destroy)
++          existing_record = send(association_name).detect{|r| r.id == id_from(attributes).to_i}
++          if existing_record
++            if has_delete_flag?(attributes) and allow_destroy
++              existing_record.mark_for_destruction
++            else
++              existing_record.attributes = attributes.except(*unassignable_keys)
++            end
++          end
+         end
+       end
+     end
+ 
+-    # Returns +true+ if <tt>allow_destroy</tt> is enabled and the attributes
+-    # contains a truthy value for the key <tt>'_delete'</tt>.
+-    #
+-    # It will _always_ remove the <tt>'_delete'</tt> key, if present.
+-    def should_destroy_nested_attributes_record?(allow_destroy, attributes)
+-      ConnectionAdapters::Column.value_to_boolean(attributes.delete('_delete')) && allow_destroy
++    # Attribute hash keys that should not be assigned as normal attributes.
++    # These hash keys are nested attributes implementation details.
++    def unassignable_keys
++      [:id, :_delete, 'id', '_delete']
+     end
+ 
+-    # Builds a new record with the given attributes.
+-    #
+-    # If a <tt>:reject_if</tt> proc exists for this association, it will be
+-    # called with the attributes as its argument. If the proc returns a truthy
+-    # value, the record is _not_ build.
+-    #
+-    # Alternatively, you can specify the <tt>'_delete'</tt> key to _not_ build
+-    # a record. See should_destroy_nested_attributes_record? for more info.
+-    def build_new_nested_attributes_record(association_name, attributes)
+-      if reject_proc = self.class.reject_new_nested_attributes_procs[association_name]
+-        return if reject_proc.call(attributes)
+-      end
+-      send(association_name).build(attributes) unless should_destroy_nested_attributes_record?(true, attributes)
++    # Determines if a hash contains a truthy _delete key.
++    def has_delete_flag?(hash)
++      ConnectionAdapters::Column.value_to_boolean(hash[:_delete] || hash['_delete'])
+     end
+-
+-    # Assigns the attributes to the record specified by +id+. Or marks it for
+-    # destruction if #should_destroy_nested_attributes_record? returns +true+.
+-    def assign_to_or_destroy_nested_attributes_record(association_name, id, attributes, allow_destroy)
+-      record = send(association_name).detect { |record| record.id == id.to_i }
+-      if should_destroy_nested_attributes_record?(allow_destroy, attributes)
+-        record.mark_for_destruction
+-      else
+-        record.attributes = attributes
+-      end
++    
++    def reject_new_record?(association_name, attributes)
++      reject_proc = self.class.reject_new_nested_attributes_procs[association_name]
++      return (reject_proc and reject_proc.call(attributes)) ? true : false
++    end
++    
++    def id_from(hash)
++      hash[:id] || hash['id']
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index 2e531a2..4648cce 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -23,7 +23,7 @@ class TestNestedAttributesInGeneral < ActiveRecord::TestCase
+   include AssertRaiseWithMessage
+ 
+   def teardown
+-    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true
++    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+   end
+ 
+   def test_base_should_have_an_empty_reject_new_nested_attributes_procs
+@@ -70,58 +70,101 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_define_an_attribute_writer_method_for_the_association
+     assert_respond_to @pirate, :ship_attributes=
+   end
+-
+-  def test_should_automatically_instantiate_an_associated_model_if_there_is_none
++  
++  def test_should_build_a_new_record_if_there_is_no_id
+     @ship.destroy
+     @pirate.reload.ship_attributes = { :name => 'Davy Jones Gold Dagger' }
+-
++    
+     assert @pirate.ship.new_record?
+     assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
+   end
+-
+-  def test_should_take_a_hash_and_assign_the_attributes_to_the_existing_associated_model
+-    @pirate.ship_attributes = { :name => 'Davy Jones Gold Dagger' }
+-    assert !@pirate.ship.new_record?
+-    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
++  
++  def test_should_not_build_a_new_record_if_there_is_no_id_and_delete_is_truthy
++    @ship.destroy
++    @pirate.reload.ship_attributes = { :name => 'Davy Jones Gold Dagger', :_delete => '1' }
++    
++    assert_nil @pirate.ship
+   end
+ 
+-  def test_should_also_work_with_a_HashWithIndifferentAccess
+-    @pirate.ship_attributes = HashWithIndifferentAccess.new(:name => 'Davy Jones Gold Dagger')
+-    assert !@pirate.ship.new_record?
+-    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
++  def test_should_not_build_a_new_record_if_a_reject_if_proc_returns_false
++    @ship.destroy
++    @pirate.reload.ship_attributes = {}
++    
++    assert_nil @pirate.ship
+   end
+ 
+-  def test_should_work_with_update_attributes_as_well
+-    @pirate.update_attributes({ :catchphrase => 'Arr', :ship_attributes => { :name => 'Mister Pablo' } })
+-    @pirate.reload
+-
+-    assert_equal 'Arr', @pirate.catchphrase
+-    assert_equal 'Mister Pablo', @pirate.ship.name
++  def test_should_replace_an_existing_record_if_there_is_no_id
++    @pirate.reload.ship_attributes = { :name => 'Davy Jones Gold Dagger' }
++    
++    assert @pirate.ship.new_record?
++    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
++    assert_equal 'Nights Dirty Lightning', @ship.name
++  end
++  
++  def test_should_not_replace_an_existing_record_if_there_is_no_id_and_delete_is_truthy
++    @pirate.reload.ship_attributes = { :name => 'Davy Jones Gold Dagger', :_delete => '1' }
++    
++    assert_equal @ship, @pirate.ship
++    assert_equal 'Nights Dirty Lightning', @pirate.ship.name
++  end
++  
++  def test_should_modify_an_existing_record_if_there_is_a_matching_id
++    @pirate.reload.ship_attributes = { :id => @ship.id, :name => 'Davy Jones Gold Dagger' }
++    
++    assert_equal @ship, @pirate.ship
++    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
+   end
+-
+-  def test_should_be_possible_to_destroy_the_associated_model
++  
++  def test_should_delete_an_existing_record_if_there_is_a_matching_id_and_delete_is_truthy
+     @pirate.ship.destroy
+-    ['1', 1, 'true', true].each do |true_variable|
++    [1, '1', true, 'true'].each do |truth|
+       @pirate.reload.create_ship(:name => 'Mister Pablo')
+       assert_difference('Ship.count', -1) do
+-        @pirate.update_attributes(:ship_attributes => { '_delete' => true_variable })
++        @pirate.update_attribute(:ship_attributes, { :id => @pirate.ship.id, :_delete => truth })
+       end
+     end
+   end
+-
+-  def test_should_not_destroy_the_associated_model_with_a_non_truthy_argument
+-    [nil, '0', 0, 'false', false].each do |false_variable|
++  
++  def test_should_not_delete_an_existing_record_if_delete_is_not_truthy
++    [nil, '0', 0, 'false', false].each do |not_truth|
+       assert_no_difference('Ship.count') do
+-        @pirate.update_attributes(:ship_attributes => { '_delete' => false_variable })
++        @pirate.update_attribute(:ship_attributes, { :id => @pirate.ship.id, :_delete => not_truth })
+       end
+     end
+   end
+ 
++  def test_should_not_delete_an_existing_record_if_allow_destroy_is_false
++    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => false, :reject_if => proc { |attributes| attributes.empty? }
++    
++    assert_no_difference('Ship.count') do
++      @pirate.update_attribute(:ship_attributes, { :id => @pirate.ship.id, :_delete => '1' })
++    end
++
++    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  end
++  
++  def test_should_also_work_with_a_HashWithIndifferentAccess
++    @pirate.ship_attributes = HashWithIndifferentAccess.new(:id => @ship.id, :name => 'Davy Jones Gold Dagger')
++    
++    assert !@pirate.ship.new_record?
++    assert_equal 'Davy Jones Gold Dagger', @pirate.ship.name
++  end
++
++  def test_should_work_with_update_attributes_as_well
++    @pirate.update_attributes({ :catchphrase => 'Arr', :ship_attributes => { :id => @ship.id, :name => 'Mister Pablo' } })
++    @pirate.reload
++
++    assert_equal 'Arr', @pirate.catchphrase
++    assert_equal 'Mister Pablo', @pirate.ship.name
++  end
++
+   def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
+     assert_no_difference('Ship.count') do
+-      @pirate.attributes = { :ship_attributes => { '_delete' => true } }
++      @pirate.attributes = { :ship_attributes => { :id => @ship.id, :_delete => '1' } }
++    end
++    assert_difference('Ship.count', -1) do
++      @pirate.save
+     end
+-    assert_difference('Ship.count', -1) { @pirate.save }
+   end
+ 
+   def test_should_automatically_enable_autosave_on_the_association
+@@ -131,63 +174,98 @@ end
+ 
+ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+   def setup
+-    @ship = Ship.create!(:name => 'Nights Dirty Lightning')
+-    @pirate = @ship.create_pirate(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @ship = Ship.new(:name => 'Nights Dirty Lightning')
++    @pirate = @ship.build_pirate(:catchphrase => 'Aye')
++    @ship.save!
+   end
+ 
+   def test_should_define_an_attribute_writer_method_for_the_association
+     assert_respond_to @ship, :pirate_attributes=
+   end
+ 
+-  def test_should_automatically_instantiate_an_associated_model_if_there_is_none
++  def test_should_build_a_new_record_if_there_is_no_id
+     @pirate.destroy
+     @ship.reload.pirate_attributes = { :catchphrase => 'Arr' }
+-
++    
+     assert @ship.pirate.new_record?
+     assert_equal 'Arr', @ship.pirate.catchphrase
+   end
++  
++  def test_should_not_build_a_new_record_if_there_is_no_id_and_delete_is_truthy
++    @pirate.destroy
++    @ship.reload.pirate_attributes = { :catchphrase => 'Arr', :_delete => '1' }
++    
++    assert_nil @ship.pirate
++  end
+ 
+-  def test_should_take_a_hash_and_assign_the_attributes_to_the_existing_associated_model
+-    @ship.pirate_attributes = { :catchphrase => 'Arr' }
+-    assert !@ship.pirate.new_record?
+-    assert_equal 'Arr', @ship.pirate.catchphrase
++  def test_should_not_build_a_new_record_if_a_reject_if_proc_returns_false
++    @pirate.destroy
++    @ship.reload.pirate_attributes = {}
++
++    assert_nil @ship.pirate
+   end
+ 
+-  def test_should_also_work_with_a_HashWithIndifferentAccess
+-    @ship.pirate_attributes = HashWithIndifferentAccess.new(:catchphrase => 'Arr')
+-    assert !@ship.pirate.new_record?
++  def test_should_replace_an_existing_record_if_there_is_no_id
++    @ship.reload.pirate_attributes = { :catchphrase => 'Arr' }
++    
++    assert @ship.pirate.new_record?
+     assert_equal 'Arr', @ship.pirate.catchphrase
++    assert_equal 'Aye', @pirate.catchphrase
++  end
++  
++  def test_should_not_replace_an_existing_record_if_there_is_no_id_and_delete_is_truthy
++    @ship.reload.pirate_attributes = { :catchphrase => 'Arr', :_delete => '1' }
++    
++    assert_equal @pirate, @ship.pirate
++    assert_equal 'Aye', @ship.pirate.catchphrase
+   end
+ 
+-  def test_should_work_with_update_attributes_as_well
+-    @ship.update_attributes({ :name => 'Mister Pablo', :pirate_attributes => { :catchphrase => 'Arr' } })
+-    @ship.reload
+-
+-    assert_equal 'Mister Pablo', @ship.name
++  def test_should_modify_an_existing_record_if_there_is_a_matching_id
++    @ship.reload.pirate_attributes = { :id => @pirate.id, :catchphrase => 'Arr' }
++    
++    assert_equal @pirate, @ship.pirate
+     assert_equal 'Arr', @ship.pirate.catchphrase
+   end
+ 
+-  def test_should_be_possible_to_destroy_the_associated_model
++  def test_should_delete_an_existing_record_if_there_is_a_matching_id_and_delete_is_truthy
+     @ship.pirate.destroy
+-    ['1', 1, 'true', true].each do |true_variable|
++    [1, '1', true, 'true'].each do |truth|
+       @ship.reload.create_pirate(:catchphrase => 'Arr')
+       assert_difference('Pirate.count', -1) do
+-        @ship.update_attributes(:pirate_attributes => { '_delete' => true_variable })
++        @ship.update_attribute(:pirate_attributes, { :id => @ship.pirate.id, :_delete => truth })
+       end
+     end
+   end
+-
+-  def test_should_not_destroy_the_associated_model_with_a_non_truthy_argument
+-    [nil, '', '0', 0, 'false', false].each do |false_variable|
++  
++  def test_should_not_delete_an_existing_record_if_delete_is_not_truthy
++    [nil, '0', 0, 'false', false].each do |not_truth|
+       assert_no_difference('Pirate.count') do
+-        @ship.update_attributes(:pirate_attributes => { '_delete' => false_variable })
++        @ship.update_attribute(:pirate_attributes, { :id => @ship.pirate.id, :_delete => not_truth })
+       end
+     end
+   end
+ 
++  def test_should_not_delete_an_existing_record_if_allow_destroy_is_false
++    Ship.accepts_nested_attributes_for :pirate, :allow_destroy => false, :reject_if => proc { |attributes| attributes.empty? }
++    
++    assert_no_difference('Pirate.count') do
++      @ship.update_attribute(:pirate_attributes, { :id => @ship.pirate.id, :_delete => '1' })
++    end
++
++    Ship.accepts_nested_attributes_for :pirate, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  end
++
++  def test_should_work_with_update_attributes_as_well
++    @ship.update_attributes({ :name => 'Mister Pablo', :pirate_attributes => { :catchphrase => 'Arr' } })
++    @ship.reload
++
++    assert_equal 'Mister Pablo', @ship.name
++    assert_equal 'Arr', @ship.pirate.catchphrase
++  end
++
+   def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
+     assert_no_difference('Pirate.count') do
+-      @ship.attributes = { :pirate_attributes => { '_delete' => true } }
++      @ship.attributes = { :pirate_attributes => { :id => @ship.pirate.id, '_delete' => true } }
+     end
+     assert_difference('Pirate.count', -1) { @ship.save }
+   end
+@@ -211,20 +289,20 @@ module NestedAttributesOnACollectionAssociationTests
+   end
+ 
+   def test_should_also_work_with_a_HashWithIndifferentAccess
+-    @pirate.send(association_setter, HashWithIndifferentAccess.new(@child_1.id => HashWithIndifferentAccess.new(:name => 'Grace OMalley')))
++    @pirate.send(association_setter, HashWithIndifferentAccess.new('foo' => HashWithIndifferentAccess.new(:id => @child_1.id, :name => 'Grace OMalley')))
+     @pirate.save
+     assert_equal 'Grace OMalley', @child_1.reload.name
+   end
+ 
+-  def test_should_take_a_hash_with_integer_keys_and_assign_the_attributes_to_the_associated_models
++  def test_should_take_a_hash_and_assign_the_attributes_to_the_associated_models
+     @pirate.attributes = @alternate_params
+     assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
+     assert_equal 'Privateers Greed', @pirate.send(@association_name).last.name
+   end
+ 
+-  def test_should_automatically_build_new_associated_models_for_each_entry_in_a_hash_where_the_id_starts_with_the_string_new_
++  def test_should_automatically_build_new_associated_models_for_each_entry_in_a_hash_where_the_id_is_missing
+     @pirate.send(@association_name).destroy_all
+-    @pirate.reload.attributes = { association_getter => { 'new_1' => { :name => 'Grace OMalley' }, 'new_2' => { :name => 'Privateers Greed' }}}
++    @pirate.reload.attributes = { association_getter => { 'foo' => { :name => 'Grace OMalley' }, 'bar' => { :name => 'Privateers Greed' }}}
+ 
+     assert @pirate.send(@association_name).first.new_record?
+     assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
+@@ -233,24 +311,31 @@ module NestedAttributesOnACollectionAssociationTests
+     assert_equal 'Privateers Greed', @pirate.send(@association_name).last.name
+   end
+ 
+-  def test_should_remove_delete_key_from_arguments_hash_of_new_records
++  def test_should_not_assign_delete_key_to_a_record
+     assert_nothing_raised ActiveRecord::UnknownAttributeError do
+-      @pirate.send(association_setter, { 'new_1' => { '_delete' => '0' }})
++      @pirate.send(association_setter, { 'foo' => { '_delete' => '0' }})
+     end
+   end
+ 
+   def test_should_ignore_new_associated_records_with_truthy_delete_attribute
+     @pirate.send(@association_name).destroy_all
+-    @pirate.reload.attributes = { association_getter => { 'new_1' => { :name => 'Grace OMalley' }, 'new_2' => { :name => 'Privateers Greed', '_delete' => '1' }}}
++    @pirate.reload.attributes = { association_getter => { 'foo' => { :name => 'Grace OMalley' }, 'bar' => { :name => 'Privateers Greed', '_delete' => '1' }}}
+ 
+     assert_equal 1, @pirate.send(@association_name).length
+     assert_equal 'Grace OMalley', @pirate.send(@association_name).first.name
+   end
+-
++  
++  def test_should_ignore_new_associated_records_if_a_reject_if_proc_returns_false
++    @alternate_params[association_getter]['baz'] = {}
++    assert_no_difference("@pirate.send(@association_name).length") do
++      @pirate.attributes = @alternate_params
++    end
++  end
++  
+   def test_should_sort_the_hash_by_the_keys_before_building_new_associated_models
+     attributes = ActiveSupport::OrderedHash.new
+-    attributes['new_123726353'] = { :name => 'Grace OMalley' }
+-    attributes['new_2'] = { :name => 'Privateers Greed' } # 2 is lower then 123726353
++    attributes['123726353'] = { :name => 'Grace OMalley' }
++    attributes['2'] = { :name => 'Privateers Greed' } # 2 is lower then 123726353
+     @pirate.send(association_setter, attributes)
+ 
+     assert_equal ['Posideons Killer', 'Killer bandita Dionne', 'Privateers Greed', 'Grace OMalley'].to_set, @pirate.send(@association_name).map(&:name).to_set
+@@ -269,19 +354,12 @@ module NestedAttributesOnACollectionAssociationTests
+   end
+ 
+   def test_should_work_with_update_attributes_as_well
+-    @pirate.update_attributes({ :catchphrase => 'Arr', association_getter => { @child_1.id => { :name => 'Grace OMalley' }}})
++    @pirate.update_attributes({ :catchphrase => 'Arr', association_getter => { 'foo' => { :id => @child_1.id, :name => 'Grace OMalley' }}})
+     assert_equal 'Grace OMalley', @child_1.reload.name
+   end
+ 
+-  def test_should_automatically_reject_any_new_record_if_a_reject_if_proc_exists_and_returns_false
+-    @alternate_params[association_getter]["new_12345"] = {}
+-    assert_no_difference("@pirate.send(@association_name).length") do
+-      @pirate.attributes = @alternate_params
+-    end
+-  end
+-
+-  def test_should_update_existing_records_and_add_new_ones_that_have_an_id_that_start_with_the_string_new_
+-    @alternate_params[association_getter]['new_12345'] = { :name => 'Buccaneers Servant' }
++  def test_should_update_existing_records_and_add_new_ones_that_have_no_id
++    @alternate_params[association_getter]['baz'] = { :name => 'Buccaneers Servant' }
+     assert_difference('@pirate.send(@association_name).count', +1) do
+       @pirate.update_attributes @alternate_params
+     end
+@@ -292,7 +370,7 @@ module NestedAttributesOnACollectionAssociationTests
+     ['1', 1, 'true', true].each do |true_variable|
+       record = @pirate.reload.send(@association_name).create!(:name => 'Grace OMalley')
+       @pirate.send(association_setter,
+-        @alternate_params[association_getter].merge(record.id => { '_delete' => true_variable })
++        @alternate_params[association_getter].merge('baz' => { :id => record.id, '_delete' => true_variable })
+       )
+ 
+       assert_difference('@pirate.send(@association_name).count', -1) do
+@@ -303,7 +381,7 @@ module NestedAttributesOnACollectionAssociationTests
+ 
+   def test_should_not_destroy_the_associated_model_with_a_non_truthy_argument
+     [nil, '', '0', 0, 'false', false].each do |false_variable|
+-      @alternate_params[association_getter][@child_1.id]['_delete'] = false_variable
++      @alternate_params[association_getter]['foo']['_delete'] = false_variable
+       assert_no_difference('@pirate.send(@association_name).count') do
+         @pirate.update_attributes(@alternate_params)
+       end
+@@ -312,7 +390,7 @@ module NestedAttributesOnACollectionAssociationTests
+ 
+   def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
+     assert_no_difference('@pirate.send(@association_name).count') do
+-      @pirate.send(association_setter, @alternate_params[association_getter].merge(@child_1.id => { '_delete' => true }))
++      @pirate.send(association_setter, @alternate_params[association_getter].merge('baz' => { :id => @child_1.id, '_delete' => true }))
+     end
+     assert_difference('@pirate.send(@association_name).count', -1) { @pirate.save }
+   end
+@@ -343,8 +421,8 @@ class TestNestedAttributesOnAHasManyAssociation < ActiveRecord::TestCase
+ 
+     @alternate_params = {
+       :birds_attributes => {
+-        @child_1.id => { :name => 'Grace OMalley' },
+-        @child_2.id => { :name => 'Privateers Greed' }
++        'foo' => { :id => @child_1.id, :name => 'Grace OMalley' },
++        'bar' => { :id => @child_2.id, :name => 'Privateers Greed' }
+       }
+     }
+   end
+@@ -363,11 +441,11 @@ class TestNestedAttributesOnAHasAndBelongsToManyAssociation < ActiveRecord::Test
+ 
+     @alternate_params = {
+       :parrots_attributes => {
+-        @child_1.id => { :name => 'Grace OMalley' },
+-        @child_2.id => { :name => 'Privateers Greed' }
++        'foo' => { :id => @child_1.id, :name => 'Grace OMalley' },
++        'bar' => { :id => @child_2.id, :name => 'Privateers Greed' }
+       }
+     }
+   end
+ 
+   include NestedAttributesOnACollectionAssociationTests
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 6a2416a..7bc50e0 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -10,7 +10,7 @@ class Pirate < ActiveRecord::Base
+   has_many :birds
+ 
+   accepts_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+-  accepts_nested_attributes_for :ship, :allow_destroy => true
++  accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+ 
+   validates_presence_of :catchphrase
+ end
+diff --git a/activerecord/test/models/ship.rb b/activerecord/test/models/ship.rb
+index c46e27f..06759d6 100644
+--- a/activerecord/test/models/ship.rb
++++ b/activerecord/test/models/ship.rb
+@@ -4,7 +4,7 @@ class Ship < ActiveRecord::Base
+   belongs_to :pirate
+   has_many :parts, :class_name => 'ShipPart', :autosave => true
+ 
+-  accepts_nested_attributes_for :pirate, :allow_destroy => true
++  accepts_nested_attributes_for :pirate, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+ 
+   validates_presence_of :name
+-end
+\ No newline at end of file
++end
+-- 
+1.5.6.3
+
+
+From 4081af820924411de03d0d50349781c86c3168ed Mon Sep 17 00:00:00 2001
+From: Lance Ivy <lance@cainlevy.net>
+Date: Fri, 6 Feb 2009 12:04:57 -0800
+Subject: [PATCH] nested attribute setters will now also accept an array of hashes
+
+---
+ .../lib/active_record/nested_attributes.rb         |   52 ++++++++++++--------
+ activerecord/test/cases/nested_attributes_test.rb  |   11 +++--
+ 2 files changed, 38 insertions(+), 25 deletions(-)
+
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index 91e3658..5d546e8 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -88,11 +88,11 @@ module ActiveRecord
+     # evaluates to +true+.
+     #
+     #   params = { :member => {
+-    #     :name => 'joe', :posts_attributes => {
+-    #       '0' => { :title => 'Kari, the awesome Ruby documentation browser!' },
+-    #       '1' => { :title => 'The egalitarian assumption of the modern citizen' },
+-    #       '2' => { :title => '', :_delete => '1' } # this will be ignored
+-    #     }
++    #     :name => 'joe', :posts_attributes => [
++    #       { :title => 'Kari, the awesome Ruby documentation browser!' },
++    #       { :title => 'The egalitarian assumption of the modern citizen' },
++    #       { :title => '', :_delete => '1' } # this will be ignored
++    #     ]
+     #   }}
+     #
+     #   member = Member.create(params['member'])
+@@ -110,11 +110,11 @@ module ActiveRecord
+     #    end
+     #
+     #   params = { :member => {
+-    #     :name => 'joe', :posts_attributes => {
+-    #       '0' => { :title => 'Kari, the awesome Ruby documentation browser!' },
+-    #       '1' => { :title => 'The egalitarian assumption of the modern citizen' },
+-    #       '2' => { :title => '' } # this will be ignored because of reject_if
+-    #     }
++    #     :name => 'joe', :posts_attributes => [
++    #       { :title => 'Kari, the awesome Ruby documentation browser!' },
++    #       { :title => 'The egalitarian assumption of the modern citizen' },
++    #       { :title => '' } # this will be ignored because of reject_if
++    #     ]
+     #   }}
+     #
+     #   member = Member.create(params['member'])
+@@ -127,10 +127,10 @@ module ActiveRecord
+     #
+     #   member.attributes = {
+     #     :name => 'Joe',
+-    #     :posts_attributes => {
+-    #       '0' => { :title => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!' },
+-    #       '1' => { :title => '[UPDATED] other post' }
+-    #     }
++    #     :posts_attributes => [
++    #       { :title => '[UPDATED] An, as of yet, undisclosed awesome Ruby documentation browser!' },
++    #       { :title => '[UPDATED] other post' }
++    #     ]
+     #   }
+     #
+     # By default the associated records are protected from being destroyed. If
+@@ -144,9 +144,9 @@ module ActiveRecord
+     #     accepts_nested_attributes_for :posts, :allow_destroy => true
+     #   end
+     #
+-    #   params = {:member => { :name => 'joe', :posts_attributes => {
+-    #     '0' => { :id => '2', :_delete => '1' }
+-    #   }}}
++    #   params = {:member => { :name => 'joe', :posts_attributes => [
++    #     { :id => '2', :_delete => '1' }
++    #   ]}}
+     #   member.attributes = params['member']
+     #   member.posts.detect { |p| p.id == 2 }.marked_for_destruction? # => true
+     #   member.posts.length #=> 2
+@@ -268,14 +268,24 @@ module ActiveRecord
+     #
+     # Will update the name of the Person with ID 1, build a new associated person with
+     # the name 'John', and mark the associatied Person with ID 2 for destruction.
++    #
++    # Will also accept an Array of attribute hashes, which function as normal. For example:
++    #
++    #   assign_nested_attributes_for_collection_association(:people, [
++    #     { :id => '1', :name => 'Peter' },
++    #     { :name => 'John' },
++    #     { :id => '2', :_delete => true }
++    #   ])
+     def assign_nested_attributes_for_collection_association(association_name, attributes_collection, allow_destroy)
+-      unless attributes_collection.is_a?(Hash)
+-        raise ArgumentError, "Hash expected, got #{attributes_collection.class.name} (#{attributes_collection.inspect})"
++      unless attributes_collection.is_a?(Hash) or attributes_collection.is_a?(Array)
++        raise ArgumentError, "Hash or Array expected, got #{attributes_collection.class.name} (#{attributes_collection.inspect})"
+       end
+ 
+-      sorted_attributes = attributes_collection.to_a.sort_by {|i| i[0].to_i}.collect {|i| i[1]}
++      if attributes_collection.is_a? Hash
++        attributes_collection = attributes_collection.to_a.sort_by {|i| i[0].to_i}.collect {|i| i[1]}
++      end
+ 
+-      sorted_attributes.each do |attributes|
++      attributes_collection.each do |attributes|
+         if id_from(attributes).blank?
+           unless has_delete_flag?(attributes) or reject_new_record?(association_name, attributes)
+             send(association_name).build(attributes.except(*unassignable_keys))
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index 4648cce..db996ee 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -287,6 +287,12 @@ module NestedAttributesOnACollectionAssociationTests
+     @pirate.update_attributes @alternate_params
+     assert_equal ['Grace OMalley', 'Privateers Greed'], [@child_1.reload.name, @child_2.reload.name]
+   end
++  
++  def test_should_take_an_array_and_assign_the_attributes_to_the_associated_models
++    @pirate.send(association_setter, @alternate_params[association_getter].values)
++    @pirate.save
++    assert_equal ['Grace OMalley', 'Privateers Greed'], [@child_1.reload.name, @child_2.reload.name]
++  end
+ 
+   def test_should_also_work_with_a_HashWithIndifferentAccess
+     @pirate.send(association_setter, HashWithIndifferentAccess.new('foo' => HashWithIndifferentAccess.new(:id => @child_1.id, :name => 'Grace OMalley')))
+@@ -345,12 +351,9 @@ module NestedAttributesOnACollectionAssociationTests
+     assert_nothing_raised(ArgumentError) { @pirate.send(association_setter, {}) }
+     assert_nothing_raised(ArgumentError) { @pirate.send(association_setter, ActiveSupport::OrderedHash.new) }
+ 
+-    assert_raise_with_message ArgumentError, 'Hash expected, got String ("foo")' do
++    assert_raise_with_message ArgumentError, 'Hash or Array expected, got String ("foo")' do
+       @pirate.send(association_setter, "foo")
+     end
+-    assert_raise_with_message ArgumentError, 'Hash expected, got Array ([:foo, :bar])' do
+-      @pirate.send(association_setter, [:foo, :bar])
+-    end
+   end
+ 
+   def test_should_work_with_update_attributes_as_well
+-- 
+1.5.6.3
+

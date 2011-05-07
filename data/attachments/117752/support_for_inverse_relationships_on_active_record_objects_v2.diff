@@ -1,0 +1,736 @@
+From 1fae7d940a53806ab12a091e9e5dab5a8ceea9ab Mon Sep 17 00:00:00 2001
+From: Murray Steele <muz@h-lame.com>
+Date: Fri, 1 May 2009 16:01:13 +0100
+Subject: [PATCH] Providing support for :inverse_of as an option to associations.
+
+You can now add an :inverse_of option to has_one, has_many and belongs_to associations.  This is best described with an example:
+
+class Man < ActiveRecord::Base
+  has_one :face, :inverse_of => :man
+end
+
+class Face < ActiveRecord::Base
+  belongs_to :man, :inverse_of => :face
+end
+
+m = Man.first
+f = m.face
+
+Without :inverse_of m and f.man would be different instances of the same object (f.man being pulled from the database again).  With these new :inverse_of options m and f.man are the same in memory instance.
+
+Currently :inverse_of supports has_one and has_many (but not the :through variants) associations.  It also supplies inverse support for belongs_to associations where the inverse is a has_one and it's not a polymorphic.
+
+Signed-off-by: Murray Steele <muz@h-lame.com>
+---
+ activerecord/lib/active_record/associations.rb     |   12 +-
+ .../associations/association_collection.rb         |   12 +-
+ .../associations/association_proxy.rb              |   14 +
+ .../associations/belongs_to_association.rb         |   14 +-
+ .../associations/has_many_association.rb           |    5 +
+ .../associations/has_many_through_association.rb   |   10 +-
+ .../associations/has_one_association.rb            |   11 +-
+ activerecord/lib/active_record/reflection.rb       |   21 ++
+ .../associations/inverse_associations_test.rb      |  252 ++++++++++++++++++++
+ activerecord/test/fixtures/faces.yml               |    7 +
+ activerecord/test/fixtures/interests.yml           |   29 +++
+ activerecord/test/fixtures/men.yml                 |    5 +
+ activerecord/test/fixtures/zines.yml               |    5 +
+ activerecord/test/models/face.rb                   |    5 +
+ activerecord/test/models/interest.rb               |    4 +
+ activerecord/test/models/man.rb                    |    7 +
+ activerecord/test/models/zine.rb                   |    3 +
+ activerecord/test/schema/schema.rb                 |   20 ++
+ 18 files changed, 421 insertions(+), 15 deletions(-)
+ create mode 100644 activerecord/test/cases/associations/inverse_associations_test.rb
+ create mode 100644 activerecord/test/fixtures/faces.yml
+ create mode 100644 activerecord/test/fixtures/interests.yml
+ create mode 100644 activerecord/test/fixtures/men.yml
+ create mode 100644 activerecord/test/fixtures/zines.yml
+ create mode 100644 activerecord/test/models/face.rb
+ create mode 100644 activerecord/test/models/interest.rb
+ create mode 100644 activerecord/test/models/man.rb
+ create mode 100644 activerecord/test/models/zine.rb
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 2115878..ef87c94 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1,4 +1,10 @@
+ module ActiveRecord
++  class InverseOfAssociationNotFoundError < ActiveRecordError #:nodoc:
++    def initialize(reflection)
++      super("Could not find the inverse association for #{reflection.name} (#{reflection.options[:inverse_of].inspect} in #{reflection.class_name})")
++    end
++  end
++  
+   class HasManyThroughAssociationNotFoundError < ActiveRecordError #:nodoc:
+     def initialize(owner_class_name, reflection)
+       super("Could not find the association #{reflection.options[:through].inspect} in model #{owner_class_name}")
+@@ -1488,7 +1494,7 @@ module ActiveRecord
+           :finder_sql, :counter_sql,
+           :before_add, :after_add, :before_remove, :after_remove,
+           :extend, :readonly,
+-          :validate
++          :validate, :inverse_of
+         ]
+ 
+         def create_has_many_reflection(association_id, options, &extension)
+@@ -1502,7 +1508,7 @@ module ActiveRecord
+         @@valid_keys_for_has_one_association = [
+           :class_name, :foreign_key, :remote, :select, :conditions, :order,
+           :include, :dependent, :counter_cache, :extend, :as, :readonly,
+-          :validate, :primary_key
++          :validate, :primary_key, :inverse_of
+         ]
+ 
+         def create_has_one_reflection(association_id, options)
+@@ -1521,7 +1527,7 @@ module ActiveRecord
+         @@valid_keys_for_belongs_to_association = [
+           :class_name, :foreign_key, :foreign_type, :remote, :select, :conditions,
+           :include, :dependent, :counter_cache, :extend, :polymorphic, :readonly,
+-          :validate, :touch
++          :validate, :touch, :inverse_of
+         ]
+ 
+         def create_belongs_to_reflection(association_id, options)
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 3aef1b2..d974eeb 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -398,12 +398,15 @@ module ActiveRecord
+             else
+               find(:all)
+             end
+-
+-          @reflection.options[:uniq] ? uniq(records) : records
++          
++          records = @reflection.options[:uniq] ? uniq(records) : records
++          records.each do |record|
++            set_inverse_instance(record, @owner)
++          end
++          records
+         end
+-
++        
+       private
+-
+         def create_record(attrs)
+           attrs.update(@reflection.options[:conditions]) if @reflection.options[:conditions].is_a?(Hash)
+           ensure_owner_is_not_new
+@@ -433,6 +436,7 @@ module ActiveRecord
+           @target ||= [] unless loaded?
+           @target << record unless @reflection.options[:uniq] && @target.include?(record)
+           callback(:after_add, record)
++          set_inverse_instance(record, @owner)
+           record
+         end
+ 
+diff --git a/activerecord/lib/active_record/associations/association_proxy.rb b/activerecord/lib/active_record/associations/association_proxy.rb
+index 241b9bf..8b93a80 100644
+--- a/activerecord/lib/active_record/associations/association_proxy.rb
++++ b/activerecord/lib/active_record/associations/association_proxy.rb
+@@ -53,6 +53,7 @@ module ActiveRecord
+ 
+       def initialize(owner, reflection)
+         @owner, @reflection = owner, reflection
++        reflection.check_validity!
+         Array(reflection.options[:extend]).each { |ext| proxy_extend(ext) }
+         reset
+       end
+@@ -274,6 +275,19 @@ module ActiveRecord
+         def owner_quoted_id
+           @owner.quoted_id
+         end
++        
++        def set_inverse_instance(record, instance)
++          return if record.nil? || !we_can_set_the_inverse_on_this?(record)
++          inverse_relationship = @reflection.inverse_of
++          unless inverse_relationship.nil?
++            record.send(:"set_#{inverse_relationship.name}_target", instance)
++          end
++        end
++        
++        # Override in subclasses
++        def we_can_set_the_inverse_on_this?(record)
++          false
++        end
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index f05c6be..37a405a 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -30,7 +30,9 @@ module ActiveRecord
+           @owner[@reflection.primary_key_name] = record.id unless record.new_record?
+           @updated = true
+         end
+-
++        
++        set_inverse_instance(record, @owner)
++        
+         loaded
+         record
+       end
+@@ -41,18 +43,26 @@ module ActiveRecord
+       
+       private
+         def find_target
+-          @reflection.klass.find(
++          the_target = @reflection.klass.find(
+             @owner[@reflection.primary_key_name],
+             :select     => @reflection.options[:select],
+             :conditions => conditions,
+             :include    => @reflection.options[:include],
+             :readonly   => @reflection.options[:readonly]
+           )
++          set_inverse_instance(the_target, @owner)
++          the_target
+         end
+ 
+         def foreign_key_present
+           !@owner[@reflection.primary_key_name].nil?
+         end
++        
++        # NOTE - for now, we're only supporting inverse setting from belongs_to back onto
++        # has_one associations.
++        def we_can_set_the_inverse_on_this?(record)
++          @reflection.has_inverse? && @reflection.inverse_of.macro == :has_one
++        end
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/associations/has_many_association.rb b/activerecord/lib/active_record/associations/has_many_association.rb
+index a2cbabf..745c438 100644
+--- a/activerecord/lib/active_record/associations/has_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_association.rb
+@@ -116,6 +116,11 @@ module ActiveRecord
+             :create => create_scoping
+           }
+         end
++        
++        def we_can_set_the_inverse_on_this?(record)
++          inverse = @reflection.inverse_of
++          return !inverse.nil?
++        end
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 1c091e7..bd33e4f 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -1,11 +1,6 @@
+ module ActiveRecord
+   module Associations
+     class HasManyThroughAssociation < HasManyAssociation #:nodoc:
+-      def initialize(owner, reflection)
+-        reflection.check_validity!
+-        super
+-      end
+-
+       alias_method :new, :build
+ 
+       def create!(attrs = nil)
+@@ -251,6 +246,11 @@ module ActiveRecord
+         def cached_counter_attribute_name
+           "#{@reflection.name}_count"
+         end
++        
++        # NOTE - not sure that we can actually cope with inverses here
++        def we_can_set_the_inverse_on_this?(record)
++          false
++        end
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/associations/has_one_association.rb b/activerecord/lib/active_record/associations/has_one_association.rb
+index b92cbbd..938eaf8 100644
+--- a/activerecord/lib/active_record/associations/has_one_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_association.rb
+@@ -74,13 +74,15 @@ module ActiveRecord
+ 
+       private
+         def find_target
+-          @reflection.klass.find(:first, 
++          the_target = @reflection.klass.find(:first, 
+             :conditions => @finder_sql,
+             :select     => @reflection.options[:select],
+             :order      => @reflection.options[:order], 
+             :include    => @reflection.options[:include],
+             :readonly   => @reflection.options[:readonly]
+           )
++          set_inverse_instance(the_target, @owner)
++          the_target
+         end
+ 
+         def construct_sql
+@@ -117,8 +119,15 @@ module ActiveRecord
+             self.target = record
+           end
+ 
++          set_inverse_instance(record, @owner)
++
+           record
+         end
++        
++        def we_can_set_the_inverse_on_this?(record)
++          inverse = @reflection.inverse_of
++          return !inverse.nil?
++        end
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 2d4c1d5..0b48017 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -212,8 +212,15 @@ module ActiveRecord
+       end
+ 
+       def check_validity!
++        check_validity_of_inverse!
+       end
+ 
++      def check_validity_of_inverse!
++        if has_inverse? && inverse_of.nil?
++          raise InverseOfAssociationNotFoundError.new(self)
++        end
++      end
++      
+       def through_reflection
+         false
+       end
+@@ -225,6 +232,18 @@ module ActiveRecord
+         nil
+       end
+ 
++      def has_inverse?
++        !@options[:inverse_of].nil?
++      end
++
++      def inverse_of
++        if has_inverse?
++          @inverse_of ||= klass.reflect_on_association(options[:inverse_of])
++        else
++          nil
++        end
++      end
++
+       private
+         def derive_class_name
+           class_name = name.to_s.camelize
+@@ -300,6 +319,8 @@ module ActiveRecord
+         unless [:belongs_to, :has_many].include?(source_reflection.macro) && source_reflection.options[:through].nil?
+           raise HasManyThroughSourceAssociationMacroError.new(self)
+         end
++        
++        check_validity_of_inverse!
+       end
+ 
+       def through_reflection_primary_key
+diff --git a/activerecord/test/cases/associations/inverse_associations_test.rb b/activerecord/test/cases/associations/inverse_associations_test.rb
+new file mode 100644
+index 0000000..512ca30
+--- /dev/null
++++ b/activerecord/test/cases/associations/inverse_associations_test.rb
+@@ -0,0 +1,252 @@
++require "cases/helper"
++require 'models/man'
++require 'models/face'
++require 'models/interest'
++require 'models/zine'
++require 'models/club'
++require 'models/sponsor'
++
++class InverseAssociationTests < ActiveRecord::TestCase
++  def test_should_allow_for_inverse_of_options_in_associations
++    assert_nothing_raised(ArgumentError, 'ActiveRecord should allow the inverse_of options on has_many') do
++      Class.new(ActiveRecord::Base).has_many(:wheels, :inverse_of => :car)
++    end
++    
++    assert_nothing_raised(ArgumentError, 'ActiveRecord should allow the inverse_of options on has_one') do
++      Class.new(ActiveRecord::Base).has_one(:engine, :inverse_of => :car)
++    end
++    
++    assert_nothing_raised(ArgumentError, 'ActiveRecord should allow the inverse_of options on belongs_to') do
++      Class.new(ActiveRecord::Base).belongs_to(:car, :inverse_of => :driver)
++    end
++  end
++  
++  def test_should_be_able_to_ask_a_reflection_if_it_has_an_inverse
++    has_one_with_inverse_ref = Man.reflect_on_association(:face)
++    assert has_one_with_inverse_ref.respond_to?(:has_inverse?)
++    assert has_one_with_inverse_ref.has_inverse?
++
++    has_many_with_inverse_ref = Man.reflect_on_association(:interests)
++    assert has_many_with_inverse_ref.respond_to?(:has_inverse?)
++    assert has_many_with_inverse_ref.has_inverse?
++    
++    belongs_to_with_inverse_ref = Face.reflect_on_association(:man)
++    assert belongs_to_with_inverse_ref.respond_to?(:has_inverse?)
++    assert belongs_to_with_inverse_ref.has_inverse?
++    
++    has_one_without_inverse_ref = Club.reflect_on_association(:sponsor)
++    assert has_one_without_inverse_ref.respond_to?(:has_inverse?)
++    assert !has_one_without_inverse_ref.has_inverse?
++    
++    has_many_without_inverse_ref = Club.reflect_on_association(:memberships)
++    assert has_many_without_inverse_ref.respond_to?(:has_inverse?)
++    assert !has_many_without_inverse_ref.has_inverse?
++    
++    belongs_to_without_inverse_ref = Sponsor.reflect_on_association(:sponsor_club)
++    assert belongs_to_without_inverse_ref.respond_to?(:has_inverse?)
++    assert !belongs_to_without_inverse_ref.has_inverse?
++  end
++  
++  def test_should_be_able_to_ask_a_reflection_what_it_is_the_inverse_of
++    has_one_ref = Man.reflect_on_association(:face)
++    assert has_one_ref.respond_to?(:inverse_of)
++
++    has_many_ref = Man.reflect_on_association(:interests)
++    assert has_many_ref.respond_to?(:inverse_of)
++
++    belongs_to_ref = Face.reflect_on_association(:man)
++    assert belongs_to_ref.respond_to?(:inverse_of)
++  end
++  
++  def test_inverse_of_method_should_supply_the_actual_reflection_instance_it_is_the_inverse_of
++    has_one_ref = Man.reflect_on_association(:face)
++    assert_equal Face.reflect_on_association(:man), has_one_ref.inverse_of
++
++    has_many_ref = Man.reflect_on_association(:interests)
++    assert_equal Interest.reflect_on_association(:man), has_many_ref.inverse_of
++
++    belongs_to_ref = Face.reflect_on_association(:man)
++    assert_equal Man.reflect_on_association(:face), belongs_to_ref.inverse_of
++  end
++  
++  def test_associations_with_no_inverse_of_should_return_nil
++    has_one_ref = Club.reflect_on_association(:sponsor)
++    assert_nil has_one_ref.inverse_of
++    
++    has_many_ref = Club.reflect_on_association(:memberships)
++    assert_nil has_many_ref.inverse_of
++    
++    belongs_to_ref = Sponsor.reflect_on_association(:sponsor_club)
++    assert_nil belongs_to_ref.inverse_of
++  end
++end
++
++class InverseHasOneTests < ActiveRecord::TestCase
++  fixtures :men, :faces
++  
++  def test_parent_instance_should_be_shared_with_child_on_find
++    m = Man.find(:first)
++    f = m.face
++    assert_equal m.name, f.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to parent instance"
++    f.man.name = 'Mungo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to child-owned instance"
++  end
++  
++  def test_parent_instance_should_be_shared_with_newly_built_child
++    m = Man.find(:first)
++    f = m.build_face(:description => 'haunted')
++    assert_not_nil f.man
++    assert_equal m.name, f.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to parent instance"
++    f.man.name = 'Mungo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to just-built-child-owned instance"
++  end
++  
++  def test_parent_instance_should_be_shared_with_newly_created_child
++    m = Man.find(:first)
++    f = m.create_face(:description => 'haunted')
++    assert_not_nil f.man
++    assert_equal m.name, f.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to parent instance"
++    f.man.name = 'Mungo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to newly-created-child-owned instance"
++  end
++  
++  def test_trying_to_use_inverses_that_dont_exist_should_raise_an_error
++    assert_raise(ActiveRecord::InverseOfAssociationNotFoundError) { Man.find(:first).dirty_face }
++  end
++end
++
++class InverseHasManyTests < ActiveRecord::TestCase
++  fixtures :men, :interests
++
++  def test_parent_instance_should_be_shared_with_every_child_on_find
++    m = Man.find(:first)
++    is = m.interests
++    is.each do |i|
++      assert_equal m.name, i.man.name, "Name of man should be the same before changes to parent instance"
++      m.name = 'Bongo'
++      assert_equal m.name, i.man.name, "Name of man should be the same after changes to parent instance"
++      i.man.name = 'Mungo'
++      assert_equal m.name, i.man.name, "Name of man should be the same after changes to child-owned instance"
++    end
++  end
++  
++  def test_parent_instance_should_be_shared_with_newly_built_child
++    m = Man.find(:first)
++    i = m.interests.build(:topic => 'Industrial Revolution Re-enactment')
++    assert_not_nil i.man
++    assert_equal m.name, i.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, i.man.name, "Name of man should be the same after changes to parent instance"
++    i.man.name = 'Mungo'
++    assert_equal m.name, i.man.name, "Name of man should be the same after changes to just-built-child-owned instance"
++  end
++  
++  def test_parent_instance_should_be_shared_with_newly_created_child
++    m = Man.find(:first)
++    i = m.interests.create(:topic => 'Industrial Revolution Re-enactment')
++    assert_not_nil i.man
++    assert_equal m.name, i.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, i.man.name, "Name of man should be the same after changes to parent instance"
++    i.man.name = 'Mungo'
++    assert_equal m.name, i.man.name, "Name of man should be the same after changes to newly-created-child-owned instance"
++  end
++  
++  def test_parent_instance_should_be_shared_with_poked_in_child
++    m = Man.find(:first)
++    i = Interest.create(:topic => 'Industrial Revolution Re-enactment')
++    m.interests << i
++    assert_not_nil i.man
++    assert_equal m.name, i.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, i.man.name, "Name of man should be the same after changes to parent instance"
++    i.man.name = 'Mungo'
++    assert_equal m.name, i.man.name, "Name of man should be the same after changes to newly-created-child-owned instance"
++  end
++  
++  def test_trying_to_use_inverses_that_dont_exist_should_raise_an_error
++    assert_raise(ActiveRecord::InverseOfAssociationNotFoundError) { Man.find(:first).secret_interests }
++  end
++end
++
++class InverseBelongsToTests < ActiveRecord::TestCase
++  fixtures :men, :faces, :interests
++
++  def test_child_instance_should_be_shared_with_parent_on_find
++    f = Face.find(:first)
++    m = f.man
++    assert_equal f.description, m.face.description, "Description of face should be the same before changes to child instance"
++    f.description = 'gormless'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to child instance"
++    m.face.description = 'pleasing'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to parent-owned instance"
++  end
++  
++  def test_child_instance_should_be_shared_with_newly_built_parent
++    f = Face.find(:first)
++    m = f.build_man(:name => 'Charles')
++    assert_not_nil m.face
++    assert_equal f.description, m.face.description, "Description of face should be the same before changes to child instance"
++    f.description = 'gormless'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to child instance"
++    m.face.description = 'pleasing'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to just-built-parent-owned instance"
++  end
++  
++  def test_child_instance_should_be_shared_with_newly_created_parent
++    f = Face.find(:first)
++    m = f.create_man(:name => 'Charles')
++    assert_not_nil m.face
++    assert_equal f.description, m.face.description, "Description of face should be the same before changes to child instance"
++    f.description = 'gormless'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to child instance"
++    m.face.description = 'pleasing'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to newly-created-parent-owned instance"
++  end
++  
++  def test_should_not_try_to_set_inverse_instances_when_the_inverse_is_a_has_many
++    i = Interest.find(:first)
++    m = i.man
++    assert_not_nil m.interests
++    iz = m.interests.detect {|iz| iz.id == i.id}
++    assert_not_nil iz
++    assert_equal i.topic, iz.topic, "Interest topics should be the same before changes to child"
++    i.topic = 'Eating cheese with a spoon'
++    assert_not_equal i.topic, iz.topic, "Interest topics should not be the same after changes to child"
++    iz.topic = 'Cow tipping'
++    assert_not_equal i.topic, iz.topic, "Interest topics should not be the same after changes to parent-owned instance"
++  end
++  
++  def test_trying_to_use_inverses_that_dont_exist_should_raise_an_error
++    assert_raise(ActiveRecord::InverseOfAssociationNotFoundError) { Face.find(:first).horrible_man }
++  end
++end
++
++# NOTE - these tests might not be meaningful, ripped as they were from the parental_control plugin
++# which would guess the inverse rather than look for an explicit configuration option.
++class InverseMultipleHasManyInversesForSameModel < ActiveRecord::TestCase
++  fixtures :men, :interests, :zines
++  
++  def test_that_we_can_load_associations_that_have_the_same_reciprocal_name_from_different_models
++    assert_nothing_raised(ActiveRecord::AssociationTypeMismatch) do
++      i = Interest.find(:first)
++      z = i.zine
++      m = i.man
++    end
++  end
++  
++  def test_that_we_can_create_associations_that_have_the_same_reciprocal_name_from_different_models
++    assert_nothing_raised(ActiveRecord::AssociationTypeMismatch) do
++      i = Interest.find(:first)
++      i.build_zine(:title => 'Get Some in Winter! 2008')
++      i.build_man(:name => 'Gordon')
++      i.save!
++    end
++  end
++end
+diff --git a/activerecord/test/fixtures/faces.yml b/activerecord/test/fixtures/faces.yml
+new file mode 100644
+index 0000000..1dd2907
+--- /dev/null
++++ b/activerecord/test/fixtures/faces.yml
+@@ -0,0 +1,7 @@
++trusting:
++  description: trusting
++  man: gordon
++
++weather_beaten:
++  description: weather beaten
++  man: steve
+diff --git a/activerecord/test/fixtures/interests.yml b/activerecord/test/fixtures/interests.yml
+new file mode 100644
+index 0000000..ec71890
+--- /dev/null
++++ b/activerecord/test/fixtures/interests.yml
+@@ -0,0 +1,29 @@
++trainspotting:
++  topic: Trainspotting
++  zine: staying_in
++  man: gordon
++
++birdwatching:
++  topic: Birdwatching
++  zine: staying_in
++  man: gordon
++
++stamp_collecting:
++  topic: Stamp Collecting
++  zine: staying_in
++  man: gordon
++
++hunting:
++  topic: Hunting
++  zine: going_out
++  man: steve
++
++woodsmanship:
++  topic: Woodsmanship
++  zine: going_out
++  man: steve
++
++survial:
++  topic: Survival
++  zine: going_out
++  man: steve
+diff --git a/activerecord/test/fixtures/men.yml b/activerecord/test/fixtures/men.yml
+new file mode 100644
+index 0000000..c67429f
+--- /dev/null
++++ b/activerecord/test/fixtures/men.yml
+@@ -0,0 +1,5 @@
++gordon:
++  name: Gordon
++
++steve:
++  name: Steve
+diff --git a/activerecord/test/fixtures/zines.yml b/activerecord/test/fixtures/zines.yml
+new file mode 100644
+index 0000000..07dce4d
+--- /dev/null
++++ b/activerecord/test/fixtures/zines.yml
+@@ -0,0 +1,5 @@
++staying_in:
++  title: Staying in '08
++
++going_out:
++  title: Outdoor Pursuits 2k+8
+diff --git a/activerecord/test/models/face.rb b/activerecord/test/models/face.rb
+new file mode 100644
+index 0000000..1540dbf
+--- /dev/null
++++ b/activerecord/test/models/face.rb
+@@ -0,0 +1,5 @@
++class Face < ActiveRecord::Base
++  belongs_to :man, :inverse_of => :face
++  # This is a "broken" inverse_of for the purposes of testing
++  belongs_to :horrible_man, :class_name => 'Man', :inverse_of => :horrible_face
++end
+diff --git a/activerecord/test/models/interest.rb b/activerecord/test/models/interest.rb
+new file mode 100644
+index 0000000..d8291d0
+--- /dev/null
++++ b/activerecord/test/models/interest.rb
+@@ -0,0 +1,4 @@
++class Interest < ActiveRecord::Base
++  belongs_to :man, :inverse_of => :interests
++  belongs_to :zine, :inverse_of => :interests
++end
+diff --git a/activerecord/test/models/man.rb b/activerecord/test/models/man.rb
+new file mode 100644
+index 0000000..f40bc9d
+--- /dev/null
++++ b/activerecord/test/models/man.rb
+@@ -0,0 +1,7 @@
++class Man < ActiveRecord::Base
++  has_one :face, :inverse_of => :man
++  has_many :interests, :inverse_of => :man
++  # These are "broken" inverse_of associations for the purposes of testing
++  has_one :dirty_face, :class_name => 'Face', :inverse_of => :dirty_man
++  has_many :secret_interests, :class_name => 'Interest', :inverse_of => :secret_man
++end
+diff --git a/activerecord/test/models/zine.rb b/activerecord/test/models/zine.rb
+new file mode 100644
+index 0000000..c2d0fda
+--- /dev/null
++++ b/activerecord/test/models/zine.rb
+@@ -0,0 +1,3 @@
++class Zine < ActiveRecord::Base
++  has_many :interests, :inverse_of => :zine
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 98e6d19..bcb7b81 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -467,6 +467,26 @@ ActiveRecord::Schema.define do
+     end
+   end
+ 
++  # NOTE - the following 4 tables are used by models that have :inverse_of options on the associations
++  create_table :men, :force => true do |t|
++    t.string  :name
++  end
++
++  create_table :faces, :force => true do |t|
++    t.string  :description
++    t.integer :man_id
++  end
++  
++  create_table :interests, :force => true do |t|
++    t.string :topic
++    t.integer :man_id
++    t.integer :zine_id
++  end
++  
++  create_table :zines, :force => true do |t|
++    t.string :title
++  end
++
+   except 'SQLite' do
+     # fk_test_has_fk should be before fk_test_has_pk
+     create_table :fk_test_has_fk, :force => true do |t|
+-- 
+1.6.2.1
+

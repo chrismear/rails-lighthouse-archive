@@ -1,0 +1,161 @@
+From 751f81ad0adc27fd24d29fc3a64c1a00565d364a Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Wed, 1 Oct 2008 15:00:25 -0400
+Subject: [PATCH] options to normalize req resp attr names
+
+---
+ activeresource/lib/active_resource/base.rb         |    4 ++-
+ activeresource/lib/active_resource/connection.rb   |    3 +-
+ activeresource/lib/active_resource/formats.rb      |   24 ++++++++++++++++++++
+ .../lib/active_resource/formats/json_format.rb     |   12 +++++++--
+ .../lib/active_resource/formats/xml_format.rb      |    2 +-
+ activeresource/test/format_test.rb                 |   19 +++++++++++++++
+ 6 files changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index d966062..034ee81 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -276,6 +276,8 @@ module ActiveResource
+         @password = password
+       end
+ 
++      attr_accessor_with_default(:dasherize_keys_on_encode, false)
++
+       # Sets the format that attributes are sent and received in from a mime type reference:
+       #
+       #   Person.format = :json
+@@ -854,7 +856,7 @@ module ActiveResource
+     #
+     #   my_group.to_xml(:skip_instruct => true)
+     #   # => <subsidiary_group> [...] </subsidiary_group>
+-    def encode(options={})
++    def encode(options={:dasherize=>self.class.dasherize_keys_on_encode})
+       case self.class.format
+         when ActiveResource::Formats[:xml]
+           self.class.format.encode(attributes, {:root => self.class.element_name}.merge(options))
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index 273fee3..bf2c8f6 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -81,11 +81,12 @@ module ActiveResource
+ 
+     # The +site+ parameter is required and will set the +site+
+     # attribute to the URI for the remote resource service.
+-    def initialize(site, format = ActiveResource::Formats[:xml])
++    def initialize(site, format = ActiveResource::Formats[:xml], underscore_on_decode = true)
+       raise ArgumentError, 'Missing site URI' unless site
+       @user = @password = nil
+       self.site = site
+       self.format = format
++      @underscore_on_decode = underscore_on_decode
+     end
+ 
+     # Set URI for remote service.
+diff --git a/activeresource/lib/active_resource/formats.rb b/activeresource/lib/active_resource/formats.rb
+index 28864cf..bc01332 100644
+--- a/activeresource/lib/active_resource/formats.rb
++++ b/activeresource/lib/active_resource/formats.rb
+@@ -7,6 +7,30 @@ module ActiveResource
+     def self.[](mime_type_reference)
+       ActiveResource::Formats.const_get(mime_type_reference.to_s.camelize + "Format")
+     end
++
++    def self.underscore_keys(hash_in)
++      recursively_normalize_hash_keys(hash_in, :underscore, :underscore_keys)
++    end
++
++    def self.dasherize_keys(hash_in)
++      recursively_normalize_hash_keys(hash_in, :dasherize, :dasherize_keys)
++    end
++
++    def self.recursively_normalize_hash_keys(hash_in, inflector, method)
++      return hash_in unless hash_in
++      hash_in.inject({}) do |hash_out, (key, value)|
++        key = key.to_s.send(inflector)
++        if value.is_a?(::Hash)
++          hash_out[key] = send(method, value)
++        elsif value.is_a?(::Array) and value[0].is_a?(::Hash)
++          hash_out[key] = value.collect { |hash| send(method, hash) }
++        else
++          hash_out[key] = value
++        end
++          hash_out
++      end
++    end
++
+   end
+ end
+ 
+diff --git a/activeresource/lib/active_resource/formats/json_format.rb b/activeresource/lib/active_resource/formats/json_format.rb
+index 9e269d4..6790412 100644
+--- a/activeresource/lib/active_resource/formats/json_format.rb
++++ b/activeresource/lib/active_resource/formats/json_format.rb
+@@ -11,12 +11,18 @@ module ActiveResource
+         "application/json"
+       end
+ 
+-      def encode(hash, options={})
+-        hash.to_json
++      def encode(hash, options={:dasherize=>false})
++        options[:dasherize] ? ActiveResource::Formats.dasherize_keys(hash).to_json : hash.to_json(options)
+       end
+ 
+       def decode(json)
+-        ActiveSupport::JSON.decode(json)
++        decoded = ActiveSupport::JSON.decode(json)
++        decoded = if decoded.is_a?(::Array)
++          decoded.collect{|hash| ActiveResource::Formats.underscore_keys(hash)}
++        else
++          ActiveResource::Formats.underscore_keys(decoded)
++        end
++        decoded
+       end
+     end
+   end
+diff --git a/activeresource/lib/active_resource/formats/xml_format.rb b/activeresource/lib/active_resource/formats/xml_format.rb
+index 86c6cec..bd9a671 100644
+--- a/activeresource/lib/active_resource/formats/xml_format.rb
++++ b/activeresource/lib/active_resource/formats/xml_format.rb
+@@ -11,7 +11,7 @@ module ActiveResource
+         "application/xml"
+       end
+ 
+-      def encode(hash, options={})
++      def encode(hash, options={:dasherize=>false})
+         hash.to_xml(options)
+       end
+ 
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index 365576a..3332ea1 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -83,6 +83,25 @@ class FormatTest < Test::Unit::TestCase
+     assert_equal ActiveResource::Formats[:json], resource.connection.format
+   end
+ 
++  def test_dasherize_on_encode
++     for format in [ :json, :xml ]
++      encoded = ActiveResource::Formats[format].encode({ :foo_bar => 'something' }, {:dasherize=>true})
++      assert_match( /foo-bar/, encoded)
++      assert 'something', ActiveResource::Formats[format].decode(encoded)[:foo_bar]
++
++
++      Person.dasherize_keys_on_encode = true
++      rus = ActiveResource::Formats[format].encode({ :first_name => 'Rus' }, {:dasherize=>true})
++      assert_match(/first-name/, rus)
++      using_format(Person, format) do
++        remote_rus = Person.new(:first_name => 'Rus')
++        ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, rus, 201, {'Location' => "/people/5.#{format}"}
++        remote_rus.save
++      end
++      Person.dasherize_keys_on_encode = false
++     end
++  end
++
+   private
+     def using_format(klass, mime_type_reference)
+       previous_format = klass.format
+-- 
+1.5.5.3
+

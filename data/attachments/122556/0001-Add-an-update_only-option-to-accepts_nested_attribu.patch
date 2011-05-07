@@ -1,0 +1,139 @@
+From 6ffcd46e5810fcdbc98187de0fb5cd084b22431e Mon Sep 17 00:00:00 2001
+From: Michael Siebert <siebertm85@googlemail.com>
+Date: Sat, 25 Apr 2009 11:49:11 +0200
+Subject: [PATCH] Add an :update_only option to accepts_nested_attributes_for
+
+Allows to specify that the an existing record can only be updated.
+A new record in only created when there is no existing record. This
+option only works for on-to-one associations and is ignored for
+collection associations.
+---
+ .../lib/active_record/nested_attributes.rb         |   34 ++++++++++++++-----
+ activerecord/test/cases/nested_attributes_test.rb  |   31 ++++++++++++++++++
+ 2 files changed, 56 insertions(+), 9 deletions(-)
+
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index e3122d1..eef94f9 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -180,6 +180,11 @@ module ActiveRecord
+       #   and the Proc should return either +true+ or +false+. When no Proc
+       #   is specified a record will be built for all attribute hashes that
+       #   do not have a <tt>_delete</tt> that evaluates to true.
++      # [:update_only]
++      #   Allows to specify that the an existing record can only be updated.
++      #   A new record in only created when there is no existing record. This
++      #   option only works for on-to-one associations and is ignored for
++      #   collection associations. This option is off by default.
+       #
+       # Examples:
+       #   # creates avatar_attributes=
+@@ -187,9 +192,9 @@ module ActiveRecord
+       #   # creates avatar_attributes= and posts_attributes=
+       #   accepts_nested_attributes_for :avatar, :posts, :allow_destroy => true
+       def accepts_nested_attributes_for(*attr_names)
+-        options = { :allow_destroy => false }
++        options = { :allow_destroy => false, :update_only => false }
+         options.update(attr_names.extract_options!)
+-        options.assert_valid_keys(:allow_destroy, :reject_if)
++        options.assert_valid_keys(:allow_destroy, :reject_if, :update_only)
+
+         attr_names.each do |association_name|
+           if reflection = reflect_on_association(association_name)
+@@ -208,7 +213,7 @@ module ActiveRecord
+             # end
+             class_eval %{
+               def #{association_name}_attributes=(attributes)
+-                assign_nested_attributes_for_#{type}_association(:#{association_name}, attributes, #{options[:allow_destroy]})
++                assign_nested_attributes_for_#{type}_association(:#{association_name}, attributes, #{options[:allow_destroy]}, #{options[:update_only]})
+               end
+             }, __FILE__, __LINE__
+           else
+@@ -235,17 +240,28 @@ module ActiveRecord
+
+     # Assigns the given attributes to the association.
+     #
+-    # If the given attributes include an <tt>:id</tt> that matches the existing
+-    # record’s id, then the existing record will be modified. Otherwise a new
+-    # record will be built.
++    # If update_only is true, a new record is only created when no object exists,
++    # otherwise it will be updated
++    #
++    # If update_only is false and the given attributes include an <tt>:id</tt>
++    # that matches the existing record’s id, then the existing record will be
++    # modified. Otherwise a new record will be built.
+     #
+     # If the given attributes include a matching <tt>:id</tt> attribute _and_ a
+     # <tt>:_delete</tt> key set to a truthy value, then the existing record
+     # will be marked for destruction.
+-    def assign_nested_attributes_for_one_to_one_association(association_name, attributes, allow_destroy)
++    def assign_nested_attributes_for_one_to_one_association(association_name, attributes, allow_destroy, update_only)
+       attributes = attributes.stringify_keys
+
+-      if attributes['id'].blank?
++      if update_only
++        if existing_record = send(association_name)
++          assign_to_or_mark_for_destruction(existing_record, attributes, allow_destroy)
++        else
++          unless reject_new_record?(association_name, attributes)
++            send("build_#{association_name}", attributes.except(*UNASSIGNABLE_KEYS))
++          end
++        end
++      elsif attributes['id'].blank?
+         unless reject_new_record?(association_name, attributes)
+           send("build_#{association_name}", attributes.except(*UNASSIGNABLE_KEYS))
+         end
+@@ -281,7 +297,7 @@ module ActiveRecord
+     #     { :name => 'John' },
+     #     { :id => '2', :_delete => true }
+     #   ])
+-    def assign_nested_attributes_for_collection_association(association_name, attributes_collection, allow_destroy)
++    def assign_nested_attributes_for_collection_association(association_name, attributes_collection, allow_destroy, update_only)
+       unless attributes_collection.is_a?(Hash) || attributes_collection.is_a?(Array)
+         raise ArgumentError, "Hash or Array expected, got #{attributes_collection.class.name} (#{attributes_collection.inspect})"
+       end
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index cd6277c..87c4f36 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -184,6 +184,37 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_automatically_enable_autosave_on_the_association
+     assert Pirate.reflect_on_association(:ship).options[:autosave]
+   end
++
++  def test_should_accept_update_only_option
++    Pirate.accepts_nested_attributes_for :ship, :update_only => true
++    @pirate.update_attribute(:ship_attributes, { :id => @pirate.ship.id, :name => 'Mayflower' })
++
++    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  end
++
++  def test_should_create_new_model_when_nothing_is_there_and_update_only_is_true
++    Pirate.accepts_nested_attributes_for :ship, :update_only => true
++    @ship.delete
++
++    assert_difference('Ship.count', 1) do
++      @pirate.reload.update_attribute(:ship_attributes, { :name => 'Mayflower' })
++    end
++
++    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  end
++
++
++  def test_should_update_existing_when_update_only_is_true_and_no_id_is_given
++    Pirate.accepts_nested_attributes_for :ship, :update_only => true
++
++    assert_no_difference('Ship.count') do
++      @pirate.reload.update_attributes(:ship_attributes => { :name => 'Mayflower' })
++    end
++
++    assert_equal 'Mayflower', @ship.reload.name
++
++    Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  end
+ end
+
+ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+--
+1.6.0
+

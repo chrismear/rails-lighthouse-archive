@@ -1,0 +1,212 @@
+From 758fab1c8d6b57cf0189e4498f13eb1564b33283 Mon Sep 17 00:00:00 2001
+From: Daniel Cadenas and rabble and Alexander Uvarov <dev+dcadenas+rabble@cuboxsa.com>
+Date: Sat, 15 May 2010 20:54:21 -0300
+Subject: [PATCH] Added hidden id field option include_id
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb |   37 +++++++-
+ actionpack/test/template/form_helper_test.rb      |   91 +++++++++++++++++++++
+ 2 files changed, 123 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index cd190e9..52d96a7 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -223,6 +223,23 @@ module ActionView
+       #    ...
+       #   <% end %>
+       #
++      # === Removing Hidden Model ID's
++      # 
++      # The form_for method automatically includes the model id as a hidden field in the form. 
++      # This is used to maintain the correlation between the form data and it's associated model.
++      # Some ORM systems like CouchRest do not use model id's so in this case you want to be able
++      # to disable the hidden id.
++      #
++      # Example: 
++      #
++      #    <%= form(@post, :include_id => false) do |f| %>
++      #      ...
++      #    <% end %>
++      #
++      # The HTML generated for this would NOT have this:
++      #
++      #    <input id="post_id" name="post[id]" type="hidden" value="321" />
++      #
+       # === Customized form builders
+       #
+       # You can also build forms using a customized FormBuilder class. Subclass
+@@ -230,7 +247,7 @@ module ActionView
+       # custom builder. For example, let's say you made a helper to
+       # automatically add labels to form inputs.
+       #
+-      #   <% form_for :person, @person, :url => { :action => "update" }, :builder => LabellingFormBuilder do |f| %>
++      #   <% form_for(:person, @person, :url => { :action => "update" }, :builder => LabellingFormBuilder) do |f| %>
+       #     <%= f.text_field :first_name %>
+       #     <%= f.text_field :last_name %>
+       #     <%= text_area :person, :biography %>
+@@ -742,6 +759,10 @@ module ActionView
+       DEFAULT_RADIO_OPTIONS     = { }.freeze unless const_defined?(:DEFAULT_RADIO_OPTIONS)
+       DEFAULT_TEXT_AREA_OPTIONS = { "cols" => 40, "rows" => 20 }.freeze unless const_defined?(:DEFAULT_TEXT_AREA_OPTIONS)
+ 
++      def include_hidden_id?
++        @include_hidden_id
++      end
++
+       def initialize(object_name, method_name, template_object, object = nil)
+         @object_name, @method_name = object_name.to_s.dup, method_name.to_s.dup
+         @template_object = template_object
+@@ -965,6 +986,7 @@ module ActionView
+ 
+       def initialize(object_name, object, template, options, proc)
+         @nested_child_index = {}
++        @include_hidden_id = options.has_key?(:include_id) ? options[:include_id] : true
+         @object_name, @object, @template, @options, @proc = object_name, object, template, options, proc
+         @default_options = @options ? @options.slice(:index) : {}
+         if @object_name.to_s.match(/\[\]$/)
+@@ -999,6 +1021,11 @@ module ActionView
+           index = ""
+         end
+ 
++        if options.has_key?(:include_id)
++          args << {} unless args.last.is_a?(Hash)
++          args.last[:include_id] = options[:include_id] unless args.last.has_key?(:include_id)
++        end
++
+         if options[:builder]
+           args << {} unless args.last.is_a?(Hash)
+           args.last[:builder] ||= options[:builder]
+@@ -1037,7 +1064,7 @@ module ActionView
+       end
+       
+       def hidden_field(method, options = {})
+-        @emitted_hidden_id = true if method == :id
++        @include_hidden_id = false if method == :id
+         @template.hidden_field(@object_name, method, objectify_options(options))
+       end
+ 
+@@ -1053,8 +1080,8 @@ module ActionView
+         @template.submit_tag(value, options.reverse_merge(:id => "#{object_name}_submit"))
+       end
+ 
+-      def emitted_hidden_id?
+-        @emitted_hidden_id
++      def include_hidden_id?
++        @include_hidden_id
+       end
+ 
+       private
+@@ -1092,7 +1119,7 @@ module ActionView
+           else
+             @template.fields_for(name, object, *args) do |builder|
+               block.call(builder)
+-              @template.concat builder.hidden_field(:id) unless builder.emitted_hidden_id?
++              @template.concat builder.hidden_field(:id, :value => object.to_key) if builder.include_hidden_id?
+             end
+           end
+         end
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 5b62674..452dd45 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -1313,6 +1313,97 @@ class FormHelperTest < ActionView::TestCase
+     assert_equal LabelledFormBuilderSubclass, klass
+   end
+ 
++  def test_nested_fields_for_with_existing_records_on_a_nested_attributes_one_to_one_association_with_disabled_nested_ids
++    @post.author = Author.new(321)
++
++    assert_deprecated do
++      form_for(:post, @post, :include_id => false) do |f|
++        concat f.text_field(:title)
++        concat f.fields_for(:author) { |af|
++          concat af.text_field(:name)
++        }
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_author_attributes_name" name="post[author_attributes][name]" size="30" type="text" value="author #321" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_existing_records_on_a_nested_attributes_collection_association_with_disabled_nested_ids
++    @post.comments = Array.new(2) { |id| Comment.new(id + 1) }
++    @post.author = Author.new(321)
++
++    assert_deprecated do
++      form_for(:post, @post, :include_id => false) do |f|
++        concat f.text_field(:title)
++        concat f.fields_for(:author, :include_id => true) { |af|
++          concat af.text_field(:name)
++        }
++        @post.comments.each do |comment|
++          concat f.fields_for(:comments, comment) { |cf|
++            concat cf.text_field(:name)
++          }
++        end
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_author_attributes_name" name="post[author_attributes][name]" size="30" type="text" value="author #321" />' +
++               '<input id="post_author_attributes_id" name="post[author_attributes][id]" type="hidden" value="321" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #1" />' +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="comment #2" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_an_existing_record_on_a_nested_attributes_one_to_one_association_with_include_id_being_true_in_the_outer_form
++    @post.author = Author.new(321)
++
++    assert_deprecated do
++      form_for(:post, @post, :include_id => true) do |f|
++        concat f.text_field(:title)
++        concat f.fields_for(:author) { |af|
++          concat af.text_field(:name)
++        }
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_author_attributes_name" name="post[author_attributes][name]" size="30" type="text" value="author #321" />' +
++               '<input id="post_author_attributes_id" name="post[author_attributes][id]" type="hidden" value="321" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_an_existing_record_on_a_nested_attributes_one_to_one_association_with_include_id_being_true_in_the_inner_form
++    @post.author = Author.new(321)
++
++    assert_deprecated do
++      form_for(:post, @post) do |f|
++        concat f.text_field(:title)
++        concat f.fields_for(:author, :include_id => true) { |af|
++          concat af.text_field(:name)
++        }
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_author_attributes_name" name="post[author_attributes][name]" size="30" type="text" value="author #321" />' +
++               '<input id="post_author_attributes_id" name="post[author_attributes][id]" type="hidden" value="321" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++
+   def test_form_for_with_html_options_adds_options_to_form_tag
+     form_for(:post, @post, :html => {:id => 'some_form', :class => 'some_class'}) do |f| end
+     expected = "<form action=\"http://www.example.com\" class=\"some_class\" id=\"some_form\" method=\"post\"></form>"
+-- 
+1.6.5.3
+

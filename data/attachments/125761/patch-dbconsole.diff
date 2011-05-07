@@ -1,0 +1,3469 @@
+From c21dbb5dcfe6b3602b08f3879663000ed94f9208 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Fri, 22 May 2009 22:09:00 -0700
+Subject: [PATCH] modified dbconsole application to use code based on dbprompt.rb from the rdb_prompt project
+
+---
+ railties/bin/dbconsole                             |   10 ++-
+ .../lib/commands/dbconsole/abstract_console.rb     |   27 ++++++
+ .../commands/dbconsole/command_line_interface.rb   |   92 ++++++++++++++++++
+ railties/lib/commands/dbconsole/mysql_console.rb   |   99 ++++++++++++++++++++
+ .../lib/commands/dbconsole/postgresql_console.rb   |   17 ++++
+ railties/lib/commands/dbconsole/sqlite3_console.rb |   16 +++
+ railties/lib/commands/dbconsole/sqlite_console.rb  |   13 +++
+ 7 files changed, 272 insertions(+), 2 deletions(-)
+ create mode 100644 railties/lib/commands/dbconsole/abstract_console.rb
+ create mode 100644 railties/lib/commands/dbconsole/command_line_interface.rb
+ create mode 100644 railties/lib/commands/dbconsole/mysql_console.rb
+ create mode 100644 railties/lib/commands/dbconsole/postgresql_console.rb
+ create mode 100644 railties/lib/commands/dbconsole/sqlite3_console.rb
+ create mode 100644 railties/lib/commands/dbconsole/sqlite_console.rb
+
+diff --git a/railties/bin/dbconsole b/railties/bin/dbconsole
+index caa60ce..d3071b8 100755
+--- a/railties/bin/dbconsole
++++ b/railties/bin/dbconsole
+@@ -1,3 +1,9 @@
+ #!/usr/bin/env ruby
+-require File.dirname(__FILE__) + '/../config/boot'
+-require 'commands/dbconsole'
++# Is there really a dependency?
++# require File.dirname(__FILE__) + '/../config/boot'
++
++require File.dirname(__FILE__) + '/../lib/commands/dbconsole/command_line_interface'
++
++cli = CommandLineInterface.new
++cli.parse_command_line_args(ARGV)
++cli.perform
+diff --git a/railties/lib/commands/dbconsole/abstract_console.rb b/railties/lib/commands/dbconsole/abstract_console.rb
+new file mode 100644
+index 0000000..40c9525
+--- /dev/null
++++ b/railties/lib/commands/dbconsole/abstract_console.rb
+@@ -0,0 +1,27 @@
++class AbstractConsole
++  attr_accessor :db_config, :options
++  def initialize(db_config, options)
++    @db_config = db_config
++    @options = options
++
++    abort 'No database name found' if db_config['database'].nil?
++    abort 'Database name is empty' if db_config['database'] == ''
++    # Todo: deal with whitespace through quoting / escaping quotes
++    abort 'Database name has whitespace. Not supported' if db_config['database'] =~ /\s/
++    abort 'Bad executable' unless @options[:executable].nil? || @options[:executable] =~ /[a-z]/i
++  end
++
++  # Returns @options[:executable] if not empty
++  # Otherwise find executable based on commands from PATH
++  # adding .exe on the win32 platform
++  def find_cmd(*commands)
++    return @options[:executable] if @options[:executable]
++    dirs_on_path = ENV['PATH'].to_s.split(File::PATH_SEPARATOR)
++    commands += commands.map{|cmd| "#{cmd}.exe"} if RUBY_PLATFORM =~ /win32/
++    commands.detect do |cmd|
++      dirs_on_path.detect do |path|
++        File.executable? File.join(path, cmd)
++      end
++    end || abort("Couldn't find database client: #{commands.join(', ')}. Check your $PATH and try again.")
++  end
++end
+diff --git a/railties/lib/commands/dbconsole/command_line_interface.rb b/railties/lib/commands/dbconsole/command_line_interface.rb
+new file mode 100644
+index 0000000..d8ca531
+--- /dev/null
++++ b/railties/lib/commands/dbconsole/command_line_interface.rb
+@@ -0,0 +1,92 @@
++require 'optparse'
++require 'yaml'
++require 'erb'
++
++require File.dirname(__FILE__) + '/mysql_console'
++require File.dirname(__FILE__) + '/postgresql_console'
++require File.dirname(__FILE__) + '/sqlite3_console'
++require File.dirname(__FILE__) + '/sqlite_console'
++
++
++
++class CommandLineInterface < OptionParser
++  attr_accessor :options, :argv
++  def initialize
++    super
++    @options = {}
++    self.banner = "Usage: #{$0} [options] [environment] [database.yml]"
++    separator ""
++    separator "Default environment is development"
++    separator "Default database.yml file is config/database.yml"
++    separator ""
++    separator "Specific options:"
++
++    def_option "-x", "--executable EXECUTABLE", String, "executable to use. Defaults are sqlite, sqlite3, psql, mysql" do |executable|
++      @options[:executable] = executable.to_s
++    end
++
++    def_option "--mycnf", "mysql only: Just output my.cnf file" do
++      @options[:mycnf_only] = true
++    end
++
++    def_option "--mode [MODE]", ['html', 'list', 'line', 'column'],
++    "sqlite3 only: put the database in the specified mode (html, list, line, column)" do |mode|
++      @options[:mode] = mode
++    end
++
++    def_option "-h", "--[no-]header", "sqlite3 only: Turn headers on or off"  do |h|
++      @options[:header] = h
++    end
++
++    def_option("-p", "--include-password", "mysql/postgresql only: Automatically provide the password from database.yml") do |v|
++      @options[:password] = true
++    end
++
++    def_option "-v", "--[no-]verbose", "Run verbosely" do |verbose|
++      @options[:verbose] = verbose
++    end
++
++    def_tail_option "--help", "Show this help message" do
++      puts self
++      exit
++    end
++  end
++
++  def parse_command_line_args(argv)
++    @argv = parse!(argv) # parse will populate options and remove the parsed options from argv
++    @environment = @argv[0] || ENV['RAILS_ENV'] || 'development'
++    @yaml_filename = @argv[1] || 'config/database.yml'
++  end
++
++  def perform
++    $stderr.puts "Using yaml file '#{@yaml_filename}'" if options[:verbose]
++    abort "Cannot read file #{@yaml_filename}" unless File.readable? @yaml_filename
++    yaml = nil
++    begin
++      yaml = YAML::load(ERB.new(IO.read(@yaml_filename)).result)
++    rescue Exception => e
++      abort "Error #{e} while reading #{@yaml_filename}"
++    end
++    
++    $stderr.puts "Using environment '#{@environment}'" if options[:verbose]
++    abort "Could not find configuration for >>#{@environment}<< in file #{@yaml_filename}." unless yaml && yaml.is_a?(Hash) && yaml[@environment]
++    
++    db_config = yaml[@environment]
++    adapter = db_config['adapter']
++    
++    $stderr.puts "Found adapter >>#{ adapter }<<" if options[:verbose]
++    # Convert adapter into a class
++    adapter_console_class = case adapter
++      when 'sqlite': SqliteConsole
++      when 'sqlite3': Sqlite3Console
++      when 'postgresql': PostgresqlConsole
++      when 'mysql': MysqlConsole
++      else
++        abort  "Unknown command-line client for database #{db_config['database']}. Submit a Rails patch to add support for the #{adapter} adapter!"
++    end
++
++    # Instantiate and run
++    adapter_console = adapter_console_class.new(db_config, options)
++    adapter_console.run
++  end
++end
+diff --git a/railties/lib/commands/dbconsole/mysql_console.rb b/railties/lib/commands/dbconsole/mysql_console.rb
+new file mode 100644
+index 0000000..bd56215
+--- /dev/null
++++ b/railties/lib/commands/dbconsole/mysql_console.rb
+@@ -0,0 +1,99 @@
++require File.dirname(__FILE__) + '/abstract_console'
++
++class MysqlConsole < AbstractConsole
++
++  DATABASE_YAML_TO_MYCNF_MAP = {
++      'host'      => 'host',
++      'port'      => 'port',
++      'socket'    => 'socket',
++      'username'  => 'user',
++      'encoding'  => 'default-character-set'}
++
++  # Username / password and other connection settings are piped in to 
++  # the mysql command (and read by mysql through the --default-config-file
++  # switch) -- depending on operating system support
++
++  def run
++    if options[:mycnf_only]
++      puts get_my_cnf
++      return
++    end
++
++    if piping_to_dev_fd_supported?
++      run_with_pipe
++    else 
++      run_with_mysql_options
++    end
++  end
++
++private
++
++  def get_my_cnf
++    my_cnf = %w( [client] )
++    map = DATABASE_YAML_TO_MYCNF_MAP.dup
++    map['password'] = 'password'
++    # sort to allow testing
++    map.each do |yaml_name, mycnf_name|
++      my_cnf << "#{mycnf_name}=#{@db_config[yaml_name]}" if @db_config[yaml_name]
++    end
++    my_cnf.join("\n")
++  end
++
++  def piping_to_dev_fd_supported?
++    reader,writer = nil,nil # just so we always close
++    begin
++      reader, writer = IO.pipe
++      test_string = Time.new.to_s
++      writer.write test_string
++      writer.close
++      return false unless reader.fileno.is_a?(Fixnum)
++      read_back = IO.read("/dev/fd/#{reader.fileno.to_s}") 
++      if test_string == read_back
++        return true
++      end
++      $stderr.puts "Wrote >>#{ test_string }<<, but read back >>#{ read_back }<<. Piping to /dev/fd/## is not supported" if options[:verbose]
++    rescue Exception => e
++      $stderr.puts "Pipe test failed with #{e}" if options[:verbose]
++    ensure
++      reader.close rescue nil
++      writer.close rescue nil
++    end
++    false
++  end
++
++  def run_with_mysql_options
++    # todo: add quotes / escaping in case of whitespace
++    args = DATABASE_YAML_TO_MYCNF_MAP.map { |yaml_name, mycnf_name|
++      "--#{mycnf_name}=#{@db_config[yaml_name]}" if @db_config[yaml_name]
++    }.compact
++  
++    if @db_config['password'] && @options[:password]
++      args << "--password=#{@db_config['password']}"
++    elsif @db_config['password'] && !@db_config['password'].to_s.empty?
++      args << "-p"
++    end
++  
++    args << @db_config['database']
++    $stderr.puts "Exec'ing command '#{find_cmd('mysql', 'mysql5')} #{ args.join ' ' }'" if options[:verbose]
++  
++    exec find_cmd('mysql', 'mysql5'), *args
++  end
++  
++  # Set up a pipe, and hook it up to the executable (mysql)
++  # See http://dev.mysql.com/doc/refman/5.0/en/password-security-user.html
++  def run_with_pipe
++    my_cnf = get_my_cnf
++    $stderr.puts "Using my.cnf\n--- BEGIN my.cnf ----\n#{my_cnf}\n--- END my.cnf ---" if options[:verbose]
++    reader, writer = IO.pipe
++    writer.write(my_cnf)
++    writer.close # reader to be closed by 'command' / the executable
++    unless reader.fileno.is_a?(Fixnum)
++      reader.close
++      abort "Bad fileno >>#{ reader.fileno }<<. Cannot pipe."  # unlikely, since checked in method piping_to_dev_fd_supported?
++    end
++    # my_cnf to be read in via --defaults-file
++    command= [ find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"]
++    $stderr.puts "Exec'ing command '#{ command.join ' ' }'" if options[:verbose]
++    exec find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"
++  end
++end
+diff --git a/railties/lib/commands/dbconsole/postgresql_console.rb b/railties/lib/commands/dbconsole/postgresql_console.rb
+new file mode 100644
+index 0000000..28ecdc6
+--- /dev/null
++++ b/railties/lib/commands/dbconsole/postgresql_console.rb
+@@ -0,0 +1,17 @@
++require File.dirname(__FILE__) + '/abstract_console'
++
++class PostgresqlConsole < AbstractConsole
++  # The default executable is psql
++  # Environment variables for user/hos/port are set according to the database config.
++  # Password is passed in environment variable PGPASSWORD with option -p / @options[:password]
++  def run
++    ENV['PGUSER']     = @db_config['username'] if @db_config["username"]
++    ENV['PGHOST']     = @db_config['host'] if @db_config["host"]
++    ENV['PGPORT']     = @db_config['port'].to_s if @db_config["port"]
++    ENV['PGPASSWORD'] = @db_config['password'].to_s if @db_config["password"] && @options[:password]
++
++    command = "#{find_cmd('psql')} #{options[:executable]} #{db_config['database']}"
++    $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++    exec find_cmd('psql'), @db_config['database']
++  end
++end
+diff --git a/railties/lib/commands/dbconsole/sqlite3_console.rb b/railties/lib/commands/dbconsole/sqlite3_console.rb
+new file mode 100644
+index 0000000..bb750b0
+--- /dev/null
++++ b/railties/lib/commands/dbconsole/sqlite3_console.rb
+@@ -0,0 +1,16 @@
++require File.dirname(__FILE__) + '/abstract_console'
++
++class Sqlite3Console < AbstractConsole
++  # The default executable is sqlite3
++  # sqlite3 support is very basic : -header option and
++  # modes html, list, line, column (---mode option / @option[:mode])
++  def run
++    args = []
++    args << "-#{@options[:mode]}" if @options[:mode]
++    args << "-header" if @options[:header]
++    args << db_config['database']
++    command = "#{find_cmd('sqlite3')} #{args.join(' ')}"
++    $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++    exec find_cmd('sqlite3'), *args
++  end
++end
+diff --git a/railties/lib/commands/dbconsole/sqlite_console.rb b/railties/lib/commands/dbconsole/sqlite_console.rb
+new file mode 100644
+index 0000000..0588508
+--- /dev/null
++++ b/railties/lib/commands/dbconsole/sqlite_console.rb
+@@ -0,0 +1,13 @@
++require File.dirname(__FILE__) + '/abstract_console'
++
++class SqliteConsole < AbstractConsole
++  # The default executable is sqlite
++  # sqlite support is very basic : no options are passed on
++  # except for the database field
++  def run
++    arg = db_config['database']
++    command = "#{find_cmd('sqlite')} #{arg}"
++    $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++    exec find_cmd('sqlite'), arg
++  end
++end
+-- 
+1.5.4.3
+
+
+From 13cdd1b5821fb4ca1a8190e92281b2e817c0986c Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Fri, 22 May 2009 22:37:35 -0700
+Subject: [PATCH] Moving classes to Dbconsole module
+
+---
+ railties/bin/dbconsole |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/railties/bin/dbconsole b/railties/bin/dbconsole
+index d3071b8..cbea662 100755
+--- a/railties/bin/dbconsole
++++ b/railties/bin/dbconsole
+@@ -4,6 +4,6 @@
+ 
+ require File.dirname(__FILE__) + '/../lib/commands/dbconsole/command_line_interface'
+ 
+-cli = CommandLineInterface.new
++cli = Dbconsole::CommandLineInterface.new
+ cli.parse_command_line_args(ARGV)
+ cli.perform
+-- 
+1.5.4.3
+
+
+From bb80e83b7fb44736a56823741189323bf5c5003f Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Fri, 22 May 2009 22:38:18 -0700
+Subject: [PATCH] Moving classes to Dbconsole module - forgot dbconsole/*rb files
+
+---
+ .../lib/commands/dbconsole/abstract_console.rb     |   52 ++++---
+ .../commands/dbconsole/command_line_interface.rb   |  136 ++++++++--------
+ railties/lib/commands/dbconsole/mysql_console.rb   |  164 ++++++++++----------
+ .../lib/commands/dbconsole/postgresql_console.rb   |   26 ++--
+ railties/lib/commands/dbconsole/sqlite3_console.rb |   26 ++--
+ railties/lib/commands/dbconsole/sqlite_console.rb  |   20 ++-
+ 6 files changed, 217 insertions(+), 207 deletions(-)
+
+diff --git a/railties/lib/commands/dbconsole/abstract_console.rb b/railties/lib/commands/dbconsole/abstract_console.rb
+index 40c9525..16143d2 100644
+--- a/railties/lib/commands/dbconsole/abstract_console.rb
++++ b/railties/lib/commands/dbconsole/abstract_console.rb
+@@ -1,27 +1,29 @@
+-class AbstractConsole
+-  attr_accessor :db_config, :options
+-  def initialize(db_config, options)
+-    @db_config = db_config
+-    @options = options
+-
+-    abort 'No database name found' if db_config['database'].nil?
+-    abort 'Database name is empty' if db_config['database'] == ''
+-    # Todo: deal with whitespace through quoting / escaping quotes
+-    abort 'Database name has whitespace. Not supported' if db_config['database'] =~ /\s/
+-    abort 'Bad executable' unless @options[:executable].nil? || @options[:executable] =~ /[a-z]/i
+-  end
+-
+-  # Returns @options[:executable] if not empty
+-  # Otherwise find executable based on commands from PATH
+-  # adding .exe on the win32 platform
+-  def find_cmd(*commands)
+-    return @options[:executable] if @options[:executable]
+-    dirs_on_path = ENV['PATH'].to_s.split(File::PATH_SEPARATOR)
+-    commands += commands.map{|cmd| "#{cmd}.exe"} if RUBY_PLATFORM =~ /win32/
+-    commands.detect do |cmd|
+-      dirs_on_path.detect do |path|
+-        File.executable? File.join(path, cmd)
+-      end
+-    end || abort("Couldn't find database client: #{commands.join(', ')}. Check your $PATH and try again.")
++module Dbconsole
++  class AbstractConsole
++    attr_accessor :db_config, :options
++    def initialize(db_config, options)
++      @db_config = db_config
++      @options = options
++  
++      abort 'No database name found' if db_config['database'].nil?
++      abort 'Database name is empty' if db_config['database'] == ''
++      # Todo: deal with whitespace through quoting / escaping quotes
++      abort 'Database name has whitespace. Not supported' if db_config['database'] =~ /\s/
++      abort 'Bad executable' unless @options[:executable].nil? || @options[:executable] =~ /[a-z]/i
++    end
++  
++    # Returns @options[:executable] if not empty
++    # Otherwise find executable based on commands from PATH
++    # adding .exe on the win32 platform
++    def find_cmd(*commands)
++      return @options[:executable] if @options[:executable]
++      dirs_on_path = ENV['PATH'].to_s.split(File::PATH_SEPARATOR)
++      commands += commands.map{|cmd| "#{cmd}.exe"} if RUBY_PLATFORM =~ /win32/
++      commands.detect do |cmd|
++        dirs_on_path.detect do |path|
++          File.executable? File.join(path, cmd)
++        end
++      end || abort("Couldn't find database client: #{commands.join(', ')}. Check your $PATH and try again.")
++    end
+   end
+ end
+diff --git a/railties/lib/commands/dbconsole/command_line_interface.rb b/railties/lib/commands/dbconsole/command_line_interface.rb
+index d8ca531..78fd5f4 100644
+--- a/railties/lib/commands/dbconsole/command_line_interface.rb
++++ b/railties/lib/commands/dbconsole/command_line_interface.rb
+@@ -9,84 +9,86 @@ require File.dirname(__FILE__) + '/sqlite_console'
+ 
+ 
+ 
+-class CommandLineInterface < OptionParser
+-  attr_accessor :options, :argv
+-  def initialize
+-    super
+-    @options = {}
+-    self.banner = "Usage: #{$0} [options] [environment] [database.yml]"
+-    separator ""
+-    separator "Default environment is development"
+-    separator "Default database.yml file is config/database.yml"
+-    separator ""
+-    separator "Specific options:"
++module Dbconsole
++  class CommandLineInterface < OptionParser
++    attr_accessor :options, :argv
++    def initialize
++      super
++      @options = {}
++      self.banner = "Usage: #{$0} [options] [environment] [database.yml]"
++      separator ""
++      separator "Default environment is development"
++      separator "Default database.yml file is config/database.yml"
++      separator ""
++      separator "Specific options:"
+ 
+-    def_option "-x", "--executable EXECUTABLE", String, "executable to use. Defaults are sqlite, sqlite3, psql, mysql" do |executable|
+-      @options[:executable] = executable.to_s
+-    end
++      def_option "-x", "--executable EXECUTABLE", String, "executable to use. Defaults are sqlite, sqlite3, psql, mysql" do |executable|
++        @options[:executable] = executable.to_s
++      end
+ 
+-    def_option "--mycnf", "mysql only: Just output my.cnf file" do
+-      @options[:mycnf_only] = true
+-    end
++      def_option "--mycnf", "mysql only: Just output my.cnf file" do
++        @options[:mycnf_only] = true
++      end
+ 
+-    def_option "--mode [MODE]", ['html', 'list', 'line', 'column'],
+-    "sqlite3 only: put the database in the specified mode (html, list, line, column)" do |mode|
+-      @options[:mode] = mode
+-    end
++      def_option "--mode [MODE]", ['html', 'list', 'line', 'column'],
++      "sqlite3 only: put the database in the specified mode (html, list, line, column)" do |mode|
++        @options[:mode] = mode
++      end
+ 
+-    def_option "-h", "--[no-]header", "sqlite3 only: Turn headers on or off"  do |h|
+-      @options[:header] = h
+-    end
++      def_option "-h", "--[no-]header", "sqlite3 only: Turn headers on or off"  do |h|
++        @options[:header] = h
++      end
+ 
+-    def_option("-p", "--include-password", "mysql/postgresql only: Automatically provide the password from database.yml") do |v|
+-      @options[:password] = true
+-    end
++      def_option("-p", "--include-password", "mysql/postgresql only: Automatically provide the password from database.yml") do |v|
++        @options[:password] = true
++      end
+ 
+-    def_option "-v", "--[no-]verbose", "Run verbosely" do |verbose|
+-      @options[:verbose] = verbose
++      def_option "-v", "--[no-]verbose", "Run verbosely" do |verbose|
++        @options[:verbose] = verbose
++      end
++
++      def_tail_option "--help", "Show this help message" do
++        puts self
++        exit
++      end
+     end
+ 
+-    def_tail_option "--help", "Show this help message" do
+-      puts self
+-      exit
++    def parse_command_line_args(argv)
++      @argv = parse!(argv) # parse will populate options and remove the parsed options from argv
++      @environment = @argv[0] || ENV['RAILS_ENV'] || 'development'
++      @yaml_filename = @argv[1] || 'config/database.yml'
+     end
+-  end
+ 
+-  def parse_command_line_args(argv)
+-    @argv = parse!(argv) # parse will populate options and remove the parsed options from argv
+-    @environment = @argv[0] || ENV['RAILS_ENV'] || 'development'
+-    @yaml_filename = @argv[1] || 'config/database.yml'
+-  end
++    def perform
++      $stderr.puts "Using yaml file '#{@yaml_filename}'" if options[:verbose]
++      abort "Cannot read file #{@yaml_filename}" unless File.readable? @yaml_filename
++      yaml = nil
++      begin
++        yaml = YAML::load(ERB.new(IO.read(@yaml_filename)).result)
++      rescue Exception => e
++        abort "Error #{e} while reading #{@yaml_filename}"
++      end
++      
++      $stderr.puts "Using environment '#{@environment}'" if options[:verbose]
++      abort "Could not find configuration for >>#{@environment}<< in file #{@yaml_filename}." unless yaml && yaml.is_a?(Hash) && yaml[@environment]
++      
++      db_config = yaml[@environment]
++      adapter = db_config['adapter']
++      
++      $stderr.puts "Found adapter >>#{ adapter }<<" if options[:verbose]
++      # Convert adapter into a class
++      adapter_console_class = case adapter
++        when 'sqlite': Dbconsole::SqliteConsole
++        when 'sqlite3': Dbconsole::Sqlite3Console
++        when 'postgresql': Dbconsole::PostgresqlConsole
++        when 'mysql': Dbconsole::MysqlConsole
++        else
++          abort  "Unknown command-line client for database #{db_config['database']}. Submit a Rails patch to add support for the #{adapter} adapter!"
++      end
+ 
+-  def perform
+-    $stderr.puts "Using yaml file '#{@yaml_filename}'" if options[:verbose]
+-    abort "Cannot read file #{@yaml_filename}" unless File.readable? @yaml_filename
+-    yaml = nil
+-    begin
+-      yaml = YAML::load(ERB.new(IO.read(@yaml_filename)).result)
+-    rescue Exception => e
+-      abort "Error #{e} while reading #{@yaml_filename}"
++      # Instantiate and run
++      adapter_console = adapter_console_class.new(db_config, options)
++      adapter_console.run
+     end
+-    
+-    $stderr.puts "Using environment '#{@environment}'" if options[:verbose]
+-    abort "Could not find configuration for >>#{@environment}<< in file #{@yaml_filename}." unless yaml && yaml.is_a?(Hash) && yaml[@environment]
+-    
+-    db_config = yaml[@environment]
+-    adapter = db_config['adapter']
+-    
+-    $stderr.puts "Found adapter >>#{ adapter }<<" if options[:verbose]
+-    # Convert adapter into a class
+-    adapter_console_class = case adapter
+-      when 'sqlite': SqliteConsole
+-      when 'sqlite3': Sqlite3Console
+-      when 'postgresql': PostgresqlConsole
+-      when 'mysql': MysqlConsole
+-      else
+-        abort  "Unknown command-line client for database #{db_config['database']}. Submit a Rails patch to add support for the #{adapter} adapter!"
+-    end
+-
+-    # Instantiate and run
+-    adapter_console = adapter_console_class.new(db_config, options)
+-    adapter_console.run
+   end
+ end
+diff --git a/railties/lib/commands/dbconsole/mysql_console.rb b/railties/lib/commands/dbconsole/mysql_console.rb
+index bd56215..f5772bc 100644
+--- a/railties/lib/commands/dbconsole/mysql_console.rb
++++ b/railties/lib/commands/dbconsole/mysql_console.rb
+@@ -1,99 +1,99 @@
+ require File.dirname(__FILE__) + '/abstract_console'
+ 
+-class MysqlConsole < AbstractConsole
++module Dbconsole
++  class MysqlConsole < Dbconsole::AbstractConsole
+ 
+-  DATABASE_YAML_TO_MYCNF_MAP = {
+-      'host'      => 'host',
+-      'port'      => 'port',
+-      'socket'    => 'socket',
+-      'username'  => 'user',
+-      'encoding'  => 'default-character-set'}
++    DATABASE_YAML_TO_MYCNF_MAP = {
++        'host'      => 'host',
++        'port'      => 'port',
++        'socket'    => 'socket',
++        'username'  => 'user',
++        'encoding'  => 'default-character-set'}
+ 
+-  # Username / password and other connection settings are piped in to 
+-  # the mysql command (and read by mysql through the --default-config-file
+-  # switch) -- depending on operating system support
++    # Username / password and other connection settings are piped in to 
++    # the mysql command (and read by mysql through the --default-config-file
++    # switch) -- depending on operating system support
+ 
+-  def run
+-    if options[:mycnf_only]
+-      puts get_my_cnf
+-      return
+-    end
++    def run
++      if options[:mycnf_only]
++        puts get_my_cnf
++        return
++      end
+ 
+-    if piping_to_dev_fd_supported?
+-      run_with_pipe
+-    else 
+-      run_with_mysql_options
++      if piping_to_dev_fd_supported?
++        run_with_pipe
++      else 
++        run_with_mysql_options
++      end
+     end
+-  end
+ 
+-private
+-
+-  def get_my_cnf
+-    my_cnf = %w( [client] )
+-    map = DATABASE_YAML_TO_MYCNF_MAP.dup
+-    map['password'] = 'password'
+-    # sort to allow testing
+-    map.each do |yaml_name, mycnf_name|
+-      my_cnf << "#{mycnf_name}=#{@db_config[yaml_name]}" if @db_config[yaml_name]
++    def get_my_cnf
++      my_cnf = %w( [client] )
++      map = DATABASE_YAML_TO_MYCNF_MAP.dup
++      map['password'] = 'password'
++      # sort to allow testing
++      map.each do |yaml_name, mycnf_name|
++        my_cnf << "#{mycnf_name}=#{@db_config[yaml_name]}" if @db_config[yaml_name]
++      end
++      my_cnf.join("\n")
+     end
+-    my_cnf.join("\n")
+-  end
+ 
+-  def piping_to_dev_fd_supported?
+-    reader,writer = nil,nil # just so we always close
+-    begin
+-      reader, writer = IO.pipe
+-      test_string = Time.new.to_s
+-      writer.write test_string
+-      writer.close
+-      return false unless reader.fileno.is_a?(Fixnum)
+-      read_back = IO.read("/dev/fd/#{reader.fileno.to_s}") 
+-      if test_string == read_back
+-        return true
++    def piping_to_dev_fd_supported?
++      reader,writer = nil,nil # just so we always close
++      begin
++        reader, writer = IO.pipe
++        test_string = Time.new.to_s
++        writer.write test_string
++        writer.close
++        return false unless reader.fileno.is_a?(Fixnum)
++        read_back = IO.read("/dev/fd/#{reader.fileno.to_s}") 
++        if test_string == read_back
++          return true
++        end
++        $stderr.puts "Wrote >>#{ test_string }<<, but read back >>#{ read_back }<<. Piping to /dev/fd/## is not supported" if options[:verbose]
++      rescue Exception => e
++        $stderr.puts "Pipe test failed with #{e}" if options[:verbose]
++      ensure
++        reader.close rescue nil
++        writer.close rescue nil
+       end
+-      $stderr.puts "Wrote >>#{ test_string }<<, but read back >>#{ read_back }<<. Piping to /dev/fd/## is not supported" if options[:verbose]
+-    rescue Exception => e
+-      $stderr.puts "Pipe test failed with #{e}" if options[:verbose]
+-    ensure
+-      reader.close rescue nil
+-      writer.close rescue nil
++      false
+     end
+-    false
+-  end
+ 
+-  def run_with_mysql_options
+-    # todo: add quotes / escaping in case of whitespace
+-    args = DATABASE_YAML_TO_MYCNF_MAP.map { |yaml_name, mycnf_name|
+-      "--#{mycnf_name}=#{@db_config[yaml_name]}" if @db_config[yaml_name]
+-    }.compact
+-  
+-    if @db_config['password'] && @options[:password]
+-      args << "--password=#{@db_config['password']}"
+-    elsif @db_config['password'] && !@db_config['password'].to_s.empty?
+-      args << "-p"
++    def run_with_mysql_options
++      # todo: add quotes / escaping in case of whitespace
++      args = DATABASE_YAML_TO_MYCNF_MAP.map { |yaml_name, mycnf_name|
++        "--#{mycnf_name}=#{@db_config[yaml_name]}" if @db_config[yaml_name]
++      }.compact
++    
++      if @db_config['password'] && @options[:password]
++        args << "--password=#{@db_config['password']}"
++      elsif @db_config['password'] && !@db_config['password'].to_s.empty?
++        args << "-p"
++      end
++    
++      args << @db_config['database']
++      $stderr.puts "Exec'ing command '#{find_cmd('mysql', 'mysql5')} #{ args.join ' ' }'" if options[:verbose]
++    
++      exec find_cmd('mysql', 'mysql5'), *args
+     end
+-  
+-    args << @db_config['database']
+-    $stderr.puts "Exec'ing command '#{find_cmd('mysql', 'mysql5')} #{ args.join ' ' }'" if options[:verbose]
+-  
+-    exec find_cmd('mysql', 'mysql5'), *args
+-  end
+-  
+-  # Set up a pipe, and hook it up to the executable (mysql)
+-  # See http://dev.mysql.com/doc/refman/5.0/en/password-security-user.html
+-  def run_with_pipe
+-    my_cnf = get_my_cnf
+-    $stderr.puts "Using my.cnf\n--- BEGIN my.cnf ----\n#{my_cnf}\n--- END my.cnf ---" if options[:verbose]
+-    reader, writer = IO.pipe
+-    writer.write(my_cnf)
+-    writer.close # reader to be closed by 'command' / the executable
+-    unless reader.fileno.is_a?(Fixnum)
+-      reader.close
+-      abort "Bad fileno >>#{ reader.fileno }<<. Cannot pipe."  # unlikely, since checked in method piping_to_dev_fd_supported?
++    
++    # Set up a pipe, and hook it up to the executable (mysql)
++    # See http://dev.mysql.com/doc/refman/5.0/en/password-security-user.html
++    def run_with_pipe
++      my_cnf = get_my_cnf
++      $stderr.puts "Using my.cnf\n--- BEGIN my.cnf ----\n#{my_cnf}\n--- END my.cnf ---" if options[:verbose]
++      reader, writer = IO.pipe
++      writer.write(my_cnf)
++      writer.close # reader to be closed by 'command' / the executable
++      unless reader.fileno.is_a?(Fixnum)
++        reader.close
++        abort "Bad fileno >>#{ reader.fileno }<<. Cannot pipe."  # unlikely, since checked in method piping_to_dev_fd_supported?
++      end
++      # my_cnf to be read in via --defaults-file
++      command= [ find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"]
++      $stderr.puts "Exec'ing command '#{ command.join ' ' }'" if options[:verbose]
++      exec find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"
+     end
+-    # my_cnf to be read in via --defaults-file
+-    command= [ find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"]
+-    $stderr.puts "Exec'ing command '#{ command.join ' ' }'" if options[:verbose]
+-    exec find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"
+   end
+ end
+diff --git a/railties/lib/commands/dbconsole/postgresql_console.rb b/railties/lib/commands/dbconsole/postgresql_console.rb
+index 28ecdc6..6f90be6 100644
+--- a/railties/lib/commands/dbconsole/postgresql_console.rb
++++ b/railties/lib/commands/dbconsole/postgresql_console.rb
+@@ -1,17 +1,19 @@
+ require File.dirname(__FILE__) + '/abstract_console'
+ 
+-class PostgresqlConsole < AbstractConsole
+-  # The default executable is psql
+-  # Environment variables for user/hos/port are set according to the database config.
+-  # Password is passed in environment variable PGPASSWORD with option -p / @options[:password]
+-  def run
+-    ENV['PGUSER']     = @db_config['username'] if @db_config["username"]
+-    ENV['PGHOST']     = @db_config['host'] if @db_config["host"]
+-    ENV['PGPORT']     = @db_config['port'].to_s if @db_config["port"]
+-    ENV['PGPASSWORD'] = @db_config['password'].to_s if @db_config["password"] && @options[:password]
++module Dbconsole
++  class PostgresqlConsole < Dbconsole::AbstractConsole
++    # The default executable is psql
++    # Environment variables for user/hos/port are set according to the database config.
++    # Password is passed in environment variable PGPASSWORD with option -p / @options[:password]
++    def run
++      ENV['PGUSER']     = @db_config['username'] if @db_config["username"]
++      ENV['PGHOST']     = @db_config['host'] if @db_config["host"]
++      ENV['PGPORT']     = @db_config['port'].to_s if @db_config["port"]
++      ENV['PGPASSWORD'] = @db_config['password'].to_s if @db_config["password"] && @options[:password]
+ 
+-    command = "#{find_cmd('psql')} #{options[:executable]} #{db_config['database']}"
+-    $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
+-    exec find_cmd('psql'), @db_config['database']
++      command = "#{find_cmd('psql')} #{options[:executable]} #{db_config['database']}"
++      $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++      exec find_cmd('psql'), @db_config['database']
++    end
+   end
+ end
+diff --git a/railties/lib/commands/dbconsole/sqlite3_console.rb b/railties/lib/commands/dbconsole/sqlite3_console.rb
+index bb750b0..ec6e38c 100644
+--- a/railties/lib/commands/dbconsole/sqlite3_console.rb
++++ b/railties/lib/commands/dbconsole/sqlite3_console.rb
+@@ -1,16 +1,18 @@
+ require File.dirname(__FILE__) + '/abstract_console'
+ 
+-class Sqlite3Console < AbstractConsole
+-  # The default executable is sqlite3
+-  # sqlite3 support is very basic : -header option and
+-  # modes html, list, line, column (---mode option / @option[:mode])
+-  def run
+-    args = []
+-    args << "-#{@options[:mode]}" if @options[:mode]
+-    args << "-header" if @options[:header]
+-    args << db_config['database']
+-    command = "#{find_cmd('sqlite3')} #{args.join(' ')}"
+-    $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
+-    exec find_cmd('sqlite3'), *args
++module Dbconsole
++  class Sqlite3Console < Dbconsole::AbstractConsole
++    # The default executable is sqlite3
++    # sqlite3 support is very basic : -header option and
++    # modes html, list, line, column (---mode option / @option[:mode])
++    def run
++      args = []
++      args << "-#{@options[:mode]}" if @options[:mode]
++      args << "-header" if @options[:header]
++      args << db_config['database']
++      command = "#{find_cmd('sqlite3')} #{args.join(' ')}"
++      $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++      exec find_cmd('sqlite3'), *args
++    end
+   end
+ end
+diff --git a/railties/lib/commands/dbconsole/sqlite_console.rb b/railties/lib/commands/dbconsole/sqlite_console.rb
+index 0588508..da8b45d 100644
+--- a/railties/lib/commands/dbconsole/sqlite_console.rb
++++ b/railties/lib/commands/dbconsole/sqlite_console.rb
+@@ -1,13 +1,15 @@
+ require File.dirname(__FILE__) + '/abstract_console'
+ 
+-class SqliteConsole < AbstractConsole
+-  # The default executable is sqlite
+-  # sqlite support is very basic : no options are passed on
+-  # except for the database field
+-  def run
+-    arg = db_config['database']
+-    command = "#{find_cmd('sqlite')} #{arg}"
+-    $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
+-    exec find_cmd('sqlite'), arg
++module Dbconsole
++  class SqliteConsole < Dbconsole::AbstractConsole
++    # The default executable is sqlite
++    # sqlite support is very basic : no options are passed on
++    # except for the database field
++    def run
++      arg = db_config['database']
++      command = "#{find_cmd('sqlite')} #{arg}"
++      $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++      exec find_cmd('sqlite'), arg
++    end
+   end
+ end
+-- 
+1.5.4.3
+
+
+From 20b1c4db888922ae2c787e9caedfb8f9f5aa7da3 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Fri, 22 May 2009 23:17:08 -0700
+Subject: [PATCH] Adding test for AbstractPrompt
+
+---
+ railties/test/abstract_unit.rb                  |    1 +
+ railties/test/dbconsole/abstract_prompt_test.rb |   50 +++++++++++++++++++++++
+ railties/test/dbconsole/test_helper.rb          |    1 +
+ 3 files changed, 52 insertions(+), 0 deletions(-)
+ create mode 100644 railties/test/dbconsole/abstract_prompt_test.rb
+ create mode 100644 railties/test/dbconsole/test_helper.rb
+
+diff --git a/railties/test/abstract_unit.rb b/railties/test/abstract_unit.rb
+index 0addcb8..ece0430 100644
+--- a/railties/test/abstract_unit.rb
++++ b/railties/test/abstract_unit.rb
+@@ -3,6 +3,7 @@ $:.unshift File.dirname(__FILE__) + "/../../activerecord/lib"
+ $:.unshift File.dirname(__FILE__) + "/../../actionpack/lib"
+ $:.unshift File.dirname(__FILE__) + "/../../actionmailer/lib"
+ $:.unshift File.dirname(__FILE__) + "/../lib"
++$:.unshift File.dirname(__FILE__) + "/../lib/commands/dbconsole"
+ $:.unshift File.dirname(__FILE__) + "/../builtin/rails_info"
+ 
+ require 'stringio'
+diff --git a/railties/test/dbconsole/abstract_prompt_test.rb b/railties/test/dbconsole/abstract_prompt_test.rb
+new file mode 100644
+index 0000000..eca81e3
+--- /dev/null
++++ b/railties/test/dbconsole/abstract_prompt_test.rb
+@@ -0,0 +1,50 @@
++require  File.dirname(__FILE__) + '/test_helper'
++
++require 'abstract_console'
++
++class AbstractConsoleTest < Test::Unit::TestCase
++  
++  def test_has_initializer
++    test_config = {'database' => 'tdb', :a => 1, :b => 2}
++    test_options = {:opt_1 => 1, :opt_2 => 2}
++    abstract_console = Dbconsole::AbstractConsole.new(test_config, test_options)
++    assert_equal test_config, abstract_console.db_config
++    assert_equal test_options, abstract_console.options
++  end
++
++  # Some checking on the value of database entry in the first hash is performed for an AbstractPrompt:
++  def test_empty_database_aborts
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('No database name found')
++    Dbconsole::AbstractConsole.new({}, {})
++  end
++
++  def test_aborts_whitespace_in_database
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Database name has whitespace. Not supported')
++    Dbconsole::AbstractConsole.new({'database'=> ' '}, {})
++  end
++
++  def test_aborts_bad_executable
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Bad executable')
++    Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {:executable => ' '})
++  end
++
++  def test_find_cmd_is_executable
++    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {})
++    File.expects(:executable?).returns(true)
++    assert_equal 's', abstract_console.find_cmd('s')
++  end
++
++  def test_find_cmd_is_not_executable
++    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {})
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with("Couldn't find database client: s. Check your $PATH and try again.")
++    File.expects(:executable?).returns(false).at_least(1)
++    abstract_console.find_cmd('s')
++  end
++
++  def test_find_cmd_with_executable_option
++    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {:executable => 'test_ex'})
++   assert_equal 'test_ex', abstract_console.find_cmd
++   assert_equal 'test_ex', abstract_console.find_cmd('a')
++   assert_equal 'test_ex', abstract_console.find_cmd('a', 'b')
++  end
++end
+diff --git a/railties/test/dbconsole/test_helper.rb b/railties/test/dbconsole/test_helper.rb
+new file mode 100644
+index 0000000..b174dec
+--- /dev/null
++++ b/railties/test/dbconsole/test_helper.rb
+@@ -0,0 +1 @@
++require File.dirname(__FILE__) + '/../abstract_unit'
+-- 
+1.5.4.3
+
+
+From cc1d88178121e9619c3fbee5b28e8c8612feea83 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 00:07:10 -0700
+Subject: [PATCH] Adding test for CommandLineInterface
+
+---
+ .../commands/dbconsole/command_line_interface.rb   |    6 +-
+ .../test/dbconsole/command_line_interface_test.rb  |  169 ++++++++++++++++++++
+ railties/test/dbconsole/test_helper.rb             |   52 ++++++
+ 3 files changed, 226 insertions(+), 1 deletions(-)
+ create mode 100644 railties/test/dbconsole/command_line_interface_test.rb
+
+diff --git a/railties/lib/commands/dbconsole/command_line_interface.rb b/railties/lib/commands/dbconsole/command_line_interface.rb
+index 78fd5f4..5f4b091 100644
+--- a/railties/lib/commands/dbconsole/command_line_interface.rb
++++ b/railties/lib/commands/dbconsole/command_line_interface.rb
+@@ -54,7 +54,11 @@ module Dbconsole
+     end
+ 
+     def parse_command_line_args(argv)
+-      @argv = parse!(argv) # parse will populate options and remove the parsed options from argv
++      begin
++        @argv = parse!(argv) # parse will populate options and remove the parsed options from argv
++      rescue OptionParser::MissingArgument => e
++        abort e.to_s
++      end
+       @environment = @argv[0] || ENV['RAILS_ENV'] || 'development'
+       @yaml_filename = @argv[1] || 'config/database.yml'
+     end
+diff --git a/railties/test/dbconsole/command_line_interface_test.rb b/railties/test/dbconsole/command_line_interface_test.rb
+new file mode 100644
+index 0000000..d1f3379
+--- /dev/null
++++ b/railties/test/dbconsole/command_line_interface_test.rb
+@@ -0,0 +1,169 @@
++require  File.dirname(__FILE__) + '/test_helper'
++
++require 'command_line_interface'
++
++require 'tempfile'
++
++class CommandLineInterfaceTest < Test::Unit::TestCase
++
++  def test_no_options
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args([])
++    assert_equal [], command_line_interface.argv
++    assert_equal ({}), command_line_interface.options
++  end
++  
++  def test_valid_executable_option
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w(-x test_ex)
++    assert_equal [], command_line_interface.argv
++    assert_equal ({:executable => 'test_ex'}), command_line_interface.options
++
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w(--executable test_exec)
++    assert_equal [], command_line_interface.argv
++    assert_equal ({:executable => 'test_exec'}), command_line_interface.options
++  end
++
++  def test_invalid_executable_option_1
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.expects(:abort).with('missing argument: --executable').raises('stub exit')
++    assert_stub_raises do
++      command_line_interface.parse_command_line_args %w(--executable )
++    end
++  end
++
++  def test_invalid_executable_option_2
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.expects(:abort).with('missing argument: -x').raises('stub exit')
++    assert_stub_raises do
++      command_line_interface.parse_command_line_args %w(-x )
++    end
++  end
++
++  def test_mycnf_option
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w(--mycnf)
++    assert_equal [], command_line_interface.argv
++    assert_equal ({:mycnf_only => true}), command_line_interface.options
++  end
++
++  def test_verbose_option
++    { '-v' => true,
++      '--verbose' => true,
++      '--no-verbose' => false}.each do |verbose_option, verbose_value|
++      command_line_interface = Dbconsole::CommandLineInterface.new
++      command_line_interface.parse_command_line_args [ verbose_option ]
++      assert_equal [], command_line_interface.argv
++      assert_equal ({:verbose => verbose_value}), command_line_interface.options
++    end
++  end
++
++  def test_aborts_invalid_yaml
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    IO.expects(:read).with('config/database.yml').returns('a')
++    command_line_interface.parse_command_line_args ['test_unknown_adapter']
++    command_line_interface.expects(:abort).with('Could not find configuration for >>test_unknown_adapter<< in file config/database.yml.').raises('stub exit')
++    assert_stub_raises do
++      command_line_interface.perform
++    end
++  end
++
++  def test_abort_no_yaml_file
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    f = Tempfile.new('testing_file')
++    path = f.path
++    f.delete # is there an easier way to create a file-path for a file that doesn't exist?
++    command_line_interface.parse_command_line_args ['no_envo', path]
++    command_line_interface.expects(:abort).raises('stub exit')
++    assert_stub_raises do
++      command_line_interface.perform
++    end
++  end
++
++  def test_abort_environment_missing
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    command_line_interface.parse_command_line_args ['no_envo']
++    command_line_interface.expects(:abort).with('Could not find configuration for >>no_envo<< in file config/database.yml.').raises('stub exit')
++    assert_stub_raises do
++      command_line_interface.perform
++    end
++  end
++
++  def test_environment_looked_up_in_yaml
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w{ other }
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    mysql_prompt_mock = mock('mysqlprompt')
++    mysql_prompt_mock.expects(:run)
++    expected_init_args = {"username"=>"other_user", "adapter"=>"mysql", "host"=>"localhost", "database"=>"other_db", "password"=>"other_password"}, {}
++    Dbconsole::MysqlConsole.expects(:new).with(*expected_init_args).returns(mysql_prompt_mock)
++    command_line_interface.perform
++  end
++
++  def test_pass_on_executable_option
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w{ -x abc other }
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    mysql_prompt_mock = mock('mysqlprompt')
++    mysql_prompt_mock.expects(:run)
++    expected_init_args = {"username"=>"other_user", "adapter"=>"mysql", "host"=>"localhost", "database"=>"other_db", "password"=>"other_password"}, {:executable=>"abc"}
++    Dbconsole::MysqlConsole.expects(:new).with(*expected_init_args).returns(mysql_prompt_mock)
++    command_line_interface.perform
++  end
++
++  def test_abort_when_adapter_not_known
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    command_line_interface.parse_command_line_args ['test_unknown_adapter']
++    command_line_interface.expects(:abort).with('Unknown command-line client for database dev_db_2. Submit a Rails patch to add support for the no_such_adapter adapter!').raises('stub exit')
++    assert_stub_raises do
++      command_line_interface.perform
++    end
++  end
++
++  def test_postgresql_console_invoked
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w{ test_postgres_env }
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    prompt_mock = mock('postgresql prompt')
++    prompt_mock.expects(:run)
++    expected_init_args = {"adapter"=>"postgresql", "timeout"=>5000, "database"=>"ps_test", "pool"=>5}, {}
++    Dbconsole::PostgresqlConsole.expects(:new).with(*expected_init_args).returns(prompt_mock)
++    command_line_interface.perform
++  end
++
++  def test_mysql_console_invoked
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w{ test_mysql_env }
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    prompt_mock = mock('postgresql prompt')
++    prompt_mock.expects(:run)
++    expected_init_args = {"username"=>"dev_user_2", "adapter"=>"mysql", "host"=>"localhost_2", "password"=>"dev_password_2", "database"=>"dev_db_2"}, {}
++    Dbconsole::MysqlConsole.expects(:new).with(*expected_init_args).returns(prompt_mock)
++    command_line_interface.perform
++  end
++
++  def test_sqlite3_console_invoked
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w{ test_sqlite3_env }
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    prompt_mock = mock('sqlite3 prompt')
++    prompt_mock.expects(:run)
++    expected_init_args = {"adapter"=>"sqlite3", "timeout"=>5000, "database"=>"test.sqlite3", "pool"=>5}, {}
++    Dbconsole::Sqlite3Console.expects(:new).with(*expected_init_args).returns(prompt_mock)
++    command_line_interface.perform
++  end
++
++  def test_sqlite_console_invoked
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w{ test_sqlite_no_3_env }
++    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++    prompt_mock = mock('sqlite prompt')
++    prompt_mock.expects(:run)
++    expected_init_args = {"adapter"=>"sqlite", "timeout"=>5000, "database"=>"test.sqlite_no_3", "pool"=>5}, {}
++    Dbconsole::SqliteConsole.expects(:new).with(*expected_init_args).returns(prompt_mock)
++    command_line_interface.perform
++  end
++end
+diff --git a/railties/test/dbconsole/test_helper.rb b/railties/test/dbconsole/test_helper.rb
+index b174dec..16c9276 100644
+--- a/railties/test/dbconsole/test_helper.rb
++++ b/railties/test/dbconsole/test_helper.rb
+@@ -1 +1,53 @@
+ require File.dirname(__FILE__) + '/../abstract_unit'
++
++class Test::Unit::TestCase
++  def assert_stub_raises(msg = 'stub exit')
++    begin 
++      yield
++    rescue RuntimeError => e
++      assert_equal msg, e.to_s
++    end
++  end
++end
++
++TEST_DATABASE_YAML = <<END_TEST_DATABASE_YAML
++development: 
++  adapter: mysql
++  username: dev_user
++  database: dev_db
++  password: dev_password
++  host: localhost
++other: 
++  adapter: mysql
++  username: other_user
++  password: other_password
++  database: other_db
++  host: localhost
++test_unknown_adapter:
++  adapter: no_such_adapter
++  username: dev_user_2
++  database: dev_db_2
++  password: dev_password_2
++  host: localhost_2
++test_mysql_env: 
++  adapter: mysql
++  username: dev_user_2
++  database: dev_db_2
++  password: dev_password_2
++  host: localhost_2
++test_postgres_env:
++  adapter: postgresql
++  database: ps_test
++  pool: 5
++  timeout: 5000
++test_sqlite3_env:
++  adapter: sqlite3
++  database: test.sqlite3
++  pool: 5
++  timeout: 5000
++test_sqlite_no_3_env:
++  adapter: sqlite
++  database: test.sqlite_no_3
++  pool: 5
++  timeout: 5000
++END_TEST_DATABASE_YAML
+-- 
+1.5.4.3
+
+
+From 37862ad81c9d9d2e0393da68f72677a0644f6272 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 00:09:05 -0700
+Subject: [PATCH] AbstractConsole test had wrong filename
+
+---
+ railties/test/dbconsole/abstract_console_test.rb |   50 ++++++++++++++++++++++
+ railties/test/dbconsole/abstract_prompt_test.rb  |   50 ----------------------
+ 2 files changed, 50 insertions(+), 50 deletions(-)
+ create mode 100644 railties/test/dbconsole/abstract_console_test.rb
+ delete mode 100644 railties/test/dbconsole/abstract_prompt_test.rb
+
+diff --git a/railties/test/dbconsole/abstract_console_test.rb b/railties/test/dbconsole/abstract_console_test.rb
+new file mode 100644
+index 0000000..eca81e3
+--- /dev/null
++++ b/railties/test/dbconsole/abstract_console_test.rb
+@@ -0,0 +1,50 @@
++require  File.dirname(__FILE__) + '/test_helper'
++
++require 'abstract_console'
++
++class AbstractConsoleTest < Test::Unit::TestCase
++  
++  def test_has_initializer
++    test_config = {'database' => 'tdb', :a => 1, :b => 2}
++    test_options = {:opt_1 => 1, :opt_2 => 2}
++    abstract_console = Dbconsole::AbstractConsole.new(test_config, test_options)
++    assert_equal test_config, abstract_console.db_config
++    assert_equal test_options, abstract_console.options
++  end
++
++  # Some checking on the value of database entry in the first hash is performed for an AbstractPrompt:
++  def test_empty_database_aborts
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('No database name found')
++    Dbconsole::AbstractConsole.new({}, {})
++  end
++
++  def test_aborts_whitespace_in_database
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Database name has whitespace. Not supported')
++    Dbconsole::AbstractConsole.new({'database'=> ' '}, {})
++  end
++
++  def test_aborts_bad_executable
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Bad executable')
++    Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {:executable => ' '})
++  end
++
++  def test_find_cmd_is_executable
++    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {})
++    File.expects(:executable?).returns(true)
++    assert_equal 's', abstract_console.find_cmd('s')
++  end
++
++  def test_find_cmd_is_not_executable
++    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {})
++    Dbconsole::AbstractConsole.any_instance.expects(:abort).with("Couldn't find database client: s. Check your $PATH and try again.")
++    File.expects(:executable?).returns(false).at_least(1)
++    abstract_console.find_cmd('s')
++  end
++
++  def test_find_cmd_with_executable_option
++    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {:executable => 'test_ex'})
++   assert_equal 'test_ex', abstract_console.find_cmd
++   assert_equal 'test_ex', abstract_console.find_cmd('a')
++   assert_equal 'test_ex', abstract_console.find_cmd('a', 'b')
++  end
++end
+diff --git a/railties/test/dbconsole/abstract_prompt_test.rb b/railties/test/dbconsole/abstract_prompt_test.rb
+deleted file mode 100644
+index eca81e3..0000000
+--- a/railties/test/dbconsole/abstract_prompt_test.rb
++++ /dev/null
+@@ -1,50 +0,0 @@
+-require  File.dirname(__FILE__) + '/test_helper'
+-
+-require 'abstract_console'
+-
+-class AbstractConsoleTest < Test::Unit::TestCase
+-  
+-  def test_has_initializer
+-    test_config = {'database' => 'tdb', :a => 1, :b => 2}
+-    test_options = {:opt_1 => 1, :opt_2 => 2}
+-    abstract_console = Dbconsole::AbstractConsole.new(test_config, test_options)
+-    assert_equal test_config, abstract_console.db_config
+-    assert_equal test_options, abstract_console.options
+-  end
+-
+-  # Some checking on the value of database entry in the first hash is performed for an AbstractPrompt:
+-  def test_empty_database_aborts
+-    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('No database name found')
+-    Dbconsole::AbstractConsole.new({}, {})
+-  end
+-
+-  def test_aborts_whitespace_in_database
+-    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Database name has whitespace. Not supported')
+-    Dbconsole::AbstractConsole.new({'database'=> ' '}, {})
+-  end
+-
+-  def test_aborts_bad_executable
+-    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Bad executable')
+-    Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {:executable => ' '})
+-  end
+-
+-  def test_find_cmd_is_executable
+-    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {})
+-    File.expects(:executable?).returns(true)
+-    assert_equal 's', abstract_console.find_cmd('s')
+-  end
+-
+-  def test_find_cmd_is_not_executable
+-    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {})
+-    Dbconsole::AbstractConsole.any_instance.expects(:abort).with("Couldn't find database client: s. Check your $PATH and try again.")
+-    File.expects(:executable?).returns(false).at_least(1)
+-    abstract_console.find_cmd('s')
+-  end
+-
+-  def test_find_cmd_with_executable_option
+-    abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {:executable => 'test_ex'})
+-   assert_equal 'test_ex', abstract_console.find_cmd
+-   assert_equal 'test_ex', abstract_console.find_cmd('a')
+-   assert_equal 'test_ex', abstract_console.find_cmd('a', 'b')
+-  end
+-end
+-- 
+1.5.4.3
+
+
+From 3290639ee74e39cf8a9725506da2587a7e60e269 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 00:16:55 -0700
+Subject: [PATCH] Adding test for PostgresqlConsole
+
+---
+ railties/test/dbconsole/postgresql_console_test.rb |   21 ++++++++++++++++++++
+ 1 files changed, 21 insertions(+), 0 deletions(-)
+ create mode 100644 railties/test/dbconsole/postgresql_console_test.rb
+
+diff --git a/railties/test/dbconsole/postgresql_console_test.rb b/railties/test/dbconsole/postgresql_console_test.rb
+new file mode 100644
+index 0000000..bdf4449
+--- /dev/null
++++ b/railties/test/dbconsole/postgresql_console_test.rb
+@@ -0,0 +1,21 @@
++require  File.dirname(__FILE__) + '/test_helper'
++
++require 'postgresql_console'
++
++
++class PostgresqlConsoleTest < Test::Unit::TestCase
++
++  def test_invoke_exec_with_psql_plus_database
++    postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {})
++    postgresql_console.expects(:exec).with('psql', 'testdb')
++    postgresql_console.run
++  end
++
++  def test_invoke_exec_with_given_executable
++    postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
++    
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:exec).with('testexecutable', 'testdb')
++    postgresql_console.run
++  end
++end
+-- 
+1.5.4.3
+
+
+From deeb49ea43e2704f9c69d75603c6ab98acd47824 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 00:19:07 -0700
+Subject: [PATCH] Adding test for Sqlite3Console
+
+---
+ railties/test/dbconsole/sqlite3_console_test.rb |   21 +++++++++++++++++++++
+ 1 files changed, 21 insertions(+), 0 deletions(-)
+ create mode 100644 railties/test/dbconsole/sqlite3_console_test.rb
+
+diff --git a/railties/test/dbconsole/sqlite3_console_test.rb b/railties/test/dbconsole/sqlite3_console_test.rb
+new file mode 100644
+index 0000000..25d6de9
+--- /dev/null
++++ b/railties/test/dbconsole/sqlite3_console_test.rb
+@@ -0,0 +1,21 @@
++require  File.dirname(__FILE__) + '/test_helper'
++
++require 'sqlite3_console'
++
++
++class Sqlite3ConsoleTest < Test::Unit::TestCase
++
++  def test_invoke_exec_with_psql_plus_database
++    sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {})
++    sqlite3_console.expects(:exec).with('sqlite3', 'testdb')
++    sqlite3_console.run
++  end
++
++  def test_invoke_exec_with_given_executable
++    sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
++    
++    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable').twice
++    sqlite3_console.expects(:exec).with('testexecutable', 'testdb')
++    sqlite3_console.run
++  end
++end
+-- 
+1.5.4.3
+
+
+From 69bf98c011b237f2c4aa4bdb28a29e27fcec73a1 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 00:20:15 -0700
+Subject: [PATCH] Adding test for SqliteConsole
+
+---
+ railties/test/dbconsole/sqlite_console_test.rb |   21 +++++++++++++++++++++
+ 1 files changed, 21 insertions(+), 0 deletions(-)
+ create mode 100644 railties/test/dbconsole/sqlite_console_test.rb
+
+diff --git a/railties/test/dbconsole/sqlite_console_test.rb b/railties/test/dbconsole/sqlite_console_test.rb
+new file mode 100644
+index 0000000..fa9a26e
+--- /dev/null
++++ b/railties/test/dbconsole/sqlite_console_test.rb
+@@ -0,0 +1,21 @@
++require  File.dirname(__FILE__) + '/test_helper'
++
++require 'sqlite_console'
++
++
++class SqliteConsoleTest < Test::Unit::TestCase
++
++  def test_invoke_exec_with_psql_plus_database
++    sqlite_console = Dbconsole::SqliteConsole.new({'database'=>'testdb'}, {})
++    sqlite_console.expects(:exec).with('sqlite', 'testdb')
++    sqlite_console.run
++  end
++
++  def test_invoke_exec_with_given_executable
++    sqlite_console = Dbconsole::SqliteConsole.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
++    
++    sqlite_console.expects(:find_cmd).with('sqlite').returns('testexecutable').twice
++    sqlite_console.expects(:exec).with('testexecutable', 'testdb')
++    sqlite_console.run
++  end
++end
+-- 
+1.5.4.3
+
+
+From 5647162a39ce72651bc22dfcc3590298f7a5f2f0 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 02:43:58 -0700
+Subject: [PATCH] Adding test for MysqlConsole
+
+---
+ railties/Rakefile                                |    8 +
+ railties/lib/commands/dbconsole/mysql_console.rb |    4 +-
+ railties/test/dbconsole/mysql_console_test.rb    |  205 ++++++++++++++++++++++
+ 3 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 railties/test/dbconsole/mysql_console_test.rb
+
+diff --git a/railties/Rakefile b/railties/Rakefile
+index 69c1ca7..e320e1d 100644
+--- a/railties/Rakefile
++++ b/railties/Rakefile
+@@ -40,6 +40,14 @@ Rake::TestTask.new("regular_test") do |t|
+   t.verbose = true
+ end
+ 
++# Run tests for dbconsole
++namespace :test do
++  Rake::TestTask.new("dbconsole") do |t|
++    t.verbose = true
++    t.test_files = Dir['test/dbconsole/**/*_test.rb']
++  end
++end
++
+ 
+ BASE_DIRS = %w( 
+   app
+diff --git a/railties/lib/commands/dbconsole/mysql_console.rb b/railties/lib/commands/dbconsole/mysql_console.rb
+index f5772bc..26be8b1 100644
+--- a/railties/lib/commands/dbconsole/mysql_console.rb
++++ b/railties/lib/commands/dbconsole/mysql_console.rb
+@@ -8,7 +8,7 @@ module Dbconsole
+         'port'      => 'port',
+         'socket'    => 'socket',
+         'username'  => 'user',
+-        'encoding'  => 'default-character-set'}
++        'encoding'  => 'default-character-set'}.freeze unless defined?(DATABASE_YAML_TO_MYCNF_MAP)
+ 
+     # Username / password and other connection settings are piped in to 
+     # the mysql command (and read by mysql through the --default-config-file
+@@ -31,7 +31,7 @@ module Dbconsole
+       my_cnf = %w( [client] )
+       map = DATABASE_YAML_TO_MYCNF_MAP.dup
+       map['password'] = 'password'
+-      # sort to allow testing
++      map['database'] = 'database'
+       map.each do |yaml_name, mycnf_name|
+         my_cnf << "#{mycnf_name}=#{@db_config[yaml_name]}" if @db_config[yaml_name]
+       end
+diff --git a/railties/test/dbconsole/mysql_console_test.rb b/railties/test/dbconsole/mysql_console_test.rb
+new file mode 100644
+index 0000000..1362415
+--- /dev/null
++++ b/railties/test/dbconsole/mysql_console_test.rb
+@@ -0,0 +1,205 @@
++require  File.dirname(__FILE__) + '/test_helper'
++require 'mysql_console'
++
++
++class MysqlConsoleTest < Test::Unit::TestCase
++
++  def testget_my_cnf
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database'=>'testdb'}, {})
++    assert_equal "[client]\ndatabase=testdb", mysql_prompt.get_my_cnf
++
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database'=>'testdb', 'host'=>'test_host'}, {})
++    assert_equal %w( [client] database=testdb host=test_host).sort, mysql_prompt.get_my_cnf.split(/\n/).sort
++
++    mysql_prompt = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
++                                                "username"=>"testuser",
++                                                "adapter"=>"mysql",
++                                                "host"=>"test-host",
++                                                "password"=>"test-pwd",
++                                                "database"=>"test-db"}, {})
++    expected_lines = ["[client]",
++                      "database=test-db",
++                      "host=test-host",
++                      "password=test-pwd",
++                      "socket=mysqld.sock",
++                      "user=testuser"]
++    get_my_cnf = mysql_prompt.get_my_cnf
++    assert_match /[client]\n/, get_my_cnf
++    assert_equal expected_lines.sort, get_my_cnf.split(/\n/).sort
++  end
++
++  def test_output_mycnf_with_mycnf_option
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{:mycnf_only => true})
++    mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
++    mysql_prompt.expects(:puts).with('test my cnf')
++    mysql_prompt.run
++  end
++
++  # Assuming piping_to_dev_fd_supported? is true
++  def test_write_mycnf_to_pipe_writer
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
++    mysql_prompt.expects(:find_cmd).returns('test-mysql').twice
++    reader = mock('IO.pipe reader')
++    reader.expects(:fileno).returns(5).at_least(2)
++    writer = mock('IO.pipe writer')
++    writer.expects(:write).with("test my cnf")
++    writer.expects(:close)
++    IO.expects(:pipe).returns( [reader,writer] )
++    mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
++    mysql_prompt.expects(:exec).with('test-mysql', '--defaults-file=/dev/fd/5')
++
++    mysql_prompt.run
++  end
++
++
++  def test_invoke_exec_with_executable
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{:executable => 'testexec'})
++    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
++    reader = mock('IO.pipe reader')
++    reader.expects(:fileno).returns(5).at_least(2)
++    writer = mock('IO.pipe writer')
++    writer.expects(:write).with("test my cnf")
++    writer.expects(:close)
++    IO.expects(:pipe).returns( [reader,writer] )
++    mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
++    mysql_prompt.expects(:exec).with('testexec', '--defaults-file=/dev/fd/5')
++
++    mysql_prompt.run
++  end
++
++  def test_uses_run_with_pipe
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
++    mysql_prompt.expects(:run_with_pipe).returns(true)
++    mysql_prompt.expects(:run_with_mysql_options).never
++    mysql_prompt.run
++  end
++
++  def test_uses_run_with_mysql_options
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_prompt.expects(:run_with_pipe).never
++    mysql_prompt.expects(:run_with_mysql_options).returns(true)
++    mysql_prompt.run
++  end
++
++  def test_run_with_mysql_options
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_prompt.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
++    mysql_prompt.expects(:exec).with('test-exec', 'required')
++    mysql_prompt.run
++
++    mysql_prompt = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
++                                                "username"=>"testuser",
++                                                "adapter"=>"mysql",
++                                                "host"=>"test-host",
++                                                "password"=>"test-pwd",
++                                                "database"=>"test-db"}, {})
++    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_prompt.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
++    mysql_prompt.expects(:exec).with('test-exec', '--socket=mysqld.sock', '--user=testuser', '--host=test-host', '-p', 'test-db') # not sure about that hash-key-order
++    mysql_prompt.run
++  end
++
++  def test_abort_if_fileno_is_not_a_fixnum
++    ['', nil, Object.new, Fixnum].each do |bad_fileno|
++      mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'}, {})
++      mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
++      reader = mock('IO.pipe reader')
++      reader.expects(:fileno).returns(bad_fileno).twice
++      writer = mock('IO.pipe writer')
++      writer.expects(:write).with("test my cnf")
++      writer.expects(:close)
++      reader.expects(:close)
++      IO.expects(:pipe).returns( [reader,writer] )
++      mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
++      mysql_prompt.expects(:exec).never
++      mysql_prompt.expects(:abort).with("Bad fileno >>#{bad_fileno.to_s}<<. Cannot pipe.").raises('stub exit')
++      assert_stub_raises do
++        mysql_prompt.run
++      end
++    end
++  end
++ 
++  # But in fact it will not get that far.
++  # Since piping_to_dev_fd_supported? will be false,
++  # if fileno happens not to be a Fixnum
++  def test_piping_to_dev_fd_not_supported_if_fileno_is_not_a_fixnum
++    ['', nil, Object.new, Fixnum].each do |bad_fileno|
++      mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++      reader = mock('IO.pipe reader')
++      reader.expects(:fileno).returns(bad_fileno)
++      reader.expects(:close)
++      time_new = mock('Time.new')
++      time_new.expects(:to_s).returns('the time is now')
++      writer = mock('IO.pipe writer')
++      writer.expects(:write).with('the time is now')
++      writer.expects(:close)
++      Time.expects(:new).returns(time_new)
++      IO.expects(:pipe).returns([reader,writer])
++      assert !mysql_prompt.piping_to_dev_fd_supported?
++    end
++  end
++  def test_piping_to_dev_fd_supported
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    reader = mock('IO.pipe reader')
++    reader.expects(:fileno).returns(5).twice
++    reader.expects(:close)
++    time_new = mock('Time.new')
++    time_new.expects(:to_s).returns('the time is now')
++    writer = mock('IO.pipe writer')
++    writer.expects(:write).with('the time is now')
++    writer.expects(:close)
++    Time.expects(:new).returns(time_new)
++    IO.expects(:pipe).returns([reader,writer])
++    IO.expects(:read).with('/dev/fd/5').returns('the time is now')
++    assert mysql_prompt.piping_to_dev_fd_supported?
++  end
++
++  def test_piping_to_dev_fd_handles_no_pipe
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    IO.expects(:pipe).raises('no pipes')
++    assert !mysql_prompt.piping_to_dev_fd_supported?
++  end
++
++  def test_piping_to_dev_fd_fails_if_cant_write
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    reader = mock('IO.pipe reader')
++    writer = mock('IO.pipe writer')
++    writer.expects(:write).raises('cannot write')
++    writer.expects(:close)
++    IO.expects(:pipe).returns([reader,writer])
++    assert !mysql_prompt.piping_to_dev_fd_supported?
++  end
++
++  def test_piping_to_dev_fd_fails_if_io_read_raises
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    reader = mock('IO.pipe reader')
++    reader.expects(:fileno).returns(5).twice
++    reader.expects(:close)
++    time_new = mock('Time.new')
++    time_new.expects(:to_s).returns('the time is now')
++    writer = mock('IO.pipe writer')
++    writer.expects(:write).with('the time is now')
++    writer.expects(:close)
++    Time.expects(:new).returns(time_new)
++    IO.expects(:pipe).returns([reader,writer])
++    IO.expects(:read).raises('no io read')
++    assert !mysql_prompt.piping_to_dev_fd_supported?
++  end
++
++  def test_piping_to_dev_fd_fails_if_io_read_differs
++    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    reader = mock('IO.pipe reader')
++    reader.expects(:fileno).returns(5).twice
++    reader.expects(:close)
++    writer = mock('IO.pipe writer')
++    writer.expects(:write)
++    writer.expects(:close)
++    IO.expects(:pipe).returns([reader,writer])
++    IO.expects(:read).returns('different time')
++    assert !mysql_prompt.piping_to_dev_fd_supported?
++  end
++end
+-- 
+1.5.4.3
+
+
+From 8cbbe0ef3f2da050492b01eec0016fbc17ed7b04 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 02:44:33 -0700
+Subject: [PATCH] Adding test for MysqlConsole / lost some change
+
+---
+ railties/test/dbconsole/mysql_console_test.rb |  118 ++++++++++++------------
+ 1 files changed, 59 insertions(+), 59 deletions(-)
+
+diff --git a/railties/test/dbconsole/mysql_console_test.rb b/railties/test/dbconsole/mysql_console_test.rb
+index 1362415..4293edd 100644
+--- a/railties/test/dbconsole/mysql_console_test.rb
++++ b/railties/test/dbconsole/mysql_console_test.rb
+@@ -5,13 +5,13 @@ require 'mysql_console'
+ class MysqlConsoleTest < Test::Unit::TestCase
+ 
+   def testget_my_cnf
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database'=>'testdb'}, {})
+-    assert_equal "[client]\ndatabase=testdb", mysql_prompt.get_my_cnf
++    mysql_console = Dbconsole::MysqlConsole.new({'database'=>'testdb'}, {})
++    assert_equal "[client]\ndatabase=testdb", mysql_console.get_my_cnf
+ 
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database'=>'testdb', 'host'=>'test_host'}, {})
+-    assert_equal %w( [client] database=testdb host=test_host).sort, mysql_prompt.get_my_cnf.split(/\n/).sort
++    mysql_console = Dbconsole::MysqlConsole.new({'database'=>'testdb', 'host'=>'test_host'}, {})
++    assert_equal %w( [client] database=testdb host=test_host).sort, mysql_console.get_my_cnf.split(/\n/).sort
+ 
+-    mysql_prompt = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
++    mysql_console = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
+                                                 "username"=>"testuser",
+                                                 "adapter"=>"mysql",
+                                                 "host"=>"test-host",
+@@ -23,90 +23,90 @@ class MysqlConsoleTest < Test::Unit::TestCase
+                       "password=test-pwd",
+                       "socket=mysqld.sock",
+                       "user=testuser"]
+-    get_my_cnf = mysql_prompt.get_my_cnf
++    get_my_cnf = mysql_console.get_my_cnf
+     assert_match /[client]\n/, get_my_cnf
+     assert_equal expected_lines.sort, get_my_cnf.split(/\n/).sort
+   end
+ 
+   def test_output_mycnf_with_mycnf_option
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{:mycnf_only => true})
+-    mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
+-    mysql_prompt.expects(:puts).with('test my cnf')
+-    mysql_prompt.run
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{:mycnf_only => true})
++    mysql_console.expects(:get_my_cnf).returns('test my cnf')
++    mysql_console.expects(:puts).with('test my cnf')
++    mysql_console.run
+   end
+ 
+   # Assuming piping_to_dev_fd_supported? is true
+   def test_write_mycnf_to_pipe_writer
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+-    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
+-    mysql_prompt.expects(:find_cmd).returns('test-mysql').twice
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
++    mysql_console.expects(:find_cmd).returns('test-mysql').twice
+     reader = mock('IO.pipe reader')
+     reader.expects(:fileno).returns(5).at_least(2)
+     writer = mock('IO.pipe writer')
+     writer.expects(:write).with("test my cnf")
+     writer.expects(:close)
+     IO.expects(:pipe).returns( [reader,writer] )
+-    mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
+-    mysql_prompt.expects(:exec).with('test-mysql', '--defaults-file=/dev/fd/5')
++    mysql_console.expects(:get_my_cnf).returns('test my cnf')
++    mysql_console.expects(:exec).with('test-mysql', '--defaults-file=/dev/fd/5')
+ 
+-    mysql_prompt.run
++    mysql_console.run
+   end
+ 
+ 
+   def test_invoke_exec_with_executable
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{:executable => 'testexec'})
+-    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{:executable => 'testexec'})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
+     reader = mock('IO.pipe reader')
+     reader.expects(:fileno).returns(5).at_least(2)
+     writer = mock('IO.pipe writer')
+     writer.expects(:write).with("test my cnf")
+     writer.expects(:close)
+     IO.expects(:pipe).returns( [reader,writer] )
+-    mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
+-    mysql_prompt.expects(:exec).with('testexec', '--defaults-file=/dev/fd/5')
++    mysql_console.expects(:get_my_cnf).returns('test my cnf')
++    mysql_console.expects(:exec).with('testexec', '--defaults-file=/dev/fd/5')
+ 
+-    mysql_prompt.run
++    mysql_console.run
+   end
+ 
+   def test_uses_run_with_pipe
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+-    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
+-    mysql_prompt.expects(:run_with_pipe).returns(true)
+-    mysql_prompt.expects(:run_with_mysql_options).never
+-    mysql_prompt.run
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
++    mysql_console.expects(:run_with_pipe).returns(true)
++    mysql_console.expects(:run_with_mysql_options).never
++    mysql_console.run
+   end
+ 
+   def test_uses_run_with_mysql_options
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+-    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(false)
+-    mysql_prompt.expects(:run_with_pipe).never
+-    mysql_prompt.expects(:run_with_mysql_options).returns(true)
+-    mysql_prompt.run
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_console.expects(:run_with_pipe).never
++    mysql_console.expects(:run_with_mysql_options).returns(true)
++    mysql_console.run
+   end
+ 
+   def test_run_with_mysql_options
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+-    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(false)
+-    mysql_prompt.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
+-    mysql_prompt.expects(:exec).with('test-exec', 'required')
+-    mysql_prompt.run
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_console.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
++    mysql_console.expects(:exec).with('test-exec', 'required')
++    mysql_console.run
+ 
+-    mysql_prompt = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
++    mysql_console = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
+                                                 "username"=>"testuser",
+                                                 "adapter"=>"mysql",
+                                                 "host"=>"test-host",
+                                                 "password"=>"test-pwd",
+                                                 "database"=>"test-db"}, {})
+-    mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(false)
+-    mysql_prompt.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
+-    mysql_prompt.expects(:exec).with('test-exec', '--socket=mysqld.sock', '--user=testuser', '--host=test-host', '-p', 'test-db') # not sure about that hash-key-order
+-    mysql_prompt.run
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_console.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
++    mysql_console.expects(:exec).with('test-exec', '--socket=mysqld.sock', '--user=testuser', '--host=test-host', '-p', 'test-db') # not sure about that hash-key-order
++    mysql_console.run
+   end
+ 
+   def test_abort_if_fileno_is_not_a_fixnum
+     ['', nil, Object.new, Fixnum].each do |bad_fileno|
+-      mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'}, {})
+-      mysql_prompt.expects(:piping_to_dev_fd_supported?).returns(true)
++      mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'}, {})
++      mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
+       reader = mock('IO.pipe reader')
+       reader.expects(:fileno).returns(bad_fileno).twice
+       writer = mock('IO.pipe writer')
+@@ -114,11 +114,11 @@ class MysqlConsoleTest < Test::Unit::TestCase
+       writer.expects(:close)
+       reader.expects(:close)
+       IO.expects(:pipe).returns( [reader,writer] )
+-      mysql_prompt.expects(:get_my_cnf).returns('test my cnf')
+-      mysql_prompt.expects(:exec).never
+-      mysql_prompt.expects(:abort).with("Bad fileno >>#{bad_fileno.to_s}<<. Cannot pipe.").raises('stub exit')
++      mysql_console.expects(:get_my_cnf).returns('test my cnf')
++      mysql_console.expects(:exec).never
++      mysql_console.expects(:abort).with("Bad fileno >>#{bad_fileno.to_s}<<. Cannot pipe.").raises('stub exit')
+       assert_stub_raises do
+-        mysql_prompt.run
++        mysql_console.run
+       end
+     end
+   end
+@@ -128,7 +128,7 @@ class MysqlConsoleTest < Test::Unit::TestCase
+   # if fileno happens not to be a Fixnum
+   def test_piping_to_dev_fd_not_supported_if_fileno_is_not_a_fixnum
+     ['', nil, Object.new, Fixnum].each do |bad_fileno|
+-      mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++      mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+       reader = mock('IO.pipe reader')
+       reader.expects(:fileno).returns(bad_fileno)
+       reader.expects(:close)
+@@ -139,11 +139,11 @@ class MysqlConsoleTest < Test::Unit::TestCase
+       writer.expects(:close)
+       Time.expects(:new).returns(time_new)
+       IO.expects(:pipe).returns([reader,writer])
+-      assert !mysql_prompt.piping_to_dev_fd_supported?
++      assert !mysql_console.piping_to_dev_fd_supported?
+     end
+   end
+   def test_piping_to_dev_fd_supported
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     reader = mock('IO.pipe reader')
+     reader.expects(:fileno).returns(5).twice
+     reader.expects(:close)
+@@ -155,27 +155,27 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     Time.expects(:new).returns(time_new)
+     IO.expects(:pipe).returns([reader,writer])
+     IO.expects(:read).with('/dev/fd/5').returns('the time is now')
+-    assert mysql_prompt.piping_to_dev_fd_supported?
++    assert mysql_console.piping_to_dev_fd_supported?
+   end
+ 
+   def test_piping_to_dev_fd_handles_no_pipe
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     IO.expects(:pipe).raises('no pipes')
+-    assert !mysql_prompt.piping_to_dev_fd_supported?
++    assert !mysql_console.piping_to_dev_fd_supported?
+   end
+ 
+   def test_piping_to_dev_fd_fails_if_cant_write
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     reader = mock('IO.pipe reader')
+     writer = mock('IO.pipe writer')
+     writer.expects(:write).raises('cannot write')
+     writer.expects(:close)
+     IO.expects(:pipe).returns([reader,writer])
+-    assert !mysql_prompt.piping_to_dev_fd_supported?
++    assert !mysql_console.piping_to_dev_fd_supported?
+   end
+ 
+   def test_piping_to_dev_fd_fails_if_io_read_raises
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     reader = mock('IO.pipe reader')
+     reader.expects(:fileno).returns(5).twice
+     reader.expects(:close)
+@@ -187,11 +187,11 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     Time.expects(:new).returns(time_new)
+     IO.expects(:pipe).returns([reader,writer])
+     IO.expects(:read).raises('no io read')
+-    assert !mysql_prompt.piping_to_dev_fd_supported?
++    assert !mysql_console.piping_to_dev_fd_supported?
+   end
+ 
+   def test_piping_to_dev_fd_fails_if_io_read_differs
+-    mysql_prompt = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     reader = mock('IO.pipe reader')
+     reader.expects(:fileno).returns(5).twice
+     reader.expects(:close)
+@@ -200,6 +200,6 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     writer.expects(:close)
+     IO.expects(:pipe).returns([reader,writer])
+     IO.expects(:read).returns('different time')
+-    assert !mysql_prompt.piping_to_dev_fd_supported?
++    assert !mysql_console.piping_to_dev_fd_supported?
+   end
+ end
+-- 
+1.5.4.3
+
+
+From 1348998a4fc96d8a2421d917097cc0f40fe45be1 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 03:06:29 -0700
+Subject: [PATCH] Deleting original dbconsole.rb script
+
+---
+ railties/lib/commands/dbconsole.rb |   83 ------------------------------------
+ 1 files changed, 0 insertions(+), 83 deletions(-)
+ delete mode 100644 railties/lib/commands/dbconsole.rb
+
+diff --git a/railties/lib/commands/dbconsole.rb b/railties/lib/commands/dbconsole.rb
+deleted file mode 100644
+index 8002264..0000000
+--- a/railties/lib/commands/dbconsole.rb
++++ /dev/null
+@@ -1,83 +0,0 @@
+-require 'erb'
+-require 'yaml'
+-require 'optparse'
+-
+-include_password = false
+-options = {}
+-
+-OptionParser.new do |opt|
+-  opt.banner = "Usage: dbconsole [options] [environment]"
+-  opt.on("-p", "--include-password", "Automatically provide the password from database.yml") do |v|
+-    include_password = true
+-  end
+-
+-  opt.on("--mode [MODE]", ['html', 'list', 'line', 'column'],
+-    "Automatically put the sqlite3 database in the specified mode (html, list, line, column).") do |mode|
+-      options['mode'] = mode
+-  end
+-
+-  opt.on("-h", "--header") do |h|
+-    options['header'] = h
+-  end
+-
+-  opt.parse!(ARGV)
+-  abort opt.to_s unless (0..1).include?(ARGV.size)
+-end
+-
+-env = ARGV.first || ENV['RAILS_ENV'] || 'development'
+-unless config = YAML::load(ERB.new(IO.read(RAILS_ROOT + "/config/database.yml")).result)[env]
+-  abort "No database is configured for the environment '#{env}'"
+-end
+-
+-
+-def find_cmd(*commands)
+-  dirs_on_path = ENV['PATH'].to_s.split(File::PATH_SEPARATOR)
+-  commands += commands.map{|cmd| "#{cmd}.exe"} if RUBY_PLATFORM =~ /win32/
+-  commands.detect do |cmd|
+-    dirs_on_path.detect do |path|
+-      File.executable? File.join(path, cmd)
+-    end
+-  end || abort("Couldn't find database client: #{commands.join(', ')}. Check your $PATH and try again.")
+-end
+-
+-case config["adapter"]
+-when "mysql"
+-  args = {
+-    'host'      => '--host',
+-    'port'      => '--port',
+-    'socket'    => '--socket',
+-    'username'  => '--user',
+-    'encoding'  => '--default-character-set'
+-  }.map { |opt, arg| "#{arg}=#{config[opt]}" if config[opt] }.compact
+-
+-  if config['password'] && include_password
+-    args << "--password=#{config['password']}"
+-  elsif config['password'] && !config['password'].to_s.empty?
+-    args << "-p"
+-  end
+-
+-  args << config['database']
+-
+-  exec(find_cmd('mysql', 'mysql5'), *args)
+-
+-when "postgresql"
+-  ENV['PGUSER']     = config["username"] if config["username"]
+-  ENV['PGHOST']     = config["host"] if config["host"]
+-  ENV['PGPORT']     = config["port"].to_s if config["port"]
+-  ENV['PGPASSWORD'] = config["password"].to_s if config["password"] && include_password
+-  exec(find_cmd('psql'), config["database"])
+-
+-when "sqlite"
+-  exec(find_cmd('sqlite'), config["database"])
+-
+-when "sqlite3"
+-  args = []
+-
+-  args << "-#{options['mode']}" if options['mode']
+-  args << "-header" if options['header']
+-  args << config['database']
+-
+-  exec(find_cmd('sqlite3'), *args)
+-else
+-  abort "Unknown command-line client for #{config['database']}. Submit a Rails patch to add support!"
+-end
+-- 
+1.5.4.3
+
+
+From d9d1745d8981b85be465d28ef9eee052e34e602c Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 11:38:18 -0700
+Subject: [PATCH] Need to require config/boot in bin/dbconsole
+
+---
+ railties/bin/dbconsole |    5 ++---
+ 1 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/railties/bin/dbconsole b/railties/bin/dbconsole
+index cbea662..d2c6ac9 100755
+--- a/railties/bin/dbconsole
++++ b/railties/bin/dbconsole
+@@ -1,8 +1,7 @@
+ #!/usr/bin/env ruby
+-# Is there really a dependency?
+-# require File.dirname(__FILE__) + '/../config/boot'
+ 
+-require File.dirname(__FILE__) + '/../lib/commands/dbconsole/command_line_interface'
++require File.dirname(__FILE__) + '/../config/boot'
++require 'commands/dbconsole/command_line_interface'
+ 
+ cli = Dbconsole::CommandLineInterface.new
+ cli.parse_command_line_args(ARGV)
+-- 
+1.5.4.3
+
+
+From 4dee6e6eb1591b626215604de9b8e041a45f2889 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 11:58:38 -0700
+Subject: [PATCH] Adding test for password handling/mysql
+
+---
+ railties/test/dbconsole/mysql_console_test.rb |   15 +++++++++++++++
+ 1 files changed, 15 insertions(+), 0 deletions(-)
+
+diff --git a/railties/test/dbconsole/mysql_console_test.rb b/railties/test/dbconsole/mysql_console_test.rb
+index 4293edd..1e1a8b8 100644
+--- a/railties/test/dbconsole/mysql_console_test.rb
++++ b/railties/test/dbconsole/mysql_console_test.rb
+@@ -84,6 +84,7 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     mysql_console.run
+   end
+ 
++  # Also tests that password is not added by default
+   def test_run_with_mysql_options
+     mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
+@@ -103,6 +104,20 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     mysql_console.run
+   end
+ 
++  # Password is passed in plaintext to mysql
++  def test_run_with_mysql_options_adds_password
++    mysql_console = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
++                                                "username"=>"testuser",
++                                                "adapter"=>"mysql",
++                                                "host"=>"test-host",
++                                                "password"=>"test-pwd",
++                                                "database"=>"test-db"}, {:password => true})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_console.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
++    mysql_console.expects(:exec).with('test-exec', '--socket=mysqld.sock', '--user=testuser', '--host=test-host', '--password=test-pwd', 'test-db')
++    mysql_console.run
++  end
++
+   def test_abort_if_fileno_is_not_a_fixnum
+     ['', nil, Object.new, Fixnum].each do |bad_fileno|
+       mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'}, {})
+-- 
+1.5.4.3
+
+
+From 9b6b3e9010d5c17c9aa76ec55f4669d7a44afc7c Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 11:59:03 -0700
+Subject: [PATCH] Adding test for password handling/postgres
+
+---
+ .../test/dbconsole/command_line_interface_test.rb  |    2 +-
+ railties/test/dbconsole/postgresql_console_test.rb |   37 ++++++++++++++++++++
+ railties/test/dbconsole/test_helper.rb             |    1 +
+ 3 files changed, 39 insertions(+), 1 deletions(-)
+
+diff --git a/railties/test/dbconsole/command_line_interface_test.rb b/railties/test/dbconsole/command_line_interface_test.rb
+index d1f3379..c796418 100644
+--- a/railties/test/dbconsole/command_line_interface_test.rb
++++ b/railties/test/dbconsole/command_line_interface_test.rb
+@@ -129,7 +129,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+     prompt_mock = mock('postgresql prompt')
+     prompt_mock.expects(:run)
+-    expected_init_args = {"adapter"=>"postgresql", "timeout"=>5000, "database"=>"ps_test", "pool"=>5}, {}
++    expected_init_args = {"adapter"=>"postgresql", "timeout"=>5000, "database"=>"ps_test", 'password' => 'testingpw', "pool"=>5}, {}
+     Dbconsole::PostgresqlConsole.expects(:new).with(*expected_init_args).returns(prompt_mock)
+     command_line_interface.perform
+   end
+diff --git a/railties/test/dbconsole/postgresql_console_test.rb b/railties/test/dbconsole/postgresql_console_test.rb
+index bdf4449..5257344 100644
+--- a/railties/test/dbconsole/postgresql_console_test.rb
++++ b/railties/test/dbconsole/postgresql_console_test.rb
+@@ -5,12 +5,49 @@ require 'postgresql_console'
+ 
+ class PostgresqlConsoleTest < Test::Unit::TestCase
+ 
++  def setup
++    ENV.delete 'PGUSER'     # = @db_config['username'] if @db_config["username"]
++    ENV.delete 'PGHOST'     # = @db_config['host'] if @db_config["host"]
++    ENV.delete 'PGPORT'     # = @db_config['port'].to_s if @db_config["port"]
++    ENV.delete 'PGPASSWORD' # = @db_config['password'].to_s if @db_config["password"] && @options[:password]
++end
++
+   def test_invoke_exec_with_psql_plus_database
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {})
++    postgresql_console.expects(:find_cmd).with('psql').returns('psql').twice
+     postgresql_console.expects(:exec).with('psql', 'testdb')
+     postgresql_console.run
+   end
+ 
++  def test_env_entries_set
++    postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb', 'username'=>'test-user','host'=>'test-host', 'port' => 'test-port'}, {})
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:exec).with('testexecutable', 'testdb')
++    assert_nil ENV['PGUSER']
++    assert_nil ENV['PGHOST']
++    assert_nil ENV['PGPORT']
++    postgresql_console.run
++    assert_equal 'test-user', ENV['PGUSER']
++    assert_equal 'test-host', ENV['PGHOST']
++    assert_equal 'test-port', ENV['PGPORT']
++  end
++
++  def test_invoke_exec_no_password
++    postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb', 'password' => 'notused'}, {})
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:exec).with('testexecutable', 'testdb')
++    postgresql_console.run
++    assert_nil ENV['PGPASSWORD']
++  end
++
++  def test_invoke_exec_sets_password
++    postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb', 'password'=>'testingpass'}, {:password => true})
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:exec).with('testexecutable', 'testdb')
++    postgresql_console.run
++    assert_equal 'testingpass', ENV['PGPASSWORD']
++  end
++
+   def test_invoke_exec_with_given_executable
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
+     
+diff --git a/railties/test/dbconsole/test_helper.rb b/railties/test/dbconsole/test_helper.rb
+index 16c9276..679e1a3 100644
+--- a/railties/test/dbconsole/test_helper.rb
++++ b/railties/test/dbconsole/test_helper.rb
+@@ -40,6 +40,7 @@ test_postgres_env:
+   database: ps_test
+   pool: 5
+   timeout: 5000
++  password: testingpw
+ test_sqlite3_env:
+   adapter: sqlite3
+   database: test.sqlite3
+-- 
+1.5.4.3
+
+
+From e5600eef0c1797aee0e1a4ddd2bdc80b6ed9bf8f Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 12:27:17 -0700
+Subject: [PATCH] Adding/Using method assert_aborts
+
+---
+ .../lib/commands/dbconsole/postgresql_console.rb   |    1 -
+ .../test/dbconsole/command_line_interface_test.rb  |   18 ++++-------
+ railties/test/dbconsole/mysql_console_test.rb      |    3 +-
+ railties/test/dbconsole/test_helper.rb             |   31 ++++++++++++++++---
+ 4 files changed, 33 insertions(+), 20 deletions(-)
+
+diff --git a/railties/lib/commands/dbconsole/postgresql_console.rb b/railties/lib/commands/dbconsole/postgresql_console.rb
+index 6f90be6..d982d22 100644
+--- a/railties/lib/commands/dbconsole/postgresql_console.rb
++++ b/railties/lib/commands/dbconsole/postgresql_console.rb
+@@ -2,7 +2,6 @@ require File.dirname(__FILE__) + '/abstract_console'
+ 
+ module Dbconsole
+   class PostgresqlConsole < Dbconsole::AbstractConsole
+-    # The default executable is psql
+     # Environment variables for user/hos/port are set according to the database config.
+     # Password is passed in environment variable PGPASSWORD with option -p / @options[:password]
+     def run
+diff --git a/railties/test/dbconsole/command_line_interface_test.rb b/railties/test/dbconsole/command_line_interface_test.rb
+index c796418..2a47109 100644
+--- a/railties/test/dbconsole/command_line_interface_test.rb
++++ b/railties/test/dbconsole/command_line_interface_test.rb
+@@ -27,16 +27,14 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+ 
+   def test_invalid_executable_option_1
+     command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.expects(:abort).with('missing argument: --executable').raises('stub exit')
+-    assert_stub_raises do
++    assert_aborts 'missing argument: --executable' do
+       command_line_interface.parse_command_line_args %w(--executable )
+     end
+   end
+ 
+   def test_invalid_executable_option_2
+     command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.expects(:abort).with('missing argument: -x').raises('stub exit')
+-    assert_stub_raises do
++    assert_aborts 'missing argument: -x' do
+       command_line_interface.parse_command_line_args %w(-x )
+     end
+   end
+@@ -63,8 +61,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     command_line_interface = Dbconsole::CommandLineInterface.new
+     IO.expects(:read).with('config/database.yml').returns('a')
+     command_line_interface.parse_command_line_args ['test_unknown_adapter']
+-    command_line_interface.expects(:abort).with('Could not find configuration for >>test_unknown_adapter<< in file config/database.yml.').raises('stub exit')
+-    assert_stub_raises do
++    assert_aborts 'Could not find configuration for >>test_unknown_adapter<< in file config/database.yml.' do
+       command_line_interface.perform
+     end
+   end
+@@ -75,8 +72,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     path = f.path
+     f.delete # is there an easier way to create a file-path for a file that doesn't exist?
+     command_line_interface.parse_command_line_args ['no_envo', path]
+-    command_line_interface.expects(:abort).raises('stub exit')
+-    assert_stub_raises do
++    assert_aborts /Cannot read file .*testing_file/ do
+       command_line_interface.perform
+     end
+   end
+@@ -85,8 +81,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     command_line_interface = Dbconsole::CommandLineInterface.new
+     IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+     command_line_interface.parse_command_line_args ['no_envo']
+-    command_line_interface.expects(:abort).with('Could not find configuration for >>no_envo<< in file config/database.yml.').raises('stub exit')
+-    assert_stub_raises do
++    assert_aborts 'Could not find configuration for >>no_envo<< in file config/database.yml.' do
+       command_line_interface.perform
+     end
+   end
+@@ -117,8 +112,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     command_line_interface = Dbconsole::CommandLineInterface.new
+     IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+     command_line_interface.parse_command_line_args ['test_unknown_adapter']
+-    command_line_interface.expects(:abort).with('Unknown command-line client for database dev_db_2. Submit a Rails patch to add support for the no_such_adapter adapter!').raises('stub exit')
+-    assert_stub_raises do
++    assert_aborts 'Unknown command-line client for database dev_db_2. Submit a Rails patch to add support for the no_such_adapter adapter!' do
+       command_line_interface.perform
+     end
+   end
+diff --git a/railties/test/dbconsole/mysql_console_test.rb b/railties/test/dbconsole/mysql_console_test.rb
+index 1e1a8b8..ba8a5b1 100644
+--- a/railties/test/dbconsole/mysql_console_test.rb
++++ b/railties/test/dbconsole/mysql_console_test.rb
+@@ -131,8 +131,7 @@ class MysqlConsoleTest < Test::Unit::TestCase
+       IO.expects(:pipe).returns( [reader,writer] )
+       mysql_console.expects(:get_my_cnf).returns('test my cnf')
+       mysql_console.expects(:exec).never
+-      mysql_console.expects(:abort).with("Bad fileno >>#{bad_fileno.to_s}<<. Cannot pipe.").raises('stub exit')
+-      assert_stub_raises do
++      assert_aborts "Bad fileno >>#{bad_fileno.to_s}<<. Cannot pipe." do
+         mysql_console.run
+       end
+     end
+diff --git a/railties/test/dbconsole/test_helper.rb b/railties/test/dbconsole/test_helper.rb
+index 679e1a3..04a5b23 100644
+--- a/railties/test/dbconsole/test_helper.rb
++++ b/railties/test/dbconsole/test_helper.rb
+@@ -1,12 +1,33 @@
+ require File.dirname(__FILE__) + '/../abstract_unit'
+ 
++# Three redefinitions to be able to test for aborts.
++class AbortException < Exception
++end
++
+ class Test::Unit::TestCase
+-  def assert_stub_raises(msg = 'stub exit')
+-    begin 
+-      yield
+-    rescue RuntimeError => e
+-      assert_equal msg, e.to_s
++  def assert_aborts(msg_or_pattern)
++    asserted = false
++    caught_exception = 'none'
++    begin
++      yield if block_given? # if there is no block, there will not be any abort either
++    rescue AbortException => e
++      caught_exception = e
++      if msg_or_pattern.is_a? String
++        assert_equal msg_or_pattern, e.to_s.sub(/^[a-z_]*: /,'')
++        asserted = true
++      end
++      if msg_or_pattern.is_a? Regexp
++        assert_match msg_or_pattern, e.to_s
++        asserted = true
++      end
+     end
++    assert asserted, "Expected to handle abort with >>#{ msg_or_pattern }<<. Caught exception >>#{ caught_exception }<< but didn't handle"
++  end
++end
++
++module Kernel
++  def abort(msg)
++    raise AbortException.new(msg)
+   end
+ end
+ 
+-- 
+1.5.4.3
+
+
+From d76e7294c063dcfc0266915d2a1abb9018165d26 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 12:55:52 -0700
+Subject: [PATCH] Adding tests for mode/header option (sqlite3). Also removing -h as option: it now invokes 'help'
+
+---
+ .../commands/dbconsole/command_line_interface.rb   |    4 +-
+ .../test/dbconsole/command_line_interface_test.rb  |   31 ++++++++++++++++++++
+ railties/test/dbconsole/sqlite3_console_test.rb    |   16 ++++++++++
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/railties/lib/commands/dbconsole/command_line_interface.rb b/railties/lib/commands/dbconsole/command_line_interface.rb
+index 5f4b091..53d92f4 100644
+--- a/railties/lib/commands/dbconsole/command_line_interface.rb
++++ b/railties/lib/commands/dbconsole/command_line_interface.rb
+@@ -35,7 +35,7 @@ module Dbconsole
+         @options[:mode] = mode
+       end
+ 
+-      def_option "-h", "--[no-]header", "sqlite3 only: Turn headers on or off"  do |h|
++      def_option "--[no-]header", "sqlite3 only: Turn headers on or off"  do |h|
+         @options[:header] = h
+       end
+ 
+@@ -47,7 +47,7 @@ module Dbconsole
+         @options[:verbose] = verbose
+       end
+ 
+-      def_tail_option "--help", "Show this help message" do
++      def_tail_option "-h", "--help", "Show this help message" do
+         puts self
+         exit
+       end
+diff --git a/railties/test/dbconsole/command_line_interface_test.rb b/railties/test/dbconsole/command_line_interface_test.rb
+index 2a47109..dbd4feb 100644
+--- a/railties/test/dbconsole/command_line_interface_test.rb
++++ b/railties/test/dbconsole/command_line_interface_test.rb
+@@ -46,6 +46,37 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     assert_equal ({:mycnf_only => true}), command_line_interface.options
+   end
+ 
++  def test_header_option
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    command_line_interface.parse_command_line_args %w(--header)
++    assert_equal [], command_line_interface.argv
++    assert_equal ({:header => true}), command_line_interface.options
++  end
++
++  def test_mode_option
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    assert_raises OptionParser::InvalidArgument do
++      command_line_interface.parse_command_line_args %w(--mode testmode )
++    end
++    %w(html list line column).each do |valid_mode|
++      command_line_interface.parse_command_line_args ['--mode', valid_mode ]
++      assert_equal [], command_line_interface.argv
++      assert_equal ({:mode => valid_mode}), command_line_interface.options
++    end
++  end
++  def test_help_option
++    # OptionParse seems to have a bug
++    # When there is a -h option and an option starting with e, for example, as with dbconsole,  --executable
++    # then the command line is treated as if it was " -h --executable lp "
++    # So we include -help here
++    %w( -h --help -help).each do |help_option|
++      command_line_interface = Dbconsole::CommandLineInterface.new
++      command_line_interface.expects(:puts).with(command_line_interface)
++      command_line_interface.expects(:exit)
++      command_line_interface.parse_command_line_args [ help_option ]
++    end
++  end
++
+   def test_verbose_option
+     { '-v' => true,
+       '--verbose' => true,
+diff --git a/railties/test/dbconsole/sqlite3_console_test.rb b/railties/test/dbconsole/sqlite3_console_test.rb
+index 25d6de9..5f04f73 100644
+--- a/railties/test/dbconsole/sqlite3_console_test.rb
++++ b/railties/test/dbconsole/sqlite3_console_test.rb
+@@ -18,4 +18,20 @@ class Sqlite3ConsoleTest < Test::Unit::TestCase
+     sqlite3_console.expects(:exec).with('testexecutable', 'testdb')
+     sqlite3_console.run
+   end
++
++  def test_invoke_with_mode_option
++    sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {:mode => 'testmode'})
++    
++    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable').twice
++    sqlite3_console.expects(:exec).with('testexecutable', '-testmode', 'testdb')
++    sqlite3_console.run
++  end
++
++  def test_invoke_with_header_option
++    sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {:header => true})
++    
++    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable').twice
++    sqlite3_console.expects(:exec).with('testexecutable', '-header', 'testdb')
++    sqlite3_console.run
++  end
+ end
+-- 
+1.5.4.3
+
+
+From 30efb90acf9dacf4ad57d326ef0b12db864f160d Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 13:22:40 -0700
+Subject: [PATCH] catching too many arguments in parser, aborting for OptionParse::Exception's
+
+---
+ .../commands/dbconsole/command_line_interface.rb   |   16 +++++++++++-----
+ .../test/dbconsole/command_line_interface_test.rb  |   19 ++++++++++++++++++-
+ 2 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/railties/lib/commands/dbconsole/command_line_interface.rb b/railties/lib/commands/dbconsole/command_line_interface.rb
+index 53d92f4..18b731a 100644
+--- a/railties/lib/commands/dbconsole/command_line_interface.rb
++++ b/railties/lib/commands/dbconsole/command_line_interface.rb
+@@ -26,6 +26,10 @@ module Dbconsole
+         @options[:executable] = executable.to_s
+       end
+ 
++      def_option("-p", "--include-password", "mysql/postgresql only: Automatically provide the password from database.yml") do |v|
++        @options[:password] = true
++      end
++
+       def_option "--mycnf", "mysql only: Just output my.cnf file" do
+         @options[:mycnf_only] = true
+       end
+@@ -39,11 +43,7 @@ module Dbconsole
+         @options[:header] = h
+       end
+ 
+-      def_option("-p", "--include-password", "mysql/postgresql only: Automatically provide the password from database.yml") do |v|
+-        @options[:password] = true
+-      end
+-
+-      def_option "-v", "--[no-]verbose", "Run verbosely" do |verbose|
++      def_tail_option "-v", "--[no-]verbose", "Run verbosely" do |verbose|
+         @options[:verbose] = verbose
+       end
+ 
+@@ -58,9 +58,15 @@ module Dbconsole
+         @argv = parse!(argv) # parse will populate options and remove the parsed options from argv
+       rescue OptionParser::MissingArgument => e
+         abort e.to_s
++      rescue OptionParser::InvalidOption => e
++        abort e.to_s
++      rescue OptionParser::InvalidArgument => e
++        abort e.to_s
+       end
++      abort self.to_s unless (0..2).include?(@argv.size)
+       @environment = @argv[0] || ENV['RAILS_ENV'] || 'development'
+       @yaml_filename = @argv[1] || 'config/database.yml'
++    
+     end
+ 
+     def perform
+diff --git a/railties/test/dbconsole/command_line_interface_test.rb b/railties/test/dbconsole/command_line_interface_test.rb
+index dbd4feb..519e8fd 100644
+--- a/railties/test/dbconsole/command_line_interface_test.rb
++++ b/railties/test/dbconsole/command_line_interface_test.rb
+@@ -12,6 +12,13 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     assert_equal [], command_line_interface.argv
+     assert_equal ({}), command_line_interface.options
+   end
++
++  def test_too_many_args
++    command_line_interface = Dbconsole::CommandLineInterface.new
++    assert_aborts command_line_interface.to_s do
++      command_line_interface.parse_command_line_args( %w(1 2 3))
++    end
++  end
+   
+   def test_valid_executable_option
+     command_line_interface = Dbconsole::CommandLineInterface.new
+@@ -46,6 +53,15 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     assert_equal ({:mycnf_only => true}), command_line_interface.options
+   end
+ 
++  def test_password_ption
++    %w( -p --include-password ).each do |pwd_option|
++      command_line_interface = Dbconsole::CommandLineInterface.new
++      command_line_interface.parse_command_line_args [ pwd_option ]
++      assert_equal [], command_line_interface.argv
++      assert_equal ({:password => true}), command_line_interface.options
++    end
++  end
++
+   def test_header_option
+     command_line_interface = Dbconsole::CommandLineInterface.new
+     command_line_interface.parse_command_line_args %w(--header)
+@@ -55,7 +71,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+ 
+   def test_mode_option
+     command_line_interface = Dbconsole::CommandLineInterface.new
+-    assert_raises OptionParser::InvalidArgument do
++    assert_aborts 'invalid argument: --mode testmode' do
+       command_line_interface.parse_command_line_args %w(--mode testmode )
+     end
+     %w(html list line column).each do |valid_mode|
+@@ -64,6 +80,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+       assert_equal ({:mode => valid_mode}), command_line_interface.options
+     end
+   end
++
+   def test_help_option
+     # OptionParse seems to have a bug
+     # When there is a -h option and an option starting with e, for example, as with dbconsole,  --executable
+-- 
+1.5.4.3
+
+
+From c710ea82ae2b06f73c772f2eb7fbecd066a8afee Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 19:01:45 -0700
+Subject: [PATCH] Adding Verbose module
+
+---
+ .../lib/commands/dbconsole/abstract_console.rb     |    3 +++
+ .../commands/dbconsole/command_line_interface.rb   |    8 +++++---
+ railties/lib/commands/dbconsole/mysql_console.rb   |   11 +++++------
+ .../lib/commands/dbconsole/postgresql_console.rb   |    3 +--
+ railties/lib/commands/dbconsole/sqlite3_console.rb |    3 +--
+ railties/lib/commands/dbconsole/sqlite_console.rb  |    3 +--
+ railties/lib/commands/dbconsole/verbose.rb         |   12 ++++++++++++
+ railties/test/dbconsole/mysql_console_test.rb      |    2 +-
+ railties/test/dbconsole/postgresql_console_test.rb |   10 +++++-----
+ railties/test/dbconsole/sqlite3_console_test.rb    |    6 +++---
+ railties/test/dbconsole/sqlite_console_test.rb     |    2 +-
+ 11 files changed, 38 insertions(+), 25 deletions(-)
+ create mode 100644 railties/lib/commands/dbconsole/verbose.rb
+
+diff --git a/railties/lib/commands/dbconsole/abstract_console.rb b/railties/lib/commands/dbconsole/abstract_console.rb
+index 16143d2..3e42d25 100644
+--- a/railties/lib/commands/dbconsole/abstract_console.rb
++++ b/railties/lib/commands/dbconsole/abstract_console.rb
+@@ -1,5 +1,8 @@
++require 'verbose'
++
+ module Dbconsole
+   class AbstractConsole
++    include Dbconsole::Verbose
+     attr_accessor :db_config, :options
+     def initialize(db_config, options)
+       @db_config = db_config
+diff --git a/railties/lib/commands/dbconsole/command_line_interface.rb b/railties/lib/commands/dbconsole/command_line_interface.rb
+index 18b731a..54067e1 100644
+--- a/railties/lib/commands/dbconsole/command_line_interface.rb
++++ b/railties/lib/commands/dbconsole/command_line_interface.rb
+@@ -2,6 +2,7 @@ require 'optparse'
+ require 'yaml'
+ require 'erb'
+ 
++require File.dirname(__FILE__) + '/verbose'
+ require File.dirname(__FILE__) + '/mysql_console'
+ require File.dirname(__FILE__) + '/postgresql_console'
+ require File.dirname(__FILE__) + '/sqlite3_console'
+@@ -11,6 +12,7 @@ require File.dirname(__FILE__) + '/sqlite_console'
+ 
+ module Dbconsole
+   class CommandLineInterface < OptionParser
++    include Dbconsole::Verbose
+     attr_accessor :options, :argv
+     def initialize
+       super
+@@ -70,7 +72,7 @@ module Dbconsole
+     end
+ 
+     def perform
+-      $stderr.puts "Using yaml file '#{@yaml_filename}'" if options[:verbose]
++      verbose { "Using yaml file '#{@yaml_filename}'" }
+       abort "Cannot read file #{@yaml_filename}" unless File.readable? @yaml_filename
+       yaml = nil
+       begin
+@@ -79,13 +81,13 @@ module Dbconsole
+         abort "Error #{e} while reading #{@yaml_filename}"
+       end
+       
+-      $stderr.puts "Using environment '#{@environment}'" if options[:verbose]
++      verbose { "Using environment '#{@environment}'" }
+       abort "Could not find configuration for >>#{@environment}<< in file #{@yaml_filename}." unless yaml && yaml.is_a?(Hash) && yaml[@environment]
+       
+       db_config = yaml[@environment]
+       adapter = db_config['adapter']
+       
+-      $stderr.puts "Found adapter >>#{ adapter }<<" if options[:verbose]
++      verbose { "Found adapter >>#{ adapter }<<" }
+       # Convert adapter into a class
+       adapter_console_class = case adapter
+         when 'sqlite': Dbconsole::SqliteConsole
+diff --git a/railties/lib/commands/dbconsole/mysql_console.rb b/railties/lib/commands/dbconsole/mysql_console.rb
+index 26be8b1..9192a73 100644
+--- a/railties/lib/commands/dbconsole/mysql_console.rb
++++ b/railties/lib/commands/dbconsole/mysql_console.rb
+@@ -50,9 +50,9 @@ module Dbconsole
+         if test_string == read_back
+           return true
+         end
+-        $stderr.puts "Wrote >>#{ test_string }<<, but read back >>#{ read_back }<<. Piping to /dev/fd/## is not supported" if options[:verbose]
++        verbose { "Wrote >>#{ test_string }<<, but read back >>#{ read_back }<<. Piping to /dev/fd/## is not supported" }
+       rescue Exception => e
+-        $stderr.puts "Pipe test failed with #{e}" if options[:verbose]
++        verbose { "Pipe test failed with #{e}" }
+       ensure
+         reader.close rescue nil
+         writer.close rescue nil
+@@ -73,7 +73,7 @@ module Dbconsole
+       end
+     
+       args << @db_config['database']
+-      $stderr.puts "Exec'ing command '#{find_cmd('mysql', 'mysql5')} #{ args.join ' ' }'" if options[:verbose]
++      verbose { "Exec'ing command '#{find_cmd('mysql', 'mysql5')} #{ args.join ' ' }'" }
+     
+       exec find_cmd('mysql', 'mysql5'), *args
+     end
+@@ -82,7 +82,7 @@ module Dbconsole
+     # See http://dev.mysql.com/doc/refman/5.0/en/password-security-user.html
+     def run_with_pipe
+       my_cnf = get_my_cnf
+-      $stderr.puts "Using my.cnf\n--- BEGIN my.cnf ----\n#{my_cnf}\n--- END my.cnf ---" if options[:verbose]
++      verbose { "Using my.cnf\n--- BEGIN my.cnf ----\n#{my_cnf}\n--- END my.cnf ---" }
+       reader, writer = IO.pipe
+       writer.write(my_cnf)
+       writer.close # reader to be closed by 'command' / the executable
+@@ -91,8 +91,7 @@ module Dbconsole
+         abort "Bad fileno >>#{ reader.fileno }<<. Cannot pipe."  # unlikely, since checked in method piping_to_dev_fd_supported?
+       end
+       # my_cnf to be read in via --defaults-file
+-      command= [ find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"]
+-      $stderr.puts "Exec'ing command '#{ command.join ' ' }'" if options[:verbose]
++      verbose { "Exec'ing command '#{ [find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"].join ' ' }'" }
+       exec find_cmd('mysql', 'mysql5'), "--defaults-file=/dev/fd/#{reader.fileno.to_s}"
+     end
+   end
+diff --git a/railties/lib/commands/dbconsole/postgresql_console.rb b/railties/lib/commands/dbconsole/postgresql_console.rb
+index d982d22..0ac8b68 100644
+--- a/railties/lib/commands/dbconsole/postgresql_console.rb
++++ b/railties/lib/commands/dbconsole/postgresql_console.rb
+@@ -10,8 +10,7 @@ module Dbconsole
+       ENV['PGPORT']     = @db_config['port'].to_s if @db_config["port"]
+       ENV['PGPASSWORD'] = @db_config['password'].to_s if @db_config["password"] && @options[:password]
+ 
+-      command = "#{find_cmd('psql')} #{options[:executable]} #{db_config['database']}"
+-      $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++      verbose { "Exec'ing command '#{find_cmd('psql')} #{@db_config['database']}" }
+       exec find_cmd('psql'), @db_config['database']
+     end
+   end
+diff --git a/railties/lib/commands/dbconsole/sqlite3_console.rb b/railties/lib/commands/dbconsole/sqlite3_console.rb
+index ec6e38c..c71c02e 100644
+--- a/railties/lib/commands/dbconsole/sqlite3_console.rb
++++ b/railties/lib/commands/dbconsole/sqlite3_console.rb
+@@ -10,8 +10,7 @@ module Dbconsole
+       args << "-#{@options[:mode]}" if @options[:mode]
+       args << "-header" if @options[:header]
+       args << db_config['database']
+-      command = "#{find_cmd('sqlite3')} #{args.join(' ')}"
+-      $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++      verbose { "Exec'ing command '#{find_cmd('sqlite3')} #{args.join(' ')}'" }
+       exec find_cmd('sqlite3'), *args
+     end
+   end
+diff --git a/railties/lib/commands/dbconsole/sqlite_console.rb b/railties/lib/commands/dbconsole/sqlite_console.rb
+index da8b45d..2907a5d 100644
+--- a/railties/lib/commands/dbconsole/sqlite_console.rb
++++ b/railties/lib/commands/dbconsole/sqlite_console.rb
+@@ -7,8 +7,7 @@ module Dbconsole
+     # except for the database field
+     def run
+       arg = db_config['database']
+-      command = "#{find_cmd('sqlite')} #{arg}"
+-      $stderr.puts "Exec'ing command '#{command}'" if options[:verbose]
++      verbose { "Exec'ing command '#{find_cmd('sqlite')} #{arg}'" }
+       exec find_cmd('sqlite'), arg
+     end
+   end
+diff --git a/railties/lib/commands/dbconsole/verbose.rb b/railties/lib/commands/dbconsole/verbose.rb
+new file mode 100644
+index 0000000..e212618
+--- /dev/null
++++ b/railties/lib/commands/dbconsole/verbose.rb
+@@ -0,0 +1,12 @@
++module Dbconsole
++  module Verbose
++    def verbose
++      return unless options[:verbose]
++      begin
++        $stderr.puts yield # if block_given?
++      rescue Exception => e
++        $stderr.puts "verbose failure #{e}"
++      end
++    end
++  end
++end
+diff --git a/railties/test/dbconsole/mysql_console_test.rb b/railties/test/dbconsole/mysql_console_test.rb
+index ba8a5b1..cfbcacc 100644
+--- a/railties/test/dbconsole/mysql_console_test.rb
++++ b/railties/test/dbconsole/mysql_console_test.rb
+@@ -39,7 +39,7 @@ class MysqlConsoleTest < Test::Unit::TestCase
+   def test_write_mycnf_to_pipe_writer
+     mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
+-    mysql_console.expects(:find_cmd).returns('test-mysql').twice
++    mysql_console.expects(:find_cmd).returns('test-mysql')
+     reader = mock('IO.pipe reader')
+     reader.expects(:fileno).returns(5).at_least(2)
+     writer = mock('IO.pipe writer')
+diff --git a/railties/test/dbconsole/postgresql_console_test.rb b/railties/test/dbconsole/postgresql_console_test.rb
+index 5257344..ebd4a11 100644
+--- a/railties/test/dbconsole/postgresql_console_test.rb
++++ b/railties/test/dbconsole/postgresql_console_test.rb
+@@ -14,14 +14,14 @@ end
+ 
+   def test_invoke_exec_with_psql_plus_database
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {})
+-    postgresql_console.expects(:find_cmd).with('psql').returns('psql').twice
++    postgresql_console.expects(:find_cmd).with('psql').returns('psql')
+     postgresql_console.expects(:exec).with('psql', 'testdb')
+     postgresql_console.run
+   end
+ 
+   def test_env_entries_set
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb', 'username'=>'test-user','host'=>'test-host', 'port' => 'test-port'}, {})
+-    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable')
+     postgresql_console.expects(:exec).with('testexecutable', 'testdb')
+     assert_nil ENV['PGUSER']
+     assert_nil ENV['PGHOST']
+@@ -34,7 +34,7 @@ end
+ 
+   def test_invoke_exec_no_password
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb', 'password' => 'notused'}, {})
+-    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable')
+     postgresql_console.expects(:exec).with('testexecutable', 'testdb')
+     postgresql_console.run
+     assert_nil ENV['PGPASSWORD']
+@@ -42,7 +42,7 @@ end
+ 
+   def test_invoke_exec_sets_password
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb', 'password'=>'testingpass'}, {:password => true})
+-    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable')
+     postgresql_console.expects(:exec).with('testexecutable', 'testdb')
+     postgresql_console.run
+     assert_equal 'testingpass', ENV['PGPASSWORD']
+@@ -51,7 +51,7 @@ end
+   def test_invoke_exec_with_given_executable
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
+     
+-    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable').twice
++    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable')
+     postgresql_console.expects(:exec).with('testexecutable', 'testdb')
+     postgresql_console.run
+   end
+diff --git a/railties/test/dbconsole/sqlite3_console_test.rb b/railties/test/dbconsole/sqlite3_console_test.rb
+index 5f04f73..f96357f 100644
+--- a/railties/test/dbconsole/sqlite3_console_test.rb
++++ b/railties/test/dbconsole/sqlite3_console_test.rb
+@@ -14,7 +14,7 @@ class Sqlite3ConsoleTest < Test::Unit::TestCase
+   def test_invoke_exec_with_given_executable
+     sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
+     
+-    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable').twice
++    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable')
+     sqlite3_console.expects(:exec).with('testexecutable', 'testdb')
+     sqlite3_console.run
+   end
+@@ -22,7 +22,7 @@ class Sqlite3ConsoleTest < Test::Unit::TestCase
+   def test_invoke_with_mode_option
+     sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {:mode => 'testmode'})
+     
+-    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable').twice
++    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable')
+     sqlite3_console.expects(:exec).with('testexecutable', '-testmode', 'testdb')
+     sqlite3_console.run
+   end
+@@ -30,7 +30,7 @@ class Sqlite3ConsoleTest < Test::Unit::TestCase
+   def test_invoke_with_header_option
+     sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {:header => true})
+     
+-    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable').twice
++    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable')
+     sqlite3_console.expects(:exec).with('testexecutable', '-header', 'testdb')
+     sqlite3_console.run
+   end
+diff --git a/railties/test/dbconsole/sqlite_console_test.rb b/railties/test/dbconsole/sqlite_console_test.rb
+index fa9a26e..397fd80 100644
+--- a/railties/test/dbconsole/sqlite_console_test.rb
++++ b/railties/test/dbconsole/sqlite_console_test.rb
+@@ -14,7 +14,7 @@ class SqliteConsoleTest < Test::Unit::TestCase
+   def test_invoke_exec_with_given_executable
+     sqlite_console = Dbconsole::SqliteConsole.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
+     
+-    sqlite_console.expects(:find_cmd).with('sqlite').returns('testexecutable').twice
++    sqlite_console.expects(:find_cmd).with('sqlite').returns('testexecutable')
+     sqlite_console.expects(:exec).with('testexecutable', 'testdb')
+     sqlite_console.run
+   end
+-- 
+1.5.4.3
+
+
+From da5a709f63422adfaa5d280c5314fc2114b1b7e0 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 19:28:07 -0700
+Subject: [PATCH] requiring 'verbose' needs path
+
+---
+ .../lib/commands/dbconsole/abstract_console.rb     |    3 ++-
+ 1 files changed, 2 insertions(+), 1 deletions(-)
+
+diff --git a/railties/lib/commands/dbconsole/abstract_console.rb b/railties/lib/commands/dbconsole/abstract_console.rb
+index 3e42d25..f370ae8 100644
+--- a/railties/lib/commands/dbconsole/abstract_console.rb
++++ b/railties/lib/commands/dbconsole/abstract_console.rb
+@@ -1,4 +1,5 @@
+-require 'verbose'
++require File.dirname(__FILE__) + '/verbose'
++
+ 
+ module Dbconsole
+   class AbstractConsole
+-- 
+1.5.4.3
+
+
+From 8ddb914613969f205bb5a3bed6c4c8b25f34e72c Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 20:30:31 -0700
+Subject: [PATCH] Refactoring unit tests
+
+---
+ railties/test/dbconsole/abstract_console_test.rb   |   23 +--
+ .../test/dbconsole/command_line_interface_test.rb  |  176 ++++++--------------
+ railties/test/dbconsole/mysql_console_test.rb      |   36 ++--
+ railties/test/dbconsole/postgresql_console_test.rb |    4 +-
+ railties/test/dbconsole/sqlite3_console_test.rb    |    4 +-
+ railties/test/dbconsole/sqlite_console_test.rb     |    8 +-
+ 6 files changed, 87 insertions(+), 164 deletions(-)
+
+diff --git a/railties/test/dbconsole/abstract_console_test.rb b/railties/test/dbconsole/abstract_console_test.rb
+index eca81e3..d987f43 100644
+--- a/railties/test/dbconsole/abstract_console_test.rb
++++ b/railties/test/dbconsole/abstract_console_test.rb
+@@ -13,21 +13,16 @@ class AbstractConsoleTest < Test::Unit::TestCase
+   end
+ 
+   # Some checking on the value of database entry in the first hash is performed for an AbstractPrompt:
+-  def test_empty_database_aborts
+-    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('No database name found')
+-    Dbconsole::AbstractConsole.new({}, {})
++  def test_initializer_aborts
++    { [{},{}] => 'No database name found',
++      [{'database'=> ' '},{}] => 'Database name has whitespace. Not supported',
++      [{'database'=> 'ok'}, {:executable => ' '}] => 'Bad executable'}.each do |init_args, abort_msg|
++      assert_aborts abort_msg do
++        Dbconsole::AbstractConsole.new(*init_args)
++      end
++    end
+   end
+-
+-  def test_aborts_whitespace_in_database
+-    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Database name has whitespace. Not supported')
+-    Dbconsole::AbstractConsole.new({'database'=> ' '}, {})
+-  end
+-
+-  def test_aborts_bad_executable
+-    Dbconsole::AbstractConsole.any_instance.expects(:abort).with('Bad executable')
+-    Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {:executable => ' '})
+-  end
+-
++        
+   def test_find_cmd_is_executable
+     abstract_console = Dbconsole::AbstractConsole.new({'database'=> 'ok'}, {})
+     File.expects(:executable?).returns(true)
+diff --git a/railties/test/dbconsole/command_line_interface_test.rb b/railties/test/dbconsole/command_line_interface_test.rb
+index 519e8fd..c68cb41 100644
+--- a/railties/test/dbconsole/command_line_interface_test.rb
++++ b/railties/test/dbconsole/command_line_interface_test.rb
+@@ -2,10 +2,7 @@ require  File.dirname(__FILE__) + '/test_helper'
+ 
+ require 'command_line_interface'
+ 
+-require 'tempfile'
+-
+ class CommandLineInterfaceTest < Test::Unit::TestCase
+-
+   def test_no_options
+     command_line_interface = Dbconsole::CommandLineInterface.new
+     command_line_interface.parse_command_line_args([])
+@@ -20,53 +17,33 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     end
+   end
+   
+-  def test_valid_executable_option
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w(-x test_ex)
+-    assert_equal [], command_line_interface.argv
+-    assert_equal ({:executable => 'test_ex'}), command_line_interface.options
+-
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w(--executable test_exec)
+-    assert_equal [], command_line_interface.argv
+-    assert_equal ({:executable => 'test_exec'}), command_line_interface.options
+-  end
+-
+-  def test_invalid_executable_option_1
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    assert_aborts 'missing argument: --executable' do
+-      command_line_interface.parse_command_line_args %w(--executable )
+-    end
+-  end
+-
+-  def test_invalid_executable_option_2
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    assert_aborts 'missing argument: -x' do
+-      command_line_interface.parse_command_line_args %w(-x )
+-    end
+-  end
+-
+-  def test_mycnf_option
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w(--mycnf)
+-    assert_equal [], command_line_interface.argv
+-    assert_equal ({:mycnf_only => true}), command_line_interface.options
+-  end
+-
+-  def test_password_ption
+-    %w( -p --include-password ).each do |pwd_option|
++  def test_executable_options
++    %w( -x --executable ).each do |switch|
+       command_line_interface = Dbconsole::CommandLineInterface.new
+-      command_line_interface.parse_command_line_args [ pwd_option ]
++      command_line_interface.parse_command_line_args [ switch, 'test-exec' ]
+       assert_equal [], command_line_interface.argv
+-      assert_equal ({:password => true}), command_line_interface.options
++      assert_equal ({:executable => 'test-exec'}), command_line_interface.options
++
++      command_line_interface = Dbconsole::CommandLineInterface.new
++      assert_aborts "missing argument: #{switch}" do
++        command_line_interface.parse_command_line_args [ switch ] # required arg missing
++      end
+     end
+   end
+ 
+-  def test_header_option
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w(--header)
+-    assert_equal [], command_line_interface.argv
+-    assert_equal ({:header => true}), command_line_interface.options
++  def test_standalone_options
++    { '--mycnf' => {:mycnf_only => true},
++      '-p' => {:password => true},
++      '--include-password' => {:password => true},
++      '--header' => {:header => true},
++      '-v' => {:verbose => true},
++      '--verbose' => {:verbose => true},
++      '--no-verbose' => {:verbose => false}}.each do |switch, expected_options|
++        command_line_interface = Dbconsole::CommandLineInterface.new
++        command_line_interface.parse_command_line_args [ switch ]
++        assert_equal [], command_line_interface.argv
++        assert_equal expected_options, command_line_interface.options
++    end
+   end
+ 
+   def test_mode_option
+@@ -74,7 +51,7 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     assert_aborts 'invalid argument: --mode testmode' do
+       command_line_interface.parse_command_line_args %w(--mode testmode )
+     end
+-    %w(html list line column).each do |valid_mode|
++    %w( html list line column ).each do |valid_mode|
+       command_line_interface.parse_command_line_args ['--mode', valid_mode ]
+       assert_equal [], command_line_interface.argv
+       assert_equal ({:mode => valid_mode}), command_line_interface.options
+@@ -94,33 +71,12 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     end
+   end
+ 
+-  def test_verbose_option
+-    { '-v' => true,
+-      '--verbose' => true,
+-      '--no-verbose' => false}.each do |verbose_option, verbose_value|
+-      command_line_interface = Dbconsole::CommandLineInterface.new
+-      command_line_interface.parse_command_line_args [ verbose_option ]
+-      assert_equal [], command_line_interface.argv
+-      assert_equal ({:verbose => verbose_value}), command_line_interface.options
+-    end
+-  end
+-
+-  def test_aborts_invalid_yaml
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    IO.expects(:read).with('config/database.yml').returns('a')
+-    command_line_interface.parse_command_line_args ['test_unknown_adapter']
+-    assert_aborts 'Could not find configuration for >>test_unknown_adapter<< in file config/database.yml.' do
+-      command_line_interface.perform
+-    end
+-  end
+-
+   def test_abort_no_yaml_file
+     command_line_interface = Dbconsole::CommandLineInterface.new
+-    f = Tempfile.new('testing_file')
+-    path = f.path
+-    f.delete # is there an easier way to create a file-path for a file that doesn't exist?
+-    command_line_interface.parse_command_line_args ['no_envo', path]
+-    assert_aborts /Cannot read file .*testing_file/ do
++    non_existing_file = 'a.out'
++    assert !File.readable?(non_existing_file), "#{non_existing_file} found. Please change test and choose another filename"
++    command_line_interface.parse_command_line_args ['no_envo', non_existing_file]
++    assert_aborts /Cannot read file .*#{non_existing_file}/ do
+       command_line_interface.perform
+     end
+   end
+@@ -145,17 +101,6 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     command_line_interface.perform
+   end
+ 
+-  def test_pass_on_executable_option
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w{ -x abc other }
+-    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+-    mysql_prompt_mock = mock('mysqlprompt')
+-    mysql_prompt_mock.expects(:run)
+-    expected_init_args = {"username"=>"other_user", "adapter"=>"mysql", "host"=>"localhost", "database"=>"other_db", "password"=>"other_password"}, {:executable=>"abc"}
+-    Dbconsole::MysqlConsole.expects(:new).with(*expected_init_args).returns(mysql_prompt_mock)
+-    command_line_interface.perform
+-  end
+-
+   def test_abort_when_adapter_not_known
+     command_line_interface = Dbconsole::CommandLineInterface.new
+     IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+@@ -165,47 +110,30 @@ class CommandLineInterfaceTest < Test::Unit::TestCase
+     end
+   end
+ 
+-  def test_postgresql_console_invoked
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w{ test_postgres_env }
+-    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+-    prompt_mock = mock('postgresql prompt')
+-    prompt_mock.expects(:run)
+-    expected_init_args = {"adapter"=>"postgresql", "timeout"=>5000, "database"=>"ps_test", 'password' => 'testingpw', "pool"=>5}, {}
+-    Dbconsole::PostgresqlConsole.expects(:new).with(*expected_init_args).returns(prompt_mock)
+-    command_line_interface.perform
+-  end
+-
+-  def test_mysql_console_invoked
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w{ test_mysql_env }
+-    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+-    prompt_mock = mock('postgresql prompt')
+-    prompt_mock.expects(:run)
+-    expected_init_args = {"username"=>"dev_user_2", "adapter"=>"mysql", "host"=>"localhost_2", "password"=>"dev_password_2", "database"=>"dev_db_2"}, {}
+-    Dbconsole::MysqlConsole.expects(:new).with(*expected_init_args).returns(prompt_mock)
+-    command_line_interface.perform
+-  end
+-
+-  def test_sqlite3_console_invoked
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w{ test_sqlite3_env }
+-    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+-    prompt_mock = mock('sqlite3 prompt')
+-    prompt_mock.expects(:run)
+-    expected_init_args = {"adapter"=>"sqlite3", "timeout"=>5000, "database"=>"test.sqlite3", "pool"=>5}, {}
+-    Dbconsole::Sqlite3Console.expects(:new).with(*expected_init_args).returns(prompt_mock)
+-    command_line_interface.perform
+-  end
+-
+-  def test_sqlite_console_invoked
+-    command_line_interface = Dbconsole::CommandLineInterface.new
+-    command_line_interface.parse_command_line_args %w{ test_sqlite_no_3_env }
+-    IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
+-    prompt_mock = mock('sqlite prompt')
+-    prompt_mock.expects(:run)
+-    expected_init_args = {"adapter"=>"sqlite", "timeout"=>5000, "database"=>"test.sqlite_no_3", "pool"=>5}, {}
+-    Dbconsole::SqliteConsole.expects(:new).with(*expected_init_args).returns(prompt_mock)
+-    command_line_interface.perform
++  def test_adapter_console_invoked
++    [ [ 'test_postgres_env',
++        Dbconsole::PostgresqlConsole,
++        {"adapter"=>"postgresql", "timeout"=>5000, "database"=>"ps_test", 'password' => 'testingpw', "pool"=>5}],
++      [ 'test_mysql_env',
++        Dbconsole::MysqlConsole,
++        {"username"=>"dev_user_2", "adapter"=>"mysql", "host"=>"localhost_2", "password"=>"dev_password_2", "database"=>"dev_db_2"}],
++      [ 'test_sqlite3_env',
++        Dbconsole::Sqlite3Console,
++        {"adapter"=>"sqlite3", "timeout"=>5000, "database"=>"test.sqlite3", "pool"=>5}],
++
++      [ 'test_sqlite_no_3_env',
++        Dbconsole::SqliteConsole,
++        {"adapter"=>"sqlite", "timeout"=>5000, "database"=>"test.sqlite_no_3", "pool"=>5}]].each do |env,adapter_class, expected_db_config|
++      command_line_interface = Dbconsole::CommandLineInterface.new
++      command_line_interface.parse_command_line_args [ env ]
++      # Also testing that options are passed on to the adapter.
++      options_mock = {}
++      command_line_interface.expects(:options).returns(options_mock).at_least(1)
++      IO.expects(:read).with('config/database.yml').returns(TEST_DATABASE_YAML)
++      prompt_mock = mock('test adapter console')
++      prompt_mock.expects(:run)
++      adapter_class.expects(:new).with(expected_db_config, options_mock).returns(prompt_mock)
++      command_line_interface.perform
++    end
+   end
+ end
+diff --git a/railties/test/dbconsole/mysql_console_test.rb b/railties/test/dbconsole/mysql_console_test.rb
+index cfbcacc..c47356c 100644
+--- a/railties/test/dbconsole/mysql_console_test.rb
++++ b/railties/test/dbconsole/mysql_console_test.rb
+@@ -23,6 +23,7 @@ class MysqlConsoleTest < Test::Unit::TestCase
+                       "password=test-pwd",
+                       "socket=mysqld.sock",
+                       "user=testuser"]
++
+     get_my_cnf = mysql_console.get_my_cnf
+     assert_match /[client]\n/, get_my_cnf
+     assert_equal expected_lines.sort, get_my_cnf.split(/\n/).sort
+@@ -32,6 +33,23 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{:mycnf_only => true})
+     mysql_console.expects(:get_my_cnf).returns('test my cnf')
+     mysql_console.expects(:puts).with('test my cnf')
++    mysql_console.expects(:exec).never
++    mysql_console.run
++  end
++
++  def test_uses_run_with_pipe
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
++    mysql_console.expects(:run_with_pipe).returns(true)
++    mysql_console.expects(:run_with_mysql_options).never
++    mysql_console.run
++  end
++
++  def test_uses_run_with_mysql_options
++    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_console.expects(:run_with_pipe).never
++    mysql_console.expects(:run_with_mysql_options).returns(true)
+     mysql_console.run
+   end
+ 
+@@ -52,7 +70,6 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     mysql_console.run
+   end
+ 
+-
+   def test_invoke_exec_with_executable
+     mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{:executable => 'testexec'})
+     mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
+@@ -68,22 +85,6 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     mysql_console.run
+   end
+ 
+-  def test_uses_run_with_pipe
+-    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+-    mysql_console.expects(:piping_to_dev_fd_supported?).returns(true)
+-    mysql_console.expects(:run_with_pipe).returns(true)
+-    mysql_console.expects(:run_with_mysql_options).never
+-    mysql_console.run
+-  end
+-
+-  def test_uses_run_with_mysql_options
+-    mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+-    mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
+-    mysql_console.expects(:run_with_pipe).never
+-    mysql_console.expects(:run_with_mysql_options).returns(true)
+-    mysql_console.run
+-  end
+-
+   # Also tests that password is not added by default
+   def test_run_with_mysql_options
+     mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+@@ -156,6 +157,7 @@ class MysqlConsoleTest < Test::Unit::TestCase
+       assert !mysql_console.piping_to_dev_fd_supported?
+     end
+   end
++
+   def test_piping_to_dev_fd_supported
+     mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'},{})
+     reader = mock('IO.pipe reader')
+diff --git a/railties/test/dbconsole/postgresql_console_test.rb b/railties/test/dbconsole/postgresql_console_test.rb
+index ebd4a11..6b7630c 100644
+--- a/railties/test/dbconsole/postgresql_console_test.rb
++++ b/railties/test/dbconsole/postgresql_console_test.rb
+@@ -4,13 +4,12 @@ require 'postgresql_console'
+ 
+ 
+ class PostgresqlConsoleTest < Test::Unit::TestCase
+-
+   def setup
+     ENV.delete 'PGUSER'     # = @db_config['username'] if @db_config["username"]
+     ENV.delete 'PGHOST'     # = @db_config['host'] if @db_config["host"]
+     ENV.delete 'PGPORT'     # = @db_config['port'].to_s if @db_config["port"]
+     ENV.delete 'PGPASSWORD' # = @db_config['password'].to_s if @db_config["password"] && @options[:password]
+-end
++  end
+ 
+   def test_invoke_exec_with_psql_plus_database
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {})
+@@ -51,7 +50,6 @@ end
+   def test_invoke_exec_with_given_executable
+     postgresql_console = Dbconsole::PostgresqlConsole.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
+     
+-    postgresql_console.expects(:find_cmd).with('psql').returns('testexecutable')
+     postgresql_console.expects(:exec).with('testexecutable', 'testdb')
+     postgresql_console.run
+   end
+diff --git a/railties/test/dbconsole/sqlite3_console_test.rb b/railties/test/dbconsole/sqlite3_console_test.rb
+index f96357f..643d786 100644
+--- a/railties/test/dbconsole/sqlite3_console_test.rb
++++ b/railties/test/dbconsole/sqlite3_console_test.rb
+@@ -5,8 +5,9 @@ require 'sqlite3_console'
+ 
+ class Sqlite3ConsoleTest < Test::Unit::TestCase
+ 
+-  def test_invoke_exec_with_psql_plus_database
++  def test_invoke_exec_with_sqlite3_plus_database
+     sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {})
++    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('sqlite3')
+     sqlite3_console.expects(:exec).with('sqlite3', 'testdb')
+     sqlite3_console.run
+   end
+@@ -14,7 +15,6 @@ class Sqlite3ConsoleTest < Test::Unit::TestCase
+   def test_invoke_exec_with_given_executable
+     sqlite3_console = Dbconsole::Sqlite3Console.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
+     
+-    sqlite3_console.expects(:find_cmd).with('sqlite3').returns('testexecutable')
+     sqlite3_console.expects(:exec).with('testexecutable', 'testdb')
+     sqlite3_console.run
+   end
+diff --git a/railties/test/dbconsole/sqlite_console_test.rb b/railties/test/dbconsole/sqlite_console_test.rb
+index 397fd80..d1231cb 100644
+--- a/railties/test/dbconsole/sqlite_console_test.rb
++++ b/railties/test/dbconsole/sqlite_console_test.rb
+@@ -5,16 +5,16 @@ require 'sqlite_console'
+ 
+ class SqliteConsoleTest < Test::Unit::TestCase
+ 
+-  def test_invoke_exec_with_psql_plus_database
+-    sqlite_console = Dbconsole::SqliteConsole.new({'database'=>'testdb'}, {})
++  def test_invoke_exec_with_sqlite_plus_database
++    sqlite_console = Dbconsole::SqliteConsole.new({'database'=>'testdb', 'pool'=>5,'timeout'=>'42'}, {})
++    sqlite_console.expects(:find_cmd).with('sqlite').returns('sqlite')
+     sqlite_console.expects(:exec).with('sqlite', 'testdb')
+     sqlite_console.run
+   end
+ 
+   def test_invoke_exec_with_given_executable
+-    sqlite_console = Dbconsole::SqliteConsole.new({'database'=>'testdb'}, {:executable => 'testexecutable'})
++    sqlite_console = Dbconsole::SqliteConsole.new({'database'=>'testdb', 'pool'=>5,'timeout'=>'42'}, {:executable => 'testexecutable'})
+     
+-    sqlite_console.expects(:find_cmd).with('sqlite').returns('testexecutable')
+     sqlite_console.expects(:exec).with('testexecutable', 'testdb')
+     sqlite_console.run
+   end
+-- 
+1.5.4.3
+
+
+From 7eb6dd83bf3b7674642e97c74275be25d4bd73c2 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 20:34:26 -0700
+Subject: [PATCH] mysql handles numeric passwords: adding test
+
+---
+ railties/test/dbconsole/mysql_console_test.rb |   13 +++++++++++++
+ 1 files changed, 13 insertions(+), 0 deletions(-)
+
+diff --git a/railties/test/dbconsole/mysql_console_test.rb b/railties/test/dbconsole/mysql_console_test.rb
+index c47356c..ab8f253 100644
+--- a/railties/test/dbconsole/mysql_console_test.rb
++++ b/railties/test/dbconsole/mysql_console_test.rb
+@@ -119,6 +119,19 @@ class MysqlConsoleTest < Test::Unit::TestCase
+     mysql_console.run
+   end
+ 
++  def test_run_with_mysql_options_handles_numeric_password
++    mysql_console = Dbconsole::MysqlConsole.new({"socket"=>"mysqld.sock",
++                                                "username"=>"testuser",
++                                                "adapter"=>"mysql",
++                                                "host"=>"test-host",
++                                                "password"=>12345,
++                                                "database"=>"test-db"}, {:password => true})
++    mysql_console.expects(:piping_to_dev_fd_supported?).returns(false)
++    mysql_console.expects(:find_cmd).with('mysql', 'mysql5').returns('test-exec')
++    mysql_console.expects(:exec).with('test-exec', '--socket=mysqld.sock', '--user=testuser', '--host=test-host', '--password=12345', 'test-db')
++    mysql_console.run
++  end
++
+   def test_abort_if_fileno_is_not_a_fixnum
+     ['', nil, Object.new, Fixnum].each do |bad_fileno|
+       mysql_console = Dbconsole::MysqlConsole.new({'database' => 'required'}, {})
+-- 
+1.5.4.3
+
+
+From c2bc1bfdfb17aa62c64d532369c727d807fa6440 Mon Sep 17 00:00:00 2001
+From: Stephan Wehner <stephanwehner@gmail.com>
+Date: Sat, 23 May 2009 21:02:04 -0700
+Subject: [PATCH] Making postgresql console more verbose/adding '-char
+
+---
+ .../lib/commands/dbconsole/postgresql_console.rb   |    6 +++++-
+ 1 files changed, 5 insertions(+), 1 deletions(-)
+
+diff --git a/railties/lib/commands/dbconsole/postgresql_console.rb b/railties/lib/commands/dbconsole/postgresql_console.rb
+index 0ac8b68..b3e7eba 100644
+--- a/railties/lib/commands/dbconsole/postgresql_console.rb
++++ b/railties/lib/commands/dbconsole/postgresql_console.rb
+@@ -10,7 +10,11 @@ module Dbconsole
+       ENV['PGPORT']     = @db_config['port'].to_s if @db_config["port"]
+       ENV['PGPASSWORD'] = @db_config['password'].to_s if @db_config["password"] && @options[:password]
+ 
+-      verbose { "Exec'ing command '#{find_cmd('psql')} #{@db_config['database']}" }
++      verbose do %w{ PGUSER PGHOST PGPORT PGPASSWORD}.collect { |key|
++                       "Set ENV['#{key}']='#{ENV[key]}'" unless ENV[key].nil?
++                 }.join("\n")
++      end
++      verbose { "Exec'ing command '#{find_cmd('psql')} #{@db_config['database']}'" }
+       exec find_cmd('psql'), @db_config['database']
+     end
+   end
+-- 
+1.5.4.3
+

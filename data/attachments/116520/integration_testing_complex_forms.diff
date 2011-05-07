@@ -1,0 +1,189 @@
+From 18f4214ec53ed91b6f1b5b89ebb36737d93ebc80 Mon Sep 17 00:00:00 2001
+From: Jarl Friis <jarl@hermes.(none)>
+Date: Wed, 29 Apr 2009 09:11:35 +0200
+Subject: [PATCH] I added support for testing complex forms in integration test
+
+---
+ actionpack/lib/action_dispatch/test/mock.rb        |   49 ++++++++++++++------
+ actionpack/test/dispatch/request/mock_request.rb   |   38 +++++++++++++++
+ .../request/multipart_params_parsing_test.rb       |   15 ++++++
+ .../test/fixtures/multipart/mock_complex_form      |    7 +++
+ 4 files changed, 94 insertions(+), 15 deletions(-)
+ create mode 100644 actionpack/test/dispatch/request/mock_request.rb
+ create mode 100644 actionpack/test/fixtures/multipart/mock_complex_form
+
+diff --git a/actionpack/lib/action_dispatch/test/mock.rb b/actionpack/lib/action_dispatch/test/mock.rb
+index 4042f9f..4b02a51 100644
+--- a/actionpack/lib/action_dispatch/test/mock.rb
++++ b/actionpack/lib/action_dispatch/test/mock.rb
+@@ -1,3 +1,5 @@
++require 'extensions/enumerable'
++
+ module ActionDispatch
+   module Test
+     class MockRequest < Rack::MockRequest
+@@ -19,8 +21,7 @@ module ActionDispatch
+           if method == "POST" && !opts.has_key?(:input)
+             opts["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+ 
+-            multipart = opts[:params].respond_to?(:any?) && opts[:params].any? { |k, v| UploadedFile === v }
+-            if multipart
++            if multipart_needed?(opts[:params])
+               opts[:input] = multipart_body(opts.delete(:params))
+               opts["CONTENT_LENGTH"] ||= opts[:input].length.to_s
+               opts["CONTENT_TYPE"] = "multipart/form-data; boundary=#{MULTIPART_BOUNDARY}"
+@@ -49,6 +50,23 @@ module ActionDispatch
+           ::Rack::MockRequest.env_for(uri.to_s, opts)
+         end
+ 
++        def multipart_needed?(params)
++          case params
++          when Array
++            params.any? do |v|
++              multipart_needed?(v)
++            end
++          when Hash
++            params.any? do |k, v|
++              multipart_needed?(v)
++            end  
++          when UploadedFile
++            true
++          else
++            false
++          end
++        end
++        
+         private
+           def requestify(value, prefix = nil)
+             case value
+@@ -65,22 +83,23 @@ module ActionDispatch
+             end
+           end
+ 
+-          def multipart_requestify(params, first=true)
+-            p = Hash.new
+-
+-            params.each do |key, value|
+-              k = first ? key.to_s : "[#{key}]"
+-
+-              if Hash === value
+-                multipart_requestify(value, false).each do |subkey, subvalue|
+-                  p[k + subkey] = subvalue
+-                end
++          def multipart_requestify(value, prefix = nil)
++            case value
++            when Array
++              value.map_with_index do |v, k|
++                multipart_requestify(v, prefix ? "#{prefix}[#{::Rack::Utils.escape(k.to_s)}]" : ::Rack::Utils.escape(k.to_s))
++              end.inject(Hash.new, :merge)
++            when Hash
++              value.map do |k, v|
++                multipart_requestify(v, prefix ? "#{prefix}[#{::Rack::Utils.escape(k)}]" : ::Rack::Utils.escape(k))
++              end.inject(Hash.new, :merge)
++            else
++              if prefix
++                { "#{prefix}" => value }
+               else
+-                p[k] = value
++                raise "Value without prefix"
+               end
+             end
+-
+-            return p
+           end
+ 
+           def multipart_body(params)
+diff --git a/actionpack/test/dispatch/request/mock_request.rb b/actionpack/test/dispatch/request/mock_request.rb
+new file mode 100644
+index 0000000..454c4fe
+--- /dev/null
++++ b/actionpack/test/dispatch/request/mock_request.rb
+@@ -0,0 +1,38 @@
++require 'abstract_unit'
++
++class MultipartParamsParsingTest < ActionController::IntegrationTest
++  FIXTURE_PATH = File.dirname(__FILE__) + '/../../fixtures/multipart'
++  test "first-level file multipart needed" do
++    params = {
++      :level0 => fixture_file_upload(FIXTURE_PATH + "/hello.txt", "text/plain")
++    }
++    assert ActionDispatch::Test::MockRequest.multipart_needed?(params)
++  end
++
++  test "complex multipart needed" do
++    params = {
++      :level0 => {
++        :level1 => [ { :file_data => fixture_file_upload(FIXTURE_PATH + "/hello.txt", "text/plain") },
++                     { :file_data => fixture_file_upload(FIXTURE_PATH + "/hello.txt", "text/plain")}
++                   ]
++      }
++    }
++    assert ActionDispatch::Test::MockRequest.multipart_needed?(params)
++  end
++
++  test "mocks complex post request" do
++    opts = Hash.new
++    opts[:method] = "POST"
++    opts[:params] = {
++      :level0 => {
++        :level1 => [ { :file_data => fixture_file_upload(FIXTURE_PATH + "/hello.txt", "text/plain") }
++                   ]
++      }
++    }
++    env = ActionDispatch::Test::MockRequest.env_for("", opts)
++    env["rack.input"].rewind
++    File.open(File.join(FIXTURE_PATH, "mock_complex_form"), 'rb') do |file|
++      assert_equal file.read, env["rack.input"].read
++    end
++  end
++end
+diff --git a/actionpack/test/dispatch/request/multipart_params_parsing_test.rb b/actionpack/test/dispatch/request/multipart_params_parsing_test.rb
+index 9e008a9..fef9223 100644
+--- a/actionpack/test/dispatch/request/multipart_params_parsing_test.rb
++++ b/actionpack/test/dispatch/request/multipart_params_parsing_test.rb
+@@ -14,6 +14,10 @@ class MultipartParamsParsingTest < ActionController::IntegrationTest
+     def read
+       render :text => "File: #{params[:uploaded_data].read}"
+     end
++
++    def read_complex
++      render :text => "File: #{params[:level0][:level1]['0'][:file_data].read}"
++    end
+   end
+ 
+   FIXTURE_PATH = File.dirname(__FILE__) + '/../../fixtures/multipart'
+@@ -132,6 +136,17 @@ class MultipartParamsParsingTest < ActionController::IntegrationTest
+     end
+   end
+ 
++  test "uploads and reads file in complex parameter" do
++    with_test_routing do
++      post '/read_complex',
++      :level0 => {
++        :level1 => [ { :file_data => fixture_file_upload(FIXTURE_PATH + "/hello.txt", "text/plain") }
++                   ]
++      }
++      assert_equal "File: Hello", response.body
++    end
++  end
++
+   private
+     def fixture(name)
+       File.open(File.join(FIXTURE_PATH, name), 'rb') do |file|
+diff --git a/actionpack/test/fixtures/multipart/mock_complex_form b/actionpack/test/fixtures/multipart/mock_complex_form
+new file mode 100644
+index 0000000..750728d
+--- /dev/null
++++ b/actionpack/test/fixtures/multipart/mock_complex_form
+@@ -0,0 +1,7 @@
++------------XnJLe9ZIbbGUYtzPQJ16u1
++Content-Disposition: form-data; name="level0[level1][0][file_data]"; filename="hello.txt"
++Content-Type: text/plain
++Content-Length: 5
++
++Hello
++------------XnJLe9ZIbbGUYtzPQJ16u1--
+\ No newline at end of file
+-- 
+1.5.6.3
+

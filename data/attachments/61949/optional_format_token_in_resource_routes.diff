@@ -1,0 +1,138 @@
+From 0cfac893065560720b72a6056cd8a39724dfb2b9 Mon Sep 17 00:00:00 2001
+From: Aaron Batalion <aaron@hungrymachine.com>
+Date: Wed, 12 Nov 2008 21:04:00 -0500
+Subject: [PATCH] Add optional format token to resource routes, reducing the # of routes required by 50%, saving massive amounts of memory on large systems.  Fixed side effect bug in sorting of routes during url writing
+
+---
+ actionpack/lib/action_controller/resources.rb      |    4 +--
+ .../lib/action_controller/routing/builder.rb       |    2 +
+ .../lib/action_controller/routing/route_set.rb     |    4 ++-
+ .../lib/action_controller/routing/segments.rb      |   30 ++++++++++++++++++++
+ actionpack/test/controller/url_rewriter_test.rb    |   19 ++++++++++++
+ 5 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/resources.rb b/actionpack/lib/action_controller/resources.rb
+index de529e2..d1fec20 100644
+--- a/actionpack/lib/action_controller/resources.rb
++++ b/actionpack/lib/action_controller/resources.rb
+@@ -643,10 +643,8 @@ module ActionController
+           formatted_route_path = "#{route_path}.:format"
+ 
+           if route_name && @set.named_routes[route_name.to_sym].nil?
+-            map.named_route(route_name, route_path, action_options)
+-            map.named_route("formatted_#{route_name}", formatted_route_path, action_options)
++            map.named_route(route_name, formatted_route_path, action_options)
+           else
+-            map.connect(route_path, action_options)
+             map.connect(formatted_route_path, action_options)
+           end
+         end
+diff --git a/actionpack/lib/action_controller/routing/builder.rb b/actionpack/lib/action_controller/routing/builder.rb
+index d4e501e..44d7594 100644
+--- a/actionpack/lib/action_controller/routing/builder.rb
++++ b/actionpack/lib/action_controller/routing/builder.rb
+@@ -34,6 +34,8 @@ module ActionController
+       def segment_for(string)
+         segment =
+           case string
++            when  /\A\.(:format)?\// 
++              OptionalFormatSegment.new
+             when /\A:(\w+)/
+               key = $1.to_sym
+               key == :controller ? ControllerSegment.new(key) : DynamicSegment.new(key)
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index ff44849..2bcd3c0 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -183,6 +183,8 @@ module ActionController
+ 
+                 url_for(#{hash_access_method}(opts))
+               end
++              #Add an alias to the formatted_* URL, which is no longer created a separate route.
++              alias_method :formatted_#{selector}, :#{selector}              
+               protected :#{selector}
+             end_eval
+             helpers << selector
+@@ -358,7 +360,7 @@ module ActionController
+           end
+ 
+           # don't use the recalled keys when determining which routes to check
+-          routes = routes_by_controller[controller][action][options.keys.sort_by { |x| x.object_id }]
++          routes = routes_by_controller[controller][action][options.reject {|k,v| !v}.keys.sort_by { |x| x.object_id }]
+ 
+           routes.each do |route|
+             results = route.__send__(method, options, merged, expire_on)
+diff --git a/actionpack/lib/action_controller/routing/segments.rb b/actionpack/lib/action_controller/routing/segments.rb
+index f6b03ed..02cfe0b 100644
+--- a/actionpack/lib/action_controller/routing/segments.rb
++++ b/actionpack/lib/action_controller/routing/segments.rb
+@@ -238,6 +238,36 @@ module ActionController
+       end
+     end
+ 
++    # The OptionalFormatSegment allows for any resource route to have an optional
++    # :format, which decreases the amount of routes created by 50%.
++    class OptionalFormatSegment < DynamicSegment
++
++      def initialize(key = nil, options = {})
++        super(:format, {:optional => true}.merge(options))            
++      end
++
++      def interpolation_chunk
++        "." + super
++      end
++
++      def regexp_chunk
++        '(\.[^/?\.]+)'
++      end
++
++      def to_s
++        '(.:format)?'
++      end
++
++      #the value should not include the period (.)
++      def match_extraction(next_capture)
++        %[
++          if (m = match[#{next_capture}])
++            params[:#{key}] = URI.unescape(m.from(1))
++          end
++        ]
++      end
++    end
++
+     class ControllerSegment < DynamicSegment #:nodoc:
+       def regexp_chunk
+         possible_names = Routing.possible_controllers.collect { |name| Regexp.escape name }
+diff --git a/actionpack/test/controller/url_rewriter_test.rb b/actionpack/test/controller/url_rewriter_test.rb
+index 64e9a08..216be0e 100644
+--- a/actionpack/test/controller/url_rewriter_test.rb
++++ b/actionpack/test/controller/url_rewriter_test.rb
+@@ -216,6 +216,25 @@ class UrlWriterTests < Test::Unit::TestCase
+     ActionController::Routing::Routes.load!
+   end
+ 
++  def test_named_routes_with_nil_keys
++    add_host!
++    ActionController::Routing::Routes.draw do |map|
++      map.main '', :controller => 'posts'
++      map.resources :posts
++      map.connect ':controller/:action/:id'
++    end
++    # We need to create a new class in order to install the new named route.
++    kls = Class.new { include ActionController::UrlWriter }
++    controller = kls.new
++    params = {:action => :index, :controller => :posts, :format => :xml}
++    assert_equal("http://www.basecamphq.com/posts.xml", controller.send(:url_for, params))    
++    params[:format] = nil
++    assert_equal("http://www.basecamphq.com/", controller.send(:url_for, params))    
++  ensure
++    ActionController::Routing::Routes.load!
++  end
++
++
+   def test_relative_url_root_is_respected_for_named_routes
+     orig_relative_url_root = ActionController::Base.relative_url_root
+     ActionController::Base.relative_url_root = '/subdir'
+-- 
+1.5.3.2
+

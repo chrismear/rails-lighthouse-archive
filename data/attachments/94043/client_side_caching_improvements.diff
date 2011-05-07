@@ -1,0 +1,222 @@
+From a1dce5ef113162352b589ff43903088c4185952a Mon Sep 17 00:00:00 2001
+From: Gregg Pollack <Gregg@RailsEnvy.com>
+Date: Fri, 27 Feb 2009 13:24:52 -0500
+Subject: [PATCH 1/2] Added ability to pass in :public => true to fresh_when and stale?
+
+---
+ actionpack/lib/action_controller/base.rb  |   23 +++++++++++++++++++++--
+ actionpack/test/controller/render_test.rb |   23 +++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index 5df94b2..6c00d19 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -1133,6 +1133,11 @@ module ActionController #:nodoc:
+       # request is considered stale and should be generated from scratch. Otherwise,
+       # it's fresh and we don't need to generate anything and a reply of "304 Not Modified" is sent.
+       #
++      # Parameters:
++      # * <tt>:etag</tt>
++      # * <tt>:last_modified</tt> 
++      # * <tt>:public</tt> By default the Cache-Control header is private, set this to true if you want your application to be cachable by other devices (proxy caches).
++      #
+       # Example:
+       #
+       #   def show
+@@ -1153,20 +1158,34 @@ module ActionController #:nodoc:
+       # Sets the etag, last_modified, or both on the response and renders a
+       # "304 Not Modified" response if the request is already fresh.
+       #
++      # Parameters:
++      # * <tt>:etag</tt>
++      # * <tt>:last_modified</tt> 
++      # * <tt>:public</tt> By default the Cache-Control header is private, set this to true if you want your application to be cachable by other devices (proxy caches).
++      #
+       # Example:
+       #
+       #   def show
+       #     @article = Article.find(params[:id])
+-      #     fresh_when(:etag => @article, :last_modified => @article.created_at.utc)
++      #     fresh_when(:etag => @article, :last_modified => @article.created_at.utc, :public => true)
+       #   end
+       #
+       # This will render the show template if the request isn't sending a matching etag or
+       # If-Modified-Since header and just a "304 Not Modified" response if there's a match.
++      #
+       def fresh_when(options)
+-        options.assert_valid_keys(:etag, :last_modified)
++        options.assert_valid_keys(:etag, :last_modified, :public)
+ 
+         response.etag          = options[:etag]          if options[:etag]
+         response.last_modified = options[:last_modified] if options[:last_modified]
++        
++        if options[:public] 
++          cache_control = response.headers["Cache-Control"].split(",").map {|k| k.strip }
++          cache_control.delete("private")
++          cache_control.delete("no-cache")
++          cache_control << "public"
++          response.headers["Cache-Control"] = cache_control.join(', ')
++        end
+ 
+         if request.fresh?(response)
+           head :not_modified
+diff --git a/actionpack/test/controller/render_test.rb b/actionpack/test/controller/render_test.rb
+index 70e5e62..1123fe0 100644
+--- a/actionpack/test/controller/render_test.rb
++++ b/actionpack/test/controller/render_test.rb
+@@ -36,6 +36,19 @@ class TestController < ActionController::Base
+       render :action => 'hello_world'
+     end
+   end
++  
++  def conditional_hello_with_public_header
++    if stale?(:last_modified => Time.now.utc.beginning_of_day, :etag => [:foo, 123], :public => true)
++      render :action => 'hello_world'
++    end
++  end
++  
++  def conditional_hello_with_public_header_and_expires_at
++    expires_in 1.minute
++    if stale?(:last_modified => Time.now.utc.beginning_of_day, :etag => [:foo, 123], :public => true)
++      render :action => 'hello_world'
++    end
++  end
+ 
+   def conditional_hello_with_bangs
+     render :action => 'hello_world'
+@@ -1553,6 +1566,16 @@ class EtagRenderTest < ActionController::TestCase
+     get :conditional_hello_with_bangs
+     assert_response :not_modified
+   end
++  
++  def test_etag_with_public_true_should_set_header
++    get :conditional_hello_with_public_header
++    assert_equal "public", @response.headers['Cache-Control']
++  end
++  
++  def test_etag_with_public_true_should_set_header_and_retain_other_headers
++    get :conditional_hello_with_public_header_and_expires_at
++    assert_equal "max-age=60, public", @response.headers['Cache-Control']
++  end
+ 
+   protected
+     def etag_for(text)
+-- 
+1.6.1.3
+
+
+From a56909c62435c1411104c5c4939f87eaf3d1a38d Mon Sep 17 00:00:00 2001
+From: Gregg Pollack <Gregg@RailsEnvy.com>
+Date: Fri, 27 Feb 2009 14:06:16 -0500
+Subject: [PATCH 2/2] Improved expires_at method and added tests
+
+---
+ actionpack/lib/action_controller/base.rb  |   19 ++++++++---
+ actionpack/test/controller/render_test.rb |   49 +++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index 6c00d19..564fdf6 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -1197,15 +1197,24 @@ module ActionController #:nodoc:
+       #
+       # Examples:
+       #   expires_in 20.minutes
+-      #   expires_in 3.hours, :private => false
+-      #   expires in 3.hours, 'max-stale' => 5.hours, :private => nil, :public => true
++      #   expires_in 3.hours, :public => true
++      #   expires in 3.hours, 'max-stale' => 5.hours, :public => true
+       #
+       # This method will overwrite an existing Cache-Control header.
+       # See http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html for more possibilities.
+       def expires_in(seconds, options = {}) #:doc:
+-        cache_options = { 'max-age' => seconds, 'private' => true }.symbolize_keys.merge!(options.symbolize_keys)
+-        cache_options.delete_if { |k,v| v.nil? or v == false }
+-        cache_control = cache_options.map{ |k,v| v == true ? k.to_s : "#{k.to_s}=#{v.to_s}"}
++        cache_control = response.headers["Cache-Control"].split(",").map {|k| k.strip }
++
++        cache_control << "max-age=#{seconds}"
++        if options[:public]
++          cache_control.delete("private")
++          cache_control.delete("no-cache")
++          cache_control << "public"
++        end
++        
++        # This allows for additional headers to be passed through like 'max-stale' => 5.hours
++        cache_control += options.symbolize_keys.reject{|k,v| k == :public || k == :private }.map{ |k,v| v == true ? k.to_s : "#{k.to_s}=#{v.to_s}"}
++        
+         response.headers["Cache-Control"] = cache_control.join(', ')
+       end
+ 
+diff --git a/actionpack/test/controller/render_test.rb b/actionpack/test/controller/render_test.rb
+index 1123fe0..02ae8ac 100644
+--- a/actionpack/test/controller/render_test.rb
++++ b/actionpack/test/controller/render_test.rb
+@@ -49,6 +49,26 @@ class TestController < ActionController::Base
+       render :action => 'hello_world'
+     end
+   end
++  
++  def conditional_hello_with_expires_in
++    expires_in 1.minute
++    render :action => 'hello_world'
++  end
++  
++  def conditional_hello_with_expires_in_with_public
++    expires_in 1.minute, :public => true
++    render :action => 'hello_world'
++  end
++  
++  def conditional_hello_with_expires_in_with_public_with_more_keys
++    expires_in 1.minute, :public => true, 'max-stale' => 5.hours
++    render :action => 'hello_world'
++  end
++  
++  def conditional_hello_with_expires_in_with_public_with_more_keys_old_syntax
++    expires_in 1.minute, :public => true, :private => nil, 'max-stale' => 5.hours
++    render :action => 'hello_world'
++  end
+ 
+   def conditional_hello_with_bangs
+     render :action => 'hello_world'
+@@ -1477,6 +1497,35 @@ class RenderTest < ActionController::TestCase
+   end
+ end
+ 
++class ExpiresInRenderTest < ActionController::TestCase
++  tests TestController
++
++  def setup
++    @request.host = "www.nextangle.com"
++  end
++  
++  def test_expires_in_header
++    get :conditional_hello_with_expires_in
++    assert_equal "max-age=60, private", @response.headers["Cache-Control"]
++  end
++  
++  def test_expires_in_header
++    get :conditional_hello_with_expires_in_with_public
++    assert_equal "max-age=60, public", @response.headers["Cache-Control"]
++  end
++  
++  def test_expires_in_header_with_additional_headers
++    get :conditional_hello_with_expires_in_with_public_with_more_keys
++    assert_equal "max-age=60, public, max-stale=18000", @response.headers["Cache-Control"]
++  end
++  
++  def test_expires_in_old_syntax
++    get :conditional_hello_with_expires_in_with_public_with_more_keys_old_syntax
++    assert_equal "max-age=60, public, max-stale=18000", @response.headers["Cache-Control"]
++  end
++end
++
++
+ class EtagRenderTest < ActionController::TestCase
+   tests TestController
+ 
+-- 
+1.6.1.3
+

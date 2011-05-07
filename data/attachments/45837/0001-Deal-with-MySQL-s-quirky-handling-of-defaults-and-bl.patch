@@ -1,0 +1,132 @@
+From 64724dc36957f928d1d72e74364f83ad762859b7 Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Sun, 14 Sep 2008 12:06:10 +0100
+Subject: [PATCH] Deal with MySQL's quirky handling of defaults and blob/text columns
+
+---
+ .../abstract/schema_definitions.rb                 |    4 ++
+ .../connection_adapters/mysql_adapter.rb           |    7 ++++-
+ activerecord/lib/active_record/schema_dumper.rb    |    2 +-
+ activerecord/test/cases/defaults_test.rb           |   31 ++++++++++++++++++++
+ activerecord/test/cases/migration_test.rb          |   10 ++++--
+ 5 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index 22304ed..8cde347 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -40,6 +40,10 @@ module ActiveRecord
+         type == :integer || type == :float || type == :decimal
+       end
+ 
++      def has_default?
++        !default.nil?
++      end
++      
+       # Returns the Ruby class that corresponds to the abstract data type.
+       def klass
+         case type
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index c2a0fb7..a759864 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -80,7 +80,7 @@ module ActiveRecord
+       def extract_default(default)
+         if type == :binary || type == :text
+           if default.blank?
+-            nil
++            return null ? nil : ''
+           else
+             raise ArgumentError, "#{type} columns cannot have a default value: #{default.inspect}"
+           end
+@@ -90,6 +90,11 @@ module ActiveRecord
+           super
+         end
+       end
++      
++      def has_default?
++        return false if type == :binary || type == :text #mysql forbids defaults on blob and text columns 
++        super
++      end
+ 
+       private
+         def simplified_type(field_type)
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index b90ed88..4f96e22 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -102,7 +102,7 @@ HEADER
+             spec[:precision] = column.precision.inspect if !column.precision.nil?
+             spec[:scale]     = column.scale.inspect if !column.scale.nil?
+             spec[:null]      = 'false' if !column.null
+-            spec[:default]   = default_string(column.default) if !column.default.nil?
++            spec[:default]   = default_string(column.default) if column.has_default?
+             (spec.keys - [:name, :type]).each{ |k| spec[k].insert(0, "#{k.inspect} => ")}
+             spec
+           end.compact
+diff --git a/activerecord/test/cases/defaults_test.rb b/activerecord/test/cases/defaults_test.rb
+index 3473b84..5da9bae 100644
+--- a/activerecord/test/cases/defaults_test.rb
++++ b/activerecord/test/cases/defaults_test.rb
+@@ -19,6 +19,37 @@ class DefaultTest < ActiveRecord::TestCase
+   end
+ 
+   if current_adapter?(:MysqlAdapter)
++
++    #MySQL 5 and higher is quirky with not null text/blob columns.
++    #With MySQL Text/blob columns cannot have defaults. If the column is not null MySQL will report that the column has a null default
++    #but it behaves as though the column had a default of ''
++    def test_mysql_text_not_null_defaults
++      klass = Class.new(ActiveRecord::Base)
++      klass.table_name = 'test_mysql_text_not_null_defaults'
++      klass.connection.create_table klass.table_name do |t|
++        t.column :non_null_text, :text, :null => false
++        t.column :non_null_blob, :blob, :null => false
++        t.column :null_text, :text, :null => true
++        t.column :null_blob, :blob, :null => true
++      end
++      assert_equal '', klass.columns_hash['non_null_blob'].default
++      assert_equal '', klass.columns_hash['non_null_text'].default
++
++      assert_equal nil, klass.columns_hash['null_blob'].default
++      assert_equal nil, klass.columns_hash['null_text'].default
++
++      assert_nothing_raised do
++        instance = klass.create!
++        assert_equal '', instance.non_null_text 
++        assert_equal '', instance.non_null_blob
++        assert_nil instance.null_text
++        assert_nil instance.null_blob
++      end
++    ensure
++      klass.connection.drop_table(klass.table_name) rescue nil
++    end
++    
++
+     # MySQL uses an implicit default 0 rather than NULL unless in strict mode.
+     # We use an implicit NULL so schema.rb is compatible with other databases.
+     def test_mysql_integer_not_null_defaults
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index c1a8da2..b2f5858 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -1132,9 +1132,13 @@ if ActiveRecord::Base.connection.supports_migrations?
+ 
+       columns = Person.connection.columns(:binary_testings)
+       data_column = columns.detect { |c| c.name == "data" }
+-
+-      assert_nil data_column.default
+-
++      
++      if current_adapter?(:MysqlAdapter)
++        assert_equal '', data_column.default
++      else
++        assert_nil data_column.default
++      end
++      
+       Person.connection.drop_table :binary_testings rescue nil
+     end
+ 
+-- 
+1.6.0.1
+

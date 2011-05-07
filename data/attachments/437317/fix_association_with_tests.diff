@@ -1,0 +1,251 @@
+From 28797c36d44f4a643d8560f90a4d62cd3d27ba77 Mon Sep 17 00:00:00 2001
+From: Carlos Antonio da Silva <carlosantoniodasilva@gmail.com>
+Date: Sun, 7 Mar 2010 21:53:21 -0300
+Subject: [PATCH] Fix associations to call :destroy or :delete based on the right :dependent option
+
+---
+ activerecord/lib/active_record/associations.rb     |    6 ++--
+ .../associations/belongs_to_associations_test.rb   |   32 ++++++++++++++++----
+ .../associations/has_many_associations_test.rb     |   20 +------------
+ .../associations/has_one_associations_test.rb      |    4 +-
+ activerecord/test/cases/calculations_test.rb       |    4 +-
+ activerecord/test/models/author.rb                 |    9 ++----
+ activerecord/test/models/company.rb                |    4 +-
+ 7 files changed, 39 insertions(+), 40 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index e1a9c54..b69577f 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1544,12 +1544,12 @@ module ActiveRecord
+               when :destroy, :delete
+                 define_method(method_name) do
+                   association = send(reflection.name)
+-                  association.destroy unless association.nil?
++                  association.send(name) if association
+                 end
+               when :nullify
+                 define_method(method_name) do
+                   association = send(reflection.name)
+-                  association.update_attribute(reflection.primary_key_name, nil) unless association.nil?
++                  association.update_attribute(reflection.primary_key_name, nil) if association
+                 end
+               else
+                 raise ArgumentError, "The :dependent option expects either :destroy, :delete or :nullify (#{reflection.options[:dependent].inspect})"
+@@ -1570,7 +1570,7 @@ module ActiveRecord
+             method_name = :"belongs_to_dependent_#{name}_for_#{reflection.name}"
+             define_method(method_name) do
+               association = send(reflection.name)
+-              association.destroy unless association.nil?
++              association.send(name) if association
+             end
+             after_destroy method_name
+           end
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 2a77eed..41a23d7 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -18,7 +18,8 @@ require 'models/essay'
+ 
+ class BelongsToAssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :companies, :developers, :projects, :topics,
+-           :developers_projects, :computers, :authors, :posts, :tags, :taggings, :comments
++           :developers_projects, :computers, :authors, :author_addresses,
++           :posts, :tags, :taggings, :comments
+ 
+   def test_belongs_to
+     Client.find(3).firm.name
+@@ -346,14 +347,14 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_raise(ActiveRecord::ReadOnlyRecord) { companies(:first_client).readonly_firm.save! }
+     assert companies(:first_client).readonly_firm.readonly?
+   end
+-  
++
+   def test_polymorphic_assignment_foreign_type_field_updating
+     # should update when assigning a saved record
+     sponsor = Sponsor.new
+     member = Member.create
+     sponsor.sponsorable = member
+     assert_equal "Member", sponsor.sponsorable_type
+-    
++
+     # should update when assigning a new record
+     sponsor = Sponsor.new
+     member = Member.new
+@@ -374,15 +375,15 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     essay.writer = writer
+     assert_equal "Author", essay.writer_type
+   end
+-  
++
+   def test_polymorphic_assignment_updates_foreign_id_field_for_new_and_saved_records
+     sponsor = Sponsor.new
+     saved_member = Member.create
+     new_member = Member.new
+-    
++
+     sponsor.sponsorable = saved_member
+     assert_equal saved_member.id, sponsor.sponsorable_id
+-    
++
+     sponsor.sponsorable = new_member
+     assert_equal nil, sponsor.sponsorable_id
+   end
+@@ -424,4 +425,23 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+       Account.find(@account.id, :include => :firm).save!
+     end
+   end
++
++  def test_dependent_delete_and_destroy_with_belongs_to
++    author_address = author_addresses(:david_address)
++    author_address_extra = author_addresses(:david_address_extra)
++    assert_equal [], AuthorAddress.destroyed_author_address_ids
++
++    assert_difference "AuthorAddress.count", -2 do
++      authors(:david).destroy
++    end
++
++    assert_equal [], AuthorAddress.find_all_by_id([author_address.id, author_address_extra.id])
++    assert_equal [author_address.id], AuthorAddress.destroyed_author_address_ids
++  end
++
++  def test_invalid_belongs_to_dependent_option_raises_exception
++    assert_raise ArgumentError do
++      Author.belongs_to :special_author_address, :dependent => :nullify
++    end
++  end
+ end
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index ce7eedb..54624e7 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -14,7 +14,7 @@ require 'models/tagging'
+ 
+ class HasManyAssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :categories, :companies, :developers, :projects,
+-           :developers_projects, :topics, :authors, :comments, :author_addresses,
++           :developers_projects, :topics, :authors, :comments,
+            :people, :posts, :readers, :taggings
+ 
+   def setup
+@@ -684,24 +684,6 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal  'Microsoft', another_ms_client.name
+   end
+ 
+-  def test_dependent_delete_and_destroy_with_belongs_to
+-    author_address = author_addresses(:david_address)
+-    assert_equal [], AuthorAddress.destroyed_author_address_ids[authors(:david).id]
+-
+-    assert_difference "AuthorAddress.count", -2 do
+-      authors(:david).destroy
+-    end
+-
+-    assert_equal nil, AuthorAddress.find_by_id(authors(:david).author_address_id)
+-    assert_equal nil, AuthorAddress.find_by_id(authors(:david).author_address_extra_id)
+-  end
+-
+-  def test_invalid_belongs_to_dependent_option_raises_exception
+-    assert_raise ArgumentError do
+-      Author.belongs_to :special_author_address, :dependent => :nullify
+-    end
+-  end
+-
+   def test_clearing_without_initial_access
+     firm = companies(:first_firm)
+ 
+diff --git a/activerecord/test/cases/associations/has_one_associations_test.rb b/activerecord/test/cases/associations/has_one_associations_test.rb
+index d359ad4..d5dbb88 100644
+--- a/activerecord/test/cases/associations/has_one_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_associations_test.rb
+@@ -14,7 +14,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     assert_equal companies(:first_firm).account, Account.find(1)
+     assert_equal Account.find(1).credit_limit, companies(:first_firm).account.credit_limit
+   end
+-  
++
+   def test_has_one_cache_nils
+     firm = companies(:another_firm)
+     assert_queries(1) { assert_nil firm.account }
+@@ -96,7 +96,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     assert_nil Account.find(old_account_id).firm_id
+   end
+ 
+-  def test_association_changecalls_delete
++  def test_association_change_calls_delete
+     companies(:first_firm).deletable_account = Account.new
+     assert_equal [], Account.destroyed_account_ids[companies(:first_firm).id]
+   end
+diff --git a/activerecord/test/cases/calculations_test.rb b/activerecord/test/cases/calculations_test.rb
+index e6d56a7..28a1ae5 100644
+--- a/activerecord/test/cases/calculations_test.rb
++++ b/activerecord/test/cases/calculations_test.rb
+@@ -38,12 +38,12 @@ class CalculationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_should_get_maximum_of_field_with_include
+-    assert_equal 50, Account.maximum(:credit_limit, :include => :firm, :conditions => "companies.name != 'Summit'")
++    assert_equal 55, Account.maximum(:credit_limit, :include => :firm, :conditions => "companies.name != 'Summit'")
+   end
+ 
+   def test_should_get_maximum_of_field_with_scoped_include
+     Account.send :with_scope, :find => { :include => :firm, :conditions => "companies.name != 'Summit'" } do
+-      assert_equal 50, Account.maximum(:credit_limit)
++      assert_equal 55, Account.maximum(:credit_limit)
+     end
+   end
+ 
+diff --git a/activerecord/test/models/author.rb b/activerecord/test/models/author.rb
+index 7cbc6e8..025f620 100644
+--- a/activerecord/test/models/author.rb
++++ b/activerecord/test/models/author.rb
+@@ -35,7 +35,7 @@ class Author < ActiveRecord::Base
+   has_many :ordered_uniq_comments, :through => :posts, :source => :comments, :uniq => true, :order => 'comments.id'
+   has_many :ordered_uniq_comments_desc, :through => :posts, :source => :comments, :uniq => true, :order => 'comments.id DESC'
+   has_many :readonly_comments, :through => :posts, :source => :comments, :readonly => true
+-  
++
+   has_many :special_posts
+   has_many :special_post_comments, :through => :special_posts, :source => :comments
+ 
+@@ -130,14 +130,11 @@ class AuthorAddress < ActiveRecord::Base
+   has_one :author
+ 
+   def self.destroyed_author_address_ids
+-    @destroyed_author_address_ids ||= Hash.new { |h,k| h[k] = [] }
++    @destroyed_author_address_ids ||= []
+   end
+ 
+   before_destroy do |author_address|
+-    if author_address.author
+-      AuthorAddress.destroyed_author_address_ids[author_address.author.id] << author_address.id
+-    end
+-    true
++    AuthorAddress.destroyed_author_address_ids << author_address.id
+   end
+ end
+ 
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index df5fd10..f31d5f8 100644
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -82,7 +82,7 @@ class Firm < Company
+   has_one :account_using_primary_key, :primary_key => "firm_id", :class_name => "Account", :order => "id"
+   has_one :account_using_foreign_and_primary_keys, :foreign_key => "firm_name", :primary_key => "name", :class_name => "Account"
+   has_one :deletable_account, :foreign_key => "firm_id", :class_name => "Account", :dependent => :delete
+-  
++
+   has_one :account_limit_500_with_hash_conditions, :foreign_key => "firm_id", :class_name => "Account", :conditions => { :credit_limit => 500 }
+ 
+   has_one :unautosaved_account, :foreign_key => "firm_id", :class_name => 'Account', :autosave => false
+@@ -155,7 +155,7 @@ class VerySpecialClient < SpecialClient
+ end
+ 
+ class Account < ActiveRecord::Base
+-  belongs_to :firm
++  belongs_to :firm, :class_name => 'Company'
+   belongs_to :unautosaved_firm, :foreign_key => "firm_id", :class_name => "Firm", :autosave => false
+ 
+   def self.destroyed_account_ids
+-- 
+1.6.3.3
+

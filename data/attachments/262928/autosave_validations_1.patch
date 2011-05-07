@@ -1,0 +1,288 @@
+From d8b0df5aee81c85d030302b7d8f842d7fc06ea75 Mon Sep 17 00:00:00 2001
+From: Alexey Kovyrin <alexey@kovyrin.net>
+Date: Mon, 7 Sep 2009 11:42:03 -0400
+Subject: [PATCH 1/4] Define association validation methods only when needed
+
+---
+ .../lib/active_record/autosave_association.rb      |   19 ++++++++++++++-----
+ 1 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index ffa9f29..5b82f49 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -157,9 +157,9 @@ module ActiveRecord
+       # Adds a validate and save callback for the association as specified by
+       # the +reflection+.
+       def add_autosave_association_callbacks(reflection)
+-        save_method = "autosave_associated_records_for_#{reflection.name}"
+-        validation_method = "validate_associated_records_for_#{reflection.name}"
+-        validate validation_method
++        save_method = "autosave_associated_records_for_#{reflection.name}".to_sym
++        validation_method = "validate_associated_records_for_#{reflection.name}".to_sym
++        force_validation = (reflection.options[:validate] == true || reflection.options[:autosave] == true)
+ 
+         case reflection.macro
+         when :has_many, :has_and_belongs_to_many
+@@ -170,7 +170,11 @@ module ActiveRecord
+           after_create save_method
+           after_update save_method
+ 
+-          define_method(validation_method) { validate_collection_association(reflection) }
++          # Define validation methods when needed
++          if force_validation || (reflection.macro == :has_many && reflection.options[:validate] != false)
++            define_method(validation_method) { validate_collection_association(reflection) }
++            validate validation_method
++          end
+         else
+           case reflection.macro
+           when :has_one
+@@ -180,7 +184,12 @@ module ActiveRecord
+             define_method(save_method) { save_belongs_to_association(reflection) }
+             before_save save_method
+           end
+-          define_method(validation_method) { validate_single_association(reflection) }
++
++          # Define validation methods when needed
++          if force_validation
++            define_method(validation_method) { validate_single_association(reflection) }
++            validate validation_method
++          end
+         end
+       end
+     end
+-- 
+1.6.4.2
+
+
+From ca672a0e2faed96a89dab4a62f310751597d36dd Mon Sep 17 00:00:00 2001
+From: Alexey Kovyrin <alexey@kovyrin.net>
+Date: Mon, 7 Sep 2009 12:01:46 -0400
+Subject: [PATCH 2/4] Add :validate options to associations to make old autosave association tests pass
+
+---
+ activerecord/test/models/pirate.rb |    6 +++---
+ activerecord/test/models/ship.rb   |    2 +-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 238917b..23e8e95 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -1,6 +1,6 @@
+ class Pirate < ActiveRecord::Base
+-  belongs_to :parrot
+-  has_and_belongs_to_many :parrots
++  belongs_to :parrot, :validate => true
++  has_and_belongs_to_many :parrots, :validate => true
+   has_and_belongs_to_many :parrots_with_method_callbacks, :class_name => "Parrot",
+     :before_add    => :log_before_add,
+     :after_add     => :log_after_add,
+@@ -16,7 +16,7 @@ class Pirate < ActiveRecord::Base
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
+   # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
+-  has_one :ship
++  has_one :ship, :validate => true
+   has_many :birds
+   has_many :birds_with_method_callbacks, :class_name => "Bird",
+     :before_add    => :log_before_add,
+diff --git a/activerecord/test/models/ship.rb b/activerecord/test/models/ship.rb
+index 06759d6..d0df951 100644
+--- a/activerecord/test/models/ship.rb
++++ b/activerecord/test/models/ship.rb
+@@ -1,7 +1,7 @@
+ class Ship < ActiveRecord::Base
+   self.record_timestamps = false
+ 
+-  belongs_to :pirate
++  belongs_to :pirate, :validate => true
+   has_many :parts, :class_name => 'ShipPart', :autosave => true
+ 
+   accepts_nested_attributes_for :pirate, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+-- 
+1.6.4.2
+
+
+From d2422a9a3431856a908783b964d24e1f01c5182d Mon Sep 17 00:00:00 2001
+From: Alexey Kovyrin <alexey@kovyrin.net>
+Date: Mon, 7 Sep 2009 14:59:31 -0400
+Subject: [PATCH 3/4] Added tests for autosave associations validation: only has_many association should be auto-validated
+
+---
+ .../test/cases/autosave_association_test.rb        |   79 ++++++++++++++++++++
+ activerecord/test/models/pirate.rb                 |    3 +
+ 2 files changed, 82 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 75d40fb..726f994 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -1025,3 +1025,82 @@ class TestAutosaveAssociationOnAHasAndBelongsToManyAssociation < ActiveRecord::T
+ 
+   include AutosaveAssociationOnACollectionAssociationTests
+ end
++
++class TestAutosaveAssociationValidationsOnAHasManyAssocication < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @pirate.birds.create(:name => 'cookoo')
++  end
++
++  test "should automatically validate associations" do
++    assert @pirate.valid?
++    @pirate.birds.each { |bird| bird.name = '' }
++
++    assert !@pirate.valid?
++  end
++end
++
++class TestAutosaveAssociationValidationsOnAHasOneAssocication < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    @pirate.create_ship(:name => 'titanic')
++  end
++
++  test "should automatically validate associations with :validate => true" do
++    assert @pirate.valid?
++    @pirate.ship.name = ''
++    assert !@pirate.valid?
++  end
++
++  test "should not automatically validate associations without :validate => true" do
++    assert @pirate.valid?
++    @pirate.non_validated_ship.name = ''
++    assert @pirate.valid?
++  end
++end
++
++class TestAutosaveAssociationValidationsOnABelongsToAssocication < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++  end
++
++  test "should automatically validate associations with :validate => true" do
++    assert @pirate.valid?
++    @pirate.parrot = Parrot.new(:name => '')
++    assert !@pirate.valid?
++  end
++
++  test "should not automatically validate associations without :validate => true" do
++    assert @pirate.valid?
++    @pirate.non_validated_parrot = Parrot.new(:name => '')
++    assert @pirate.valid?
++  end
++end
++
++class TestAutosaveAssociationValidationsOnAHABTMAssocication < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++  end
++
++  test "should automatically validate associations with :validate => true" do
++    assert @pirate.valid?
++    @pirate.parrots = [ Parrot.new(:name => 'popuga') ]
++    @pirate.parrots.each { |parrot| parrot.name = '' }
++    assert !@pirate.valid?
++  end
++
++  test "should not automatically validate associations without :validate => true" do
++    assert @pirate.valid?
++    @pirate.non_validated_parrots = [ Parrot.new(:name => 'popuga') ]
++    @pirate.non_validated_parrots.each { |parrot| parrot.name = '' }
++    assert @pirate.valid?
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 23e8e95..bcf23f0 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -1,6 +1,8 @@
+ class Pirate < ActiveRecord::Base
+   belongs_to :parrot, :validate => true
++  belongs_to :non_validated_parrot, :class_name => 'Parrot'
+   has_and_belongs_to_many :parrots, :validate => true
++  has_and_belongs_to_many :non_validated_parrots, :class_name => 'Parrot'
+   has_and_belongs_to_many :parrots_with_method_callbacks, :class_name => "Parrot",
+     :before_add    => :log_before_add,
+     :after_add     => :log_after_add,
+@@ -17,6 +19,7 @@ class Pirate < ActiveRecord::Base
+ 
+   # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
+   has_one :ship, :validate => true
++  has_one :non_validated_ship, :class_name => 'Ship'
+   has_many :birds
+   has_many :birds_with_method_callbacks, :class_name => "Bird",
+     :before_add    => :log_before_add,
+-- 
+1.6.4.2
+
+
+From 29438c3a7fa8d3542342af348b842ddfbc1fd4f5 Mon Sep 17 00:00:00 2001
+From: Alexey Kovyrin <alexey@kovyrin.net>
+Date: Mon, 7 Sep 2009 15:10:36 -0400
+Subject: [PATCH 4/4] Added tests for autosave association validations method generation code: we do no need validator methods for all associations
+
+---
+ .../test/cases/autosave_association_test.rb        |   38 +++++++++++++++++++-
+ 1 files changed, 37 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 726f994..d91f90a 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -1103,4 +1103,40 @@ class TestAutosaveAssociationValidationsOnAHABTMAssocication < ActiveRecord::Tes
+     @pirate.non_validated_parrots.each { |parrot| parrot.name = '' }
+     assert @pirate.valid?
+   end
+-end
+\ No newline at end of file
++end
++
++class TestAutosaveAssociationValidationMethodsGeneration < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++
++  def setup
++    @pirate = Pirate.new
++  end
++
++  test "should generate validation methods for has_many associations" do
++    assert @pirate.respond_to?(:validate_associated_records_for_birds)
++  end
++
++  test "should generate validation methods for has_one associations with :validate => true" do
++    assert @pirate.respond_to?(:validate_associated_records_for_ship)
++  end
++
++  test "should not generate validation methods for has_one associations without :validate => true" do
++    assert !@pirate.respond_to?(:validate_associated_records_for_non_validated_ship)
++  end
++
++  test "should generate validation methods for belongs_to associations with :validate => true" do
++    assert @pirate.respond_to?(:validate_associated_records_for_parrot)
++  end
++
++  test "should not generate validation methods for belongs_to associations without :validate => true" do
++    assert !@pirate.respond_to?(:validate_associated_records_for_non_validated_parrot)
++  end
++
++  test "should generate validation methods for HABTM associations with :validate => true" do
++    assert @pirate.respond_to?(:validate_associated_records_for_parrots)
++  end
++
++  test "should not generate validation methods for HABTM associations without :validate => true" do
++    assert !@pirate.respond_to?(:validate_associated_records_for_non_validated_parrots)
++  end
++end
+-- 
+1.6.4.2
+

@@ -1,0 +1,185 @@
+From 8112c6b6c63ddcfceea253825e67e8d89cc4158b Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Jos=C3=A9=20Valim?= <jose.valim@gmail.com>
+Date: Sun, 19 Jul 2009 17:07:34 +0200
+Subject: [PATCH] Allow error_messages_for to use new ActiveRecord::Errors structure.
+
+---
+ .../action_view/helpers/active_record_helper.rb    |   37 +++++++++++++++----
+ .../template/active_record_helper_i18n_test.rb     |    2 +-
+ .../test/template/active_record_helper_test.rb     |   36 ++++++++++++++++---
+ 3 files changed, 60 insertions(+), 15 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/active_record_helper.rb b/actionpack/lib/action_view/helpers/active_record_helper.rb
+index 541899e..bdc0e12 100644
+--- a/actionpack/lib/action_view/helpers/active_record_helper.rb
++++ b/actionpack/lib/action_view/helpers/active_record_helper.rb
+@@ -145,6 +145,7 @@ module ActionView
+       # * <tt>:header_message</tt> - The message in the header of the error div.  Pass +nil+
+       #   or an empty string to avoid the header message altogether. (Default: "X errors
+       #   prohibited this object from being saved").
++      # * <tt>:associations</tt> - When supplied, nest errors for the given associations.
+       # * <tt>:message</tt> - The explanation message after the header message and before
+       #   the error list.  Pass +nil+ or an empty string to avoid the explanation message
+       #   altogether. (Default: "There were problems with the following fields:").
+@@ -173,32 +174,38 @@ module ActionView
+         if object = options.delete(:object)
+           objects = [object].flatten
+         else
+-          objects = params.collect {|object_name| instance_variable_get("@#{object_name}") }.compact
++          objects = params.collect{ |object_name| instance_variable_get("@#{object_name}") }.compact
+         end
++        count = objects.inject(0){ |sum, object| sum + object.errors.count }
+ 
+-        count  = objects.inject(0) {|sum, object| sum + object.errors.count }
+         unless count.zero?
+           html = {}
++          options[:object_name] ||= params.first
++          associations = options.delete(:associations)
++
+           [:id, :class].each do |key|
+-            if options.include?(key)
++            if options.key?(key)
+               value = options[key]
+               html[key] = value unless value.blank?
+             else
+               html[key] = 'errorExplanation'
+             end
+           end
+-          options[:object_name] ||= params.first
++
++          error_messages = objects.sum do |object|
++            errors = object.errors.to_a(:associations => associations)
++            convert_error_messages_to_html(object, errors)
++          end
+ 
+           I18n.with_options :locale => options[:locale], :scope => [:activerecord, :errors, :template] do |locale|
+-            header_message = if options.include?(:header_message)
++            header_message = if options.key?(:header_message)
+               options[:header_message]
+             else
+               object_name = options[:object_name].to_s.gsub('_', ' ')
+-              object_name = I18n.t(object_name, :default => object_name, :scope => [:activerecord, :models], :count => 1)
++              object_name = I18n.t(options[:object_name].to_s, :default => object_name, :scope => [:activerecord, :models], :count => 1)
+               locale.t :header, :count => count, :model => object_name
+             end
+-            message = options.include?(:message) ? options[:message] : locale.t(:body)
+-            error_messages = objects.sum {|object| object.errors.full_messages.map {|msg| content_tag(:li, ERB::Util.html_escape(msg)) } }.join
++            message = options.key?(:message) ? options[:message] : locale.t(:body)
+ 
+             contents = ''
+             contents << content_tag(options[:header_tag] || :h2, header_message) unless header_message.blank?
+@@ -213,6 +220,20 @@ module ActionView
+       end
+ 
+       private
++        def convert_error_messages_to_html(object, errors)
++          errors.sum do |error|
++            content = if error.is_a?(Hash)
++              association, association_errors = error.to_a.first
++              association_name = object.class.human_attribute_name(association)
++              association_name + content_tag(:ul, convert_error_messages_to_html(object, association_errors))
++            else
++              ERB::Util.html_escape(error)
++            end
++
++            content_tag(:li, content)
++          end
++        end
++
+         def all_input_tags(record, record_name, options)
+           input_block = options[:input_block] || default_input_block
+           record.class.content_columns.collect{ |column| input_block.call(record_name, column) }.join("\n")
+diff --git a/actionpack/test/template/active_record_helper_i18n_test.rb b/actionpack/test/template/active_record_helper_i18n_test.rb
+index 4b6e8dd..11ab5a4 100644
+--- a/actionpack/test/template/active_record_helper_i18n_test.rb
++++ b/actionpack/test/template/active_record_helper_i18n_test.rb
+@@ -5,7 +5,7 @@ class ActiveRecordHelperI18nTest < Test::Unit::TestCase
+   
+   attr_reader :request
+   def setup
+-    @object = stub :errors => stub(:count => 1, :full_messages => ['full_messages'])
++    @object = stub :errors => stub(:count => 1, :to_a => ['full_messages'])
+     @object_name = 'book'
+     stubs(:content_tag).returns 'content_tag'
+ 
+diff --git a/actionpack/test/template/active_record_helper_test.rb b/actionpack/test/template/active_record_helper_test.rb
+index 11812e7..99b0c0f 100644
+--- a/actionpack/test/template/active_record_helper_test.rb
++++ b/actionpack/test/template/active_record_helper_test.rb
+@@ -9,6 +9,10 @@ class ActiveRecordHelperTest < ActionView::TestCase
+       alias_method :title_before_type_cast, :title unless respond_to?(:title_before_type_cast)
+       alias_method :body_before_type_cast, :body unless respond_to?(:body_before_type_cast)
+       alias_method :author_name_before_type_cast, :author_name unless respond_to?(:author_name_before_type_cast)
++
++      def self.human_attribute_name(attribute)
++        attribute.to_s.humanize
++      end
+     end
+ 
+     User = Struct.new("User", :email)
+@@ -29,13 +33,14 @@ class ActiveRecordHelperTest < ActionView::TestCase
+         1
+       end
+ 
+-      def full_messages
+-        ["Author name can't be <em>empty</em>"]
+-      end
+-
+       def on(field)
+         "can't be <em>empty</em>"
+       end
++
++      def to_a(options={})
++        ["Author name can't be <em>empty</em>"]
++      end
++      alias :full_messages :to_a
+     end
+ 
+     def errors
+@@ -59,7 +64,8 @@ class ActiveRecordHelperTest < ActionView::TestCase
+         end
+         def empty?() false end
+         def count() 1 end
+-        def full_messages() [ "Author name can't be empty" ] end
++        def to_a(options={}) [ "Author name can't be empty" ] end
++        alias :full_messages :to_a
+       }.new
+     end
+ 
+@@ -88,7 +94,8 @@ class ActiveRecordHelperTest < ActionView::TestCase
+         def on(field) field == "email" end
+         def empty?() false end
+         def count() 1 end
+-        def full_messages() [ "User email can't be empty" ] end
++        def to_a(options={}) [ "User email can't be empty" ] end
++        alias :full_messages :to_a
+       }.new
+     end
+ 
+@@ -277,6 +284,23 @@ class ActiveRecordHelperTest < ActionView::TestCase
+     assert_dom_equal %(<div class="errorExplanation" id="errorExplanation"><h2>#{header_message}</h2><p>#{message}</p><ul><li>User email can't be empty</li><li>Author name can't be empty</li></ul></div>), error_messages_for(:user, :post, :header_message => header_message, :message => message)
+   end
+ 
++  def test_error_messages_for_with_associations
++    def @post.errors
++      @errors ||= Class.new {
++        def count() 2 end
++        def to_a(options={})
++          if options[:associations] == 'user'
++            [ "Author name can't be empty", { :user => [ "User email can't be empty" ] } ]
++          else
++            []
++          end
++        end
++      }.new
++    end
++
++    assert_dom_equal %(<div class="errorExplanation" id="errorExplanation"><h2>2 errors prohibited this post from being saved</h2><p>There were problems with the following fields:</p><ul><li>Author name can't be empty</li><li>User<ul><li>User email can't be empty</li></ul></li></ul></div>), error_messages_for("post", :associations => "user")
++  end
++
+   def test_error_messages_for_non_instance_variable
+     actual_user = @user
+     actual_post = @post
+-- 
+1.5.4.3
+

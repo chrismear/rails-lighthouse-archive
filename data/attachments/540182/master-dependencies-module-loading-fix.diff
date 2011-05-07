@@ -1,0 +1,161 @@
+From 6fcc915cc97c99c1b7ac613d24cc8537bcae8d7b Mon Sep 17 00:00:00 2001
+From: Serge Balyuk <bgipsy@gmail.com>
+Date: Sun, 30 May 2010 15:52:05 +0300
+Subject: [PATCH] fixed handling of autoloaded modules
+
+---
+ activesupport/lib/active_support/dependencies.rb   |   30 +++++++++++++++++--
+ .../class_with_failing_dependency.rb               |    4 ++
+ .../lib/module_folder/library_class.rb             |    2 +
+ .../module_folder/class_with_syntax_error.rb       |    3 ++
+ activesupport/test/dependencies_test.rb            |   24 ++++++++++++++++
+ 5 files changed, 59 insertions(+), 4 deletions(-)
+ create mode 100644 activesupport/test/autoloading_fixtures/class_with_failing_dependency.rb
+ create mode 100644 activesupport/test/autoloading_fixtures/lib/module_folder/library_class.rb
+ create mode 100644 activesupport/test/autoloading_fixtures/module_folder/class_with_syntax_error.rb
+
+diff --git a/activesupport/lib/active_support/dependencies.rb b/activesupport/lib/active_support/dependencies.rb
+index e14e225..e549bd3 100644
+--- a/activesupport/lib/active_support/dependencies.rb
++++ b/activesupport/lib/active_support/dependencies.rb
+@@ -47,6 +47,10 @@ module ActiveSupport #:nodoc:
+     mattr_accessor :autoloaded_constants
+     self.autoloaded_constants = []
+ 
++    # An array of module names which were created from directories by autoload_module!
++    mattr_accessor :autoloaded_modules
++    self.autoloaded_modules = []
++
+     # An array of constant names that need to be unloaded on every request. Used
+     # to allow arbitrary constants to be marked for unloading.
+     mattr_accessor :explicitly_unloadable_constants
+@@ -394,6 +398,7 @@ module ActiveSupport #:nodoc:
+       mod = Module.new
+       into.const_set const_name, mod
+       autoloaded_constants << qualified_name unless load_once_paths.include?(base_path)
++      autoloaded_modules << qualified_name
+       return mod
+     end
+ 
+@@ -415,12 +420,25 @@ module ActiveSupport #:nodoc:
+         result = Kernel.load path
+       end
+ 
+-      autoloaded_constants.concat newly_defined_paths unless load_once_path?(path)
+-      autoloaded_constants.uniq!
++      if load_once_path?(path)
++        self.autoloaded_constants -= all_levels_of_parents(parent_paths)
++      else
++        autoloaded_constants.concat newly_defined_paths
++        autoloaded_constants.uniq!
++      end
++
+       log "loading #{path} defined #{newly_defined_paths * ', '}" unless newly_defined_paths.empty?
+       return result
+     end
+ 
++    # Return names of all levels of parents (including grandparents, etc) for given names
++    def all_levels_of_parents(parent_paths)
++      parent_paths.collect do |path|
++        names = path.to_s.split('::')
++        (1..names.size).collect {|i| names[0, i].join('::')}
++      end.flatten.uniq
++    end
++
+     # Return the constant path for the provided parent and constant name.
+     def qualified_name_for(mod, name)
+       mod_name = to_constant_name mod
+@@ -448,7 +466,7 @@ module ActiveSupport #:nodoc:
+ 
+       file_path = search_for_file(path_suffix)
+ 
+-      if file_path && ! loaded.include?(File.expand_path(file_path)) # We found a matching file to load
++      if file_path && ! loaded.include?(File.expand_path(file_path).gsub(/\.rb$/, '')) # We found a matching file to load
+         require_or_load file_path
+         raise LoadError, "Expected #{file_path} to define #{qualified_name}" unless local_const_defined?(from_mod, const_name)
+         return from_mod.const_get(const_name)
+@@ -476,6 +494,7 @@ module ActiveSupport #:nodoc:
+     def remove_unloadable_constants!
+       autoloaded_constants.each { |const| remove_constant const }
+       autoloaded_constants.clear
++      autoloaded_modules.clear
+       explicitly_unloadable_constants.each { |const| remove_constant const }
+     end
+ 
+@@ -529,7 +548,10 @@ module ActiveSupport #:nodoc:
+         return new_constants unless aborting
+ 
+         log "Error during loading, removing partially loaded constants "
+-        new_constants.each {|c| remove_constant(c) }.clear
++        # New modules which are created by autoload_module! can contain properly
++        # loaded consts. If we remove those, we can end up with situation where we have
++        # file path in loaded set while corresponding constant is undefined.
++        new_constants.each {|c| remove_constant(c) unless autoloaded_modules.include?(c) }.clear
+       end
+ 
+       return []
+diff --git a/activesupport/test/autoloading_fixtures/class_with_failing_dependency.rb b/activesupport/test/autoloading_fixtures/class_with_failing_dependency.rb
+new file mode 100644
+index 0000000..a5a2137
+--- /dev/null
++++ b/activesupport/test/autoloading_fixtures/class_with_failing_dependency.rb
+@@ -0,0 +1,4 @@
++class ClassWithFailingDependency
++  A = ModuleFolder::InlineClass
++  B = ModuleFolder::ClassWithSyntaxError
++end
+diff --git a/activesupport/test/autoloading_fixtures/lib/module_folder/library_class.rb b/activesupport/test/autoloading_fixtures/lib/module_folder/library_class.rb
+new file mode 100644
+index 0000000..a4a29a8
+--- /dev/null
++++ b/activesupport/test/autoloading_fixtures/lib/module_folder/library_class.rb
+@@ -0,0 +1,2 @@
++class ModuleFolder::LibraryClass
++end
+diff --git a/activesupport/test/autoloading_fixtures/module_folder/class_with_syntax_error.rb b/activesupport/test/autoloading_fixtures/module_folder/class_with_syntax_error.rb
+new file mode 100644
+index 0000000..047fb7e
+--- /dev/null
++++ b/activesupport/test/autoloading_fixtures/module_folder/class_with_syntax_error.rb
+@@ -0,0 +1,3 @@
++class ModuleFolder::ClassWithSyntaxError
++end
++end
+diff --git a/activesupport/test/dependencies_test.rb b/activesupport/test/dependencies_test.rb
+index 75ff885..b801a0a 100644
+--- a/activesupport/test/dependencies_test.rb
++++ b/activesupport/test/dependencies_test.rb
+@@ -180,6 +180,30 @@ class DependenciesTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_failing_nested_class_does_not_affect_other_classes_in_the_same_module
++    with_autoloading_fixtures do
++      assert_raise(SyntaxError) { ClassWithFailingDependency }
++      assert_kind_of Class, ModuleFolder::InlineClass
++      Object.__send__ :remove_const, :ModuleFolder
++    end
++  end
++
++  def test_namespace_can_span_across_reloadable_and_load_once_paths
++    with_autoloading_fixtures do
++      lib_path = File.dirname(__FILE__) + '/autoloading_fixtures/lib'
++      ActiveSupport::Dependencies.load_paths << lib_path
++      ActiveSupport::Dependencies.load_once_paths = [lib_path]
++      assert_kind_of Class, ModuleFolder::InlineClass
++      assert_kind_of Class, ModuleFolder::LibraryClass
++      ActiveSupport::Dependencies.clear
++      assert !ModuleFolder.const_defined?(:InlineClass)
++      assert ModuleFolder.const_defined?(:LibraryClass)
++      Object.__send__ :remove_const, :ModuleFolder
++    end
++  ensure
++    ActiveSupport::Dependencies.load_once_paths = []
++  end
++
+   def test_class_with_nested_class
+     with_autoloading_fixtures do
+       assert_kind_of Class, ClassFolder::NestedClass
+-- 
+1.6.3.3
+

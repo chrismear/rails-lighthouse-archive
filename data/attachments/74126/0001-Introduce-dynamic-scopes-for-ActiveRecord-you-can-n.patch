@@ -1,0 +1,136 @@
+From 3f1cd9e0592961ee6ded0d7b348dc8cad73458fe Mon Sep 17 00:00:00 2001
+From: Yaroslav Markin <yaroslav@markin.net>
+Date: Sun, 28 Dec 2008 22:25:55 +0300
+Subject: [PATCH] Introduce dynamic scopes for ActiveRecord: you can now use class methods like scoped_by_user_name(user_name) and scoped_by_user_name_and_password(user_name, password) that will use the scoped method with attributes you supply.
+
+---
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/base.rb             |   23 +++++++++++++++++-
+ .../lib/active_record/dynamic_scope_match.rb       |   25 ++++++++++++++++++++
+ activerecord/test/cases/named_scope_test.rb        |   20 ++++++++++++++++
+ 4 files changed, 68 insertions(+), 1 deletions(-)
+ create mode 100644 activerecord/lib/active_record/dynamic_scope_match.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index c428366..390c005 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -51,6 +51,7 @@ module ActiveRecord
+   autoload :Callbacks, 'active_record/callbacks'
+   autoload :Dirty, 'active_record/dirty'
+   autoload :DynamicFinderMatch, 'active_record/dynamic_finder_match'
++  autoload :DynamicScopeMatch, 'active_record/dynamic_scope_match'
+   autoload :Migration, 'active_record/migration'
+   autoload :Migrator, 'active_record/migration'
+   autoload :NamedScope, 'active_record/named_scope'
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 80c109a..bbb782e 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1456,7 +1456,10 @@ module ActiveRecord #:nodoc:
+       def respond_to?(method_id, include_private = false)
+         if match = DynamicFinderMatch.match(method_id)
+           return true if all_attributes_exists?(match.attribute_names)
++        elsif match = DynamicScopeMatch.match(method_id)
++          return true if all_attributes_exists?(match.attribute_names)
+         end
++        
+         super
+       end
+ 
+@@ -1809,7 +1812,11 @@ module ActiveRecord #:nodoc:
+         # This also enables you to initialize a record if it is not found, such as find_or_initialize_by_amount(amount)
+         # or find_or_create_by_user_and_password(user, password).
+         #
+-        # Each dynamic finder or initializer/creator is also defined in the class after it is first invoked, so that future
++        # Also enables dynamic scopes like scoped_by_user_name(user_name) and scoped_by_user_name_and_password(user_name, password) that
++        # are turned into scoped(:conditions => ["user_name = ?", user_name]) and scoped(:conditions => ["user_name = ? AND password = ?", user_name, password])
++        # respectively.
++        #
++        # Each dynamic finder, scope or initializer/creator is also defined in the class after it is first invoked, so that future
+         # attempts to use it do not run through method_missing.
+         def method_missing(method_id, *arguments, &block)
+           if match = DynamicFinderMatch.match(method_id)
+@@ -1868,6 +1875,20 @@ module ActiveRecord #:nodoc:
+               }, __FILE__, __LINE__
+               send(method_id, *arguments, &block)
+             end
++          elsif match = DynamicScopeMatch.match(method_id)
++            attribute_names = match.attribute_names
++            super unless all_attributes_exists?(attribute_names)
++            if match.scope?
++              self.class_eval %{
++                def self.#{method_id}(*args)                                                                # def self.scoped_by_user_name_and_password(*args)
++                  options = args.extract_options!                                                           #   options = args.extract_options!
++                  attributes = construct_attributes_from_arguments([:#{attribute_names.join(',:')}], args)  #   attributes = construct_attributes_from_arguments([:user_name,:password], args)
++                                                                                                            #   
++                  scoped(:conditions => attributes)                                                         #   scoped(:conditions => attributes)
++                end                                                                                         # end
++              }, __FILE__, __LINE__
++              send(method_id, *arguments)
++            end
+           else
+             super
+           end
+diff --git a/activerecord/lib/active_record/dynamic_scope_match.rb b/activerecord/lib/active_record/dynamic_scope_match.rb
+new file mode 100644
+index 0000000..f796ba6
+--- /dev/null
++++ b/activerecord/lib/active_record/dynamic_scope_match.rb
+@@ -0,0 +1,25 @@
++module ActiveRecord
++  class DynamicScopeMatch
++    def self.match(method)
++      ds_match = self.new(method)
++      ds_match.scope ? ds_match : nil
++    end
++
++    def initialize(method)
++      @scope = true
++      case method.to_s
++      when /^scoped_by_([_a-zA-Z]\w*)$/
++        names = $1
++      else
++        @scope = nil
++      end
++      @attribute_names = names && names.split('_and_')
++    end
++
++    attr_reader :scope, :attribute_names
++
++    def scope?
++      !@scope.nil?
++    end
++  end
++end
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index 64e8997..b152f95 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -278,3 +278,23 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert_equal post.comments.size, Post.scoped(:joins => join).scoped(:joins => join, :conditions => "posts.id = #{post.id}").size
+   end
+ end
++
++class DynamicScopeMatchTest < ActiveRecord::TestCase  
++  def test_scoped_by_no_match
++    assert_nil ActiveRecord::DynamicScopeMatch.match("not_scoped_at_all")
++  end
++
++  def test_scoped_by
++    match = ActiveRecord::DynamicScopeMatch.match("scoped_by_age_and_sex_and_location")
++    assert_not_nil match
++    assert match.scope?
++    assert_equal %w(age sex location), match.attribute_names
++  end
++end
++
++class DynamicScopeTest < ActiveRecord::TestCase
++  def test_dynamic_scope
++    assert_equal Post.scoped_by_author_id(1).find(1), Post.find(1)
++    assert_equal Post.scoped_by_author_id_and_title(1, "Welcome to the weblog").first, Post.find(:first, :conditions => { :author_id => 1, :title => "Welcome to the weblog"})
++  end
++end
+-- 
+1.6.0.4
+

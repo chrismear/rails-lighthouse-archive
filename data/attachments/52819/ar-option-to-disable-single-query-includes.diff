@@ -1,0 +1,111 @@
+From 24f9e792c773dca21afeb59aee0abe7c6d145545 Mon Sep 17 00:00:00 2001
+From: Pivotal  Labs <pivotal@cumberland.flood.pivotallabs.com>
+Date: Thu, 9 Oct 2008 09:31:00 -0700
+Subject: [PATCH] ActiveRecord can disable single-query LEFT OUTER JOIN style includes entirely with a configuration option.
+
+---
+ activerecord/lib/active_record/associations.rb     |    9 +++++-
+ activerecord/lib/active_record/base.rb             |    7 ++++-
+ activerecord/test/cases/associations/eager_test.rb |   30 +++++++++++++++++++-
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index d1a0b2f..398c45c 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -526,6 +526,13 @@ module ActiveRecord
+     # to the previous implementation of eager loading and will raise ActiveRecord::EagerLoadPolymorphicError. The reason is that the parent 
+     # model's type is a column value so its corresponding table name cannot be put in the +FROM+/+JOIN+ clauses of that query.
+     #
++    # Sometimes ActiveRecord incorrectly determines that it needs to fall back to a LEFT OUTER JOIN, such as when you reference conditions or order on tables
++    # brought in through a :join option.  You can change the following configuration variable to globally disable the single-query style of includes.  This
++    # will improve the performance of your :includes across the board, but be careful... queries that reference tables only brought in through :include clauses
++    # will fail with exceptions. 
++    #
++    #   ActiveRecord::Base.disable_single_query_includes = true
++    #
+     # == Table Aliasing
+     #
+     # Active Record uses table aliasing in the case that a table is referenced multiple times in a join.  If a table is referenced only once,
+@@ -1758,7 +1765,7 @@ module ActiveRecord
+         end
+ 
+         def references_eager_loaded_tables?(options)
+-          include_eager_order?(options) || include_eager_conditions?(options) || include_eager_select?(options)
++          ActiveRecord::Base.disable_single_query_includes || include_eager_order?(options) || include_eager_conditions?(options) || include_eager_select?(options)
+         end
+ 
+         def using_limitable_reflections?(reflections)
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 6a1a379..d5ab3dd 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -494,6 +494,11 @@ module ActiveRecord #:nodoc:
+     # Determine whether to store the full constant name including namespace when using STI
+     superclass_delegating_accessor :store_full_sti_class
+     self.store_full_sti_class = false
++    
++    # Specify whether or not to disable the pre-rails-2.1 style single query includes.  If disabled, errors will be raised if queries 
++    # reference tables that are brought in through :include clauses only.  When used safely, however, performance of :include should be better.
++    cattr_accessor :disable_single_query_includes , :instance_writer => false
++    @@disable_single_query_includes = false
+ 
+     class << self # Class methods
+       # Find operates with four different retrieval approaches:
+@@ -1483,7 +1488,7 @@ module ActiveRecord #:nodoc:
+         def find_every(options)
+           include_associations = merge_includes(scope(:find, :include), options[:include])
+ 
+-          if include_associations.any? && references_eager_loaded_tables?(options)
++          if include_associations.any? && !ActiveRecord::Base.disable_single_query_includes && references_eager_loaded_tables?(options)
+             records = find_with_associations(options)
+           else
+             records = find_by_sql(construct_finder_sql(options))
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 7f42577..1d1b2ea 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -39,11 +39,39 @@ class EagerAssociationTest < ActiveRecord::TestCase
+   end
+ 
+   def test_loading_with_one_association_with_non_preload
+-    posts = Post.find(:all, :include => :last_comment, :order => 'comments.id DESC')
++    posts = nil
++    assert_queries(1) do    
++      posts = Post.find(:all, :include => :last_comment, :order => 'comments.id DESC')
++    end
++    post = posts.find { |p| p.id == 1 }
++    assert_equal Post.find(1).last_comment, post.last_comment
++  end
++
++  def test_loading_with_one_association_and_single_query_includes_disabled
++    posts = nil
++    assert_queries(2) do
++      ActiveRecord::Base.disable_single_query_includes = true
++      begin
++        posts = Post.find(:all, :include => :last_comment, :joins => :last_comment, :order => 'comments.id DESC')
++      ensure 
++        ActiveRecord::Base.disable_single_query_includes = false
++      end
++    end
+     post = posts.find { |p| p.id == 1 }
+     assert_equal Post.find(1).last_comment, post.last_comment
+   end
+ 
++  def test_loading_with_one_association_and_single_query_includes_disabled_invalid_case
++    assert_raise(ActiveRecord::StatementInvalid) do    
++      ActiveRecord::Base.disable_single_query_includes = true
++      begin
++        Post.find(:all, :include => :last_comment, :order => 'comments.id DESC')
++      ensure 
++        ActiveRecord::Base.disable_single_query_includes = false
++      end
++    end
++  end
++
+   def test_loading_conditions_with_or
+     posts = authors(:david).posts.find(:all, :include => :comments, :conditions => "comments.body like 'Normal%' OR comments.#{QUOTED_TYPE} = 'SpecialComment'")
+     assert_nil posts.detect { |p| p.author_id != authors(:david).id },
+-- 
+1.6.0.1
+

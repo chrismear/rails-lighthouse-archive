@@ -1,0 +1,444 @@
+From 7835bfc2047f3d36b185e30192b4199dae055913 Mon Sep 17 00:00:00 2001
+From: Levin Alexander <mail@levinalex.net>
+Date: Mon, 26 Jan 2009 16:10:41 +0100
+Subject: [PATCH] Make TimeWithZone#to_formatted_s an alias to TimeWithZone#to_s [#1796 state:resolved]
+
+---
+ actionpack/lib/action_controller/rescue.rb         |    2 +-
+ actionpack/lib/action_view/base.rb                 |    8 ++-
+ actionpack/lib/action_view/partials.rb             |    1 -
+ actionpack/lib/action_view/paths.rb                |   17 ++--
+ actionpack/lib/action_view/renderable.rb           |    7 +-
+ actionpack/lib/action_view/template.rb             |   80 ++++++++++---------
+ .../test/template/compiled_templates_test.rb       |   42 ++++++-----
+ actionpack/test/template/render_test.rb            |   15 +----
+ railties/environments/production.rb                |    1 +
+ railties/lib/initializer.rb                        |   13 ---
+ 10 files changed, 84 insertions(+), 102 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/rescue.rb b/actionpack/lib/action_controller/rescue.rb
+index ec61715..40aa7cd 100644
+--- a/actionpack/lib/action_controller/rescue.rb
++++ b/actionpack/lib/action_controller/rescue.rb
+@@ -38,7 +38,7 @@ module ActionController #:nodoc:
+       'ActionView::TemplateError'         => 'template_error'
+     }
+ 
+-    RESCUES_TEMPLATE_PATH = ActionView::Template::EagerPath.new(
++    RESCUES_TEMPLATE_PATH = ActionView::Template::Path.new(
+       File.join(File.dirname(__FILE__), "templates"))
+ 
+     def self.included(base) #:nodoc:
+diff --git a/actionpack/lib/action_view/base.rb b/actionpack/lib/action_view/base.rb
+index 70a0ba9..3134807 100644
+--- a/actionpack/lib/action_view/base.rb
++++ b/actionpack/lib/action_view/base.rb
+@@ -182,6 +182,10 @@ module ActionView #:nodoc:
+     # that alert()s the caught exception (and then re-raises it).
+     cattr_accessor :debug_rjs
+ 
++    # Specify whether to check whether modified templates are recompiled without a restart
++    @@cache_template_loading = false
++    cattr_accessor :cache_template_loading
++
+     attr_internal :request
+ 
+     delegate :request_forgery_protection_token, :template, :params, :session, :cookies, :response, :headers,
+@@ -243,8 +247,8 @@ module ActionView #:nodoc:
+         if options[:layout]
+           _render_with_layout(options, local_assigns, &block)
+         elsif options[:file]
+-          tempalte = self.view_paths.find_template(options[:file], template_format)
+-          tempalte.render_template(self, options[:locals])
++          template = self.view_paths.find_template(options[:file], template_format)
++          template.render_template(self, options[:locals])
+         elsif options[:partial]
+           render_partial(options)
+         elsif options[:inline]
+diff --git a/actionpack/lib/action_view/partials.rb b/actionpack/lib/action_view/partials.rb
+index 9e5e0f7..6fe4dbf 100644
+--- a/actionpack/lib/action_view/partials.rb
++++ b/actionpack/lib/action_view/partials.rb
+@@ -235,6 +235,5 @@ module ActionView
+ 
+         self.view_paths.find_template(path, self.template_format)
+       end
+-      memoize :_pick_partial_template
+   end
+ end
+diff --git a/actionpack/lib/action_view/paths.rb b/actionpack/lib/action_view/paths.rb
+index b487bd1..e14b212 100644
+--- a/actionpack/lib/action_view/paths.rb
++++ b/actionpack/lib/action_view/paths.rb
+@@ -2,11 +2,7 @@ module ActionView #:nodoc:
+   class PathSet < Array #:nodoc:
+     def self.type_cast(obj)
+       if obj.is_a?(String)
+-        if !Object.const_defined?(:Rails) || Rails.configuration.cache_classes
+-          Template::EagerPath.new(obj)
+-        else
+-          Template::Path.new(obj)
+-        end
++        Template::Path.new(obj)
+       else
+         obj
+       end
+@@ -36,9 +32,8 @@ module ActionView #:nodoc:
+       super(*objs.map { |obj| self.class.type_cast(obj) })
+     end
+ 
+-    def find_template(original_template_path, format = nil)
+-      return original_template_path if original_template_path.respond_to?(:render)
+-      template_path = original_template_path.sub(/^\//, '')
++    def find_template(template_path, format = nil)
++      return template_path if template_path.respond_to?(:render)
+ 
+       each do |load_path|
+         if format && (template = load_path["#{template_path}.#{I18n.locale}.#{format}"])
+@@ -57,7 +52,11 @@ module ActionView #:nodoc:
+         end
+       end
+ 
+-      Template.new(original_template_path, self)
++      if File.exist?(template_path)
++        return Template.new(template_path, template_path[0] == 47 ? "" : ".")
++      end
++
++      raise MissingTemplate.new(self, template_path, format)
+     end
+   end
+ end
+diff --git a/actionpack/lib/action_view/renderable.rb b/actionpack/lib/action_view/renderable.rb
+index cb774d8..c127bb2 100644
+--- a/actionpack/lib/action_view/renderable.rb
++++ b/actionpack/lib/action_view/renderable.rb
+@@ -18,7 +18,6 @@ module ActionView
+     def compiled_source
+       handler.call(self)
+     end
+-    memoize :compiled_source
+ 
+     def method_name_without_locals
+       ['_run', extension, method_segment].compact.join('_')
+@@ -80,6 +79,8 @@ module ActionView
+ 
+         begin
+           ActionView::Base::CompiledTemplates.module_eval(source, filename, 0)
++        rescue Errno::ENOENT => e
++          raise e # Missing template file, re-raise for Base to rescue
+         rescue Exception => e # errors from template code
+           if logger = defined?(ActionController) && Base.logger
+             logger.debug "ERROR: compiling #{render_symbol} RAISED #{e}"
+@@ -90,9 +91,5 @@ module ActionView
+           raise ActionView::TemplateError.new(self, {}, e)
+         end
+       end
+-
+-      def recompile?
+-        false
+-      end
+   end
+ end
+diff --git a/actionpack/lib/action_view/template.rb b/actionpack/lib/action_view/template.rb
+index 575ec7c..ee1b9f2 100644
+--- a/actionpack/lib/action_view/template.rb
++++ b/actionpack/lib/action_view/template.rb
+@@ -7,6 +7,11 @@ module ActionView #:nodoc:
+       def initialize(path)
+         raise ArgumentError, "path already is a Path class" if path.is_a?(Path)
+         @path = path.freeze
++
++        @paths = {}
++        templates_in_path do |template|
++          load_template(template)
++        end
+       end
+ 
+       def to_s
+@@ -39,12 +44,7 @@ module ActionView #:nodoc:
+       # etc. A format must be supplied to match a formated file. +hello/index+
+       # will never match +hello/index.html.erb+.
+       def [](path)
+-        templates_in_path do |template|
+-          if template.accessible_paths.include?(path)
+-            return template
+-          end
+-        end
+-        nil
++        @paths[path] || find_template(path)
+       end
+ 
+       private
+@@ -57,25 +57,30 @@ module ActionView #:nodoc:
+         def create_template(file)
+           Template.new(file.split("#{self}/").last, self)
+         end
+-    end
+ 
+-    class EagerPath < Path
+-      def initialize(path)
+-        super
+-
+-        @paths = {}
+-        templates_in_path do |template|
++        def load_template(template)
+           template.load!
+           template.accessible_paths.each do |path|
+             @paths[path] = template
+           end
+         end
+-        @paths.freeze
+-      end
+ 
+-      def [](path)
+-        @paths[path]
+-      end
++        def matching_templates(template_path)
++          Dir.glob("#{@path}/#{template_path}.*").each do |file|
++            yield create_template(file) unless File.directory?(file)
++          end
++        end
++
++        def find_template(path)
++          return nil if Base.cache_template_loading || ActionController::Base.allow_concurrency
++          matching_templates(path) do |template|
++            if template.accessible_paths.include?(path)
++              load_template(template)
++              return template
++            end
++          end
++          nil
++        end
+     end
+ 
+     extend TemplateHandlers
+@@ -97,9 +102,9 @@ module ActionView #:nodoc:
+     attr_accessor :locale, :name, :format, :extension
+     delegate :to_s, :to => :path
+ 
+-    def initialize(template_path, load_paths = [])
++    def initialize(template_path, load_path)
+       template_path = template_path.dup
+-      @load_path, @filename = find_full_path(template_path, load_paths)
++      @load_path, @filename = load_path, File.join(load_path, template_path)
+       @base_path, @name, @locale, @format, @extension = split(template_path)
+       @base_path.to_s.gsub!(/\/$/, '') # Push to split method
+ 
+@@ -171,7 +176,6 @@ module ActionView #:nodoc:
+     def source
+       File.read(filename)
+     end
+-    memoize :source
+ 
+     def method_segment
+       relative_path.to_s.gsub(/([^a-zA-Z0-9_])/) { $1.ord }
+@@ -185,25 +189,34 @@ module ActionView #:nodoc:
+       if TemplateError === e
+         e.sub_template_of(self)
+         raise e
++      elsif Errno::ENOENT === e
++        raise MissingTemplate.new(view.view_paths, filename.sub("#{RAILS_ROOT}/#{load_path}/", ""))
+       else
+         raise TemplateError.new(self, view.assigns, e)
+       end
+     end
+ 
+     def stale?
+-      File.mtime(filename) > mtime
+-    end
+-
+-    def recompile?
+-      !@cached
++      !frozen? && mtime < mtime(:reload)
+     end
+ 
+     def load!
+-      @cached = true
+-      freeze
++      reloadable? ? memoize_all : freeze
+     end
+ 
+     private
++      def cached?
++        Base.cache_template_loading || ActionController::Base.allow_concurrency
++      end
++
++      def reloadable?
++        !cached?
++      end
++
++      def recompile?
++        reloadable? ? stale? : false
++      end
++
+       def valid_extension?(extension)
+         !Template.registered_template_handler(extension).nil?
+       end
+@@ -212,15 +225,6 @@ module ActionView #:nodoc:
+         I18n.available_locales.include?(locale.to_sym)
+       end
+ 
+-      def find_full_path(path, load_paths)
+-        load_paths = Array(load_paths) + [nil]
+-        load_paths.each do |load_path|
+-          file = load_path ? "#{load_path.to_str}/#{path}" : path
+-          return load_path, file if File.file?(file)
+-        end
+-        raise MissingTemplate.new(load_paths, path)
+-      end
+-
+       # Returns file split into an array
+       #   [base_path, name, locale, format, extension]
+       def split(file)
+@@ -259,5 +263,5 @@ module ActionView #:nodoc:
+ 
+         [base_path, name, locale, format, extension]
+       end
+-  end
++ end
+ end
+diff --git a/actionpack/test/template/compiled_templates_test.rb b/actionpack/test/template/compiled_templates_test.rb
+index a7ed13c..2c32fde 100644
+--- a/actionpack/test/template/compiled_templates_test.rb
++++ b/actionpack/test/template/compiled_templates_test.rb
+@@ -39,35 +39,29 @@ class CompiledTemplatesTest < Test::Unit::TestCase
+   end
+ 
+   def test_template_changes_are_not_reflected_with_cached_templates
+-    assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+-    modify_template "test/hello_world.erb", "Goodbye world!" do
++    with_caching(true) do
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++      modify_template "test/hello_world.erb", "Goodbye world!" do
++        assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++      end
+       assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+     end
+-    assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+   end
+ 
+-  def test_template_changes_are_reflected_with_uncached_templates
+-    assert_equal "Hello world!", render_without_cache(:file => "test/hello_world.erb")
+-    modify_template "test/hello_world.erb", "Goodbye world!" do
+-      assert_equal "Goodbye world!", render_without_cache(:file => "test/hello_world.erb")
++  def test_template_changes_are_reflected_without_cached_templates
++    with_caching(false) do
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
++      modify_template "test/hello_world.erb", "Goodbye world!" do
++        assert_equal "Goodbye world!", render(:file => "test/hello_world.erb")
++        sleep(1) # Need to sleep so that the timestamp actually changes
++      end
++      assert_equal "Hello world!", render(:file => "test/hello_world.erb")
+     end
+-    assert_equal "Hello world!", render_without_cache(:file => "test/hello_world.erb")
+   end
+ 
+   private
+     def render(*args)
+-      render_with_cache(*args)
+-    end
+-
+-    def render_with_cache(*args)
+       view_paths = ActionController::Base.view_paths
+-      assert_equal ActionView::Template::EagerPath, view_paths.first.class
+-      ActionView::Base.new(view_paths, {}).render(*args)
+-    end
+-
+-    def render_without_cache(*args)
+-      path = ActionView::Template::Path.new(FIXTURE_LOAD_PATH)
+-      view_paths = ActionView::Base.process_view_paths(path)
+       assert_equal ActionView::Template::Path, view_paths.first.class
+       ActionView::Base.new(view_paths, {}).render(*args)
+     end
+@@ -82,4 +76,14 @@ class CompiledTemplatesTest < Test::Unit::TestCase
+         File.open(filename, "wb+") { |f| f.write(old_content) }
+       end
+     end
++
++    def with_caching(caching_enabled)
++      old_caching_enabled = ActionView::Base.cache_template_loading
++      begin
++        ActionView::Base.cache_template_loading = caching_enabled
++        yield
++      ensure
++        ActionView::Base.cache_template_loading = old_caching_enabled
++      end
++    end
+ end
+diff --git a/actionpack/test/template/render_test.rb b/actionpack/test/template/render_test.rb
+index 9db62d9..34e7e82 100644
+--- a/actionpack/test/template/render_test.rb
++++ b/actionpack/test/template/render_test.rb
+@@ -243,25 +243,12 @@ module RenderTestCases
+   end
+ end
+ 
+-class CachedViewRenderTest < Test::Unit::TestCase
++class CachedRenderTest < Test::Unit::TestCase
+   include RenderTestCases
+ 
+   # Ensure view path cache is primed
+   def setup
+     view_paths = ActionController::Base.view_paths
+-    assert_equal ActionView::Template::EagerPath, view_paths.first.class
+-    setup_view(view_paths)
+-  end
+-end
+-
+-class LazyViewRenderTest < Test::Unit::TestCase
+-  include RenderTestCases
+-
+-  # Test the same thing as above, but make sure the view path
+-  # is not eager loaded
+-  def setup
+-    path = ActionView::Template::Path.new(FIXTURE_LOAD_PATH)
+-    view_paths = ActionView::Base.process_view_paths(path)
+     assert_equal ActionView::Template::Path, view_paths.first.class
+     setup_view(view_paths)
+   end
+diff --git a/railties/environments/production.rb b/railties/environments/production.rb
+index 1fc9f6b..27119d2 100644
+--- a/railties/environments/production.rb
++++ b/railties/environments/production.rb
+@@ -7,6 +7,7 @@ config.cache_classes = true
+ # Full error reports are disabled and caching is turned on
+ config.action_controller.consider_all_requests_local = false
+ config.action_controller.perform_caching             = true
++config.action_view.cache_template_loading            = true
+ 
+ # See everything in the log (default is :info)
+ # config.log_level = :debug
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index e3811dd..2cc0943 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -181,9 +181,6 @@ module Rails
+       # Observers are loaded after plugins in case Observers or observed models are modified by plugins.
+       load_observers
+ 
+-      # Load view path cache
+-      load_view_paths
+-
+       # Load application classes
+       load_application_classes
+ 
+@@ -367,16 +364,6 @@ Run `rake gems:install` to install the missing gems.
+       end
+     end
+ 
+-    def load_view_paths
+-      if configuration.frameworks.include?(:action_view)
+-        if configuration.cache_classes
+-          view_path = ActionView::Template::EagerPath.new(configuration.view_path)
+-          ActionController::Base.view_paths = view_path if configuration.frameworks.include?(:action_controller)
+-          ActionMailer::Base.template_root = view_path if configuration.frameworks.include?(:action_mailer)
+-        end
+-      end
+-    end
+-
+     # Eager load application classes
+     def load_application_classes
+       return if $rails_rake_task
+-- 
+1.5.4.5
+

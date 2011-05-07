@@ -1,0 +1,182 @@
+From b26c52e0da18aef918224124ad3ec1624a494c2d Mon Sep 17 00:00:00 2001
+From: Matt Jones <al2o3cr@gmail.com>
+Date: Tue, 2 Dec 2008 16:21:21 -0500
+Subject: [PATCH] fix preloading of has_one :through associations on belongs_to
+
+---
+ .../lib/active_record/association_preload.rb       |   15 ++++++++++++---
+ .../associations/association_collection.rb         |    6 +++++-
+ .../has_one_through_associations_test.rb           |   17 ++++++++++++++++-
+ activerecord/test/fixtures/member_types.yml        |    6 ++++++
+ activerecord/test/fixtures/members.yml             |    4 +++-
+ activerecord/test/models/member.rb                 |    1 +
+ activerecord/test/models/member_detail.rb          |    1 +
+ activerecord/test/models/member_type.rb            |    3 +++
+ activerecord/test/schema/schema.rb                 |    5 +++++
+ 9 files changed, 52 insertions(+), 6 deletions(-)
+ create mode 100644 activerecord/test/fixtures/member_types.yml
+ create mode 100644 activerecord/test/models/member_type.rb
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index 69300e5..5dad4ed 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -204,9 +204,18 @@ module ActiveRecord
+           unless through_records.empty?
+             source = reflection.source_reflection.name
+             through_records.first.class.preload_associations(through_records, source)
+-            through_records.each do |through_record|
+-              add_preloaded_record_to_collection(id_to_record_map[through_record[through_primary_key].to_s],
+-                                                 reflection.name, through_record.send(source))
++            if through_reflection.macro == :belongs_to
++              rev_id_to_record_map, rev_ids = construct_id_map(records, through_primary_key)
++              rev_primary_key = through_reflection.klass.primary_key
++              through_records.each do |through_record|
++                add_preloaded_record_to_collection(rev_id_to_record_map[through_record[rev_primary_key].to_s],
++                                                   reflection.name, through_record.send(source))
++              end
++            else
++              through_records.each do |through_record|
++                add_preloaded_record_to_collection(id_to_record_map[through_record[through_primary_key].to_s],
++                                                   reflection.name, through_record.send(source))
++              end
+             end
+           end
+         else
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0ff91fb..0fefec1 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -83,7 +83,11 @@ module ActiveRecord
+ 
+       def to_ary
+         load_target
+-        @target.to_ary
++        if @target.is_a?(Array)
++          @target.to_ary
++        else
++          Array(@target)
++        end
+       end
+ 
+       def reset
+diff --git a/activerecord/test/cases/associations/has_one_through_associations_test.rb b/activerecord/test/cases/associations/has_one_through_associations_test.rb
+index 7d418de..f65d76e 100644
+--- a/activerecord/test/cases/associations/has_one_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_through_associations_test.rb
+@@ -1,5 +1,6 @@
+ require "cases/helper"
+ require 'models/club'
++require 'models/member_type'
+ require 'models/member'
+ require 'models/membership'
+ require 'models/sponsor'
+@@ -7,7 +8,7 @@ require 'models/organization'
+ require 'models/member_detail'
+ 
+ class HasOneThroughAssociationsTest < ActiveRecord::TestCase
+-  fixtures :members, :clubs, :memberships, :sponsors, :organizations
++  fixtures :member_types, :members, :clubs, :memberships, :sponsors, :organizations
+   
+   def setup
+     @member = members(:groucho)
+@@ -158,4 +159,18 @@ class HasOneThroughAssociationsTest < ActiveRecord::TestCase
+     assert @new_organization.members.include?(@member)
+   end
+ 
++  def test_preloading_has_one_through_on_belongs_to
++    assert_not_nil @member.member_type
++    @organization = organizations(:nsa)
++    @member_detail = MemberDetail.new
++    @member.member_detail = @member_detail
++    @member.organization = @organization
++    @member_details = assert_queries(3) do
++      MemberDetail.find(:all, :include => :member_type)
++    end
++    @new_detail = @member_details[0]
++    assert @new_detail.loaded_member_type?
++    assert_not_nil assert_no_queries { @new_detail.member_type }
++  end
++
+ end
+diff --git a/activerecord/test/fixtures/member_types.yml b/activerecord/test/fixtures/member_types.yml
+new file mode 100644
+index 0000000..797a574
+--- /dev/null
++++ b/activerecord/test/fixtures/member_types.yml
+@@ -0,0 +1,6 @@
++founding:
++  id: 1
++  name: Founding
++provisional:
++  id: 2
++  name: Provisional
+diff --git a/activerecord/test/fixtures/members.yml b/activerecord/test/fixtures/members.yml
+index 67a6cc4..6db945e 100644
+--- a/activerecord/test/fixtures/members.yml
++++ b/activerecord/test/fixtures/members.yml
+@@ -1,4 +1,6 @@
+ groucho:
+   name: Groucho Marx
++  member_type_id: 1
+ some_other_guy:
+-  name: Englebert Humperdink
+\ No newline at end of file
++  name: Englebert Humperdink
++  member_type_id: 2
+diff --git a/activerecord/test/models/member.rb b/activerecord/test/models/member.rb
+index 77a37ab..255fb56 100644
+--- a/activerecord/test/models/member.rb
++++ b/activerecord/test/models/member.rb
+@@ -8,4 +8,5 @@ class Member < ActiveRecord::Base
+   has_one :sponsor_club, :through => :sponsor
+   has_one :member_detail
+   has_one :organization, :through => :member_detail
++  belongs_to :member_type
+ end
+\ No newline at end of file
+diff --git a/activerecord/test/models/member_detail.rb b/activerecord/test/models/member_detail.rb
+index e731454..94f59e5 100644
+--- a/activerecord/test/models/member_detail.rb
++++ b/activerecord/test/models/member_detail.rb
+@@ -1,4 +1,5 @@
+ class MemberDetail < ActiveRecord::Base
+   belongs_to :member
+   belongs_to :organization
++  has_one :member_type, :through => :member
+ end
+diff --git a/activerecord/test/models/member_type.rb b/activerecord/test/models/member_type.rb
+new file mode 100644
+index 0000000..a13561c
+--- /dev/null
++++ b/activerecord/test/models/member_type.rb
+@@ -0,0 +1,3 @@
++class MemberType < ActiveRecord::Base
++  has_many :members
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 6217e3b..fbacc69 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -195,6 +195,7 @@ ActiveRecord::Schema.define do
+ 
+   create_table :members, :force => true do |t|
+     t.string :name
++    t.integer :member_type_id
+   end
+ 
+   create_table :member_details, :force => true do |t|
+@@ -210,6 +211,10 @@ ActiveRecord::Schema.define do
+     t.string :type
+   end
+ 
++  create_table :member_types, :force => true do |t|
++    t.string :name
++  end
++
+   create_table :references, :force => true do |t|
+     t.integer :person_id
+     t.integer :job_id
+-- 
+1.5.3.1
+

@@ -1,0 +1,109 @@
+From 3ee028ee8e363c4353a8f7f8de21e623334fd996 Mon Sep 17 00:00:00 2001
+From: Robert Pankowecki (Gavdi) <rpa@gavdi.com>
+Date: Fri, 26 Nov 2010 19:16:13 +0100
+Subject: [PATCH] Simplifies observer implementation [#6065 state:resolved]
+
+---
+ activerecord/lib/active_record/observer.rb |   30 +++------------------------
+ activerecord/test/cases/lifecycle_test.rb  |   16 ++++++++++++++
+ 2 files changed, 20 insertions(+), 26 deletions(-)
+
+diff --git a/activerecord/lib/active_record/observer.rb b/activerecord/lib/active_record/observer.rb
+index 022cf10..f0da420 100644
+--- a/activerecord/lib/active_record/observer.rb
++++ b/activerecord/lib/active_record/observer.rb
+@@ -89,51 +89,29 @@ module ActiveRecord
+   # singletons and that call instantiates and registers them.
+   #
+   class Observer < ActiveModel::Observer
+-    class_attribute :observed_methods
+-    self.observed_methods = [].freeze
+ 
+     def initialize
+       super
+       observed_descendants.each { |klass| add_observer!(klass) }
+     end
+ 
+-    def self.method_added(method)
+-      method = method.to_sym
+-
+-      if ActiveRecord::Callbacks::CALLBACKS.include?(method)
+-        self.observed_methods += [method]
+-        self.observed_methods.freeze
+-      end
+-    end
+-
+     protected
+ 
+       def observed_descendants
+         observed_classes.sum([]) { |klass| klass.descendants }
+       end
+ 
+-      def observe_callbacks?
+-        self.class.observed_methods.any?
+-      end
+-
+       def add_observer!(klass)
+         super
+-        define_callbacks klass if observe_callbacks?
++        define_callbacks klass
+       end
+ 
+       def define_callbacks(klass)
+-        existing_methods = klass.instance_methods.map { |m| m.to_sym }
+         observer = self
+-        observer_name = observer.class.name.underscore.gsub('/', '__')
+ 
+-        self.class.observed_methods.each do |method|
+-          callback = :"_notify_#{observer_name}_for_#{method}"
+-          unless existing_methods.include? callback
+-            klass.send(:define_method, callback) do  # def _notify_user_observer_for_before_save
+-              observer.update(method, self)          #   observer.update(:before_save, self)
+-            end                                      # end
+-            klass.send(method, callback)             # before_save :_notify_user_observer_for_before_save
+-          end
++        ActiveRecord::Callbacks::CALLBACKS.each do |callback|
++          next unless respond_to?(callback)
++          klass.send(callback){|record| observer.send(callback, record)}
+         end
+       end
+   end
+diff --git a/activerecord/test/cases/lifecycle_test.rb b/activerecord/test/cases/lifecycle_test.rb
+index 2333384..b8c3ffb 100644
+--- a/activerecord/test/cases/lifecycle_test.rb
++++ b/activerecord/test/cases/lifecycle_test.rb
+@@ -9,10 +9,19 @@ class SpecialDeveloper < Developer; end
+ 
+ class SalaryChecker < ActiveRecord::Observer
+   observe :special_developer
++  attr_accessor :last_saved
+ 
+   def before_save(developer)
+     return developer.salary > 80000
+   end
++
++  module Implementation
++    def after_save(developer)
++      self.last_saved = developer
++    end
++  end
++  include Implementation
++
+ end
+ 
+ class TopicaAuditor < ActiveRecord::Observer
+@@ -179,4 +188,11 @@ class LifecycleTest < ActiveRecord::TestCase
+     developer = SpecialDeveloper.new :name => 'Rookie', :salary => 50000
+     assert !developer.save, "allowed to save a developer with too low salary"
+   end
++
++  test "able to call methods defined with included module" do # https://rails.lighthouseapp.com/projects/8994/tickets/6065-activerecordobserver-is-not-aware-of-method-added-by-including-modules
++    SalaryChecker.instance # activate
++    developer = SpecialDeveloper.create! :name => 'Roger', :salary => 100000
++    assert_equal developer, SalaryChecker.instance.last_saved
++  end
++
+ end
+-- 
+1.7.0.4
+

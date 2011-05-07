@@ -1,0 +1,651 @@
+From b6c35b6d90d53701dfcafd0d45f3a064d00d3234 Mon Sep 17 00:00:00 2001
+From: Matthias Folz und Markus Schwed <ma.schwed@googlemail.com>
+Date: Fri, 25 Feb 2011 18:05:37 +0100
+Subject: [PATCH 1/4] Added ActiveResource - Association-Builder and Reflections
+
+---
+ activeresource/lib/active_resource/associations.rb |   17 +++++
+ .../associations/builder/association.rb            |   34 ++++++++++
+ .../associations/builder/has_many.rb               |    5 ++
+ activeresource/lib/active_resource/base.rb         |    3 +
+ activeresource/lib/active_resource/reflection.rb   |   68 ++++++++++++++++++++
+ activeresource/test/cases/association_test.rb      |   33 ++++++++++
+ activeresource/test/cases/reflection_test.rb       |   51 +++++++++++++++
+ activeresource/test/fixtures/person.rb             |    6 ++
+ 8 files changed, 217 insertions(+), 0 deletions(-)
+ create mode 100644 activeresource/lib/active_resource/associations.rb
+ create mode 100644 activeresource/lib/active_resource/associations/builder/association.rb
+ create mode 100644 activeresource/lib/active_resource/associations/builder/has_many.rb
+ create mode 100644 activeresource/lib/active_resource/associations/builder/has_one.rb
+ create mode 100644 activeresource/lib/active_resource/reflection.rb
+ create mode 100644 activeresource/test/cases/association_test.rb
+ create mode 100644 activeresource/test/cases/reflection_test.rb
+
+diff --git a/activeresource/lib/active_resource/associations.rb b/activeresource/lib/active_resource/associations.rb
+new file mode 100644
+index 0000000..c1433bb
+--- /dev/null
++++ b/activeresource/lib/active_resource/associations.rb
+@@ -0,0 +1,17 @@
++module ActiveResource::Associations
++
++  module Builder
++    autoload :Association, 'active_resource/associations/builder/association'
++    autoload :HasMany,     'active_resource/associations/builder/has_many'
++  end
++
++
++
++  # 
++  #
++  #
++  #
++  def has_many(name, options = {})
++    Builder::HasMany.build(self, name, options)
++  end 
++end
+diff --git a/activeresource/lib/active_resource/associations/builder/association.rb b/activeresource/lib/active_resource/associations/builder/association.rb
+new file mode 100644
+index 0000000..22a8f0b
+--- /dev/null
++++ b/activeresource/lib/active_resource/associations/builder/association.rb
+@@ -0,0 +1,34 @@
++module ActiveResource::Associations::Builder
++  class Association #:nodoc:
++    
++    # providing a Class-Variable, which will have a differend store of subclasses
++    class_attribute :valid_options
++    self.valid_options = [:class_name]
++  
++    # would identify subclasses of association
++    class_attribute :macro
++
++    attr_reader :model, :name, :options, :klass
++
++    def self.build(model, name, options)
++      new(model, name, options).build
++    end
++
++    def initialize(model, name, options)
++      @model, @name, @options = model, name, options
++    end
++
++    def build
++      validate_options
++      reflection = model.create_reflection(self.class.macro, name, options)
++    end
++
++    private
++
++    def validate_options
++      options.assert_valid_keys(self.class.valid_options)
++    end
++  end
++end
++
++
+diff --git a/activeresource/lib/active_resource/associations/builder/has_many.rb b/activeresource/lib/active_resource/associations/builder/has_many.rb
+new file mode 100644
+index 0000000..696a5d6
+--- /dev/null
++++ b/activeresource/lib/active_resource/associations/builder/has_many.rb
+@@ -0,0 +1,5 @@
++module ActiveResource::Associations::Builder 
++  class HasMany < Associations
++    self.macro = :has_many 
++  end
++end
+diff --git a/activeresource/lib/active_resource/associations/builder/has_one.rb b/activeresource/lib/active_resource/associations/builder/has_one.rb
+new file mode 100644
+index 0000000..e69de29
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index daa8962..4cb6c0a 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -18,6 +18,8 @@ require 'active_resource/connection'
+ require 'active_resource/formats'
+ require 'active_resource/schema'
+ require 'active_resource/log_subscriber'
++require 'active_resource/associations'
++require 'active_resource/reflection'
+ 
+ module ActiveResource
+   # ActiveResource::Base is the main class for mapping RESTful resources as models in a Rails application.
+@@ -1431,5 +1433,6 @@ module ActiveResource
+     include ActiveModel::Conversion
+     include ActiveModel::Serializers::JSON
+     include ActiveModel::Serializers::Xml
++    include ActiveResource::Reflection
+   end
+ end
+diff --git a/activeresource/lib/active_resource/reflection.rb b/activeresource/lib/active_resource/reflection.rb
+new file mode 100644
+index 0000000..eb99028
+--- /dev/null
++++ b/activeresource/lib/active_resource/reflection.rb
+@@ -0,0 +1,68 @@
++require 'active_support/core_ext/class/attribute'
++require 'active_support/core_ext/module/deprecation'
++
++module ActiveResource
++  # = Active Resource reflection
++  # 
++  # Associations in ActiveResource would be used to resolve nested attributes
++  # in a response with correct classes.
++  # Now they could be specify over Associations with the options :class_name 
++  module Reflection # :nodoc:
++    extend ActiveSupport::Concern
++
++    included do
++      class_attribute :reflections
++      self.reflections = {}
++    end
++
++    module ClassMethods
++      def create_reflection(macro, name, options)
++        reflection = AssociationReflection.new(macro, name, options)
++        self.reflections = self.reflections.merge(name => reflection)
++        reflection
++      end
++    end
++
++
++    class AssociationReflection
++
++      def initialize(macro, name, options)
++        @macro, @name, @options = macro, name, options
++      end
++
++      # Returns the name of the macro.
++      #
++      # <tt>has_many :clients</tt> returns <tt>:clients</tt>
++      attr_reader :name
++
++      # Returns the macro type.
++      #
++      # <tt>has_many :clients</tt> returns <tt>:has_many</tt>
++      attr_reader :macro
++
++      # Returns the hash of options used for the macro.
++      #
++      # <tt>has_many :clients</tt> returns +{}+
++      attr_reader :options
++
++      # Returns the class for the macro.
++      #
++      # <tt>has_many :clients</tt> returns the Client class
++      def klass
++        @klass ||= class_name.constantize
++      end
++
++      # Returns the class name for the macro.
++      #
++      # <tt>has_many :clients</tt> returns <tt>'Client'</tt>
++      def class_name
++        @class_name ||= derive_class_name
++      end
++
++      private
++        def derive_class_name
++          return (options[:class_name] ? options[:class_name].to_s : name.to_s).classify
++        end
++    end
++  end
++end
+diff --git a/activeresource/test/cases/association_test.rb b/activeresource/test/cases/association_test.rb
+new file mode 100644
+index 0000000..4899548
+--- /dev/null
++++ b/activeresource/test/cases/association_test.rb
+@@ -0,0 +1,33 @@
++require 'abstract_unit'
++
++require 'fixtures/person'
++require 'fixtures/beast'
++require 'fixtures/customer'
++
++
++class AssociationTest < Test::Unit::TestCase
++  def setup
++    @klass = ActiveResource::Associations::Builder::Association
++  end
++
++
++  def test_validations_for_instance
++    object = @klass.new(Person, :customers, {})
++    object.send(:validate_options)
++  end
++
++  def test_instance_build
++    object = @klass.new(Person, :customers, {})
++    object.build
++  end
++
++  def test_valid_options
++    assert_raise ArgumentError do 
++      @klass.build(Person, :customers, {:soo_invalid => true})
++    end
++  end
++
++  def test_association_class_build
++    @klass.build(Person, :customers, {})
++  end
++end
+diff --git a/activeresource/test/cases/reflection_test.rb b/activeresource/test/cases/reflection_test.rb
+new file mode 100644
+index 0000000..240c61f
+--- /dev/null
++++ b/activeresource/test/cases/reflection_test.rb
+@@ -0,0 +1,51 @@
++require 'abstract_unit'
++
++require 'fixtures/person'
++require 'fixtures/customer'
++
++
++
++class ReflectionTest < Test::Unit::TestCase
++  def setup
++  end
++
++  def test_correct_class_attributes
++    object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {})
++    assert_equal object.name, :people
++    assert_equal object.macro, :test
++    assert_equal object.options, {} 
++  end
++
++  def test_correct_class_name_matching_without_class_name
++    object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {})
++    assert_equal object.klass, Person
++  end
++
++  def test_correct_class_name_matching_as_string
++    object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => 'Person'})
++    assert_equal object.klass, Person
++  end
++
++  def test_correct_class_name_matching_as_symbol
++    object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => :person})
++    assert_equal object.klass, Person
++  end
++
++  def test_correct_class_name_matching_as_class
++    object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => Person})
++    assert_equal object.klass, Person
++  end
++
++  def test_correct_class_name_matching_as_string_with_namespace
++    object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => 'external/person'})
++    assert_equal object.klass, External::Person
++  end
++
++  def test_creation_of_reflection
++    object = Person.create_reflection(:test, :people, {})
++    assert_equal object.class, ActiveResource::Reflection::AssociationReflection
++    assert_equal Person.reflections.count, 1
++    assert_equal Person.reflections[:people].klass, Person
++  end
++
++end
+diff --git a/activeresource/test/fixtures/person.rb b/activeresource/test/fixtures/person.rb
+index e88bb69..b2b9ce9 100644
+--- a/activeresource/test/fixtures/person.rb
++++ b/activeresource/test/fixtures/person.rb
+@@ -1,3 +1,9 @@
+ class Person < ActiveResource::Base
+   self.site = "http://37s.sunrise.i:3000"
+ end
++
++module External
++  class Person < ActiveResource::Base
++    self.site = "http://atq.caffeine.intoxication.it"
++  end
++end
+-- 
+1.7.1
+
+
+From 925af42bcd64e5d3f22b701cd92c9789e9a9f997 Mon Sep 17 00:00:00 2001
+From: Matthias Folz and Markus Schwed <folz.matthias@googlemail.com>
+Date: Fri, 25 Feb 2011 19:48:31 +0100
+Subject: [PATCH 2/4] Added comments for ActiveResource::Associations has_many and has_one
+
+---
+ activeresource/lib/active_resource/associations.rb |   44 +++++++++++++++++++-
+ .../associations/builder/has_one.rb                |    5 ++
+ activeresource/test/fixtures/person.rb             |    5 ++
+ 3 files changed, 53 insertions(+), 1 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/associations.rb b/activeresource/lib/active_resource/associations.rb
+index c1433bb..4a1dbb8 100644
+--- a/activeresource/lib/active_resource/associations.rb
++++ b/activeresource/lib/active_resource/associations.rb
+@@ -7,11 +7,53 @@ module ActiveResource::Associations
+ 
+ 
+ 
+-  # 
++  # Specifies a one-to-many association.
+   #
++  # === Options
++  # [:class_name]
++  #   Specify the class name of the association. This class name would
++  #   be used for resolving the association class. 
+   #
++  # ==== Example for [:class_name] - option
++  # GET /posts/123.xml delivers following response body:
++  #   <post>
++  #     <title>ActiveResource now have associations</title>
++  #     <content> ... </content>
++  #     <comments>
++  #       <comment> ... </comment>
++  #       <comment> ... </comment>
++  #     </comments>
++  #   </post>
++  # ====
+   #
++  # <tt>has_many :comments, :class_name => 'myblog/comments'</tt>
++  # Would resolve this comments into the <tt>Myblog::Comments</tt> class.
+   def has_many(name, options = {})
+     Builder::HasMany.build(self, name, options)
+   end 
++
++  # Specifies a one-to-one association.
++  #
++  # === Options
++  # [:class_name]
++  #   Specify the class name of the association. This class name would
++  #   be used for resolving the association class. 
++  #
++  # ==== Example for [:class_name] - option
++  # GET /posts/123.xml delivers following response body:
++  #   <post>
++  #     <title>ActiveResource now have associations</title>
++  #     <content> ... </content>
++  #     <author>
++  #       <name>caffeinatedBoys</name>
++  #     </author>
++  #   </post>
++  # ==== 
++  #
++  # <tt>has_one :author, :class_name => 'myblog/author'</tt>
++  # Would resolve this author into the <tt>Myblog::Author</tt> class.
++  def has_one(name, options = {})
++    Builder::HasOne.build(self, name, options)
++  end 
++
+ end
+diff --git a/activeresource/lib/active_resource/associations/builder/has_one.rb b/activeresource/lib/active_resource/associations/builder/has_one.rb
+index e69de29..9f03496 100644
+--- a/activeresource/lib/active_resource/associations/builder/has_one.rb
++++ b/activeresource/lib/active_resource/associations/builder/has_one.rb
+@@ -0,0 +1,5 @@
++module ActiveResource::Associations::Builder 
++  class HasOne < Associations
++    self.macro = :has_one
++  end
++end
+diff --git a/activeresource/test/fixtures/person.rb b/activeresource/test/fixtures/person.rb
+index b2b9ce9..474d574 100644
+--- a/activeresource/test/fixtures/person.rb
++++ b/activeresource/test/fixtures/person.rb
+@@ -7,3 +7,8 @@ module External
+     self.site = "http://atq.caffeine.intoxication.it"
+   end
+ end
++
++class SalesMan < ActiveResource::Base
++  self.site = "http://atq.is.hungry.it"
++  has_many :people
++end
+-- 
+1.7.1
+
+
+From 9bc1abf26d3670a983c86935dc36de48f9ca58e2 Mon Sep 17 00:00:00 2001
+From: Matthias Folz and Markus Schwed <folz.matthias@googlemail.com>
+Date: Fri, 25 Feb 2011 20:07:20 +0100
+Subject: [PATCH 3/4] Fixed some comments
+
+---
+ activeresource/lib/active_resource/associations.rb |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/associations.rb b/activeresource/lib/active_resource/associations.rb
+index 4a1dbb8..b044147 100644
+--- a/activeresource/lib/active_resource/associations.rb
++++ b/activeresource/lib/active_resource/associations.rb
+@@ -26,8 +26,8 @@ module ActiveResource::Associations
+   #   </post>
+   # ====
+   #
+-  # <tt>has_many :comments, :class_name => 'myblog/comments'</tt>
+-  # Would resolve this comments into the <tt>Myblog::Comments</tt> class.
++  # <tt>has_many :comments, :class_name => 'myblog/comment'</tt>
++  # Would resolve this comments into the <tt>Myblog::Comment</tt> class.
+   def has_many(name, options = {})
+     Builder::HasMany.build(self, name, options)
+   end 
+-- 
+1.7.1
+
+
+From 8907d58de0d2360d4ce791d759a3226505417cec Mon Sep 17 00:00:00 2001
+From: Matthias Folz and Markus Schwed <folz.matthias@googlemail.com>
+Date: Fri, 25 Feb 2011 21:33:07 +0100
+Subject: [PATCH 4/4] ActiveResource::Reflection now recognized by find_or_create_resource_for_collection
+
+---
+ activeresource/lib/active_resource/associations.rb |    1 +
+ .../associations/builder/has_many.rb               |    2 +-
+ .../associations/builder/has_one.rb                |    2 +-
+ activeresource/lib/active_resource/base.rb         |    5 ++++
+ activeresource/test/abstract_unit.rb               |    5 +++-
+ activeresource/test/cases/association_test.rb      |   10 ++++++++
+ activeresource/test/cases/base_test.rb             |   14 +++++++++++
+ activeresource/test/cases/reflection_test.rb       |   24 +++++++++----------
+ activeresource/test/fixtures/person.rb             |    4 ---
+ 9 files changed, 47 insertions(+), 20 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/associations.rb b/activeresource/lib/active_resource/associations.rb
+index b044147..ab2746d 100644
+--- a/activeresource/lib/active_resource/associations.rb
++++ b/activeresource/lib/active_resource/associations.rb
+@@ -3,6 +3,7 @@ module ActiveResource::Associations
+   module Builder
+     autoload :Association, 'active_resource/associations/builder/association'
+     autoload :HasMany,     'active_resource/associations/builder/has_many'
++    autoload :HasOne,      'active_resource/associations/builder/has_one'
+   end
+ 
+ 
+diff --git a/activeresource/lib/active_resource/associations/builder/has_many.rb b/activeresource/lib/active_resource/associations/builder/has_many.rb
+index 696a5d6..074bae1 100644
+--- a/activeresource/lib/active_resource/associations/builder/has_many.rb
++++ b/activeresource/lib/active_resource/associations/builder/has_many.rb
+@@ -1,5 +1,5 @@
+ module ActiveResource::Associations::Builder 
+-  class HasMany < Associations
++  class HasMany < Association
+     self.macro = :has_many 
+   end
+ end
+diff --git a/activeresource/lib/active_resource/associations/builder/has_one.rb b/activeresource/lib/active_resource/associations/builder/has_one.rb
+index 9f03496..897e070 100644
+--- a/activeresource/lib/active_resource/associations/builder/has_one.rb
++++ b/activeresource/lib/active_resource/associations/builder/has_one.rb
+@@ -1,5 +1,5 @@
+ module ActiveResource::Associations::Builder 
+-  class HasOne < Associations
++  class HasOne < Association
+     self.macro = :has_one
+   end
+ end
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 4cb6c0a..4e70225 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -1365,6 +1365,7 @@ module ActiveResource
+     private
+       # Tries to find a resource for a given collection name; if it fails, then the resource is created
+       def find_or_create_resource_for_collection(name)
++        return reflections[name.to_sym].klass if reflections.key?(name.to_sym)
+         find_or_create_resource_for(ActiveSupport::Inflector.singularize(name.to_s))
+       end
+ 
+@@ -1385,6 +1386,8 @@ module ActiveResource
+ 
+       # Tries to find a resource for a given name; if it fails, then the resource is created
+       def find_or_create_resource_for(name)
++        return reflections[name.to_sym].klass if reflections.key?(name.to_sym)
++
+         resource_name = name.to_s.camelize
+         ancestors = self.class.name.split("::")
+         if ancestors.size > 1
+@@ -1429,6 +1432,8 @@ module ActiveResource
+ 
+   class Base
+     extend ActiveModel::Naming
++    extend ActiveResource::Associations
++
+     include CustomMethods, Observing, Validations
+     include ActiveModel::Conversion
+     include ActiveModel::Serializers::JSON
+diff --git a/activeresource/test/abstract_unit.rb b/activeresource/test/abstract_unit.rb
+index 195f93f..b5db3bb 100644
+--- a/activeresource/test/abstract_unit.rb
++++ b/activeresource/test/abstract_unit.rb
+@@ -60,7 +60,10 @@ def setup_response
+                                         {:name => 'Elsa',
+                                          :children => [{:name => 'Natacha'}]},
+                                         {:name => 'Milena',
+-                                         :children => []}]}]}.to_xml(:root => 'customer')
++                                         :children => []}]}],
++            :enemies => [{:name => 'Joker'}],
++            :mother => {:name => 'Ingeborg'}
++  }.to_xml(:root => 'customer')
+   # - resource with yaml array of strings; for ARs using serialize :bar, Array
+   @marty = <<-eof.strip
+     <?xml version=\"1.0\" encoding=\"UTF-8\"?>
+diff --git a/activeresource/test/cases/association_test.rb b/activeresource/test/cases/association_test.rb
+index 4899548..aec3e84 100644
+--- a/activeresource/test/cases/association_test.rb
++++ b/activeresource/test/cases/association_test.rb
+@@ -30,4 +30,14 @@ class AssociationTest < Test::Unit::TestCase
+   def test_association_class_build
+     @klass.build(Person, :customers, {})
+   end
++
++  def test_has_many
++    External::Person.send(:has_many, :people)
++    assert_equal 1, External::Person.reflections.select{|name, reflection| reflection.macro.eql?(:has_many)}.count
++  end
++  
++  def test_has_one
++    External::Person.send(:has_one, :customer)
++    assert_equal 1, External::Person.reflections.select{|name, reflection| reflection.macro.eql?(:has_one)}.count
++  end
+ end
+diff --git a/activeresource/test/cases/base_test.rb b/activeresource/test/cases/base_test.rb
+index ab80190..28ad032 100644
+--- a/activeresource/test/cases/base_test.rb
++++ b/activeresource/test/cases/base_test.rb
+@@ -1041,6 +1041,20 @@ class BaseTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_parse_resource_with_given_has_one_resources
++    Customer.send(:has_one, :mother, :class_name => "external/person")
++    luis = Customer.find(1)
++    assert_kind_of External::Person, luis.mother
++  end
++
++  def test_parse_resources_with_given_has_many_resources
++    Customer.send(:has_many, :enemies, :class_name => "external/person")
++    luis = Customer.find(1)
++    luis.enemies.each do |enemy|
++      assert_kind_of External::Person, enemy
++    end
++  end
++
+   def test_load_yaml_array
+     assert_nothing_raised do
+       marty = Person.find(5)
+diff --git a/activeresource/test/cases/reflection_test.rb b/activeresource/test/cases/reflection_test.rb
+index 240c61f..dd51242 100644
+--- a/activeresource/test/cases/reflection_test.rb
++++ b/activeresource/test/cases/reflection_test.rb
+@@ -6,46 +6,44 @@ require 'fixtures/customer'
+ 
+ 
+ class ReflectionTest < Test::Unit::TestCase
+-  def setup
+-  end
+ 
+   def test_correct_class_attributes
+     object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {})
+-    assert_equal object.name, :people
+-    assert_equal object.macro, :test
+-    assert_equal object.options, {} 
++    assert_equal :people, object.name
++    assert_equal :test, object.macro
++    assert_equal({}, object.options)
+   end
+ 
+   def test_correct_class_name_matching_without_class_name
+     object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {})
+-    assert_equal object.klass, Person
++    assert_equal Person, object.klass
+   end
+ 
+   def test_correct_class_name_matching_as_string
+     object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => 'Person'})
+-    assert_equal object.klass, Person
++    assert_equal Person, object.klass
+   end
+ 
+   def test_correct_class_name_matching_as_symbol
+     object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => :person})
+-    assert_equal object.klass, Person
++    assert_equal Person, object.klass
+   end
+ 
+   def test_correct_class_name_matching_as_class
+     object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => Person})
+-    assert_equal object.klass, Person
++    assert_equal Person, object.klass
+   end
+ 
+   def test_correct_class_name_matching_as_string_with_namespace
+     object = ActiveResource::Reflection::AssociationReflection.new(:test, :people, {:class_name => 'external/person'})
+-    assert_equal object.klass, External::Person
++    assert_equal External::Person, object.klass
+   end
+ 
+   def test_creation_of_reflection
+     object = Person.create_reflection(:test, :people, {})
+-    assert_equal object.class, ActiveResource::Reflection::AssociationReflection
+-    assert_equal Person.reflections.count, 1
+-    assert_equal Person.reflections[:people].klass, Person
++    assert_equal ActiveResource::Reflection::AssociationReflection, object.class
++    assert Person.reflections[:people].present?
++    assert_equal Person, Person.reflections[:people].klass
+   end
+ 
+ end
+diff --git a/activeresource/test/fixtures/person.rb b/activeresource/test/fixtures/person.rb
+index 474d574..948965b 100644
+--- a/activeresource/test/fixtures/person.rb
++++ b/activeresource/test/fixtures/person.rb
+@@ -8,7 +8,3 @@ module External
+   end
+ end
+ 
+-class SalesMan < ActiveResource::Base
+-  self.site = "http://atq.is.hungry.it"
+-  has_many :people
+-end
+-- 
+1.7.1
+

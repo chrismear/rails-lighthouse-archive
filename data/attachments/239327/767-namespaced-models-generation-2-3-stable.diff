@@ -1,0 +1,138 @@
+From 18b8f8e1507ab31470d6183bdd766addef6bfd4b Mon Sep 17 00:00:00 2001
+From: Hugo Peixoto <hugo.peixoto@gmail.com>
+Date: Sun, 9 Aug 2009 12:22:04 +0100
+Subject: [PATCH] added tests for namespaced models generation and fixed a bug related to it. Also fixed a pluralization=false issue.
+
+---
+ railties/lib/rails_generator/base.rb               |    2 +-
+ .../generators/components/model/model_generator.rb |   11 ++++-
+ railties/test/generators/generator_test_helper.rb  |    7 +++
+ .../test/generators/rails_model_generator_test.rb  |   48 ++++++++++++++++++++
+ 4 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/railties/lib/rails_generator/base.rb b/railties/lib/rails_generator/base.rb
+index aa7081f..dd75f05 100644
+--- a/railties/lib/rails_generator/base.rb
++++ b/railties/lib/rails_generator/base.rb
+@@ -233,13 +233,13 @@ module Rails
+           base_name, @class_path, @file_path, @class_nesting, @class_nesting_depth = extract_modules(@name)
+           @class_name_without_nesting, @singular_name, @plural_name = inflect_names(base_name)
+           @table_name = (!defined?(ActiveRecord::Base) || ActiveRecord::Base.pluralize_table_names) ? plural_name : singular_name
+-          @table_name.gsub! '/', '_'
+           if @class_nesting.empty?
+             @class_name = @class_name_without_nesting
+           else
+             @table_name = @class_nesting.underscore << "_" << @table_name
+             @class_name = "#{@class_nesting}::#{@class_name_without_nesting}"
+           end
++          @table_name.gsub! '/', '_'
+         end
+ 
+         # Extract modules from filesystem-style or ruby-style path:
+diff --git a/railties/lib/rails_generator/generators/components/model/model_generator.rb b/railties/lib/rails_generator/generators/components/model/model_generator.rb
+index 582a289..1895d8a 100644
+--- a/railties/lib/rails_generator/generators/components/model/model_generator.rb
++++ b/railties/lib/rails_generator/generators/components/model/model_generator.rb
+@@ -19,10 +19,17 @@ class ModelGenerator < Rails::Generator::NamedBase
+        	m.template 'fixtures.yml',  File.join('test/fixtures', "#{table_name}.yml")
+       end
+ 
++      migration_file_path = file_path.gsub(/\//, '_')
++      migration_name = class_name
++      if ActiveRecord::Base.pluralize_table_names
++        migration_name = migration_name.pluralize
++        migration_file_path = migration_file_path.pluralize
++      end
++
+       unless options[:skip_migration]
+         m.migration_template 'migration.rb', 'db/migrate', :assigns => {
+-          :migration_name => "Create#{class_name.pluralize.gsub(/::/, '')}"
+-        }, :migration_file_name => "create_#{file_path.gsub(/\//, '_').pluralize}"
++          :migration_name => "Create#{migration_name.gsub(/::/, '')}"
++        }, :migration_file_name => "create_#{migration_file_path}"
+       end
+     end
+   end
+diff --git a/railties/test/generators/generator_test_helper.rb b/railties/test/generators/generator_test_helper.rb
+index 01bf1c9..6f02eb3 100644
+--- a/railties/test/generators/generator_test_helper.rb
++++ b/railties/test/generators/generator_test_helper.rb
+@@ -264,6 +264,8 @@ class GeneratorTestCase < Test::Unit::TestCase
+ 
+   def assert_generated_migration(name, parent = "ActiveRecord::Migration")
+     file = Dir.glob("#{RAILS_ROOT}/db/migrate/*_#{name.to_s.underscore}.rb").first
++    assert !file.nil?, "should have generated the migration file but didn't"
++
+     file = file.match(/db\/migrate\/[0-9]+_\w+/).to_s
+     assert_generated_class file, parent do |body|
+       assert_match /timestamps/, body, "should have timestamps defined"
+@@ -300,4 +302,9 @@ class GeneratorTestCase < Test::Unit::TestCase
+   def assert_generated_column(body, name, type)
+     assert_match /t\.#{type.to_s} :#{name.to_s}/, body, "should have column #{name.to_s} defined"
+   end
++
++  # Asserts that the given table is defined in the migration.
++  def assert_generated_table(body, name)
++    assert_match /create_table :#{name.to_s} do/, body, "should have table #{name.to_s} defined"
++  end
+ end
+diff --git a/railties/test/generators/rails_model_generator_test.rb b/railties/test/generators/rails_model_generator_test.rb
+index aea2aba..208b0c4 100644
+--- a/railties/test/generators/rails_model_generator_test.rb
++++ b/railties/test/generators/rails_model_generator_test.rb
+@@ -45,4 +45,52 @@ class RailsModelGeneratorTest < GeneratorTestCase
+       assert body =~ /^\s+belongs_to :supplier/, "#{body.inspect} should contain 'belongs_to :supplier'"
+     end
+   end
++
++  def test_migration_with_namespace
++    run_generator('model', %w(Gallery::Image))
++    assert_generated_migration :gallery_images
++    assert_skipped_migration :create_images
++  end
++
++  def test_migration_with_nested_namespace
++    run_generator('model', %w(Admin::Gallery::Image))
++    assert_skipped_migration :create_images
++    assert_skipped_migration :create_gallery_images
++
++    assert_generated_migration :admin_gallery_images do |t|
++      assert_generated_table t, :admin_gallery_images
++    end
++  end
++
++  def test_migration_with_nested_namespace_without_pluralization
++    ActiveRecord::Base.pluralize_table_names = false
++    run_generator('model', %w(Admin::Gallery::Image))
++    assert_skipped_migration :create_images
++    assert_skipped_migration :create_gallery_images
++    assert_skipped_migration :create_admin_gallery_images
++    assert_generated_migration :admin_gallery_image do |t|
++      assert_generated_table t, :admin_gallery_image
++    end
++  ensure
++    ActiveRecord::Base.pluralize_table_names = true
++  end
++  
++  def test_migration_with_namespaces_in_model_name_without_plurization
++    ActiveRecord::Base.pluralize_table_names = false
++    run_generator('model', %w(Gallery::Image))
++    assert_generated_migration :create_gallery_image
++    assert_skipped_migration :create_gallery_images
++  ensure
++    ActiveRecord::Base.pluralize_table_names = true
++  end
++
++  def test_migration_without_pluralization
++    ActiveRecord::Base.pluralize_table_names = false
++    run_generator('model', %w(Account))
++    assert_generated_migration :create_account
++    assert_skipped_migration :create_accounts
++  ensure
++    ActiveRecord::Base.pluralize_table_names = true
++  end
++
+ end
+-- 
+1.6.3.3
+

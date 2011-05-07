@@ -1,0 +1,677 @@
+From 33f8f4c1edc81ddfe0e1e381c378c5d4532ca989 Mon Sep 17 00:00:00 2001
+From: Harri Kauhanen <hazard@Weasel.local>
+Date: Wed, 18 Jun 2008 17:29:32 +0300
+Subject: [PATCH] Improved support for namespaced model
+
+---
+ activerecord/lib/active_record/base.rb             |   11 ++++--
+ activerecord/lib/active_record/fixtures.rb         |   27 +++++++++++++--
+ activerecord/test/cases/modules_test.rb            |    9 +++--
+ activerecord/test/cases/reflection_test.rb         |    6 ++--
+ activerecord/test/schema/schema.rb                 |   19 +++++++++++
+ railties/lib/rails_generator/base.rb               |    5 ++-
+ railties/lib/rails_generator/commands.rb           |   26 +++++++++++++-
+ .../components/controller/controller_generator.rb  |    5 ++-
+ .../generators/components/model/model_generator.rb |    6 ++--
+ .../components/resource/resource_generator.rb      |    8 ++--
+ .../components/scaffold/scaffold_generator.rb      |    8 ++--
+ .../components/scaffold/templates/controller.rb    |   35 ++++++++++---------
+ .../scaffold/templates/functional_test.rb          |    6 ++--
+ .../scaffold/templates/view_edit.html.erb          |    2 +-
+ .../scaffold/templates/view_index.html.erb         |    4 +-
+ .../scaffold/templates/view_new.html.erb           |    2 +-
+ .../scaffold/templates/view_show.html.erb          |    4 +-
+ 17 files changed, 128 insertions(+), 55 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 74299bd..e21eb62 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -957,7 +957,8 @@ module ActiveRecord #:nodoc:
+       # in Active Support, which knows almost all common English inflections. You can add new inflections in config/initializers/inflections.rb.
+       #
+       # Nested classes are given table names prefixed by the singular form of
+-      # the parent's table name. Enclosing modules are not considered. Examples:
++      # the parent's table name. Enclosing modules are also prefixed by the underscored form of module name.
++      # Examples:
+       #
+       #   class Invoice < ActiveRecord::Base; end;
+       #   file                  class               table_name
+@@ -969,7 +970,7 @@ module ActiveRecord #:nodoc:
+       #
+       #   module Invoice; class Lineitem < ActiveRecord::Base; end; end;
+       #   file                  class               table_name
+-      #   invoice/lineitem.rb   Invoice::Lineitem   lineitems
++      #   invoice/lineitem.rb   Invoice::Lineitem   invoice_lineitems
+       #
+       # Additionally, the class-level table_name_prefix is prepended and the
+       # table_name_suffix is appended.  So if you have "myapp_" as a prefix,
+@@ -995,7 +996,8 @@ module ActiveRecord #:nodoc:
+             base.table_name
+           else
+             # Nested classes are prefixed with singular parent table name.
+-            if parent < ActiveRecord::Base && !parent.abstract_class?
++            # (harrikauhanen) Is parent.table_exists? correct way to fix the problem with namespaced models?
++            if parent < ActiveRecord::Base && !parent.abstract_class? && parent.table_exists?
+               contained = parent.table_name
+               contained = contained.singularize if parent.pluralize_table_names
+               contained << '_'
+@@ -1566,7 +1568,8 @@ module ActiveRecord #:nodoc:
+ 
+         # Guesses the table name, but does not decorate it with prefix and suffix information.
+         def undecorated_table_name(class_name = base_class.name)
+-          table_name = Inflector.underscore(Inflector.demodulize(class_name))
++          table_name = Inflector.underscore(class_name)
++          table_name.gsub!('/', '_') # is this 'Windows safe'?
+           table_name = Inflector.pluralize(table_name) if pluralize_table_names
+           table_name
+         end
+diff --git a/activerecord/lib/active_record/fixtures.rb b/activerecord/lib/active_record/fixtures.rb
+index 9367ea5..08ebd3b 100755
+--- a/activerecord/lib/active_record/fixtures.rb
++++ b/activerecord/lib/active_record/fixtures.rb
+@@ -509,7 +509,8 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+           fixtures_map = {}
+ 
+           fixtures = table_names_to_fetch.map do |table_name|
+-            fixtures_map[table_name] = Fixtures.new(connection, File.split(table_name.to_s).last, class_names[table_name.to_sym], File.join(fixtures_directory, table_name.to_s))
++            fixtures_file = locate_fixtures_file(fixtures_directory, table_name)
++            fixtures_map[table_name] = Fixtures.new(connection, File.split(table_name.to_s).last, class_names[table_name.to_sym], fixtures_file)
+           end
+ 
+           all_loaded_fixtures.update(fixtures_map)
+@@ -646,6 +647,18 @@ class Fixtures < (RUBY_VERSION < '1.9' ? YAML::Omap : Hash)
+   end
+ 
+   private
++  
++    def self.locate_fixtures_file(fixtures_directory, table_name)
++      fixture_file_candidates = Dir.glob(File.join(fixtures_directory, '**', '*.{yml,csv}'))
++      fixture_file_candidates.map! { |f| f[fixtures_directory.length..f.length-5]}
++      fixture_file_candidates.each do |candidate|
++        if table_name == candidate.sub(/\/*/, '').gsub(File::Separator, '_')
++          return fixtures_directory + candidate
++        end
++      end
++      nil
++    end
++  
+     class HabtmFixtures < ::Fixtures #:nodoc:
+       def read_fixture_files; end
+     end
+@@ -839,8 +852,16 @@ module Test #:nodoc:
+ 
+         def fixtures(*table_names)
+           if table_names.first == :all
+-            table_names = Dir["#{fixture_path}/*.yml"] + Dir["#{fixture_path}/*.csv"]
+-            table_names.map! { |f| File.basename(f).split('.')[0..-2].join('.') }
++            fixture_files = Dir[File.join("#{fixture_path}", "**", "*.{yml,csv}")]
++            fixture_files_stripped = fixture_files.map { |f| f.sub(fixture_path, '').split('.')[0..-2].join('.').sub(/\/*/, '') }
++            table_names = fixture_files_stripped.map { |f| f.gsub(File::SEPARATOR, '_') }
++            # There propably is a neater 'Ruby way' to do this..
++            for i in 0..(table_names.size - 1)
++              class_portions = fixture_files_stripped[i].split(File::SEPARATOR)
++              class_portions.map! { |c| c.classify }
++              class_name = class_portions.join('::')
++              fixture_class_names[table_names[i].to_sym] = class_name
++            end
+           else
+             table_names = table_names.flatten.map { |n| n.to_s }
+           end
+diff --git a/activerecord/test/cases/modules_test.rb b/activerecord/test/cases/modules_test.rb
+index 283333f..48665f5 100644
+--- a/activerecord/test/cases/modules_test.rb
++++ b/activerecord/test/cases/modules_test.rb
+@@ -2,7 +2,8 @@ require "cases/helper"
+ require 'models/company_in_module'
+ 
+ class ModulesTest < ActiveRecord::TestCase
+-  fixtures :accounts, :companies, :projects, :developers
++  # (harrikauhanen) I also had to copy/paste those fixtures, because I cannot no longer "recycle" them between namespaces
++  fixtures :my_application_billing_accounts, :my_application_business_companies, :my_application_business_projects, :developers
+ 
+   def test_module_spanning_associations
+     firm = MyApplication::Business::Firm.find(:first)
+@@ -32,8 +33,8 @@ class ModulesTest < ActiveRecord::TestCase
+   end
+ 
+   def test_table_name
+-    assert_equal 'accounts', MyApplication::Billing::Account.table_name, 'table_name for ActiveRecord model in module'
+-    assert_equal 'companies', MyApplication::Business::Client.table_name, 'table_name for ActiveRecord model subclass'
+-    assert_equal 'company_contacts', MyApplication::Business::Client::Contact.table_name, 'table_name for ActiveRecord model enclosed by another ActiveRecord model'
++    assert_equal 'my_application_billing_accounts', MyApplication::Billing::Account.table_name, 'table_name for ActiveRecord model in module'
++    assert_equal 'my_application_business_companies', MyApplication::Business::Client.table_name, 'table_name for ActiveRecord model subclass'
++    assert_equal 'my_application_business_company_my_application_business_client_contacts', MyApplication::Business::Client::Contact.table_name, 'table_name for ActiveRecord model enclosed by another ActiveRecord model'
+   end
+ end
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index c8ee40e..911eec6 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -125,19 +125,19 @@ class ReflectionTest < ActiveRecord::TestCase
+       :clients_of_firm,
+       :klass      => MyApplication::Business::Client,
+       :class_name => 'Client',
+-      :table_name => 'companies'
++      :table_name => 'my_application_business_companies'
+ 
+     assert_reflection MyApplication::Billing::Account,
+       :firm,
+       :klass      => MyApplication::Business::Firm,
+       :class_name => 'MyApplication::Business::Firm',
+-      :table_name => 'companies'
++      :table_name => 'my_application_business_companies'
+ 
+     assert_reflection MyApplication::Billing::Account,
+       :qualified_billing_firm,
+       :klass      => MyApplication::Billing::Firm,
+       :class_name => 'MyApplication::Billing::Firm',
+-      :table_name => 'companies'
++      :table_name => 'companies' # because self.table_name = 'companies' was defined
+ 
+     assert_reflection MyApplication::Billing::Account,
+       :unqualified_billing_firm,
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 818237f..d12f87d 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -233,6 +233,25 @@ ActiveRecord::Schema.define do
+     t.string      :name
+   end
+ 
++  create_table :my_application_billing_accounts, :force => true do |t|
++    t.integer :firm_id
++    t.integer :credit_limit
++  end
++
++  create_table :my_application_business_companies, :force => true do |t|
++    t.string  :type
++    t.string  :ruby_type
++    t.integer :firm_id
++    t.string  :name
++    t.integer :client_of
++    t.integer :rating, :default => 1
++  end
++
++  create_table :my_application_business_projects, :force => true do |t|
++    t.string :name
++    t.string :type
++  end
++
+   create_table :numeric_data, :force => true do |t|
+     t.decimal :bank_balance, :precision => 10, :scale => 2
+     t.decimal :big_bank_balance, :precision => 15, :scale => 2
+diff --git a/railties/lib/rails_generator/base.rb b/railties/lib/rails_generator/base.rb
+index 1ebcff9..0bfebe5 100644
+--- a/railties/lib/rails_generator/base.rb
++++ b/railties/lib/rails_generator/base.rb
+@@ -197,6 +197,7 @@ module Rails
+     class NamedBase < Base
+       attr_reader   :name, :class_name, :singular_name, :plural_name, :table_name
+       attr_reader   :class_path, :file_path, :class_nesting, :class_nesting_depth
++      attr_reader   :nesting_underscored, :nesting_path
+       alias_method  :file_name,  :singular_name
+       alias_method  :actions, :args
+ 
+@@ -229,12 +230,14 @@ module Rails
+           @name = name
+           base_name, @class_path, @file_path, @class_nesting, @class_nesting_depth = extract_modules(@name)
+           @class_name_without_nesting, @singular_name, @plural_name = inflect_names(base_name)
++          @nesting_underscored =  @class_nesting.underscore.gsub('/', '_') + '_' if not @class_nesting.empty?
++          @nesting_path = '/' + @class_nesting.underscore
+           @table_name = (!defined?(ActiveRecord::Base) || ActiveRecord::Base.pluralize_table_names) ? plural_name : singular_name
+           @table_name.gsub! '/', '_'
+           if @class_nesting.empty?
+             @class_name = @class_name_without_nesting
+           else
+-            @table_name = @class_nesting.underscore << "_" << @table_name
++            @table_name = @nesting_underscored + @table_name
+             @class_name = "#{@class_nesting}::#{@class_name_without_nesting}"
+           end
+         end
+diff --git a/railties/lib/rails_generator/commands.rb b/railties/lib/rails_generator/commands.rb
+index 440bab2..5351cb5 100644
+--- a/railties/lib/rails_generator/commands.rb
++++ b/railties/lib/rails_generator/commands.rb
+@@ -339,17 +339,38 @@ HELP
+           template(relative_source, "#{relative_destination}/#{next_migration_string}_#{migration_file_name}.rb", template_options)
+         end
+ 
+-        def route_resources(*resources)
++        def route_resources(namespace, *resources)
+           resource_list = resources.map { |r| r.to_sym.inspect }.join(', ')
+           sentinel = 'ActionController::Routing::Routes.draw do |map|'
+ 
+           logger.route "map.resources #{resource_list}"
+           unless options[:pretend]
++            if namespace.length > 0
++              route_to_add = route_nested(namespace.split('::'), resource_list)
++            else
++              route_to_add = "  map.resources #{resource_list}"
++            end
+             gsub_file 'config/routes.rb', /(#{Regexp.escape(sentinel)})/mi do |match|
+-              "#{match}\n  map.resources #{resource_list}\n"
++              "#{match}\n#{route_to_add}\n"
+             end
+           end
+         end
++        
++        def route_nested(splitted_namespace, resource_list, parent_namespace = 'map', level = 1)
++          namespace = splitted_namespace.shift
++          route_to_add = tabulator(level) + "#{parent_namespace}.namespace :#{namespace.underscore} do |#{namespace.underscore}|\n"
++          if splitted_namespace.size > 0
++            route_to_add += route_nested(splitted_namespace, resource_list, namespace.underscore, level + 1)
++          else
++            route_to_add += tabulator(level + 1) + "#{namespace.underscore}.resources #{resource_list}\n"
++          end
++          route_to_add += tabulator(level) + "end\n"
++          return route_to_add
++        end
++        
++        def tabulator(level)
++          "  " * level
++        end
+ 
+         private
+           def render_file(path, options = {})
+@@ -550,6 +571,7 @@ end_message
+           logger.migration_template file_name
+         end
+ 
++        # (harrikauhanen) Should we do something about this as we changed it in Create module???
+         def route_resources(*resources)
+           resource_list = resources.map { |r| r.to_sym.inspect }.join(', ')
+           logger.route "map.resources #{resource_list}"
+diff --git a/railties/lib/rails_generator/generators/components/controller/controller_generator.rb b/railties/lib/rails_generator/generators/components/controller/controller_generator.rb
+index c37ff45..c20edf1 100644
+--- a/railties/lib/rails_generator/generators/components/controller/controller_generator.rb
++++ b/railties/lib/rails_generator/generators/components/controller/controller_generator.rb
+@@ -2,7 +2,10 @@ class ControllerGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions class_path, "#{class_name}Controller", "#{class_name}ControllerTest", "#{class_name}Helper"
++      # (harrikauhanen) Is this change ok? We will get name collision with namespaced models if we use the original way
++      #                 Same change made in other generators as well!
++      # m.class_collisions class_path, "#{class_name}Controller", "#{class_name}ControllerTest", "#{class_name}Helper"
++      m.class_collisions "#{class_name}Controller", "#{class_name}ControllerTest", "#{class_name}Helper"
+ 
+       # Controller, helper, views, and test directories.
+       m.directory File.join('app/controllers', class_path)
+diff --git a/railties/lib/rails_generator/generators/components/model/model_generator.rb b/railties/lib/rails_generator/generators/components/model/model_generator.rb
+index 9be9cad..76351a5 100644
+--- a/railties/lib/rails_generator/generators/components/model/model_generator.rb
++++ b/railties/lib/rails_generator/generators/components/model/model_generator.rb
+@@ -4,7 +4,7 @@ class ModelGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions class_path, class_name, "#{class_name}Test"
++      m.class_collisions class_name, "#{class_name}Test"
+ 
+       # Model, test, and fixture directories.
+       m.directory File.join('app/models', class_path)
+@@ -15,8 +15,8 @@ class ModelGenerator < Rails::Generator::NamedBase
+       m.template 'model.rb',      File.join('app/models', class_path, "#{file_name}.rb")
+       m.template 'unit_test.rb',  File.join('test/unit', class_path, "#{file_name}_test.rb")
+ 
+-      unless options[:skip_fixture] 
+-       	m.template 'fixtures.yml',  File.join('test/fixtures', "#{table_name}.yml")
++      unless options[:skip_fixture]
++        m.template 'fixtures.yml',  File.join('test/fixtures', "#{nesting_path}/#{file_name.pluralize}.yml")
+       end
+ 
+       unless options[:skip_migration]
+diff --git a/railties/lib/rails_generator/generators/components/resource/resource_generator.rb b/railties/lib/rails_generator/generators/components/resource/resource_generator.rb
+index d5491ec..f5a03b4 100644
+--- a/railties/lib/rails_generator/generators/components/resource/resource_generator.rb
++++ b/railties/lib/rails_generator/generators/components/resource/resource_generator.rb
+@@ -30,9 +30,9 @@ class ResourceGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions(controller_class_path, "#{controller_class_name}Controller", "#{controller_class_name}Helper")
+-      m.class_collisions(class_path, "#{class_name}")
+-
++      m.class_collisions("#{controller_class_name}Controller", "#{controller_class_name}Helper")
++      m.class_collisions("#{class_name}")
++      
+       # Controller, helper, views, and test directories.
+       m.directory(File.join('app/models', class_path))
+       m.directory(File.join('app/controllers', controller_class_path))
+@@ -50,7 +50,7 @@ class ResourceGenerator < Rails::Generator::NamedBase
+       m.template('functional_test.rb', File.join('test/functional', controller_class_path, "#{controller_file_name}_controller_test.rb"))
+       m.template('helper.rb',          File.join('app/helpers',     controller_class_path, "#{controller_file_name}_helper.rb"))
+ 
+-      m.route_resources controller_file_name
++      m.route_resources @controller_class_nesting, controller_file_name
+     end
+   end
+ 
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb b/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb
+index 864a0bc..b43fd8d 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb
++++ b/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb
+@@ -31,9 +31,9 @@ class ScaffoldGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions(controller_class_path, "#{controller_class_name}Controller", "#{controller_class_name}Helper")
+-      m.class_collisions(class_path, "#{class_name}")
+-
++      m.class_collisions("#{controller_class_name}Controller", "#{controller_class_name}Helper")
++      m.class_collisions("#{class_name}")
++      
+       # Controller, helper, views, and test directories.
+       m.directory(File.join('app/models', class_path))
+       m.directory(File.join('app/controllers', controller_class_path))
+@@ -61,7 +61,7 @@ class ScaffoldGenerator < Rails::Generator::NamedBase
+       m.template('functional_test.rb', File.join('test/functional', controller_class_path, "#{controller_file_name}_controller_test.rb"))
+       m.template('helper.rb',          File.join('app/helpers',     controller_class_path, "#{controller_file_name}_helper.rb"))
+ 
+-      m.route_resources controller_file_name
++      m.route_resources @controller_class_nesting, controller_file_name
+ 
+       m.dependency 'model', [name] + @args, :collision => :skip
+     end
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb b/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb
+index cbfd88f..68bf2a4 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb
+@@ -1,17 +1,18 @@
+ class <%= controller_class_name %>Controller < ApplicationController
+-  # GET /<%= table_name %>
+-  # GET /<%= table_name %>.xml
++
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>.xml
+   def index
+-    @<%= table_name %> = <%= class_name %>.find(:all)
++    @<%= file_name.pluralize %> = <%= class_name %>.find(:all)
+ 
+     respond_to do |format|
+       format.html # index.html.erb
+-      format.xml  { render :xml => @<%= table_name %> }
++      format.xml  { render :xml => @<%= file_name.pluralize %> }
+     end
+   end
+ 
+-  # GET /<%= table_name %>/1
+-  # GET /<%= table_name %>/1.xml
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/1
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/1.xml
+   def show
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+ 
+@@ -21,8 +22,8 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # GET /<%= table_name %>/new
+-  # GET /<%= table_name %>/new.xml
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/new
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>new.xml
+   def new
+     @<%= file_name %> = <%= class_name %>.new
+ 
+@@ -32,15 +33,15 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # GET /<%= table_name %>/1/edit
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/1/edit
+   def edit
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+   end
+ 
+-  # POST /<%= table_name %>
+-  # POST /<%= table_name %>.xml
++  # POST <%= nesting_path %>/<%= file_name.pluralize %>
++  # POST<%= nesting_path %>/<%= file_name.pluralize %>.xml
+   def create
+-    @<%= file_name %> = <%= class_name %>.new(params[:<%= file_name %>])
++    @<%= file_name %> = <%= class_name %>.new(params[:<%= nesting_underscored %><%= file_name %>])
+ 
+     respond_to do |format|
+       if @<%= file_name %>.save
+@@ -54,13 +55,13 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # PUT /<%= table_name %>/1
+-  # PUT /<%= table_name %>/1.xml
++  # PUT <%= nesting_path %>/<%= file_name.pluralize %>/1
++  # PUT <%= nesting_path %>/<%= file_name.pluralize %>/1.xml
+   def update
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+ 
+     respond_to do |format|
+-      if @<%= file_name %>.update_attributes(params[:<%= file_name %>])
++      if @<%= file_name %>.update_attributes(params[:<%= nesting_underscored %><%= file_name %>])
+         flash[:notice] = '<%= class_name %> was successfully updated.'
+         format.html { redirect_to(@<%= file_name %>) }
+         format.xml  { head :ok }
+@@ -71,8 +72,8 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # DELETE /<%= table_name %>/1
+-  # DELETE /<%= table_name %>/1.xml
++  # DELETE <%= nesting_path %>/<%= file_name.pluralize %>/1
++  # DELETE <%= nesting_path %>/<%= file_name.pluralize %>/1.xml
+   def destroy
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+     @<%= file_name %>.destroy
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb b/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb
+index 3b430a2..7467aa1 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb
+@@ -4,7 +4,7 @@ class <%= controller_class_name %>ControllerTest < ActionController::TestCase
+   def test_should_get_index
+     get :index
+     assert_response :success
+-    assert_not_nil assigns(:<%= table_name %>)
++    assert_not_nil assigns(:<%= file_name.pluralize %>)
+   end
+ 
+   def test_should_get_new
+@@ -17,7 +17,7 @@ class <%= controller_class_name %>ControllerTest < ActionController::TestCase
+       post :create, :<%= file_name %> => { }
+     end
+ 
+-    assert_redirected_to <%= file_name %>_path(assigns(:<%= file_name %>))
++    assert_redirected_to <%= nesting_underscored %><%= file_name %>_path(assigns(:<%= file_name %>))
+   end
+ 
+   def test_should_show_<%= file_name %>
+@@ -32,7 +32,7 @@ class <%= controller_class_name %>ControllerTest < ActionController::TestCase
+ 
+   def test_should_update_<%= file_name %>
+     put :update, :id => <%= table_name %>(:one).id, :<%= file_name %> => { }
+-    assert_redirected_to <%= file_name %>_path(assigns(:<%= file_name %>))
++    assert_redirected_to <%= nesting_underscored %><%= file_name %>_path(assigns(:<%= file_name %>))
+   end
+ 
+   def test_should_destroy_<%= file_name %>
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb
+index e289975..7f19dfb 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb
+@@ -15,4 +15,4 @@
+ <%% end %>
+ 
+ <%%= link_to 'Show', @<%= singular_name %> %> |
+-<%%= link_to 'Back', <%= plural_name %>_path %>
++<%%= link_to 'Back', <%= nesting_underscored %><%= plural_name %>_path %>
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb
+index e89757e..07088e9 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb
+@@ -13,7 +13,7 @@
+     <td><%%=h <%= singular_name %>.<%= attribute.name %> %></td>
+ <% end -%>
+     <td><%%= link_to 'Show', <%= singular_name %> %></td>
+-    <td><%%= link_to 'Edit', edit_<%= singular_name %>_path(<%= singular_name %>) %></td>
++    <td><%%= link_to 'Edit', edit_<%= nesting_underscored %><%= singular_name %>_path(<%= singular_name %>) %></td>
+     <td><%%= link_to 'Destroy', <%= singular_name %>, :confirm => 'Are you sure?', :method => :delete %></td>
+   </tr>
+ <%% end %>
+@@ -21,4 +21,4 @@
+ 
+ <br />
+ 
+-<%%= link_to 'New <%= singular_name %>', new_<%= singular_name %>_path %>
++<%%= link_to 'New <%= singular_name %>', new_<%= nesting_underscored %><%= singular_name %>_path %>
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb
+index c47e811..504f79d 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb
+@@ -14,4 +14,4 @@
+   </p>
+ <%% end %>
+ 
+-<%%= link_to 'Back', <%= plural_name %>_path %>
++<%%= link_to 'Back', <%= nesting_underscored %><%= plural_name %>_path %>
+\ No newline at end of file
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb
+index 9b6b11b..ac70689 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb
+@@ -6,5 +6,5 @@
+ 
+ <% end -%>
+ 
+-<%%= link_to 'Edit', edit_<%= singular_name %>_path(@<%= singular_name %>) %> |
+-<%%= link_to 'Back', <%= plural_name %>_path %>
++<%%= link_to 'Edit', edit_<%= nesting_underscored %><%= singular_name %>_path(@<%= singular_name %>) %> |
++<%%= link_to 'Back', <%= nesting_underscored %><%= plural_name %>_path %>
+\ No newline at end of file
+-- 
+1.5.5.1
+
+
+From 5e05489e86a3734442b2975c3fd1f7616ced5338 Mon Sep 17 00:00:00 2001
+From: Harri Kauhanen <hazard@Weasel.local>
+Date: Wed, 18 Jun 2008 17:40:15 +0300
+Subject: [PATCH] FIxture files were missing
+
+---
+ .../fixtures/my_application/billing/accounts.yml   |   28 ++++++++++
+ .../fixtures/my_application/business/companies.yml |   55 ++++++++++++++++++++
+ .../fixtures/my_application/business_projects.yml  |    7 +++
+ 3 files changed, 90 insertions(+), 0 deletions(-)
+ create mode 100644 activerecord/test/fixtures/my_application/billing/accounts.yml
+ create mode 100644 activerecord/test/fixtures/my_application/business/companies.yml
+ create mode 100644 activerecord/test/fixtures/my_application/business_projects.yml
+
+diff --git a/activerecord/test/fixtures/my_application/billing/accounts.yml b/activerecord/test/fixtures/my_application/billing/accounts.yml
+new file mode 100644
+index 0000000..b2d0191
+--- /dev/null
++++ b/activerecord/test/fixtures/my_application/billing/accounts.yml
+@@ -0,0 +1,28 @@
++signals37:
++  id: 1
++  firm_id: 1
++  credit_limit: 50
++
++unknown:
++  id: 2
++  credit_limit: 50
++
++rails_core_account:
++  id: 3
++  firm_id: 6
++  credit_limit: 50
++
++last_account:
++  id: 4
++  firm_id: 2
++  credit_limit: 60
++
++rails_core_account_2:
++  id: 5
++  firm_id: 6
++  credit_limit: 55
++
++odegy_account:
++  id: 6
++  firm_id: 9
++  credit_limit: 53
+diff --git a/activerecord/test/fixtures/my_application/business/companies.yml b/activerecord/test/fixtures/my_application/business/companies.yml
+new file mode 100644
+index 0000000..c61128c
+--- /dev/null
++++ b/activerecord/test/fixtures/my_application/business/companies.yml
+@@ -0,0 +1,55 @@
++first_client:
++  id: 2
++  type: Client
++  firm_id: 1
++  client_of: 2
++  name: Summit
++  ruby_type: Client
++
++first_firm:
++  id: 1
++  type: Firm
++  name: 37signals
++  ruby_type: Firm
++
++second_client:
++  id: 3
++  type: Client
++  firm_id: 1
++  client_of: 1
++  name: Microsoft
++  ruby_type: Client
++
++another_firm:
++  id: 4
++  type: Firm
++  name: Flamboyant Software
++  ruby_type: Firm
++
++another_client:
++  id: 5
++  type: Client
++  firm_id: 4
++  client_of: 4
++  name: Ex Nihilo
++  ruby_type: Client
++
++rails_core:
++  id: 6          
++  name: RailsCore
++  type: DependentFirm
++  
++leetsoft:
++  id: 7 
++  name: Leetsoft
++  client_of: 6
++  
++jadedpixel:
++  id: 8 
++  name: Jadedpixel
++  client_of: 6
++
++odegy:
++  id: 9
++  name: Odegy
++  type: ExclusivelyDependentFirm
+diff --git a/activerecord/test/fixtures/my_application/business_projects.yml b/activerecord/test/fixtures/my_application/business_projects.yml
+new file mode 100644
+index 0000000..02800c7
+--- /dev/null
++++ b/activerecord/test/fixtures/my_application/business_projects.yml
+@@ -0,0 +1,7 @@
++action_controller:
++  id: 2
++  name: Active Controller
++
++active_record:
++  id: 1
++  name: Active Record
+-- 
+1.5.5.1
+

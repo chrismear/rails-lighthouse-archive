@@ -1,0 +1,95 @@
+From 25c07b59affa3cfa389ca45e29c05d2b3a7dc055 Mon Sep 17 00:00:00 2001
+From: Diego Algorta <diego@oboxodo.com>
+Date: Fri, 13 Feb 2009 03:07:39 -0300
+Subject: [PATCH] Fixed bug that makes named_scopes _forgot_ current scope
+
+---
+ activerecord/lib/active_record/named_scope.rb |   13 +++++++++++--
+ activerecord/test/cases/named_scope_test.rb   |    9 +++++++++
+ activerecord/test/models/post.rb              |    6 ++++++
+ 3 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 989b2a1..022fdaf 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -100,7 +100,7 @@ module ActiveRecord
+     end
+     
+     class Scope
+-      attr_reader :proxy_scope, :proxy_options
++      attr_reader :proxy_scope, :proxy_options, :current_scoped_methods_when_defined
+       NON_DELEGATE_METHODS = %w(nil? send object_id class extend find size count sum average maximum minimum paginate first last empty? any? respond_to?).to_set
+       [].methods.each do |m|
+         unless m =~ /^__/ || NON_DELEGATE_METHODS.include?(m.to_s)
+@@ -113,6 +113,9 @@ module ActiveRecord
+       def initialize(proxy_scope, options, &block)
+         [options[:extend]].flatten.each { |extension| extend extension } if options[:extend]
+         extend Module.new(&block) if block_given?
++        unless Scope === proxy_scope
++          @current_scoped_methods_when_defined = proxy_scope.send(:current_scoped_methods)
++        end
+         @proxy_scope, @proxy_options = proxy_scope, options.except(:extend)
+       end
+ 
+@@ -168,7 +171,13 @@ module ActiveRecord
+         else
+           with_scope :find => proxy_options, :create => proxy_options[:conditions].is_a?(Hash) ?  proxy_options[:conditions] : {} do
+             method = :new if method == :build
+-            proxy_scope.send(method, *args, &block)
++            if current_scoped_methods_when_defined
++              with_scope current_scoped_methods_when_defined do
++                proxy_scope.send(method, *args, &block)
++              end
++            else
++              proxy_scope.send(method, *args, &block)
++            end
+           end
+         end
+       end
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index e1e27fa..f28285f 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -142,6 +142,15 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert_equal authors(:david).comments & Comment.containing_the_letter_e, authors(:david).comments.containing_the_letter_e
+   end
+ 
++  def test_named_scopes_honor_current_scopes_from_when_defined
++    assert !Post.ranked_by_comments.limit(5).empty?
++    assert !authors(:david).posts.ranked_by_comments.limit(5).empty?
++    assert_not_equal Post.ranked_by_comments.limit(5), authors(:david).posts.ranked_by_comments.limit(5)
++    assert_not_equal Post.top(5), authors(:david).posts.top(5)
++    assert_equal authors(:david).posts.ranked_by_comments.limit(5), authors(:david).posts.top(5)
++    assert_equal Post.ranked_by_comments.limit(5), Post.top(5)
++  end
++
+   def test_active_records_have_scope_named__all__
+     assert !Topic.find(:all).empty?
+ 
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index 388fff8..374e536 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -1,5 +1,7 @@
+ class Post < ActiveRecord::Base
+   named_scope :containing_the_letter_a, :conditions => "body LIKE '%a%'"
++  named_scope :ranked_by_comments, :order => "comments_count DESC"
++  named_scope :limit, lambda {|limit| {:limit => limit} }
+   named_scope :with_authors_at_address, lambda { |address| {
+       :conditions => [ 'authors.author_address_id = ?', address.id ],
+       :joins => 'JOIN authors ON authors.id = posts.author_id'
+@@ -68,6 +70,10 @@ class Post < ActiveRecord::Base
+               :before_remove => lambda {|owner, reader| log(:removed, :before, reader.first_name) },
+               :after_remove  => lambda {|owner, reader| log(:removed, :after,  reader.first_name) }
+ 
++  def self.top(limit)
++    ranked_by_comments.limit(limit)
++  end
++
+   def self.reset_log
+     @log = []
+   end
+-- 
+1.5.6.3
+

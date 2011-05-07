@@ -1,0 +1,120 @@
+From b52e7ca9186d7fd3c2d9736c779520d514c409ee Mon Sep 17 00:00:00 2001
+From: Jakub <qoobaa@gmail.com>
+Date: Thu, 16 Jul 2009 20:16:23 +0200
+Subject: [PATCH] ActiveRecord::Base finders select merging
+
+---
+ activerecord/lib/active_record/base.rb         |   32 +++++++++++++++++++++-
+ activerecord/test/cases/method_scoping_test.rb |   34 ++++++++++++++++++++++-
+ 2 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 9bc8131..ab09173 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1712,9 +1712,37 @@ module ActiveRecord #:nodoc:
+           end
+         end
+ 
++        def merge_selects(*selects)
++          distinct_select = false
++
++          selects_without_distincts = selects.compact.map do |select|
++            select_without_distinct = select.sub(/^\s*(DISTINCT|distinct)\s/, "")
++            distinct_select ||= $1
++            select_without_distinct
++          end
++
++          splitted_selects = selects_without_distincts.inject([]) { |array, select| array + select.split(",") }
++          joined_selects = splitted_selects.map(&:strip).uniq.join(",")
++
++          distinct_select ? "DISTINCT #{joined_selects}" : joined_selects
++        end
++
++        def add_selects!(sql, options, scope = :auto)
++          if options[:select] || scope && scope[:select]
++            select = merge_selects(options[:select], scope[:select])
++          else
++            select = default_select(options[:joins] || (scope && scope[:joins]))
++          end
++          sql << "#{select} "
++        end
++
+         def construct_finder_sql(options)
+           scope = scope(:find)
+-          sql  = "SELECT #{options[:select] || (scope && scope[:select]) || default_select(options[:joins] || (scope && scope[:joins]))} "
++
++          sql  = "SELECT "
++
++          add_selects!(sql, options, scope)
++
+           sql << "FROM #{options[:from]  || (scope && scope[:from]) || quoted_table_name} "
+ 
+           add_joins!(sql, options[:joins], scope)
+@@ -2142,6 +2170,8 @@ module ActiveRecord #:nodoc:
+                         hash[method][key] = merge_includes(hash[method][key], params[key]).uniq
+                       elsif key == :joins && merge
+                         hash[method][key] = merge_joins(params[key], hash[method][key])
++                      elsif key == :select && merge
++                        hash[method][key] = merge_selects(params[key], hash[method][key])
+                       else
+                         hash[method][key] = hash[method][key] || params[key]
+                       end
+diff --git a/activerecord/test/cases/method_scoping_test.rb b/activerecord/test/cases/method_scoping_test.rb
+index d8246f4..7755299 100644
+--- a/activerecord/test/cases/method_scoping_test.rb
++++ b/activerecord/test/cases/method_scoping_test.rb
+@@ -77,11 +77,11 @@ class MethodScopingTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  def test_options_select_replaces_scope_select
++  def test_options_select_merges_scope_select
+     Developer.with_scope(:find => { :select => "id, name" }) do
+       developer = Developer.find(:first, :select => 'id, salary', :conditions => "name = 'David'")
+       assert_equal 80000, developer.salary
+-      assert !developer.has_attribute?(:name)
++      assert_equal "David", developer.name
+     end
+   end
+ 
+@@ -312,6 +312,36 @@ class NestedScopingTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_nested_scoped_find_merged_select
++    Developer.with_scope(:find => { :select => "id" }) do
++      Developer.with_scope(:find => { :select => "salary" }) do
++        assert_equal 80000, Developer.find(:first).salary
++        assert_equal 1, Developer.find(:first).id
++        assert !Developer.find(:first).has_attribute?(:name)
++      end
++    end
++  end
++
++  def test_nested_scoped_find_merged_select_distinct
++    Developer.with_scope(:find => { :select => "DISTINCT id" }) do
++      Developer.with_scope(:find => { :select => "DISTINCT salary" }) do
++        assert_equal 80000, Developer.find(:first).salary
++        assert_equal 1, Developer.find(:first).id
++        assert !Developer.find(:first).has_attribute?(:name)
++      end
++    end
++  end
++
++  def test_nested_scoped_find_merged_select_star
++    Developer.with_scope(:find => { :select => "DISTINCT id" }) do
++      Developer.with_scope(:find => { :select => "DISTINCT *" }) do
++        assert_equal 80000, Developer.find(:first).salary
++        assert_equal 1, Developer.find(:first).id
++        assert_equal "David", Developer.find(:first).name
++      end
++    end
++  end
++
+   def test_nested_scoped_find_include
+     Developer.with_scope(:find => { :include => :projects }) do
+       Developer.with_scope(:find => { :conditions => "projects.id = 2" }) do
+-- 
+1.6.0.4
+

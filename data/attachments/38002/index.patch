@@ -1,0 +1,170 @@
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index 31d6c79..c897bf9 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -245,7 +245,7 @@ module ActiveRecord
+         end
+     end
+ 
+-    class IndexDefinition < Struct.new(:table, :name, :unique, :columns) #:nodoc:
++    class IndexDefinition < Struct.new(:table, :name, :unique, :columns, :index_lengths) #:nodoc:
+     end
+ 
+     class ColumnDefinition < Struct.new(:base, :name, :type, :limit, :precision, :scale, :default, :null) #:nodoc:
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 204ebaa..3e0ce14 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -405,6 +405,37 @@ module ActiveRecord
+       def drop_table(table_name, options = {})
+         super(table_name, options)
+       end
++      
++      def build_length_hash(column_names, length_option = {})
++        length_option ||= {}
++        if length_option.is_a? Hash
++          raise ArgumentError, ":length options must match colums" unless length_option.keys.all?{|x| column_names.include?(x)}
++          length_hash = length_option
++        else
++          raise ArgumentError, ":length must be hash if multiple index columns are specified" if column_names.size > 1
++          length_hash = { column_names[0] => length_option }
++        end
++        length_hash
++      end
++      
++      def index_column_definition(e, lengths_hash)
++        quote_column_name(e) + (lengths_hash[e] ? "(#{lengths_hash[e]})" : "")
++      end
++      
++      def add_index(table_name, column_name, options = {})
++        column_names = Array(column_name)
++        index_name   = index_name(table_name, :column => column_names)
++
++        if Hash === options # legacy support, since this param was a string
++          index_type = options[:unique] ? "UNIQUE" : ""
++          index_name = options[:name] || index_name
++          lengths_hash = build_length_hash(column_names, options[:length])
++        else
++          index_type = options
++        end
++        quoted_column_names = column_names.map { |e| index_column_definition(e, lengths_hash) }.join(", ")
++        execute "CREATE #{index_type} INDEX #{quote_column_name(index_name)} ON #{quote_table_name(table_name)} (#{quoted_column_names})"
++      end
+ 
+       def indexes(table_name, name = nil)#:nodoc:
+         indexes = []
+@@ -413,10 +444,11 @@ module ActiveRecord
+           if current_index != row[2]
+             next if row[2] == "PRIMARY" # skip the primary key
+             current_index = row[2]
+-            indexes << IndexDefinition.new(row[0], row[2], row[1] == "0", [])
++            indexes << IndexDefinition.new(row[0], row[2], row[1] == "0", [], [])
+           end
+ 
+           indexes.last.columns << row[4]
++          indexes.last.index_lengths << row[7]
+         end
+         indexes
+       end
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index b90ed88..306f70a 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -163,6 +163,16 @@ HEADER
+         indexes.each do |index|
+           stream.print "  add_index #{index.table.inspect}, #{index.columns.inspect}, :name => #{index.name.inspect}"
+           stream.print ", :unique => true" if index.unique
++          
++          if index.index_lengths.any?
++            index_options = []
++            index.index_lengths.each_with_index do |ix, i|
++              index_options << ":#{index.columns[i]} => #{ix}" if ix
++            end
++
++            stream.print ", :length => {#{index_options.join(', ')}}"
++          end
++
+           stream.puts
+         end
+         stream.puts unless indexes.empty?
+diff --git a/activerecord/test/cases/active_schema_test_mysql.rb b/activerecord/test/cases/active_schema_test_mysql.rb
+index 2a42dc3..ef68e80 100644
+--- a/activerecord/test/cases/active_schema_test_mysql.rb
++++ b/activerecord/test/cases/active_schema_test_mysql.rb
+@@ -34,6 +34,29 @@ class ActiveSchemaTest < ActiveRecord::TestCase
+   def test_add_column_with_limit
+     assert_equal "ALTER TABLE `people` ADD `key` varchar(32)", add_column(:people, :key, :string, :limit => 32)
+   end
++  
++  def test_add_index
++    assert_equal "CREATE  INDEX `index_people_on_col_name` ON `people` (`col_name`)", add_index(:people, :col_name)
++    assert_equal "CREATE  INDEX `index_people_on_col_name` ON `people` (`col_name`)", add_index(:people, :col_name, :length => nil)
++    assert_equal "CREATE  INDEX `index_people_on_col_name` ON `people` (`col_name`(5))", add_index(:people, :col_name, :length => 5)
++    assert_equal "CREATE UNIQUE INDEX `index_people_on_col_name` ON `people` (`col_name`(5))", add_index(:people, :col_name, :length => 5, :unique => true)
++  end
++  
++  def test_add_index_with_multiple_columns
++    assert_equal "CREATE  INDEX `index_people_on_col_name_and_other_col` ON `people` (`col_name`(5), `other_col`(1))", add_index(:people, [:col_name, :other_col], :length => {:col_name => 5, :other_col => 1})
++    assert_equal "CREATE  INDEX `index_people_on_col_name_and_other_col` ON `people` (`col_name`(5), `other_col`)", add_index(:people, [:col_name, :other_col], :length => {:col_name => 5})
++    assert_equal "CREATE  INDEX `index_people_on_col_name_and_other_col` ON `people` (`col_name`, `other_col`)", add_index(:people, [:col_name, :other_col])
++  end
++  
++  def test_add_index_with_wrong_syntax
++    assert_raise(ArgumentError) do
++      add_index(:people, [:col_name, :other_col], :length => 1)
++    end
++    
++    assert_raise(ArgumentError) do
++      add_index(:people, :col_name, :length => {:other_col => 5})
++    end
++  end
+ 
+   def test_drop_table_with_specific_database
+     assert_equal "DROP TABLE `otherdb`.`people`", drop_table('otherdb.people')
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index ee7e285..1180033 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -149,6 +149,42 @@ class SchemaDumperTest < ActiveRecord::TestCase
+   end
+ 
+   if current_adapter?(:MysqlAdapter)
++    def clean_indices
++      ActiveRecord::Migration.remove_index(:audit_logs, :message) rescue nil
++      ActiveRecord::Migration.remove_index(:topics, [:title, :author_name]) rescue nil
++    end
++      
++    
++    def test_schema_dump_should_honor_index_length
++      clean_indices
++      
++      ActiveRecord::Migration.add_index(:audit_logs, :message, :length => 5)
++      output = standard_dump
++      assert_match %r{:length => \{:message => 5\}}, output
++      
++      clean_indices
++    end
++    
++    def test_schema_dump_should_honor_index_length_with_multiple_columns
++      clean_indices
++      
++      ActiveRecord::Migration.add_index(:audit_logs, [:message, :developer_id], :length => {:message => 5})
++      output = standard_dump
++      assert_match %r{:length => \{:message => 5\}}, output
++      
++      clean_indices
++    end
++    
++    def test_schema_dump_should_honor_index_length_with_multiple_columns
++      clean_indices
++      
++      ActiveRecord::Migration.add_index(:topics, [:title, :author_name], :length => {:title => 5, :author_name => 1})
++      output = standard_dump
++      assert_match %r{:length => \{:title => 5, :author_name => 1\}}, output
++      
++      clean_indices
++    end
++    
+     def test_schema_dump_should_not_add_default_value_for_mysql_text_field
+       output = standard_dump
+       assert_match %r{t.text\s+"body",\s+:null => false$}, output

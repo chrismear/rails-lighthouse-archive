@@ -1,0 +1,117 @@
+From 674afca52eb225b6679afe1d872c689b219823ce Mon Sep 17 00:00:00 2001
+From: moro <moronatural@gmail.com>
+Date: Wed, 25 Feb 2009 18:30:21 +0900
+Subject: [PATCH] dynamic scope should reflect chained scopes.
+
+fix bug for ignoring chaining scopes.
+---
+ activerecord/lib/active_record/base.rb             |   19 ++++---------------
+ .../lib/active_record/dynamic_scope_match.rb       |    9 +++++++++
+ activerecord/lib/active_record/named_scope.rb      |    5 +++++
+ activerecord/test/cases/named_scope_test.rb        |   20 ++++++++++++++++++++
+ 4 files changed, 38 insertions(+), 15 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 55ab1fa..dfbca97 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1947,21 +1947,10 @@ module ActiveRecord #:nodoc:
+               send(method_id, *arguments, &block)
+             end
+           elsif match = DynamicScopeMatch.match(method_id)
+-            attribute_names = match.attribute_names
+-            super unless all_attributes_exists?(attribute_names)
+-            if match.scope?
+-              self.class_eval %{
+-                def self.#{method_id}(*args)                        # def self.scoped_by_user_name_and_password(*args)
+-                  options = args.extract_options!                   #   options = args.extract_options!
+-                  attributes = construct_attributes_from_arguments( #   attributes = construct_attributes_from_arguments(
+-                    [:#{attribute_names.join(',:')}], args          #     [:user_name, :password], args
+-                  )                                                 #   )
+-                                                                    # 
+-                  scoped(:conditions => attributes)                 #   scoped(:conditions => attributes)
+-                end                                                 # end
+-              }, __FILE__, __LINE__
+-              send(method_id, *arguments)
+-            end
++            super unless match.scope? && all_attributes_exists?(match.attribute_names)
++            match.build(method_id, self)
++
++            send(method_id, *arguments)
+           else
+             super
+           end
+diff --git a/activerecord/lib/active_record/dynamic_scope_match.rb b/activerecord/lib/active_record/dynamic_scope_match.rb
+index f796ba6..5314ca8 100644
+--- a/activerecord/lib/active_record/dynamic_scope_match.rb
++++ b/activerecord/lib/active_record/dynamic_scope_match.rb
+@@ -21,5 +21,14 @@ module ActiveRecord
+     def scope?
+       !@scope.nil?
+     end
++
++    def build(method_id, parent)
++      parent.named_scope method_id, proc{|*args|
++        attributes = parent.send(:construct_attributes_from_arguments,
++          attribute_names.map(&:to_sym), args
++        )
++        {:conditions => attributes}
++      }
++    end
+   end
+ end
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 989b2a1..2bf29ed 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -165,6 +165,11 @@ module ActiveRecord
+       def method_missing(method, *args, &block)
+         if scopes.include?(method)
+           scopes[method].call(self, *args)
++        elsif match = DynamicScopeMatch.match(method)
++          super unless match.scope? && all_attributes_exists?(match.attribute_names)
++          match.build(method, self)
++
++          send(method, *args)
+         else
+           with_scope :find => proxy_options, :create => proxy_options[:conditions].is_a?(Hash) ?  proxy_options[:conditions] : {} do
+             method = :new if method == :build
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index e1e27fa..ab251d9 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -310,11 +310,31 @@ class DynamicScopeMatchTest < ActiveRecord::TestCase
+     assert match.scope?
+     assert_equal %w(age sex location), match.attribute_names
+   end
++
++  def test_build
++    match = ActiveRecord::DynamicScopeMatch.match("scoped_by_age_and_sex_and_location")
++
++    model_class = mock()
++    model_class.expects(:named_scope)
++
++    match.build(:scoped_by_age_and_sex_and_location, model_class)
++  end
+ end
+ 
+ class DynamicScopeTest < ActiveRecord::TestCase
++  def setup
++    unless ::Post.respond_to?(:title_like_comment)
++      ::Post.named_scope :title_like_comment, {:conditions => "#{Post.quoted_table_name}.title like '%comment%'"}
++    end
++  end
++
+   def test_dynamic_scope
+     assert_equal Post.scoped_by_author_id(1).find(1), Post.find(1)
+     assert_equal Post.scoped_by_author_id_and_title(1, "Welcome to the weblog").first, Post.find(:first, :conditions => { :author_id => 1, :title => "Welcome to the weblog"})
+   end
++
++  def test_dynamic_scope_chain
++    assert_equal [Post.find(2)], Post.scoped_by_type("SpecialPost").scoped_by_author_id(1).find(:all)
++    assert_equal [Post.find(3)], Post.title_like_comment.scoped_by_body("I just don't want to").find(:all)
++  end
+ end
+-- 
+1.6.0
+

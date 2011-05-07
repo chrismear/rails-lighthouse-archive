@@ -1,0 +1,192 @@
+From 2b15322f7bd46381591bbaafb9f3a274bf362f34 Mon Sep 17 00:00:00 2001
+From: Peter Wagenet <peter.wagenet@gmail.com>
+Date: Thu, 12 Mar 2009 21:02:22 -0400
+Subject: [PATCH] Attribute Preserving Hash and XML
+
+---
+ activeresource/lib/active_resource/formats.rb      |    1 +
+ .../formats/attribute_preserving_xml_format.rb     |   11 ++++++
+ activeresource/test/format_test.rb                 |   18 ++++++++++
+ .../active_support/core_ext/hash/conversions.rb    |   20 +++++++----
+ activesupport/test/core_ext/hash_ext_test.rb       |   34 +++++++++++++++++++-
+ 5 files changed, 76 insertions(+), 8 deletions(-)
+ create mode 100644 activeresource/lib/active_resource/formats/attribute_preserving_xml_format.rb
+
+diff --git a/activeresource/lib/active_resource/formats.rb b/activeresource/lib/active_resource/formats.rb
+index 28864cf..1fb30fe 100644
+--- a/activeresource/lib/active_resource/formats.rb
++++ b/activeresource/lib/active_resource/formats.rb
+@@ -11,4 +11,5 @@ module ActiveResource
+ end
+ 
+ require 'active_resource/formats/xml_format'
++require 'active_resource/formats/attribute_preserving_xml_format'
+ require 'active_resource/formats/json_format'
+\ No newline at end of file
+diff --git a/activeresource/lib/active_resource/formats/attribute_preserving_xml_format.rb b/activeresource/lib/active_resource/formats/attribute_preserving_xml_format.rb
+new file mode 100644
+index 0000000..86851ed
+--- /dev/null
++++ b/activeresource/lib/active_resource/formats/attribute_preserving_xml_format.rb
+@@ -0,0 +1,11 @@
++module ActiveResource
++  module Formats
++    module AttributePreservingXmlFormat
++      extend XmlFormat
++
++      def self.decode(xml)
++        from_xml_data(Hash.from_xml(xml, :preserve_attributes => true))
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index c3733e1..eb5e17a 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -100,6 +100,24 @@ class FormatTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_attribute_preserving_xml_format
++    xml = <<-EOT
++      <person>
++        <name type="first">David</name>
++        <email-address location="home">david@loudthinking.com</email-address>
++      </person>
++    EOT
++    
++    using_format(Person, :attribute_preserving_xml) do
++      ActiveResource::HttpMock.respond_to.get "/people/1.xml", {'Accept' => ActiveResource::Formats[:xml].mime_type}, xml
++      person = Person.find(1)
++      assert_equal "first", person.name.attributes["type"] # The type method is already in use (though deprecated)
++      assert_equal "David", person.name.content
++      assert_equal "home", person.email_address.location
++      assert_equal "david@loudthinking.com", person.email_address.content
++    end
++  end
++
+   private
+     def using_format(klass, mime_type_reference)
+       previous_format = klass.format
+diff --git a/activesupport/lib/active_support/core_ext/hash/conversions.rb b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+index 991a5a6..7eb92c6 100644
+--- a/activesupport/lib/active_support/core_ext/hash/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+@@ -149,12 +149,15 @@ module ActiveSupport #:nodoc:
+         end
+ 
+         module ClassMethods
+-          def from_xml(xml)
+-            typecast_xml_value(unrename_keys(XmlMini.parse(xml)))
++          def from_xml(xml, options = {})
++            typecast_xml_value(unrename_keys(XmlMini.parse(xml)), options)
+           end
+ 
+           private
+-            def typecast_xml_value(value)
++            def typecast_xml_value(value, options = {})
++              options.symbolize_keys!
++              options.reverse_merge!(:preserve_attributes => false)
++              
+               case value.class.to_s
+                 when 'Hash'
+                   if value['type'] == 'array'
+@@ -164,9 +167,9 @@ module ActiveSupport #:nodoc:
+                     else
+                       case entries.class.to_s   # something weird with classes not matching here.  maybe singleton methods breaking is_a?
+                       when "Array"
+-                        entries.collect { |v| typecast_xml_value(v) }
++                        entries.collect { |v| typecast_xml_value(v, options) }
+                       when "Hash"
+-                        [typecast_xml_value(entries)]
++                        [typecast_xml_value(entries, options)]
+                       else
+                         raise "can't typecast #{entries.inspect}"
+                       end
+@@ -179,6 +182,9 @@ module ActiveSupport #:nodoc:
+                       else
+                         XML_PARSING[value["type"]].call(content)
+                       end
++                    elsif options[:preserve_attributes] && value.keys.size > 1
++                      value["content"] = value.delete("__content__")
++                      value
+                     else
+                       content
+                     end
+@@ -194,7 +200,7 @@ module ActiveSupport #:nodoc:
+                     nil
+                   else
+                     xml_value = value.inject({}) do |h,(k,v)|
+-                      h[k] = typecast_xml_value(v)
++                      h[k] = typecast_xml_value(v, options)
+                       h
+                     end
+                     
+@@ -203,7 +209,7 @@ module ActiveSupport #:nodoc:
+                     xml_value["file"].is_a?(StringIO) ? xml_value["file"] : xml_value
+                   end
+                 when 'Array'
+-                  value.map! { |i| typecast_xml_value(i) }
++                  value.map! { |i| typecast_xml_value(i, options) }
+                   case value.length
+                     when 0 then nil
+                     when 1 then value.first
+diff --git a/activesupport/test/core_ext/hash_ext_test.rb b/activesupport/test/core_ext/hash_ext_test.rb
+index b63ab30..2c4adca 100644
+--- a/activesupport/test/core_ext/hash_ext_test.rb
++++ b/activesupport/test/core_ext/hash_ext_test.rb
+@@ -490,7 +490,7 @@ class HashToXmlTest < Test::Unit::TestCase
+     assert xml.include?(%(<addresses type="array"><address><streets type="array"><street><name>))
+   end
+ 
+-  def test_single_record_from_xml
++  def test_single_record_from_xml_with_and_without_preserving_attributes
+     topic_xml = <<-EOT
+       <topic>
+         <title>The First Topic</title>
+@@ -527,8 +527,40 @@ class HashToXmlTest < Test::Unit::TestCase
+       :resident => :yes
+     }.stringify_keys
+ 
++    [false, true].each{|preserve| assert_equal expected_topic_hash, Hash.from_xml(topic_xml, :preserve_attributes => preserve)["topic"] }
++  end
++  
++  def test_single_record_from_xml_with_attributes_and_without_preservation
++    topic_xml = <<-EOT
++      <topic>
++        <title type="main">The First Topic</title>
++        <author-email-address location="home">david@loudthinking.com</author-email-address>
++      </topic>
++    EOT
++  
++    expected_topic_hash = {
++      :title => "The First Topic",
++      :author_email_address => "david@loudthinking.com"
++    }.stringify_keys
++  
+     assert_equal expected_topic_hash, Hash.from_xml(topic_xml)["topic"]
+   end
++  
++  def test_single_record_from_xml_with_attributes_and_with_preservation
++    topic_xml = <<-EOT
++      <topic>
++        <title type="main">The First Topic</title>
++        <author-email-address location="home">david@loudthinking.com</author-email-address>
++      </topic>
++    EOT
++  
++    expected_topic_hash = {
++      :title => { "type" => "main", "content" => "The First Topic" },
++      :author_email_address => { "location" => "home", "content" => "david@loudthinking.com" }
++    }.stringify_keys
++  
++    assert_equal expected_topic_hash, Hash.from_xml(topic_xml, :preserve_attributes => true)["topic"]
++  end
+ 
+   def test_single_record_from_xml_with_nil_values
+     topic_xml = <<-EOT
+-- 
+1.5.5
+

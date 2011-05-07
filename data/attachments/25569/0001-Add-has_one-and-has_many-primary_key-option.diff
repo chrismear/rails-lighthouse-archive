@@ -1,0 +1,275 @@
+From d745fff1b0a2b9a3cfb12f477bc03f9d37e9aca3 Mon Sep 17 00:00:00 2001
+From: Andre Arko <andre@arko.net>
+Date: Sat, 31 May 2008 23:19:40 -0700
+Subject: [PATCH] Add has_many :primary_key option to allow setting the primary key on a has many association
+
+---
+ activerecord/lib/active_record/associations.rb     |    5 +++--
+ .../associations/has_many_association.rb           |   14 +++++++++++---
+ .../associations/has_many_associations_test.rb     |    4 ++++
+ activerecord/test/cases/reflection_test.rb         |    4 ++--
+ activerecord/test/fixtures/companies.yml           |    1 +
+ activerecord/test/models/company.rb                |    2 ++
+ activerecord/test/schema/schema.rb                 |    1 +
+ 7 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index a3d1bbb..711aec7 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -663,6 +663,7 @@ module ActiveRecord
+       # * <tt>:foreign_key</tt> - Specify the foreign key used for the association. By default this is guessed to be the name
+       #   of this class in lower-case and "_id" suffixed. So a Person class that makes a +has_many+ association will use "person_id"
+       #   as the default <tt>:foreign_key</tt>.
++      # * <tt>:primary_key</tt> - Specify the method that returns the primary key used for the association. By default this is +id+.
+       # * <tt>:dependent</tt> - If set to <tt>:destroy</tt> all the associated objects are destroyed
+       #   alongside this object by calling their +destroy+ method.  If set to <tt>:delete_all</tt> all associated
+       #   objects are deleted *without* calling their +destroy+ method.  If set to <tt>:nullify</tt> all associated
+@@ -678,7 +679,7 @@ module ActiveRecord
+       # * <tt>:limit</tt> - An integer determining the limit on the number of rows that should be returned.
+       # * <tt>:offset</tt> - An integer determining the offset from where the rows should be fetched. So at 5, it would skip the first 4 rows.
+       # * <tt>:select</tt> - By default, this is <tt>*</tt> as in <tt>SELECT * FROM</tt>, but can be changed if you, for example, want to do a join
+-      #   but not include the joined columns. Do not forget to include the primary and foreign keys, otherwise it will rise an error.
++      #   but not include the joined columns. Do not forget to include the primary and foreign keys, otherwise it will raise an error.
+       # * <tt>:as</tt> - Specifies a polymorphic interface (See <tt>belongs_to</tt>).
+       # * <tt>:through</tt> - Specifies a Join Model through which to perform the query.  Options for <tt>:class_name</tt> and <tt>:foreign_key</tt>
+       #   are ignored, as the association uses the source reflection. You can only use a <tt>:through</tt> query through a <tt>belongs_to</tt>
+@@ -1336,7 +1337,7 @@ module ActiveRecord
+ 
+         def create_has_many_reflection(association_id, options, &extension)
+           options.assert_valid_keys(
+-            :class_name, :table_name, :foreign_key,
++            :class_name, :table_name, :foreign_key, :primary_key,
+             :dependent,
+             :select, :conditions, :include, :order, :group, :limit, :offset,
+             :as, :through, :source, :source_type,
+diff --git a/activerecord/lib/active_record/associations/has_many_association.rb b/activerecord/lib/active_record/associations/has_many_association.rb
+index f584a97..bc6e5de 100644
+--- a/activerecord/lib/active_record/associations/has_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_association.rb
+@@ -19,6 +19,14 @@ module ActiveRecord
+       end
+ 
+       protected
++        def quoted_id
++          if @reflection.options[:primary_key]
++            quote_value(@owner.send(@reflection.options[:primary_key]))
++          else
++            @owner.quoted_id
++          end
++        end
++
+         def count_records
+           count = if has_cached_counter?
+             @owner.send(:read_attribute, cached_counter_attribute_name)
+@@ -60,7 +68,7 @@ module ActiveRecord
+               ids = quoted_record_ids(records)
+               @reflection.klass.update_all(
+                 "#{@reflection.primary_key_name} = NULL", 
+-                "#{@reflection.primary_key_name} = #{@owner.quoted_id} AND #{@reflection.klass.primary_key} IN (#{ids})"
++                "#{@reflection.primary_key_name} = #{quoted_id} AND #{@reflection.klass.primary_key} IN (#{ids})"
+               )
+           end
+         end
+@@ -76,12 +84,12 @@ module ActiveRecord
+ 
+             when @reflection.options[:as]
+               @finder_sql = 
+-                "#{@reflection.quoted_table_name}.#{@reflection.options[:as]}_id = #{@owner.quoted_id} AND " +
++                "#{@reflection.quoted_table_name}.#{@reflection.options[:as]}_id = #{quoted_id} AND " +
+                 "#{@reflection.quoted_table_name}.#{@reflection.options[:as]}_type = #{@owner.class.quote_value(@owner.class.base_class.name.to_s)}"
+               @finder_sql << " AND (#{conditions})" if conditions
+             
+             else
+-              @finder_sql = "#{@reflection.quoted_table_name}.#{@reflection.primary_key_name} = #{@owner.quoted_id}"
++              @finder_sql = "#{@reflection.quoted_table_name}.#{@reflection.primary_key_name} = #{quoted_id}"
+               @finder_sql << " AND (#{conditions})" if conditions
+           end
+ 
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index dbfa025..fac5b17 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -129,6 +129,10 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal "Microsoft", Firm.find(:first).clients_like_ms_with_hash_conditions.first.name
+   end
+ 
++  def test_finding_using_primary_key
++    assert_equal "Summit", Firm.find(:first).clients_using_primary_key.first.name
++  end
++
+   def test_finding_using_sql
+     firm = Firm.find(:first)
+     first_client = firm.clients_using_sql.first
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 8b4d232..61d6ede 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -160,8 +160,8 @@ class ReflectionTest < ActiveRecord::TestCase
+ 
+   def test_reflection_of_all_associations
+     # FIXME these assertions bust a lot
+-    assert_equal 20, Firm.reflect_on_all_associations.size
+-    assert_equal 16, Firm.reflect_on_all_associations(:has_many).size
++    assert_equal 21, Firm.reflect_on_all_associations.size
++    assert_equal 17, Firm.reflect_on_all_associations(:has_many).size
+     assert_equal 4, Firm.reflect_on_all_associations(:has_one).size
+     assert_equal 0, Firm.reflect_on_all_associations(:belongs_to).size
+   end
+diff --git a/activerecord/test/fixtures/companies.yml b/activerecord/test/fixtures/companies.yml
+index c61128c..e7691fd 100644
+--- a/activerecord/test/fixtures/companies.yml
++++ b/activerecord/test/fixtures/companies.yml
+@@ -5,6 +5,7 @@ first_client:
+   client_of: 2
+   name: Summit
+   ruby_type: Client
++  firm_name: 37signals
+ 
+ first_firm:
+   id: 1
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index 70f83fa..e9ca764 100755
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -45,6 +45,8 @@ class Firm < Company
+   has_many :clients_using_finder_sql, :class_name => "Client", :finder_sql => 'SELECT * FROM companies WHERE 1=1'
+   has_many :plain_clients, :class_name => 'Client'
+   has_many :readonly_clients, :class_name => 'Client', :readonly => true
++  has_many :clients_using_primary_key, :class_name => 'Client',
++           :primary_key => 'name', :foreign_key => 'firm_name'
+ 
+   has_one :account, :foreign_key => "firm_id", :dependent => :destroy
+   has_one :account_with_select, :foreign_key => "firm_id", :select => "id, firm_id", :class_name=>'Account'
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 423929f..9a9c105 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -102,6 +102,7 @@ ActiveRecord::Schema.define do
+     t.string  :type
+     t.string  :ruby_type
+     t.integer :firm_id
++    t.string  :firm_name
+     t.string  :name
+     t.integer :client_of
+     t.integer :rating, :default => 1
+-- 
+1.5.5.1
+
+
+From 5be412172264939fc14df1574fb816eaf5d0ef87 Mon Sep 17 00:00:00 2001
+From: Brad Greenlee <brad@wesabe.com>
+Date: Mon, 2 Jun 2008 22:04:46 -0700
+Subject: [PATCH] Add support for :primary_key option to has_one as well as has_many so that a key other than the default primary key can be used for the association
+
+---
+ activerecord/lib/active_record/associations.rb     |    3 ++-
+ .../associations/has_one_association.rb            |   13 +++++++++++--
+ .../associations/has_one_associations_test.rb      |    7 +++++++
+ activerecord/test/cases/reflection_test.rb         |    4 ++--
+ activerecord/test/models/company.rb                |    1 +
+ 5 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 711aec7..bfaba09 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -757,6 +757,7 @@ module ActiveRecord
+       # * <tt>:foreign_key</tt> - Specify the foreign key used for the association. By default this is guessed to be the name
+       #   of this class in lower-case and "_id" suffixed. So a Person class that makes a +has_one+ association will use "person_id"
+       #   as the default <tt>:foreign_key</tt>.
++      # * <tt>:primary_key</tt> - Specify the method that returns the primary key used for the association. By default this is +id+.
+       # * <tt>:include</tt> - Specify second-order associations that should be eager loaded when this object is loaded.
+       # * <tt>:as</tt> - Specifies a polymorphic interface (See <tt>belongs_to</tt>).
+       # * <tt>:select</tt> - By default, this is <tt>*</tt> as in <tt>SELECT * FROM</tt>, but can be changed if, for example, you want to do a join
+@@ -1354,7 +1355,7 @@ module ActiveRecord
+ 
+         def create_has_one_reflection(association_id, options)
+           options.assert_valid_keys(
+-            :class_name, :foreign_key, :remote, :select, :conditions, :order, :include, :dependent, :counter_cache, :extend, :as, :readonly
++            :class_name, :foreign_key, :primary_key, :remote, :select, :conditions, :order, :include, :dependent, :counter_cache, :extend, :as, :readonly
+           )
+ 
+           create_reflection(:has_one, association_id, options, self)
+diff --git a/activerecord/lib/active_record/associations/has_one_association.rb b/activerecord/lib/active_record/associations/has_one_association.rb
+index c2b3503..4c6c2ac 100755
+--- a/activerecord/lib/active_record/associations/has_one_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_association.rb
+@@ -47,6 +47,15 @@ module ActiveRecord
+           return (obj.nil? ? nil : self)
+         end
+       end
++      
++      protected
++        def quoted_id
++          if @reflection.options[:primary_key]
++            quote_value(@owner.send(@reflection.options[:primary_key]))
++          else
++            @owner.quoted_id
++          end
++        end      
+             
+       private
+         def find_target
+@@ -63,10 +72,10 @@ module ActiveRecord
+           case
+             when @reflection.options[:as]
+               @finder_sql = 
+-                "#{@reflection.quoted_table_name}.#{@reflection.options[:as]}_id = #{@owner.quoted_id} AND " +
++                "#{@reflection.quoted_table_name}.#{@reflection.options[:as]}_id = #{quoted_id} AND " +
+                 "#{@reflection.quoted_table_name}.#{@reflection.options[:as]}_type = #{@owner.class.quote_value(@owner.class.base_class.name.to_s)}"
+             else
+-              @finder_sql = "#{@reflection.quoted_table_name}.#{@reflection.primary_key_name} = #{@owner.quoted_id}"
++              @finder_sql = "#{@reflection.quoted_table_name}.#{@reflection.primary_key_name} = #{quoted_id}"
+           end
+           @finder_sql << " AND (#{conditions})" if conditions
+         end
+diff --git a/activerecord/test/cases/associations/has_one_associations_test.rb b/activerecord/test/cases/associations/has_one_associations_test.rb
+index abc7ee7..6ee14e7 100755
+--- a/activerecord/test/cases/associations/has_one_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_associations_test.rb
+@@ -29,6 +29,13 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     assert_equal Firm.find(1, :include => :account_with_select).account_with_select.attributes.size, 2
+   end
+ 
++  def test_finding_using_primary_key
++    firm = companies(:first_firm)
++    assert_equal Account.find_by_firm_id(firm.id), firm.account
++    firm.firm_id = companies(:rails_core).id
++    assert_equal accounts(:rails_core_account), firm.account_using_primary_key
++  end
++    
+   def test_can_marshal_has_one_association_with_nil_target
+     firm = Firm.new
+     assert_nothing_raised do
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 61d6ede..0c57b79 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -160,9 +160,9 @@ class ReflectionTest < ActiveRecord::TestCase
+ 
+   def test_reflection_of_all_associations
+     # FIXME these assertions bust a lot
+-    assert_equal 21, Firm.reflect_on_all_associations.size
++    assert_equal 22, Firm.reflect_on_all_associations.size
+     assert_equal 17, Firm.reflect_on_all_associations(:has_many).size
+-    assert_equal 4, Firm.reflect_on_all_associations(:has_one).size
++    assert_equal 5, Firm.reflect_on_all_associations(:has_one).size
+     assert_equal 0, Firm.reflect_on_all_associations(:belongs_to).size
+   end
+ 
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index e9ca764..044cb62 100755
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -51,6 +51,7 @@ class Firm < Company
+   has_one :account, :foreign_key => "firm_id", :dependent => :destroy
+   has_one :account_with_select, :foreign_key => "firm_id", :select => "id, firm_id", :class_name=>'Account'
+   has_one :readonly_account, :foreign_key => "firm_id", :class_name => "Account", :readonly => true
++  has_one :account_using_primary_key, :primary_key => "firm_id", :class_name => "Account"
+ end
+ 
+ class DependentFirm < Company
+-- 
+1.5.5.1
+

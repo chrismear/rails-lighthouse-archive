@@ -1,0 +1,210 @@
+From 6e526a316318bf1a5a815ff8cb946b02b6b66f66 Mon Sep 17 00:00:00 2001
+From: Zach Dennis <zach.dennis@gmail.com>
+Date: Tue, 3 Jun 2008 15:51:37 -0400
+Subject: [PATCH] Fixed has_many :through bug where it was generating the incorrect SQL when the :through reflection was a belongs_to association
+
+---
+ .../lib/active_record/association_preload.rb       |   44 +++++++++++++++----
+ .../associations/has_many_through_association.rb   |   11 +++++
+ activerecord/test/cases/associations/eager_test.rb |    9 ++++
+ .../associations/has_many_associations_test.rb     |    1 +
+ .../has_many_through_associations_test.rb          |   17 +++++++-
+ activerecord/test/models/post.rb                   |    2 +
+ 6 files changed, 73 insertions(+), 11 deletions(-)
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index c759480..a28b8e5 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -4,6 +4,28 @@ module ActiveRecord
+       base.extend(ClassMethods)
+     end
+ 
++    class HasManyAssociationStrategy
++      def initialize(through_reflection)
++        @through_reflection = through_reflection
++      end
++  
++      def primary_key
++        if @through_reflection && @through_reflection.macro == :belongs_to
++          @through_reflection.klass.primary_key
++        else
++          @through_reflection.primary_key_name
++        end
++      end
++  
++      def primary_key_name
++        if @through_reflection && @through_reflection.macro == :belongs_to
++          @through_reflection.primary_key_name
++        else
++          nil
++        end
++      end
++    end
++
+     module ClassMethods
+ 
+       # Loads the named associations for the activerecord record (or records) given
+@@ -79,12 +101,13 @@ module ActiveRecord
+         end
+       end
+ 
+-      def construct_id_map(records)
++      def construct_id_map(records, primary_key=nil)
+         id_to_record_map = {}
+         ids = []
+         records.each do |record|
+-          ids << record.id
+-          mapped_records = (id_to_record_map[record.id.to_s] ||= [])
++          primary_key ||= record.class.primary_key
++          ids << record[primary_key]
++          mapped_records = (id_to_record_map[ids.last.to_s] ||= [])
+           mapped_records << record
+         end
+         ids.uniq!
+@@ -133,23 +156,24 @@ module ActiveRecord
+       end
+ 
+       def preload_has_many_association(records, reflection, preload_options={})
+-        id_to_record_map, ids = construct_id_map(records)
+-        records.each {|record| record.send(reflection.name).loaded}
+         options = reflection.options
++        through_reflection = reflections[options[:through]]
++        strat = HasManyAssociationStrategy.new(through_reflection)
++        id_to_record_map, ids = construct_id_map(records, strat.primary_key_name)
++        records.each {|record| record.send(reflection.name).loaded}
+ 
+         if options[:through]
+           through_records = preload_through_records(records, reflection, options[:through])
+           through_reflection = reflections[options[:through]]
+-          through_primary_key = through_reflection.primary_key_name
+           unless through_records.empty?
+             source = reflection.source_reflection.name
+-            #add conditions from reflection!
+-            through_records.first.class.preload_associations(through_records, source, reflection.options)
++            through_records.first.class.preload_associations(through_records, source, options)
+             through_records.each do |through_record|
+-              add_preloaded_records_to_collection(id_to_record_map[through_record[through_primary_key].to_s],
+-                                                 reflection.name, through_record.send(source))
++              through_record_id = through_record[strat.primary_key].to_s
++              add_preloaded_records_to_collection(id_to_record_map[through_record_id], reflection.name, through_record.send(source))
+             end
+           end
++
+         else
+           set_association_collection_records(id_to_record_map, reflection.name, find_associated_records(ids, reflection, preload_options),
+                                              reflection.primary_key_name)
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 24b02ef..4af0e0a 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -42,6 +42,14 @@ module ActiveRecord
+       end
+ 
+       protected
++        def target_reflection_has_associated_record?
++          if @reflection.through_reflection.macro == :belongs_to && @owner[@reflection.through_reflection.primary_key_name].blank?
++            false
++          else
++            true
++          end
++        end
++      
+         def construct_find_options!(options)
+           options[:select]  = construct_select(options[:select])
+           options[:from]  ||= construct_from
+@@ -70,6 +78,7 @@ module ActiveRecord
+         end
+ 
+         def find_target
++          return [] unless target_reflection_has_associated_record?
+           @reflection.klass.find(:all,
+             :select     => construct_select,
+             :conditions => construct_conditions,
+@@ -111,6 +120,8 @@ module ActiveRecord
+               "#{as}_type" => reflection.klass.quote_value(
+                 @owner.class.base_class.name.to_s,
+                 reflection.klass.columns_hash["#{as}_type"]) }
++          elsif reflection.macro == :belongs_to
++            { reflection.klass.primary_key => @owner[reflection.primary_key_name] }
+           else
+             { reflection.primary_key_name => owner_quoted_id }
+           end
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 5850657..94f3c69 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -262,6 +262,15 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_equal authors(:david), assert_no_queries { posts_with_comments_and_author.first.author }
+   end
+ 
++  def test_eager_with_has_many_through_a_belongs_to_association
++    author = authors(:mary)
++    post = Post.create!(:author => author, :title => "TITLE", :body => "BODY")
++    author.author_favorites.create(:favorite_author_id => 1)
++    author.author_favorites.create(:favorite_author_id => 2)
++    posts_with_author_favorites = author.posts.find(:all, :include => :author_favorites)
++    assert_no_queries { posts_with_author_favorites.first.author_favorites.first.author_id }
++  end
++  
+   def test_eager_with_has_many_through_an_sti_join_model
+     author = Author.find(:first, :include => :special_post_comments, :order => 'authors.id')
+     assert_equal [comments(:does_it_hurt)], assert_no_queries { author.special_post_comments }
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index b806e88..3d2e4cb 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1018,3 +1018,4 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+   end
+ 
+ end
++
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index d51a3c7..a208340 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -5,7 +5,7 @@ require 'models/reader'
+ require 'models/comment'
+ 
+ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+-  fixtures :posts, :readers, :people, :comments
++  fixtures :posts, :readers, :people, :comments, :authors
+ 
+   def test_associate_existing
+     assert_queries(2) { posts(:thinking);people(:david) }
+@@ -196,4 +196,19 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     # due to Unknown column 'comments.id'
+     assert Person.find(1).posts_with_comments_sorted_by_comment_id.find_by_title('Welcome to the weblog')
+   end
++
++  def test_has_many_association_through_a_belongs_to_association_where_the_association_doesnt_exist
++    author = authors(:mary)
++    post = Post.create!(:title => "TITLE", :body => "BODY")
++    assert_equal [], post.author_favorites
++  end  
++  
++  def test_has_many_association_through_a_belongs_to_association
++    author = authors(:mary)
++    post = Post.create!(:author => author, :title => "TITLE", :body => "BODY")
++    author.author_favorites.create(:favorite_author_id => 1)
++    author.author_favorites.create(:favorite_author_id => 2)
++    author.author_favorites.create(:favorite_author_id => 3)
++    assert_equal post.author.author_favorites, post.author_favorites
++  end  
+ end
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index e23818e..0da5c57 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -22,6 +22,8 @@ class Post < ActiveRecord::Base
+     end
+   end
+ 
++  has_many :author_favorites, :through => :author
++
+   has_many :comments_with_interpolated_conditions, :class_name => 'Comment',
+       :conditions => ['#{"#{aliased_table_name}." rescue ""}body = ?', 'Thank you for the welcome']
+ 
+-- 
+1.5.6.5
+

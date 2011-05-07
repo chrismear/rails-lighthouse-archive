@@ -1,0 +1,180 @@
+From 984038a270ac34382fbdb95288d4db1971e54dd5 Mon Sep 17 00:00:00 2001
+From: Dmitry Ratnikov <ratnikov@gmail.com>
+Date: Sun, 9 Aug 2009 03:04:52 -0500
+Subject: [PATCH] Fixed to specify the class for account, since there is none in the same
+ namespace
+
+---
+ activerecord/test/models/company_in_module.rb |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/test/models/company_in_module.rb b/activerecord/test/models/company_in_module.rb
+index 7f02403..e071525 100644
+--- a/activerecord/test/models/company_in_module.rb
++++ b/activerecord/test/models/company_in_module.rb
+@@ -11,7 +11,7 @@ module MyApplication
+       has_many :clients_like_ms, :conditions => "name = 'Microsoft'", :class_name => "Client", :order => "id"
+       has_many :clients_using_sql, :class_name => "Client", :finder_sql => 'SELECT * FROM companies WHERE client_of = #{id}'
+ 
+-      has_one :account, :dependent => :destroy
++      has_one :account, :class_name => 'MyApplication::Billing::Account', :dependent => :destroy
+     end
+ 
+     class Client < Company
+-- 
+1.6.0.2
+
+
+From 357544d49f0ea2d37832ca3e0c9d0b5729724af9 Mon Sep 17 00:00:00 2001
+From: Dmitry Ratnikov <ratnikov@gmail.com>
+Date: Sun, 9 Aug 2009 03:35:45 -0500
+Subject: [PATCH] Modified Rich Bradley's test-case to fail as part of suite and with a
+ reasonable message
+
+---
+ activerecord/lib/active_record/associations.rb |    2 +-
+ activerecord/test/cases/modules_test.rb        |   27 ++++++++++++++++++++++++
+ 2 files changed, 28 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 66db63a..388a785 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1838,7 +1838,7 @@ module ActiveRecord
+                     descendant
+                   end.flatten.compact
+ 
+-                  remove_duplicate_results!(reflection.class_name.constantize, parent_records, associations[name]) unless parent_records.empty?
++                  remove_duplicate_results!(reflection.klass, parent_records, associations[name]) unless parent_records.empty?
+                 end
+             end
+           end
+diff --git a/activerecord/test/cases/modules_test.rb b/activerecord/test/cases/modules_test.rb
+index 283333f..8ad9f8c 100644
+--- a/activerecord/test/cases/modules_test.rb
++++ b/activerecord/test/cases/modules_test.rb
+@@ -4,6 +4,16 @@ require 'models/company_in_module'
+ class ModulesTest < ActiveRecord::TestCase
+   fixtures :accounts, :companies, :projects, :developers
+ 
++  def setup
++    # need to make sure Object::Firm is not defined, so that constantize will not be able to cheat when having to load namespaced classes
++    @firm_const = Object.send(:remove_const, :Firm) if Object.const_defined?(:Firm)
++  end
++
++  def teardown
++    # reinstate the Object::Firm constant for further tests
++    Object.send :const_set, :Firm, @firm_const unless @firm_const.nil?
++  end
++
+   def test_module_spanning_associations
+     firm = MyApplication::Business::Firm.find(:first)
+     assert !firm.clients.empty?, "Firm should have clients"
+@@ -36,4 +46,21 @@ class ModulesTest < ActiveRecord::TestCase
+     assert_equal 'companies', MyApplication::Business::Client.table_name, 'table_name for ActiveRecord model subclass'
+     assert_equal 'company_contacts', MyApplication::Business::Client::Contact.table_name, 'table_name for ActiveRecord model enclosed by another ActiveRecord model'
+   end
++
++  def test_eager_loading_in_modules
++    # need to add an eager loading condition to force the eager loading model into
++    # the old join model, to test that. See http://dev.rubyonrails.org/ticket/9640
++    begin
++      client_join_loaded = MyApplication::Business::Client.find(3, :include => {:firm => :account}, :conditions => 'accounts.id IS NOT NULL')
++      client_sequential_loaded = MyApplication::Business::Client.find(3, :include => {:firm => :account})
++    rescue NameError => nE
++      flunk "Should be able to resolve all classes via reflections" 
++    end
++
++    [client_join_loaded, client_sequential_loaded].each do |client|
++      assert_no_queries do
++        assert_not_nil(client.firm.account)
++      end
++    end
++  end
+ end
+-- 
+1.6.0.2
+
+
+From fa2850f65dede33be75015c552a5d0480c4b418a Mon Sep 17 00:00:00 2001
+From: Dmitry Ratnikov <ratnikov@gmail.com>
+Date: Sun, 9 Aug 2009 03:48:49 -0500
+Subject: [PATCH] Changed to use klass instead of constantanizing in assign_ids generated
+ method
+
+---
+ activerecord/lib/active_record/associations.rb |    2 +-
+ activerecord/test/cases/modules_test.rb        |   27 +++++++++++++++++++----
+ 2 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 388a785..7732bb5 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1293,7 +1293,7 @@ module ActiveRecord
+ 
+             define_method("#{reflection.name.to_s.singularize}_ids=") do |new_value|
+               ids = (new_value || []).reject { |nid| nid.blank? }
+-              send("#{reflection.name}=", reflection.class_name.constantize.find(ids))
++              send("#{reflection.name}=", reflection.klass.find(ids))
+             end
+           end
+         end
+diff --git a/activerecord/test/cases/modules_test.rb b/activerecord/test/cases/modules_test.rb
+index 8ad9f8c..2acc07e 100644
+--- a/activerecord/test/cases/modules_test.rb
++++ b/activerecord/test/cases/modules_test.rb
+@@ -5,13 +5,20 @@ class ModulesTest < ActiveRecord::TestCase
+   fixtures :accounts, :companies, :projects, :developers
+ 
+   def setup
+-    # need to make sure Object::Firm is not defined, so that constantize will not be able to cheat when having to load namespaced classes
+-    @firm_const = Object.send(:remove_const, :Firm) if Object.const_defined?(:Firm)
++    # need to make sure Object::Firm and Object::Client are not defined,
++    # so that constantize will not be able to cheat when having to load namespaced classes
++    @undefined_consts = {}
++
++    [:Firm, :Client].each do |const|
++      @undefined_consts.merge! const => Object.send(:remove_const, const) if Object.const_defined?(const)
++    end
+   end
+ 
+   def teardown
+-    # reinstate the Object::Firm constant for further tests
+-    Object.send :const_set, :Firm, @firm_const unless @firm_const.nil?
++    # reinstate the constants that we undefined in the setup
++    @undefined_consts.each do |constant, value|
++      Object.send :const_set, constant, value unless value.nil?
++    end
+   end
+ 
+   def test_module_spanning_associations
+@@ -47,6 +54,16 @@ class ModulesTest < ActiveRecord::TestCase
+     assert_equal 'company_contacts', MyApplication::Business::Client::Contact.table_name, 'table_name for ActiveRecord model enclosed by another ActiveRecord model'
+   end
+ 
++  def test_assign_ids
++    firm = MyApplication::Business::Firm.first
++
++    begin
++      firm.client_ids = [ MyApplication::Business::Client.first.id ]
++    rescue NameError
++      flunk "Should be able to resolve all class constants via reflection"
++    end
++  end
++
+   def test_eager_loading_in_modules
+     # need to add an eager loading condition to force the eager loading model into
+     # the old join model, to test that. See http://dev.rubyonrails.org/ticket/9640
+@@ -54,7 +71,7 @@ class ModulesTest < ActiveRecord::TestCase
+       client_join_loaded = MyApplication::Business::Client.find(3, :include => {:firm => :account}, :conditions => 'accounts.id IS NOT NULL')
+       client_sequential_loaded = MyApplication::Business::Client.find(3, :include => {:firm => :account})
+     rescue NameError => nE
+-      flunk "Should be able to resolve all classes via reflections" 
++      flunk "Should be able to resolve all class constants via reflection" 
+     end
+ 
+     [client_join_loaded, client_sequential_loaded].each do |client|
+-- 
+1.6.0.2
+

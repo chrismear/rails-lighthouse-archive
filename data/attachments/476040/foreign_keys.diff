@@ -1,0 +1,743 @@
+From ab18f1b0f58ee9e154179c75462a438404ea4fe0 Mon Sep 17 00:00:00 2001
+From: Matthew <developer@matthewhiggins.com>
+Date: Wed, 7 Apr 2010 23:13:21 -0700
+Subject: [PATCH 1/4] implementation without tests
+
+---
+ .../abstract/schema_definitions.rb                 |   31 +++++++
+ .../abstract/schema_statements.rb                  |   88 ++++++++++++++++++++
+ .../connection_adapters/mysql_adapter.rb           |   29 +++++++
+ .../connection_adapters/postgresql_adapter.rb      |   48 +++++++++--
+ .../connection_adapters/sqlite_adapter.rb          |   10 ++
+ activerecord/lib/active_record/schema_dumper.rb    |   35 +++++++-
+ 6 files changed, 233 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index 6c477e4..4d29fdc 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -261,6 +261,9 @@ module ActiveRecord
+     class IndexDefinition < Struct.new(:table, :name, :unique, :columns) #:nodoc:
+     end
+ 
++    class ForeignKeyDefinition < Struct.new(:referencing_table, :referenced_table, :options) #:nodoc:
++    end
++
+     # Abstract representation of a column definition. Instances of this type
+     # are typically created by methods in TableDefinition, and added to the
+     # +columns+ attribute of said TableDefinition object, in order to be used
+@@ -596,6 +599,21 @@ module ActiveRecord
+         @base.add_index(@table_name, column_name, options)
+       end
+ 
++      # Adds a new foreign key to the table. See SchemaStatements#add_foreign_key
++      #
++      # ===== Examples
++      # ====== Creating a simple foreign key
++      #  t.foreign_key(:people)
++      # ====== Defining the column
++      #  t.foreign_key(:people, :column => :sender_id)
++      # ====== Creating a named foreign key
++      #  t.foreign_key(:people, :column => :sender_id, :name => 'sender_foreign_key')
++      # ====== Cascade delete this table if referenced_table is deleted.
++      #  t.foreign_key(:people, :column => :sender_id, :dependency => :delete)
++      def foreign_key(referenced_table, options = {})
++        @base.add_foreign_key(@table_name, referenced_table, options)
++      end
++
+       # Adds timestamps (created_at and updated_at) columns to the table. See SchemaStatements#add_timestamps
+       # ===== Example
+       #  t.timestamps
+@@ -643,6 +661,19 @@ module ActiveRecord
+         @base.remove_index(@table_name, options)
+       end
+ 
++      # Remove the given foreign key from the table.
++      #
++      # ===== Examples
++      # ====== Remove the fk_suppliers_company_id in the suppliers table.
++      #   t.remove_foreign_key :companies
++      # ====== Remove the foreign key named fk_accounts_branch_id in the accounts table.
++      #   remove_foreign_key :column => :branch_id
++      # ====== Remove the foreign key named party_foreign_key in the accounts table.
++      #   remove_index :name => :party_foreign_key
++      def remove_foreign_key(referenced_table_or_options)
++        @base.remove_foreign_key(@table_name, referenced_table_or_options)
++      end
++
+       # Removes the timestamp columns (created_at and updated_at) from the table.
+       # ===== Example
+       #  t.remove_timestamps
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+index 6d4ab50..745e386 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+@@ -308,6 +308,94 @@ module ActiveRecord
+         end
+       end
+ 
++      # Adds a new foreign key to the +referencing_table+, pointing to the primary key of the +referenced_table+
++      #
++      # The foreign key will be named after the +referencing_table+ and column, unless you pass
++      # <tt>:name</tt> as an option.
++      #
++      # ===== Examples
++      # ====== Creating a foreign key
++      #  add_foreign_key(:comments, :posts)
++      # generates
++      #  ALTER TABLE `comments` ADD CONSTRAINT
++      #     `fk_comments_post_id` FOREIGN KEY (`post_id`) REFERENCES `posts` (`id`)
++      # 
++      # ====== Creating a named foreign key
++      #  add_foreign_key(:comments, :posts, :name => 'comments_belongs_to_posts')
++      # generates
++      #  ALTER TABLE `comments` ADD CONSTRAINT
++      #     `comments_belongs_to_posts` FOREIGN KEY (`post_id`) REFERENCES `posts` (`id`)
++      # 
++      # ====== Creating a cascading foreign_key on a custom column
++      #  add_foreign_key(:people, :people, :column => 'best_friend_id', :dependent => :nullify)
++      # generates
++      #  ALTER TABLE `people` ADD CONSTRAINT
++      #     `fk_people_best_friend_id` FOREIGN KEY (`best_friend_id`) REFERENCES `people` (`id`)
++      #     ON DELETE SET NULL
++      # 
++      # === Supported options
++      # [:column]
++      #   Specify the column name on the referencing_table that points to the referenced_table. By default
++      #   this is guessed to be the singular name of the referenced_table with "_id" suffixed. So a referenced_table
++      #   of :posts will use "post_id" as the default <tt>:column</tt>.
++      # [:name]
++      #   Specify the name of the foreign key constraint. This defaults to use the referencing_table and column.
++      # [:primary_key]
++      #   Specify the column name on the referenced_table that is referenced by this foreign key. This defaults to "id".
++      # [:dependent]
++      #   If set to <tt>:delete</tt>, the associated records in the referencing_table are deleted when records
++      #   in referenced_table are deleted. If set to <tt>:nullify</tt>, the foreign key column is set to +NULL+.
++      def add_foreign_key(referencing_table, referenced_table, options = {})
++        column            = options[:column] || "#{referenced_table.to_s.singularize}_id"
++        foreign_key_name  = foreign_key_name(referencing_table, options.merge(:column => column))
++        primary_key       = options[:primary_key] || 'id'
++        dependency        = foreign_key_dependency(options)
++
++        execute(
++          "ALTER TABLE #{quote_table_name(referencing_table)} " +
++          "ADD CONSTRAINT #{quote_column_name(foreign_key_name)} " +
++          "FOREIGN KEY (#{quote_column_name(column)}) " +
++          "REFERENCES #{quote_table_name(ActiveRecord::Migrator.proper_table_name(referenced_table))}(#{primary_key}) " +
++          dependency
++        )
++      end
++
++      # Remove the given foreign key from the table.
++      #
++      # Remove the foreign key fk_suppliers_company_id in the suppliers table.
++      #   remove_foreign_key :suppliers, :companies
++      # Remove the foreign key fk_accounts_branch_id in the accounts table.
++      #   remove_foreign_key :accounts, :column => :branch_id
++      # Remove the foreign key named party_foreign_key in the accounts table.
++      #   remove_foreign_key :accounts, :name => :party_foreign_key
++      def remove_foreign_key(referencing_table, referenced_table_or_options)
++        if Hash === options
++          foreign_key_name = foreign_key_name(referencing_table, options)
++        else
++          foreign_key_name = foreign_key_name(referencing_table, :column => "#{referenced_table.to_s.singularize}_id")
++        end
++
++        execute "ALTER TABLE #{quote_table_name(referencing_table)} DROP FOREIGN KEY #{quote_column_name(foreign_key_name)}"
++      end
++
++      def foreign_key_name(referencing_table, options)
++        if options[:name]
++          options[:name]
++        elsif options[:column]
++          "fk_#{referencing_table}_#{options[:column]}"
++        else
++          raise ArgumentError, "You must specify the foreign key name"
++        end
++      end
++
++      def foreign_key_dependency(options)
++        case options[:dependency]
++          when :nullify then "ON DELETE SET NULL"
++          when :delete  then "ON DELETE CASCADE"
++          else ""
++        end
++      end
++
+       # Returns a string of <tt>CREATE TABLE</tt> SQL statement(s) for recreating the
+       # entire structure of the database.
+       def structure_dump
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 55d9d20..1076a40 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -469,6 +469,35 @@ module ActiveRecord
+         result.free
+         indexes
+       end
++      
++      def foreign_keys(table_name, name = nil)#:nodoc:
++        results = select_all(<<-SQL, name)
++          SELECT fk.referenced_table_name as 'referenced_table'
++                ,fk.referenced_column_name as 'primary_key'
++                ,fk.column_name as 'column'
++                ,fk.constraint_name as 'name'
++          FROM information_schema.key_column_usage fk
++          WHERE fk.referenced_column_name is not null
++            AND fk.table_schema = '#{@config[:database]}'
++            AND fk.table_name = '#{table_name}'
++        SQL
++
++        structure = select_one("SHOW CREATE TABLE #{quote_table_name(table_name)}")["Create Table"]
++
++        results.map do |row|
++          options = {:column => row['column'], :name => row['name'], :primary_key => row['primary_key']}
++
++          if structure =~ /CONSTRAINT #{quote_column_name(row['name'])} FOREIGN KEY .* REFERENCES .* ON DELETE (CASCADE|SET NULL)/
++            if $1 == 'CASCADE'
++              options[:dependent] = :delete
++            elsif $1 == 'SET NULL'
++              options[:dependent] = :nullify
++            end
++          end
++
++          ForeignKeyDefinition.new(table_name, row['referenced_table'], options)
++        end
++      end
+ 
+       def columns(table_name, name = nil)#:nodoc:
+         sql = "SHOW FIELDS FROM #{quote_table_name(table_name)}"
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 2395a74..491c4c3 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -703,10 +703,7 @@ module ActiveRecord
+           ORDER BY i.relname
+         SQL
+ 
+-
+-        indexes = []
+-
+-        indexes = result.map do |row|
++        result.map do |row|
+           index_name = row[0]
+           unique = row[1] == 't'
+           indkey = row[2].split(" ")
+@@ -721,10 +718,39 @@ module ActiveRecord
+ 
+           column_names = indkey.map {|attnum| columns[attnum] }
+           IndexDefinition.new(table_name, index_name, unique, column_names)
+-
+         end
++      end
+ 
+-        indexes
++      def foreign_keys(table_name, name = nil)
++        results = select_all(<<-SQL, name)
++          SELECT tc.constraint_name as name
++                ,ccu.table_name as referenced_table
++                ,ccu.column_name as primary_key
++                ,kcu.column_name as column
++                ,rc.delete_rule as dependency
++          FROM information_schema.table_constraints tc
++          JOIN information_schema.key_column_usage kcu
++          USING (constraint_catalog, constraint_schema, constraint_name)
++          JOIN information_schema.referential_constraints rc
++          USING (constraint_catalog, constraint_schema, constraint_name)
++          JOIN information_schema.constraint_column_usage ccu
++          USING (constraint_catalog, constraint_schema, constraint_name)
++          WHERE tc.constraint_type = 'FOREIGN KEY'
++            AND tc.constraint_catalog = '#{@config[:database]}'
++            AND tc.table_name = '#{table_name}'
++        SQL
++
++        results.map do |row|
++          options = {:column => row['column'], :name => row['name'], :primary_key => row['primary_key']}
++
++          if row['dependency'] == 'CASCADE'
++            options[:dependent] = :delete
++          elsif row['dependency'] == 'SET NULL'
++            options[:dependent] = :nullify
++          end
++
++          ForeignKeyDefinition.new(table_name, row['referenced_table'], options)
++        end
+       end
+ 
+       # Returns the list of all column definitions for a table.
+@@ -922,6 +948,16 @@ module ActiveRecord
+         execute "DROP INDEX #{quote_table_name(index_name(table_name, options))}"
+       end
+ 
++      def remove_foreign_key(table, options)
++        if Hash === options
++          foreign_key_name = foreign_key_name(table, options[:column], options)
++        else
++          foreign_key_name = foreign_key_name(table, "#{options.to_s.singularize}_id")
++        end
++
++        execute "ALTER TABLE #{quote_table_name(table)} DROP CONSTRAINT #{quote_column_name(foreign_key_name)}"
++      end
++
+       # Maps logical Rails types to PostgreSQL-specific data types.
+       def type_to_sql(type, limit = nil, precision = nil, scale = nil)
+         return super unless type.to_s == 'integer'
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 29225b8..09ead91 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -211,6 +211,10 @@ module ActiveRecord
+           index
+         end
+       end
++      
++      def foreign_keys(table_name, name = nil)
++        []
++      end
+ 
+       def primary_key(table_name) #:nodoc:
+         column = table_structure(table_name).find {|field| field['pk'].to_i == 1}
+@@ -221,6 +225,12 @@ module ActiveRecord
+         execute "DROP INDEX #{quote_column_name(index_name(table_name, options))}"
+       end
+ 
++      def add_foreign_key(referencing_table, referenced_table, options = {})
++      end
++
++      def remove_foreign_key(referencing_table, referenced_table_or_options)
++      end
++
+       def rename_table(name, new_name)
+         execute "ALTER TABLE #{quote_table_name(name)} RENAME TO #{quote_table_name(new_name)}"
+       end
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index c8e1b4f..6bbe934 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -6,7 +6,7 @@ module ActiveRecord
+   # output format (i.e., ActiveRecord::Schema).
+   class SchemaDumper #:nodoc:
+     private_class_method :new
+-    
++
+     ##
+     # :singleton-method:
+     # A list of tables which should not be dumped to the schema. 
+@@ -38,7 +38,7 @@ module ActiveRecord
+       def header(stream)
+         define_params = @version ? ":version => #{@version}" : ""
+ 
+-        stream.puts <<HEADER
++        stream.puts <<-HEADER
+ # This file is auto-generated from the current state of the database. Instead of editing this file, 
+ # please use the migrations feature of Active Record to incrementally modify your database, and
+ # then regenerate this schema definition.
+@@ -60,6 +60,8 @@ HEADER
+       end
+ 
+       def tables(stream)
++        fks = StringIO.new
++
+         @connection.tables.sort.each do |tbl|
+           next if ['schema_migrations', ignore_tables].flatten.any? do |ignored|
+             case ignored
+@@ -70,7 +72,11 @@ HEADER
+             end
+           end 
+           table(tbl, stream)
++          foreign_keys(tbl, fks)
+         end
++
++        fks.rewind
++        stream.print fks.read
+       end
+ 
+       def table(table, stream)
+@@ -185,5 +191,30 @@ HEADER
+           stream.puts
+         end
+       end
++
++      def foreign_keys(table_name, stream)
++        if (foreign_keys = @connection.foreign_keys(table_name)).any?
++          add_foreign_key_statements = foreign_keys.map do |foreign_key|
++            statement_parts = [ ('add_foreign_key ' + foreign_key.referencing_table.inspect) ]
++            statement_parts << foreign_key.referenced_table.inspect
++            statement_parts << (':name => ' + foreign_key.options[:name].inspect)
++            
++            if foreign_key.options[:column] != "#{foreign_key.referenced_table.singularize}_id"
++              statement_parts << (':column => ' + foreign_key.options[:column].inspect)
++            end
++            if foreign_key.options[:primary_key] != 'id'
++              statement_parts << (':primary_key => ' + foreign_key.options[:primary_key].inspect)
++            end
++            if foreign_key.options[:dependent].present?
++              statement_parts << (':dependent => ' + foreign_key.options[:dependent].inspect)
++            end
++
++            '  ' + statement_parts.join(', ')
++          end
++
++          stream.puts add_foreign_key_statements.sort.join("\n")
++          stream.puts
++        end
++      end
+   end
+ end
+-- 
+1.7.0.4
+
+
+From e9e40c108fb403fb498b0d6e5c468a00c20604a9 Mon Sep 17 00:00:00 2001
+From: Matthew <developer@matthewhiggins.com>
+Date: Thu, 8 Apr 2010 09:54:46 -0700
+Subject: [PATCH 2/4] Tests, tweaks and docs
+
+---
+ .../abstract/schema_statements.rb                  |    6 ++--
+ .../connection_adapters/abstract_adapter.rb        |    6 +++++
+ .../connection_adapters/sqlite_adapter.rb          |    4 +++
+ activerecord/lib/active_record/migration.rb        |    3 ++
+ activerecord/test/cases/adapter_test.rb            |   24 ++++++++++++++++++-
+ activerecord/test/cases/migration_test.rb          |   18 +++++++++++++++
+ activerecord/test/cases/schema_dumper_test.rb      |    4 +++
+ activerecord/test/schema/schema.rb                 |   24 +++++--------------
+ railties/guides/source/migrations.textile          |    4 ++-
+ 9 files changed, 70 insertions(+), 23 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+index 745e386..b2ac01d 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+@@ -368,11 +368,11 @@ module ActiveRecord
+       #   remove_foreign_key :accounts, :column => :branch_id
+       # Remove the foreign key named party_foreign_key in the accounts table.
+       #   remove_foreign_key :accounts, :name => :party_foreign_key
+-      def remove_foreign_key(referencing_table, referenced_table_or_options)
++      def remove_foreign_key(referencing_table, options)
+         if Hash === options
+           foreign_key_name = foreign_key_name(referencing_table, options)
+         else
+-          foreign_key_name = foreign_key_name(referencing_table, :column => "#{referenced_table.to_s.singularize}_id")
++          foreign_key_name = foreign_key_name(referencing_table, :column => "#{options.to_s.singularize}_id")
+         end
+ 
+         execute "ALTER TABLE #{quote_table_name(referencing_table)} DROP FOREIGN KEY #{quote_column_name(foreign_key_name)}"
+@@ -389,7 +389,7 @@ module ActiveRecord
+       end
+ 
+       def foreign_key_dependency(options)
+-        case options[:dependency]
++        case options[:dependent]
+           when :nullify then "ON DELETE SET NULL"
+           when :delete  then "ON DELETE CASCADE"
+           else ""
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index 6ffffc8..9ea3801 100755
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -62,6 +62,12 @@ module ActiveRecord
+         false
+       end
+ 
++      # Does this adapter support foreign key constraints?  This is +true+
++      # for all adapters except sqlite.
++      def supports_foreign_keys?
++        true
++      end
++
+       # Does this adapter support using DISTINCT within COUNT?  This is +true+
+       # for all adapters except sqlite.
+       def supports_count_distinct?
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 09ead91..b002e86 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -84,6 +84,10 @@ module ActiveRecord
+         true
+       end
+ 
++      def supports_foreign_keys?
++        false
++      end
++
+       def requires_reloading?
+         true
+       end
+diff --git a/activerecord/lib/active_record/migration.rb b/activerecord/lib/active_record/migration.rb
+index c163fb9..d96de14 100644
+--- a/activerecord/lib/active_record/migration.rb
++++ b/activerecord/lib/active_record/migration.rb
+@@ -96,6 +96,9 @@ module ActiveRecord
+   # * <tt>add_index(table_name, column_names, options)</tt>: Adds a new index with the name of the column. Other options include
+   #   <tt>:name</tt> and <tt>:unique</tt> (e.g. <tt>{ :name => "users_name_index", :unique => true }</tt>).
+   # * <tt>remove_index(table_name, index_name)</tt>: Removes the index specified by +index_name+.
++  # * <tt>add_foreign_key(referencing_table, referenced_table, options)</tt>: Adds a new foreign key to the referencing_table,
++  #   with a constraint on the primary key of the referenced_table. Options include <tt>:column</tt>, <tt>:name</tt>, <tt>:primary_key</tt>
++  #   and <tt>:dependent</tt>. (e.g. <tt>{:name => 'my_foreign_key', :column => 'author_id', :dependent => :delete})
+   #
+   # == Irreversible transformations
+   #
+diff --git a/activerecord/test/cases/adapter_test.rb b/activerecord/test/cases/adapter_test.rb
+index 9f78ae0..f8ff892 100644
+--- a/activerecord/test/cases/adapter_test.rb
++++ b/activerecord/test/cases/adapter_test.rb
+@@ -41,6 +41,26 @@ class AdapterTest < ActiveRecord::TestCase
+     @connection.remove_index(:accounts, :name => idx_name) rescue nil
+   end
+ 
++  def test_foreign_keys
++    fk_name = 'favorited_author'
++
++    if @connection.supports_foreign_keys?
++      foreign_keys = @connection.foreign_keys("author_favorites")
++      assert foreign_keys.empty?
++
++      @connection.add_foreign_key :author_favorites, :authors, :name => fk_name, :column => 'favorite_author_id', :dependent => :delete
++      @connection.foreign_keys("author_favorites").first.tap do |foreign_key|
++        assert_equal 'author_favorites', foreign_key.referencing_table
++        assert_equal 'authors', foreign_key.referenced_table
++        assert_equal fk_name, foreign_key.options[:name]
++        assert_equal 'favorite_author_id', foreign_key.options[:column]
++        assert_equal :delete, foreign_key.options[:dependent]
++      end
++    end
++  ensure
++    @connection.remove_foreign_key :author_favorites, :name => fk_name
++  end
++
+   def test_current_database
+     if @connection.respond_to?(:current_database)
+       assert_equal ENV['ARUNIT_DB_NAME'] || "activerecord_unittest", @connection.current_database
+@@ -136,7 +156,7 @@ class AdapterTest < ActiveRecord::TestCase
+   end
+ 
+   def test_foreign_key_violations_are_translated_to_specific_exception
+-    unless @connection.adapter_name == 'SQLite'
++    if @connection.supports_foreign_keys?
+       assert_raises(ActiveRecord::InvalidForeignKey) do
+         # Oracle adapter uses prefetched primary key values from sequence and passes them to connection adapter insert method
+         if @connection.prefetch_primary_key?
+@@ -151,7 +171,7 @@ class AdapterTest < ActiveRecord::TestCase
+ 
+   def test_add_limit_offset_should_sanitize_sql_injection_for_limit_without_comas
+     sql_inject = "1 select * from schema"
+-      assert_equal " LIMIT 1", @connection.add_limit_offset!("", :limit => sql_inject)
++    assert_equal " LIMIT 1", @connection.add_limit_offset!("", :limit => sql_inject)
+     if current_adapter?(:MysqlAdapter)
+       assert_equal " LIMIT 7, 1", @connection.add_limit_offset!("", :limit => sql_inject, :offset => 7)
+     else
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index e213986..67a464e 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -111,6 +111,17 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def test_add_foreign_key
++      Subscription.delete_all
++      Order.delete_all
++      assert_nothing_raised { Subscription.connection.add_foreign_key :subscriptions, :books }
++      assert_nothing_raised { Subscription.connection.remove_foreign_key :subscriptions, :books }
++      assert_nothing_raised { Subscription.connection.add_foreign_key :subscriptions, :books, :name => 'fk_subscribed_books' }
++      assert_nothing_raised { Subscription.connection.remove_foreign_key :subscriptions, :name => 'fk_subscribed_books' }
++      assert_nothing_raised { Order.connection.add_foreign_key :orders, :people, :column => 'billing_customer_id'}
++      assert_nothing_raised { Order.connection.remove_foreign_key :orders, :column => 'billing_customer_id' }
++    end
++
+     def testing_table_with_only_foo_attribute
+       Person.connection.create_table :testings, :id => false do |t|
+         t.column :foo, :string
+@@ -1606,6 +1617,13 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def test_foreign_key_creates_foreign_key
++      with_change_table do |t|
++        @connection.expects(:add_foreign_key).with(:delete_me, :bar, {:dependent => :delete})
++        t.foreign_key :bar, :dependent => :delete
++      end
++    end
++
+     def test_change_changes_column
+       with_change_table do |t|
+         @connection.expects(:change_column).with(:delete_me, :bar, :string, {})
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index 1c43e3c..3af5698 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -162,6 +162,10 @@ class SchemaDumperTest < ActiveRecord::TestCase
+     assert_equal 'add_index "companies", ["firm_id", "type", "rating", "ruby_type"], :name => "company_index"', index_definition
+   end
+ 
++  def test_foreign_keys
++    output = standard_dump
++  end
++
+   def test_schema_dump_should_honor_nonstandard_primary_keys
+     output = standard_dump
+     match = output.match(%r{create_table "movies"(.*)do})
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index bec4291..18698cf 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -1,10 +1,4 @@
+ ActiveRecord::Schema.define do
+-  def except(adapter_names_to_exclude)
+-    unless [adapter_names_to_exclude].flatten.include?(adapter_name)
+-      yield
+-    end
+-  end
+-
+   #put adapter specific setup here
+   case adapter_name
+     # For Firebird, set the sequence values 10000 when create_table is called;
+@@ -545,18 +539,14 @@ ActiveRecord::Schema.define do
+   create_table :zines, :force => true do |t|
+     t.string :title
+   end
+-
+-  except 'SQLite' do
+-    # fk_test_has_fk should be before fk_test_has_pk
+-    create_table :fk_test_has_fk, :force => true do |t|
+-      t.integer :fk_id, :null => false
+-    end
+-
+-    create_table :fk_test_has_pk, :force => true do |t|
+-    end
+-
+-    execute "ALTER TABLE fk_test_has_fk ADD CONSTRAINT fk_name FOREIGN KEY (#{quote_column_name 'fk_id'}) REFERENCES #{quote_table_name 'fk_test_has_pk'} (#{quote_column_name 'id'})"
++  
++  create_table :fk_test_has_fk, :force => true do |t|
++    t.integer :fk_id, :null => false
++  end
++  
++  create_table :fk_test_has_pk, :force => true do |t|
+   end
++  add_foreign_key :fk_test_has_fk, :fk_test_has_pk, :column => :fk_id, :name => 'fk_id'
+ end
+ 
+ Course.connection.create_table :courses, :force => true do |t|
+diff --git a/railties/guides/source/migrations.textile b/railties/guides/source/migrations.textile
+index 558cbb4..c3fca91 100644
+--- a/railties/guides/source/migrations.textile
++++ b/railties/guides/source/migrations.textile
+@@ -75,6 +75,8 @@ Active Record provides methods that perform common data definition tasks in a da
+ * +remove_column+
+ * +add_index+
+ * +remove_index+
++* +add_foreign_key+
++* +remove_foreign_key+
+ 
+ If you need to perform tasks specific to your database (for example create a "foreign key":#active-record-and-referential-integrity constraint) then the +execute+ function allows you to execute arbitrary SQL. A migration is just a regular Ruby class so you're not limited to these functions. For example after adding a column you could write code to set the value of that column for existing records (if necessary using your models).
+ 
+@@ -564,7 +566,7 @@ ActiveRecord::Schema.define(:version => 20080906171750) do
+ end
+ </ruby>
+ 
+-In many ways this is exactly what it is. This file is created by inspecting the database and expressing its structure using +create_table+, +add_index+, and so on. Because this is database independent it could be loaded into any database that Active Record supports. This could be very useful if you were to distribute an application that is able to run against multiple databases.
++In many ways this is exactly what it is. This file is created by inspecting the database and expressing its structure using +create_table+, +add_index+, and +add_foreign_key+. Because this is database independent it could be loaded into any database that Active Record supports. This could be very useful if you were to distribute an application that is able to run against multiple databases.
+ 
+ There is however a trade-off: +db/schema.rb+ cannot express database specific items such as foreign key constraints, triggers or stored procedures. While in a migration you can execute custom SQL statements, the schema dumper cannot reconstitute those statements from the database. If you are using features like this then you should set the schema format to +:sql+.
+ 
+-- 
+1.7.0.4
+
+
+From 818304962e4164e5ca7e89f1ad8277a0f04cf890 Mon Sep 17 00:00:00 2001
+From: Matthew <developer@matthewhiggins.com>
+Date: Thu, 8 Apr 2010 10:02:18 -0700
+Subject: [PATCH 3/4] Add test for t.remove_foreign_key
+
+---
+ activerecord/test/cases/migration_test.rb |    9 +++++++++
+ 1 files changed, 9 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index 67a464e..d64ecc8 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -1,7 +1,9 @@
+ require "cases/helper"
+ require 'bigdecimal/util'
+ 
++require 'models/order'
+ require 'models/person'
++require 'models/subscription'
+ require 'models/topic'
+ require 'models/developer'
+ 
+@@ -1666,6 +1668,13 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def test_remove_foreign_key
++      with_change_table do |t|
++        @connection.expects(:remove_foreign_key).with(:delete_me, {:name => 'foo'})
++        t.remove_foreign_key :name => 'foo'
++      end
++    end
++
+     def test_rename_renames_column
+       with_change_table do |t|
+         @connection.expects(:rename_column).with(:delete_me, :bar, :baz)
+-- 
+1.7.0.4
+
+
+From 4304633099b638e043e4820f6bbbe645323dc746 Mon Sep 17 00:00:00 2001
+From: Matthew <developer@matthewhiggins.com>
+Date: Thu, 8 Apr 2010 10:29:30 -0700
+Subject: [PATCH 4/4] Separate table dumps from foreign key dumps
+
+---
+ activerecord/lib/active_record/schema_dumper.rb |   18 ++++++------------
+ 1 files changed, 6 insertions(+), 12 deletions(-)
+
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index 6bbe934..6e206c6 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -22,7 +22,8 @@ module ActiveRecord
+ 
+     def dump(stream)
+       header(stream)
+-      tables(stream)
++      table_names.each { |tbl| table(tbl, stream) }
++      table_names.each { |tbl| foreign_keys(tbl, stream) }
+       trailer(stream)
+       stream
+     end
+@@ -59,24 +60,17 @@ HEADER
+         stream.puts "end"
+       end
+ 
+-      def tables(stream)
+-        fks = StringIO.new
+-
+-        @connection.tables.sort.each do |tbl|
+-          next if ['schema_migrations', ignore_tables].flatten.any? do |ignored|
++      def table_names
++        @connection.tables.sort.reject do |tbl|
++          ['schema_migrations', ignore_tables].flatten.any? do |ignored|
+             case ignored
+             when String; tbl == ignored
+             when Regexp; tbl =~ ignored
+             else
+               raise StandardError, 'ActiveRecord::SchemaDumper.ignore_tables accepts an array of String and / or Regexp values.'
+             end
+-          end 
+-          table(tbl, stream)
+-          foreign_keys(tbl, fks)
++          end
+         end
+-
+-        fks.rewind
+-        stream.print fks.read
+       end
+ 
+       def table(table, stream)
+-- 
+1.7.0.4
+

@@ -1,0 +1,100 @@
+From 5a231fdfdad984aa247ec580a3542184c809a75a Mon Sep 17 00:00:00 2001
+From: Hemant Kumar <hkumar@crri.co.in>
+Date: Thu, 30 Sep 2010 12:12:23 +0530
+Subject: [PATCH] fix ruby 1.9 deadlock problem, fixes #5736
+ add connection pool tests
+
+---
+ .../abstract/connection_pool.rb                    |   14 ++++-----
+ activerecord/test/cases/connection_pool_test.rb    |   29 ++++++++++++++++++++
+ 2 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+index 37e584a..0c264de 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+@@ -75,10 +75,7 @@ module ActiveRecord
+         @queue = @connection_mutex.new_cond
+ 
+         # default 5 second timeout unless on ruby 1.9
+-        @timeout =
+-          if RUBY_VERSION < '1.9'
+-            spec.config[:wait_timeout] || 5
+-          end
++        @timeout = spec.config[:wait_timeout] || 5
+ 
+         # default max pool size to 5
+         @size = (spec.config[:pool] && spec.config[:pool].to_i) || 5
+@@ -161,7 +158,6 @@ module ActiveRecord
+         keys = @reserved_connections.keys - Thread.list.find_all { |t|
+           t.alive?
+         }.map { |thread| thread.object_id }
+-
+         keys.each do |key|
+           checkin @reserved_connections[key]
+           @reserved_connections.delete(key)
+@@ -194,16 +190,18 @@ module ActiveRecord
+                      checkout_new_connection
+                    end
+             return conn if conn
+-            # No connections available; wait for one
+-            if @queue.wait(@timeout)
++
++            @queue.wait(@timeout)
++
++            if(@checked_out.size < @connections.size)
+               next
+             else
+-              # try looting dead threads
+               clear_stale_cached_connections!
+               if @size == @checked_out.size
+                 raise ConnectionTimeoutError, "could not obtain a database connection#{" within #{@timeout} seconds" if @timeout}.  The max pool size is currently #{@size}; consider increasing it."
+               end
+             end
++
+           end
+         end
+       end
+diff --git a/activerecord/test/cases/connection_pool_test.rb b/activerecord/test/cases/connection_pool_test.rb
+index 82b3c36..f0ec5c7 100644
+--- a/activerecord/test/cases/connection_pool_test.rb
++++ b/activerecord/test/cases/connection_pool_test.rb
+@@ -26,6 +26,35 @@ module ActiveRecord
+                "threads should have been removed")
+         assert_equal pool.checkins.length, threads.length
+       end
++
++      def test_checkout_behaviour
++        pool = ConnectionPool.new ActiveRecord::Base.connection_pool.spec
++        connection = pool.connection
++        assert_not_nil connection
++        threads = []
++        4.times do |i|
++          threads << Thread.new(i) do |pool_count|
++            connection = pool.connection
++            assert_not_nil connection
++          end
++        end
++        
++        threads.each {|t| t.join}
++        
++        Thread.new do
++          threads.each do |t|
++            thread_ids = pool.instance_variable_get(:@reserved_connections).keys
++            assert thread_ids.include?(t.object_id)
++          end
++
++          pool.connection
++          threads.each do |t|
++            thread_ids = pool.instance_variable_get(:@reserved_connections).keys
++            assert !thread_ids.include?(t.object_id)
++          end
++        end.join()
++
++      end
+     end
+   end
+ end
+-- 
+1.7.2.1
+

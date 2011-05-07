@@ -1,0 +1,104 @@
+From 58526c9a426f034efa6c0164ae41a6dd374bb5b7 Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Sun, 22 Aug 2010 18:48:26 +0100
+Subject: [PATCH] Cache the symbolized path parameters using a instance variable in the request object
+ rather than the environment hash. This it to prevent stale parameters in later
+ routing constraints/redirects as only the normal path parameters are set by Rack::Mount.
+
+Also if a constraint proc arity is more than one, pass the symbolized path parameters
+as the first argument to match redirect proc args and provide easier access.
+
+[#5157 state:resolved]
+---
+ actionpack/lib/action_dispatch/http/parameters.rb |    4 ++--
+ actionpack/lib/action_dispatch/routing/mapper.rb  |    7 ++++++-
+ actionpack/test/dispatch/routing_test.rb          |   21 +++++++++++++++++++++
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/actionpack/lib/action_dispatch/http/parameters.rb b/actionpack/lib/action_dispatch/http/parameters.rb
+index add8cab..5e1a240 100644
+--- a/actionpack/lib/action_dispatch/http/parameters.rb
++++ b/actionpack/lib/action_dispatch/http/parameters.rb
+@@ -15,14 +15,14 @@ module ActionDispatch
+       alias :params :parameters
+ 
+       def path_parameters=(parameters) #:nodoc:
+-        @env.delete("action_dispatch.request.symbolized_path_parameters")
++        @_symbolized_path_params = nil
+         @env.delete("action_dispatch.request.parameters")
+         @env["action_dispatch.request.path_parameters"] = parameters
+       end
+ 
+       # The same as <tt>path_parameters</tt> with explicitly symbolized keys.
+       def symbolized_path_parameters
+-        @env["action_dispatch.request.symbolized_path_parameters"] ||= path_parameters.symbolize_keys
++        @_symbolized_path_params ||= path_parameters.symbolize_keys
+       end
+ 
+       # Returns a hash with the \parameters used to form the \path of the request.
+diff --git a/actionpack/lib/action_dispatch/routing/mapper.rb b/actionpack/lib/action_dispatch/routing/mapper.rb
+index 00f8fb9..23b13d1 100644
+--- a/actionpack/lib/action_dispatch/routing/mapper.rb
++++ b/actionpack/lib/action_dispatch/routing/mapper.rb
+@@ -26,13 +26,18 @@ module ActionDispatch
+           @constraints.each { |constraint|
+             if constraint.respond_to?(:matches?) && !constraint.matches?(req)
+               return [ 404, {'X-Cascade' => 'pass'}, [] ]
+-            elsif constraint.respond_to?(:call) && !constraint.call(req)
++            elsif constraint.respond_to?(:call) && !constraint.call(*constraint_args(constraint, req))
+               return [ 404, {'X-Cascade' => 'pass'}, [] ]
+             end
+           }
+ 
+           @app.call(env)
+         end
++
++        private
++          def constraint_args(constraint, request)
++            constraint.arity == 1 ? [request] : [request.symbolized_path_parameters, request]
++          end
+       end
+ 
+       class Mapping #:nodoc:
+diff --git a/actionpack/test/dispatch/routing_test.rb b/actionpack/test/dispatch/routing_test.rb
+index 44b83f3..c529db4 100644
+--- a/actionpack/test/dispatch/routing_test.rb
++++ b/actionpack/test/dispatch/routing_test.rb
+@@ -427,6 +427,13 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+         get :preview, :on => :member
+       end
+ 
++      scope '/countries/:country', :constraints => lambda { |params, req| %[all France].include?(params[:country]) } do
++        match '/',       :to => 'countries#index'
++        match '/cities', :to => 'countries#cities'
++      end
++
++      match '/countries/:country/(*other)', :to => redirect{ |params, req| params[:other] ? "/countries/all/#{params[:other]}" : '/countries/all' }
++
+       match '/:locale/*file.:format', :to => 'files#show', :file => /path\/to\/existing\/file/
+     end
+   end
+@@ -2013,6 +2020,20 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  def test_symbolized_path_parameters_is_not_stale
++    get '/countries/France'
++    assert_equal 'countries#index', @response.body
++
++    get '/countries/France/cities'
++    assert_equal 'countries#cities', @response.body
++
++    get '/countries/UK'
++    verify_redirect 'http://www.example.com/countries/all'
++
++    get '/countries/UK/cities'
++    verify_redirect 'http://www.example.com/countries/all/cities'
++  end
++
+ private
+   def with_test_routes
+     yield
+-- 
+1.7.1
+

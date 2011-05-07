@@ -1,0 +1,574 @@
+From 42f6a0a2feb64ad5fcee6ac690bf90ccdc3bd8ff Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Wed, 18 Jun 2008 17:13:16 -0400
+Subject: [PATCH] format related patches to support serializing data out in the correct format with correct http request headers per http method type
+
+---
+ activeresource/lib/active_resource/base.rb         |   13 ++++++---
+ activeresource/lib/active_resource/connection.rb   |   27 ++++++++++++++------
+ .../lib/active_resource/custom_methods.rb          |    9 +++---
+ .../lib/active_resource/formats/json_format.rb     |    4 +-
+ .../lib/active_resource/formats/xml_format.rb      |    6 ++--
+ activeresource/lib/active_resource/http_mock.rb    |    2 +-
+ activeresource/test/base/custom_methods_test.rb    |    1 -
+ activeresource/test/base_test.rb                   |    2 +-
+ activeresource/test/format_test.rb                 |   26 ++++++++++++++-----
+ 9 files changed, 59 insertions(+), 31 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 347dbb8..5c912e5 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -840,8 +840,13 @@ module ActiveResource
+     #
+     #   my_group.to_xml(:skip_instruct => true)
+     #   # => <subsidiary_group> [...] </subsidiary_group>
+-    def to_xml(options={})
+-      attributes.to_xml({:root => self.class.element_name}.merge(options))
++    def encode(options={})
++      case self.class.format
++      	when ActiveResource::Formats[:xml]
++	      self.class.format.encode(attributes, {:root => self.class.element_name}.merge(options))
++      	else
++      	  self.class.format.encode(attributes, options)
++      end
+     end
+ 
+     # A method to reload the attributes of this object from the remote web service.
+@@ -926,14 +931,14 @@ module ActiveResource
+ 
+       # Update the resource on the remote service.
+       def update
+-        returning connection.put(element_path(prefix_options), to_xml, self.class.headers) do |response|
++        returning connection.put(element_path(prefix_options), encode, self.class.headers) do |response|
+           load_attributes_from_response(response)
+         end
+       end
+ 
+       # Create (i.e., save to the remote service) the new resource.
+       def create
+-        returning connection.post(collection_path, to_xml, self.class.headers) do |response|
++        returning connection.post(collection_path, encode, self.class.headers) do |response|
+           self.id = id_from_response(response)
+           load_attributes_from_response(response)
+         end
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index 0c4ea43..13f923c 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -63,6 +63,13 @@ module ActiveResource
+   # This class is used by ActiveResource::Base to interface with REST
+   # services.
+   class Connection
++
++    HTTP_FORMAT_HEADER_NAMES = {  :get => 'Accept',
++      :put => 'Content-Type',
++      :post => 'Content-Type',
++      :delete => 'Accept'
++    }
++
+     attr_reader :site, :user, :password, :timeout
+     attr_accessor :format
+ 
+@@ -106,25 +113,25 @@ module ActiveResource
+     # Execute a GET request.
+     # Used to get (find) resources.
+     def get(path, headers = {})
+-      format.decode(request(:get, path, build_request_headers(headers)).body)
++      format.decode(request(:get, path, build_request_headers(headers, :get)).body)
+     end
+ 
+     # Execute a DELETE request (see HTTP protocol documentation if unfamiliar).
+     # Used to delete resources.
+     def delete(path, headers = {})
+-      request(:delete, path, build_request_headers(headers))
++      request(:delete, path, build_request_headers(headers, :delete))
+     end
+ 
+     # Execute a PUT request (see HTTP protocol documentation if unfamiliar).
+     # Used to update resources.
+     def put(path, body = '', headers = {})
+-      request(:put, path, body.to_s, build_request_headers(headers))
++      request(:put, path, body.to_s, build_request_headers(headers, :put))
+     end
+ 
+     # Execute a POST request.
+     # Used to create new resources.
+     def post(path, body = '', headers = {})
+-      request(:post, path, body.to_s, build_request_headers(headers))
++      request(:post, path, body.to_s, build_request_headers(headers, :post))
+     end
+ 
+     # Execute a HEAD request.
+@@ -139,7 +146,7 @@ module ActiveResource
+       def request(method, path, *arguments)
+         logger.info "#{method.to_s.upcase} #{site.scheme}://#{site.host}:#{site.port}#{path}" if logger
+         result = nil
+-        time = Benchmark.realtime { result = http.send(method, path, *arguments) }
++	time = Benchmark.realtime { result = http.send(method, path, *arguments) }
+         logger.info "--> #{result.code} #{result.message} (#{result.body ? result.body.length : 0}b %.2fs)" % time if logger
+         handle_response(result)
+       rescue Timeout::Error => e
+@@ -187,18 +194,22 @@ module ActiveResource
+       end
+ 
+       def default_header
+-        @default_header ||= { 'Content-Type' => format.mime_type }
++        @default_header ||= {}
+       end
+ 
+       # Builds headers for request to remote service.
+-      def build_request_headers(headers)
+-        authorization_header.update(default_header).update(headers)
++      def build_request_headers(headers, http_method=nil)
++        authorization_header.update(default_header).update(headers).update(http_format_header(http_method))
+       end
+ 
+       # Sets authorization header
+       def authorization_header
+         (@user || @password ? { 'Authorization' => 'Basic ' + ["#{@user}:#{ @password}"].pack('m').delete("\r\n") } : {})
+       end
++    
++      def http_format_header(http_method)
++        {HTTP_FORMAT_HEADER_NAMES[http_method] => format.mime_type}
++      end
+ 
+       def logger #:nodoc:
+         ActiveResource::Base.logger
+diff --git a/activeresource/lib/active_resource/custom_methods.rb b/activeresource/lib/active_resource/custom_methods.rb
+index 4c86992..b122d85 100644
+--- a/activeresource/lib/active_resource/custom_methods.rb
++++ b/activeresource/lib/active_resource/custom_methods.rb
+@@ -89,11 +89,12 @@ module ActiveResource
+         connection.get(custom_method_element_url(method_name, options), self.class.headers)
+       end
+       
+-      def post(method_name, options = {}, body = '')
+-        if new?
+-          connection.post(custom_method_new_element_url(method_name, options), (body.nil? ? to_xml : body), self.class.headers)
++      def post(method_name, options = {}, body = nil)
++	request_body = body.nil? ? encode : body
++	if new?
++          connection.post(custom_method_new_element_url(method_name, options), request_body, self.class.headers)
+         else
+-          connection.post(custom_method_element_url(method_name, options), body, self.class.headers)
++          connection.post(custom_method_element_url(method_name, options), request_body, self.class.headers)
+         end
+       end
+       
+diff --git a/activeresource/lib/active_resource/formats/json_format.rb b/activeresource/lib/active_resource/formats/json_format.rb
+index df0d6ca..eeff4ed 100644
+--- a/activeresource/lib/active_resource/formats/json_format.rb
++++ b/activeresource/lib/active_resource/formats/json_format.rb
+@@ -11,7 +11,7 @@ module ActiveResource
+         "application/json"
+       end
+       
+-      def encode(hash)
++      def encode(hash, options={})
+         hash.to_json
+       end
+       
+@@ -20,4 +20,4 @@ module ActiveResource
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activeresource/lib/active_resource/formats/xml_format.rb b/activeresource/lib/active_resource/formats/xml_format.rb
+index 5e97ffa..a4fa997 100644
+--- a/activeresource/lib/active_resource/formats/xml_format.rb
++++ b/activeresource/lib/active_resource/formats/xml_format.rb
+@@ -11,8 +11,8 @@ module ActiveResource
+         "application/xml"
+       end
+       
+-      def encode(hash)
+-        hash.to_xml
++      def encode(hash, options={})
++        hash.to_xml(options)
+       end
+       
+       def decode(xml)
+@@ -31,4 +31,4 @@ module ActiveResource
+         end      
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activeresource/lib/active_resource/http_mock.rb b/activeresource/lib/active_resource/http_mock.rb
+index 22f83ae..7b6e110 100644
+--- a/activeresource/lib/active_resource/http_mock.rb
++++ b/activeresource/lib/active_resource/http_mock.rb
+@@ -146,7 +146,7 @@ module ActiveResource
+     attr_accessor :path, :method, :body, :headers
+ 
+     def initialize(method, path, body = nil, headers = {})
+-      @method, @path, @body, @headers = method, path, body, headers.reverse_merge('Content-Type' => 'application/xml')
++      @method, @path, @body, @headers = method, path, body, headers.merge(ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES[method] => 'application/xml')
+     end
+ 
+     def ==(other_request)
+diff --git a/activeresource/test/base/custom_methods_test.rb b/activeresource/test/base/custom_methods_test.rb
+index 62c33ef..0e00454 100644
+--- a/activeresource/test/base/custom_methods_test.rb
++++ b/activeresource/test/base/custom_methods_test.rb
+@@ -10,7 +10,6 @@ class CustomMethodsTest < Test::Unit::TestCase
+     @ryan  = { :name => 'Ryan' }.to_xml(:root => 'person')
+     @addy  = { :id => 1, :street => '12345 Street' }.to_xml(:root => 'address')
+     @addy_deep  = { :id => 1, :street => '12345 Street', :zip => "27519" }.to_xml(:root => 'address')
+-    @default_request_headers = { 'Content-Type' => 'application/xml' }
+     
+     ActiveResource::HttpMock.respond_to do |mock|
+       mock.get    "/people/1.xml",             {}, @matz
+diff --git a/activeresource/test/base_test.rb b/activeresource/test/base_test.rb
+index 4addd52..487fbf8 100644
+--- a/activeresource/test/base_test.rb
++++ b/activeresource/test/base_test.rb
+@@ -810,7 +810,7 @@ class BaseTest < Test::Unit::TestCase
+   
+   def test_to_xml
+     matz = Person.find(1)
+-    xml = matz.to_xml
++    xml = matz.encode
+     assert xml.starts_with?('<?xml version="1.0" encoding="UTF-8"?>')
+     assert xml.include?('<name>Matz</name>')
+     assert xml.include?('<id type="integer">1</id>')
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index 3c81803..4aeb147 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -8,11 +8,19 @@ class FormatTest < Test::Unit::TestCase
+     
+     @programmers = [ @matz, @david ]
+   end
++
++  def test_http_format_header_name
++    header_name = ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES[:get]
++    assert_equal 'Accept', header_name
++    
++    headers_names = [ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES[:put], ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES[:post]]
++    headers_names.each{|header_name| assert_equal 'Content-Type', header_name}
++  end
+   
+   def test_formats_on_single_element
+     for format in [ :json, :xml ]
+       using_format(Person, format) do
+-        ActiveResource::HttpMock.respond_to.get "/people/1.#{format}", {}, ActiveResource::Formats[format].encode(@david)
++        ActiveResource::HttpMock.respond_to.get "/people/1.#{format}", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode(@david)
+         assert_equal @david[:name], Person.find(1).name
+       end
+     end
+@@ -21,7 +29,7 @@ class FormatTest < Test::Unit::TestCase
+   def test_formats_on_collection
+     for format in [ :json, :xml ]
+       using_format(Person, format) do
+-        ActiveResource::HttpMock.respond_to.get "/people.#{format}", {}, ActiveResource::Formats[format].encode(@programmers)
++        ActiveResource::HttpMock.respond_to.get "/people.#{format}", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode(@programmers)
+         remote_programmers = Person.find(:all)
+         assert_equal 2, remote_programmers.size
+         assert remote_programmers.select { |p| p.name == 'David' }
+@@ -32,7 +40,7 @@ class FormatTest < Test::Unit::TestCase
+   def test_formats_on_custom_collection_method
+     for format in [ :json, :xml ]
+       using_format(Person, format) do
+-        ActiveResource::HttpMock.respond_to.get "/people/retrieve.#{format}?name=David", {}, ActiveResource::Formats[format].encode([@david])
++        ActiveResource::HttpMock.respond_to.get "/people/retrieve.#{format}?name=David", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode([@david])
+         remote_programmers = Person.get(:retrieve, :name => 'David')
+         assert_equal 1, remote_programmers.size
+         assert_equal @david[:id], remote_programmers[0]['id']
+@@ -45,8 +53,8 @@ class FormatTest < Test::Unit::TestCase
+     for format in [ :json, :xml ]
+       using_format(Person, format) do
+         ActiveResource::HttpMock.respond_to do |mock|
+-          mock.get "/people/2.#{format}", {}, ActiveResource::Formats[format].encode(@david)
+-          mock.get "/people/2/shallow.#{format}", {}, ActiveResource::Formats[format].encode(@david)
++          mock.get "/people/2.#{format}", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode(@david)
++          mock.get "/people/2/shallow.#{format}", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode(@david)
+         end
+         remote_programmer = Person.find(2).get(:shallow)
+         assert_equal @david[:id], remote_programmer['id']
+@@ -57,8 +65,12 @@ class FormatTest < Test::Unit::TestCase
+     for format in [ :json, :xml ]
+       ryan = ActiveResource::Formats[format].encode({ :name => 'Ryan' })
+       using_format(Person, format) do
+-        ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {}, ryan, 201, 'Location' => "/people/5.#{format}"
+-        remote_ryan = Person.new(:name => 'Ryan')
++	remote_ryan = Person.new(:name => 'Ryan')
++	ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, ryan, 201, {'Location' => "/people/5.#{format}"}
++        remote_ryan.save
++
++	remote_ryan = Person.new(:name => 'Ryan')
++        ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, ryan, 201, {'Location' => "/people/5.#{format}"}
+         assert_equal ActiveResource::Response.new(ryan, 201, {'Location' => "/people/5.#{format}"}), remote_ryan.post(:register)
+       end
+     end
+-- 
+1.5.5.3
+
+
+From 868566f140f103f26c0522ebf8fe0ceb2b2abd04 Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Wed, 18 Jun 2008 18:08:27 -0400
+Subject: [PATCH] format related patches to support serializing data out in the correct format with correct http request headers per http method type
+
+---
+ .../lib/active_resource/custom_methods.rb          |    2 +-
+ activeresource/test/format_test.rb                 |    6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/custom_methods.rb b/activeresource/lib/active_resource/custom_methods.rb
+index b122d85..a441ef1 100644
+--- a/activeresource/lib/active_resource/custom_methods.rb
++++ b/activeresource/lib/active_resource/custom_methods.rb
+@@ -93,7 +93,7 @@ module ActiveResource
+ 	request_body = body.nil? ? encode : body
+ 	if new?
+           connection.post(custom_method_new_element_url(method_name, options), request_body, self.class.headers)
+-        else
++	else
+           connection.post(custom_method_element_url(method_name, options), request_body, self.class.headers)
+         end
+       end
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index 4aeb147..710d431 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -66,12 +66,12 @@ class FormatTest < Test::Unit::TestCase
+       ryan = ActiveResource::Formats[format].encode({ :name => 'Ryan' })
+       using_format(Person, format) do
+ 	remote_ryan = Person.new(:name => 'Ryan')
+-	ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, ryan, 201, {'Location' => "/people/5.#{format}"}
++	ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
+         remote_ryan.save
+ 
+ 	remote_ryan = Person.new(:name => 'Ryan')
+-        ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, ryan, 201, {'Location' => "/people/5.#{format}"}
+-        assert_equal ActiveResource::Response.new(ryan, 201, {'Location' => "/people/5.#{format}"}), remote_ryan.post(:register)
++        ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
++        assert_equal ActiveResource::Response.new('', 201, {'Location' => "/people/5.#{format}"}), remote_ryan.post(:register)
+       end
+     end
+   end
+-- 
+1.5.5.3
+
+
+From 52b662596ee990e9d734c9aa32973c215da4de16 Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Wed, 18 Jun 2008 18:10:24 -0400
+Subject: [PATCH] format related patches to support serializing data out in the correct format with correct http request headers per http method type
+
+---
+ activeresource/test/format_test.rb |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index 710d431..3e9ca00 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -67,7 +67,7 @@ class FormatTest < Test::Unit::TestCase
+       using_format(Person, format) do
+ 	remote_ryan = Person.new(:name => 'Ryan')
+ 	ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
+-        remote_ryan.save
++	remote_ryan.save
+ 
+ 	remote_ryan = Person.new(:name => 'Ryan')
+         ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
+-- 
+1.5.5.3
+
+
+From 9997319aacb87d3f091b744d2f4c8717de28635d Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Wed, 18 Jun 2008 18:11:47 -0400
+Subject: [PATCH] format related patches to support serializing data out in the correct format with correct http request headers per http method type
+
+---
+ activeresource/test/format_test.rb |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index 3e9ca00..5c97409 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -70,8 +70,8 @@ class FormatTest < Test::Unit::TestCase
+ 	remote_ryan.save
+ 
+ 	remote_ryan = Person.new(:name => 'Ryan')
+-        ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
+-        assert_equal ActiveResource::Response.new('', 201, {'Location' => "/people/5.#{format}"}), remote_ryan.post(:register)
++	ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
++	assert_equal ActiveResource::Response.new('', 201, {'Location' => "/people/5.#{format}"}), remote_ryan.post(:register)
+       end
+     end
+   end
+-- 
+1.5.5.3
+
+
+From 7f07ea27806a80614d2d13ebe5ed7606fa365cea Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Thu, 19 Jun 2008 11:31:51 -0400
+Subject: [PATCH] http_mock can now take into account a request_body if provided, moving forward request bodies should be used when testing put and post reqeusts with http_mocks
+
+---
+ activeresource/lib/active_resource/http_mock.rb |   16 ++++++++++++----
+ activeresource/test/format_test.rb              |    6 +++---
+ 2 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/http_mock.rb b/activeresource/lib/active_resource/http_mock.rb
+index 7b6e110..05b389e 100644
+--- a/activeresource/lib/active_resource/http_mock.rb
++++ b/activeresource/lib/active_resource/http_mock.rb
+@@ -55,8 +55,8 @@ module ActiveResource
+ 
+       for method in [ :post, :put, :get, :delete, :head ]
+         module_eval <<-EOE, __FILE__, __LINE__
+-          def #{method}(path, request_headers = {}, body = nil, status = 200, response_headers = {})
+-            @responses[Request.new(:#{method}, path, nil, request_headers)] = Response.new(body || "", status, response_headers)
++          def #{method}(path, request_headers = {}, body = nil, status = 200, response_headers = {}, request_body = nil)
++            @responses[Request.new(:#{method}, path, request_body, request_headers)] = Response.new(body || "", status, response_headers)
+           end
+         EOE
+       end
+@@ -150,8 +150,12 @@ module ActiveResource
+     end
+ 
+     def ==(other_request)
+-      other_request.hash == hash
+-    end
++      if !other_request.body.nil? and !body.nil?
++	other_request.hash_with_body == hash_with_body
++      else
++        other_request.hash == hash
++      end
++     end
+ 
+     def eql?(other_request)
+       self == other_request
+@@ -164,6 +168,10 @@ module ActiveResource
+     def hash
+       "#{path}#{method}#{headers}".hash
+     end
++
++    def hash_with_body
++      "#{path}#{method}#{headers}#{body}".hash
++    end
+   end
+ 
+   class Response
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index 5c97409..62e66fa 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -63,14 +63,14 @@ class FormatTest < Test::Unit::TestCase
+     end
+ 
+     for format in [ :json, :xml ]
+-      ryan = ActiveResource::Formats[format].encode({ :name => 'Ryan' })
++      ryan = ActiveResource::Formats[format].encode({ :name => 'Ryan' }, {:root=>'person'})
+       using_format(Person, format) do
+ 	remote_ryan = Person.new(:name => 'Ryan')
+-	ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
++	ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}, ryan
+ 	remote_ryan.save
+ 
+ 	remote_ryan = Person.new(:name => 'Ryan')
+-	ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}
++	ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}, ryan
+ 	assert_equal ActiveResource::Response.new('', 201, {'Location' => "/people/5.#{format}"}), remote_ryan.post(:register)
+       end
+     end
+-- 
+1.5.5.3
+
+
+From 183ea439a97e0f6707200f199f5f1bd49b009737 Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Thu, 19 Jun 2008 11:35:05 -0400
+Subject: [PATCH] slight format_test.rb refactoring
+
+---
+ activeresource/test/format_test.rb |    5 +++--
+ 1 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/activeresource/test/format_test.rb b/activeresource/test/format_test.rb
+index 62e66fa..6ce0512 100644
+--- a/activeresource/test/format_test.rb
++++ b/activeresource/test/format_test.rb
+@@ -64,13 +64,14 @@ class FormatTest < Test::Unit::TestCase
+ 
+     for format in [ :json, :xml ]
+       ryan = ActiveResource::Formats[format].encode({ :name => 'Ryan' }, {:root=>'person'})
++      post_format_header = {'Content-Type' => ActiveResource::Formats[format].mime_type}
+       using_format(Person, format) do
+ 	remote_ryan = Person.new(:name => 'Ryan')
+-	ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}, ryan
++	ActiveResource::HttpMock.respond_to.post "/people.#{format}", post_format_header, '', 201, {'Location' => "/people/5.#{format}"}, ryan
+ 	remote_ryan.save
+ 
+ 	remote_ryan = Person.new(:name => 'Ryan')
+-	ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, '', 201, {'Location' => "/people/5.#{format}"}, ryan
++	ActiveResource::HttpMock.respond_to.post "/people/new/register.#{format}", post_format_header, '', 201, {'Location' => "/people/5.#{format}"}, ryan
+ 	assert_equal ActiveResource::Response.new('', 201, {'Location' => "/people/5.#{format}"}), remote_ryan.post(:register)
+       end
+     end
+-- 
+1.5.5.3
+
+
+From bdac1048235dd964fb2475b88b3801d95b6a0193 Mon Sep 17 00:00:00 2001
+From: Rasik Pandey <rbpandey@gmail.com>
+Date: Thu, 19 Jun 2008 11:55:39 -0400
+Subject: [PATCH] documentation updates
+
+---
+ activeresource/lib/active_resource/base.rb |   12 ++++++------
+ 1 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 5c912e5..4818ac7 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -815,12 +815,12 @@ module ActiveResource
+       !new? && self.class.exists?(to_param, :params => prefix_options)      
+     end
+ 
+-    # A method to convert the the resource to an XML string.
++    # A method to convert the the resource to an encoded (XML/JSON) string.
+     #
+     # ==== Options
+-    # The +options+ parameter is handed off to the +to_xml+ method on each
++    # The +options+ parameter is handed off to the +ActiveResource::Format.encode+ method on each
+     # attribute, so it has the same options as the +to_xml+ methods in
+-    # Active Support.
++    # Active Support when using +ActiveResource::Format::XmlFormat+.
+     #
+     # * <tt>:indent</tt> - Set the indent level for the XML output (default is +2+).
+     # * <tt>:dasherize</tt> - Boolean option to determine whether or not element names should
+@@ -830,15 +830,15 @@ module ActiveResource
+     #
+     # ==== Examples
+     #   my_group = SubsidiaryGroup.find(:first)
+-    #   my_group.to_xml
++    #   my_group.encode
+     #   # => <?xml version="1.0" encoding="UTF-8"?>
+     #   #    <subsidiary_group> [...] </subsidiary_group>
+     #
+-    #   my_group.to_xml(:dasherize => true)
++    #   my_group.encode(:dasherize => true)
+     #   # => <?xml version="1.0" encoding="UTF-8"?>
+     #   #    <subsidiary-group> [...] </subsidiary-group>
+     #
+-    #   my_group.to_xml(:skip_instruct => true)
++    #   my_group.encode(:skip_instruct => true)
+     #   # => <subsidiary_group> [...] </subsidiary_group>
+     def encode(options={})
+       case self.class.format
+-- 
+1.5.5.3
+

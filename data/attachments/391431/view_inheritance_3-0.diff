@@ -1,0 +1,264 @@
+From b8d8bd1204dcb7d5892a5bccdf57157281e4d984 Mon Sep 17 00:00:00 2001
+From: artemave <artemave@gmail.com>
+Date: Wed, 27 Jan 2010 16:12:38 +0000
+Subject: [PATCH] generating squashed patch
+
+---
+ actionpack/lib/abstract_controller/rendering.rb    |    6 +-
+ actionpack/lib/action_view/base.rb                 |   31 ++++++----
+ actionpack/lib/action_view/paths.rb                |   60 +++++++++++--------
+ .../new_base/render_implicit_action_test.rb        |   26 ++++++++-
+ .../controller/new_base/render_partial_test.rb     |   12 ++++-
+ 5 files changed, 93 insertions(+), 42 deletions(-)
+
+diff --git a/actionpack/lib/abstract_controller/rendering.rb b/actionpack/lib/abstract_controller/rendering.rb
+index 1dec3f2..8588008 100644
+--- a/actionpack/lib/abstract_controller/rendering.rb
++++ b/actionpack/lib/abstract_controller/rendering.rb
+@@ -14,7 +14,7 @@ module AbstractController
+ 
+     included do
+       extlib_inheritable_accessor :_view_paths
+-      self._view_paths ||= ActionView::PathSet.new
++      self._view_paths ||= ActionView::PathSet.new(self)
+     end
+ 
+     # An instance of a view class. The default view class is ActionView::Base
+@@ -217,8 +217,8 @@ module AbstractController
+       #   otherwise, process the parameter into a ViewPathSet.
+       def view_paths=(paths)
+         clear_template_caches!
+-        self._view_paths = paths.is_a?(ActionView::PathSet) ? paths : ActionView::Base.process_view_paths(paths)
++        self._view_paths = paths.is_a?(ActionView::PathSet) ? paths : ActionView::Base.process_view_paths(paths, self)
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/actionpack/lib/action_view/base.rb b/actionpack/lib/action_view/base.rb
+index af13f2c..ff8f85a 100644
+--- a/actionpack/lib/action_view/base.rb
++++ b/actionpack/lib/action_view/base.rb
+@@ -6,15 +6,22 @@ module ActionView #:nodoc:
+   end
+ 
+   class MissingTemplate < ActionViewError #:nodoc:
+-    attr_reader :path, :action_name
+-
+-    def initialize(paths, path, template_format = nil)
+-      @path = path
+-      @action_name = path.split("/").last.split(".")[0...-1].join(".")
+-      full_template_path = path.include?('.') ? path : "#{path}.erb"
+-      display_paths = paths.compact.join(":")
+-      template_type = (path =~ /layouts/i) ? 'layout' : 'template'
+-      super("Missing #{template_type} #{full_template_path} in view path #{display_paths}")
++    def initialize(paths, path, details = {}, prefixes = [], partial = false)
++      display_paths = paths.compact.uniq.join(":")
++      
++      template_type = prefixes.find {|p| p =~ /^layouts/i } ? 'layout' : 'template'
++      
++      path.sub!(/([^\/]*)$/, '_\1') if partial
++
++      if not prefixes.empty?
++        p = prefixes.join(',')
++        p = "{#{p}}" if prefixes.length > 1
++        path = "#{p}/#{path}" unless p.empty?
++      end
++
++      details[:partial] = !!partial
++
++      super("Missing #{template_type} #{path} - #{details.inspect} - in view path #{display_paths}")
+     end
+   end
+ 
+@@ -235,8 +242,8 @@ module ActionView #:nodoc:
+ 
+     include Context
+ 
+-    def self.process_view_paths(value)
+-      ActionView::PathSet.new(Array(value))
++    def self.process_view_paths(value, controller = nil)
++      ActionView::PathSet.new(controller, Array(value))
+     end
+ 
+     extlib_inheritable_accessor :helpers
+@@ -288,7 +295,7 @@ module ActionView #:nodoc:
+     attr_reader :view_paths
+ 
+     def view_paths=(paths)
+-      @view_paths = self.class.process_view_paths(paths)
++      @view_paths = self.class.process_view_paths(paths, controller)
+     end
+ 
+     def punctuate_body!(part)
+diff --git a/actionpack/lib/action_view/paths.rb b/actionpack/lib/action_view/paths.rb
+index 0059b79..bff1cc0 100644
+--- a/actionpack/lib/action_view/paths.rb
++++ b/actionpack/lib/action_view/paths.rb
+@@ -12,7 +12,16 @@ module ActionView #:nodoc:
+       end
+     end
+ 
+-    def initialize(*args)
++    def initialize(controller, *args)
++      @parent_controllers = []
++      if @controller = controller
++        cc = @controller.is_a?(Class) ? @controller.superclass : @controller.class.superclass
++        while cc.respond_to?(:abstract?) and not cc.abstract?
++          @parent_controllers << cc
++          cc = cc.superclass
++        end
++      end
++
+       super(*args).map! { |obj| self.class.type_cast(obj) }
+     end
+ 
+@@ -37,44 +46,45 @@ module ActionView #:nodoc:
+     end
+ 
+     def find(path, details = {}, prefix = nil, partial = false)
+-      template_path = path
++      load_path_chain = PathSet.new(nil)
++      prefixes = []
+ 
+-      each do |load_path|
+-        if template = load_path.find(template_path, details, prefix, partial)
+-          return template
++      with_template_inheritance(prefix) do |view_paths, prefix|
++        prefixes << prefix
++
++        view_paths.each do |load_path|
++          load_path_chain << load_path
++          if template = load_path.find(path, details, prefix, partial)
++            return template
++          end
+         end
+       end
+       
+-      raise ActionView::MissingTemplate.new(self, "#{prefix}/#{path} - #{details.inspect} - partial: #{!!partial}")
++      raise ActionView::MissingTemplate.new(load_path_chain, path, details, prefixes, partial)
+     end
+-    
++
+     def exists?(path, extension = nil, prefix = nil, partial = false)
+       template_path = path.sub(/^\//, '')
+ 
+-      each do |load_path|
+-        return true if template = load_path.find(template_path, extension, prefix, partial)
+-      end      
++      with_template_inheritance(prefix) do |view_paths, prefix|
++        view_paths.each do |load_path|
++          return true if template = load_path.find(template_path, extension, prefix, partial)
++        end      
++      end
+       false
+     end
+ 
+-    def find_template(original_template_path, format = nil, html_fallback = true)
+-      return original_template_path if original_template_path.respond_to?(:render)
+-      template_path = original_template_path.sub(/^\//, '')
++    private
++
++    def with_template_inheritance(original_prefix)
++      yield self, original_prefix
+ 
+-      each do |load_path|
+-        if template = load_path.find(template_path, format)
+-          return template
+-        # Try to find html version if the format is javascript
+-        elsif format == :js && html_fallback && template = load_path["#{template_path}.#{I18n.locale}.html"]
+-          return template
+-        elsif format == :js && html_fallback && template = load_path["#{template_path}.html"]
+-          return template
++      # works only for implicitly named templates (excluding layouts)
++      if @controller and original_prefix == @controller.controller_path
++        @parent_controllers.each do |cc|
++          yield cc.view_paths, cc.controller_path
+         end
+       end
+-
+-      return Template.new(original_template_path, original_template_path.to_s =~ /\A\// ? "" : ".") if File.file?(original_template_path)
+-
+-      raise MissingTemplate.new(self, original_template_path, format)
+     end
+   end
+ end
+diff --git a/actionpack/test/controller/new_base/render_implicit_action_test.rb b/actionpack/test/controller/new_base/render_implicit_action_test.rb
+index 90cc793..7befda7 100644
+--- a/actionpack/test/controller/new_base/render_implicit_action_test.rb
++++ b/actionpack/test/controller/new_base/render_implicit_action_test.rb
+@@ -4,12 +4,22 @@ module RenderImplicitAction
+   class SimpleController < ::ApplicationController
+     self.view_paths = [ActionView::FixtureResolver.new(
+       "render_implicit_action/simple/hello_world.html.erb" => "Hello world!",
+-      "render_implicit_action/simple/hyphen-ated.html.erb" => "Hello hyphen-ated!"
++      "render_implicit_action/simple/hyphen-ated.html.erb" => "Hello hyphen-ated!",
++      "render_implicit_action/simple/overriden.html.erb"   => "parent content"
+     )]
+     
+     def hello_world() end
++
++    def overriden() end
+   end
+   
++  class ChildController < SimpleController
++    self.view_paths = [ActionView::FixtureResolver.new(
++      "render_implicit_action/child/overriden.html.erb" => "child content",
++      "render_implicit_action/child/hello_world.js.erb" => "child content"
++    )]
++  end
++
+   class RenderImplicitActionTest < Rack::TestCase
+     test "render a simple action with new explicit call to render" do
+       get "/render_implicit_action/simple/hello_world"
+@@ -25,4 +35,18 @@ module RenderImplicitAction
+       assert_status 200
+     end
+   end
++
++  class RenderImplicitInheritableTemplateTest < Rack::TestCase
++    test "if template from child controller gets picked over parent one" do
++      get "/render_implicit_action/child/overriden"
++      assert_body "child content"
++      assert_status 200
++    end
++
++    test "if template from parent controller gets picked if missing in child controller" do
++      get "/render_implicit_action/child/hello_world"
++      assert_body "Hello world!"
++      assert_status 200
++    end
++  end
+ end
+diff --git a/actionpack/test/controller/new_base/render_partial_test.rb b/actionpack/test/controller/new_base/render_partial_test.rb
+index 8fddcbc..000a18e 100644
+--- a/actionpack/test/controller/new_base/render_partial_test.rb
++++ b/actionpack/test/controller/new_base/render_partial_test.rb
+@@ -15,6 +15,8 @@ module RenderPartial
+     end    
+   end
+   
++  class ChildController < BasicController; end
++
+   class TestPartial < Rack::TestCase
+     testing BasicController
+     
+@@ -23,5 +25,13 @@ module RenderPartial
+       assert_response("goodbyeOMG!goodbye")
+     end
+   end
+-  
++
++  class TestInheritedPartial < Rack::TestCase
++    testing ChildController
++
++    test "partial from parent controller gets picked if missing in child one" do
++      get :changing
++      assert_response("goodbyeOMG!goodbye")
++    end
++  end
+ end
+-- 
+1.6.0.4
+

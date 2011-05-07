@@ -1,0 +1,387 @@
+From 4f51f01ff9125579f977295a99c593b7951068dd Mon Sep 17 00:00:00 2001
+From: Steve Hull <p.witty@gmail.com>
+Date: Mon, 8 Nov 2010 00:53:18 -0800
+Subject: [PATCH] Making caching work with content_for (in action caches and fragment caches)
+
+---
+ actionpack/lib/abstract_controller/base.rb         |    3 +-
+ actionpack/lib/abstract_controller/rendering.rb    |    4 +-
+ .../lib/action_controller/caching/actions.rb       |   13 +----
+ .../lib/action_controller/caching/fragments.rb     |   21 ++++++--
+ actionpack/lib/action_view/helpers/cache_helper.rb |   13 ++++-
+ .../lib/action_view/helpers/capture_helper.rb      |   15 ++++++
+ actionpack/test/controller/caching_test.rb         |   53 +++++++++++++++++--
+ .../action_caching_test/with_content_for.html.erb  |    2 +
+ .../fragment_cached_with_content_for.html.erb      |    6 ++
+ .../test/fixtures/layouts/talk_from_action.erb     |    2 +-
+ actionpack/test/template/capture_helper_test.rb    |   29 +++++++++++
+ 11 files changed, 135 insertions(+), 26 deletions(-)
+ create mode 100644 actionpack/test/fixtures/action_caching_test/with_content_for.html.erb
+ create mode 100644 actionpack/test/fixtures/functional_caching/fragment_cached_with_content_for.html.erb
+
+diff --git a/actionpack/lib/abstract_controller/base.rb b/actionpack/lib/abstract_controller/base.rb
+index f83eade..c272ce1 100644
+--- a/actionpack/lib/abstract_controller/base.rb
++++ b/actionpack/lib/abstract_controller/base.rb
+@@ -9,9 +9,10 @@ module AbstractController
+   # <tt>AbstractController::Base</tt> is a low-level API. Nobody should be
+   # using it directly, and subclasses (like ActionController::Base) are
+   # expected to provide their own +render+ method, since rendering means
+-  # different things depending on the context.  
++  # different things depending on the context.
+   class Base
+     attr_internal :response_body
++    attr_internal :content_to_cache
+     attr_internal :action_name
+     attr_internal :formats
+ 
+diff --git a/actionpack/lib/abstract_controller/rendering.rb b/actionpack/lib/abstract_controller/rendering.rb
+index 475785a..67cae47 100644
+--- a/actionpack/lib/abstract_controller/rendering.rb
++++ b/actionpack/lib/abstract_controller/rendering.rb
+@@ -111,7 +111,9 @@ module AbstractController
+     # Find and renders a template based on the options given.
+     # :api: private
+     def _render_template(options) #:nodoc:
+-      view_context.render(options)
++      rendered_body = view_context.render(options)
++      self.content_to_cache = view_context.content_to_cache.merge(:layout => rendered_body)
++      return rendered_body
+     end
+ 
+     # The prefix used in render "foo" shortcuts.
+diff --git a/actionpack/lib/action_controller/caching/actions.rb b/actionpack/lib/action_controller/caching/actions.rb
+index d69d96b..26f6adc 100644
+--- a/actionpack/lib/action_controller/caching/actions.rb
++++ b/actionpack/lib/action_controller/caching/actions.rb
+@@ -88,15 +88,6 @@ module ActionController #:nodoc:
+         end
+       end
+ 
+-      def _save_fragment(name, options)
+-        return unless caching_allowed?
+-
+-        content = response_body
+-        content = content.join if content.is_a?(Array)
+-
+-        write_fragment(name, content, options)
+-      end
+-
+     protected
+       def expire_action(options = {})
+         return unless cache_configured?
+@@ -130,7 +121,9 @@ module ActionController #:nodoc:
+             controller.action_has_layout = false unless @cache_layout
+             yield
+             controller.action_has_layout = true
+-            body = controller._save_fragment(cache_path.path, @store_options)
++
++            for_cache = @cache_layout ? Array(controller.response_body).join : controller.content_to_cache
++            body = controller.write_fragment(cache_path.path, for_cache, @store_options) if controller.caching_allowed?
+           end
+ 
+           body = controller.render_to_string(:text => body, :layout => true) unless @cache_layout
+diff --git a/actionpack/lib/action_controller/caching/fragments.rb b/actionpack/lib/action_controller/caching/fragments.rb
+index 37c155b..7e16b0f 100644
+--- a/actionpack/lib/action_controller/caching/fragments.rb
++++ b/actionpack/lib/action_controller/caching/fragments.rb
+@@ -36,14 +36,15 @@ module ActionController #:nodoc:
+ 
+       # Writes <tt>content</tt> to the location signified by <tt>key</tt> (see <tt>expire_fragment</tt> for acceptable formats)
+       def write_fragment(key, content, options = nil)
+-        return content unless cache_configured?
++        return_value = content.is_a?(Hash) ? content[:layout] : content
++        return return_value  unless cache_configured?
+ 
+         key = fragment_cache_key(key)
+         instrument_fragment_cache :write_fragment, key do
+           content = content.html_safe.to_str if content.respond_to?(:html_safe)
+           cache_store.write(key, content, options)
+         end
+-        content
++        return_value
+       end
+ 
+       # Reads a cached fragment from the location signified by <tt>key</tt> (see <tt>expire_fragment</tt> for acceptable formats)
+@@ -53,6 +54,14 @@ module ActionController #:nodoc:
+         key = fragment_cache_key(key)
+         instrument_fragment_cache :read_fragment, key do
+           result = cache_store.read(key, options)
++
++          if result.is_a?(Hash)
++            result = result.dup if result.frozen?
++            fragment = result.delete(:layout)
++            result.each {|k,v| view_context.content_for(k,v) }
++            result = fragment
++          end
++
+           result.respond_to?(:html_safe) ? result.html_safe : result
+         end
+       end
+@@ -86,14 +95,18 @@ module ActionController #:nodoc:
+       # method (or <tt>delete_matched</tt>, for Regexp keys.)
+       def expire_fragment(key, options = nil)
+         return unless cache_configured?
+-        key = fragment_cache_key(key) unless key.is_a?(Regexp)
+-        message = nil
++
++        unless key.is_a?(Regexp)
++          key = fragment_cache_key(key)
++          key_for_content_for = fragment_cache_key(key)
++        end
+ 
+         instrument_fragment_cache :expire_fragment, key do
+           if key.is_a?(Regexp)
+             cache_store.delete_matched(key, options)
+           else
+             cache_store.delete(key, options)
++            cache_store.delete(key_for_content_for, options)
+           end
+         end
+       end
+diff --git a/actionpack/lib/action_view/helpers/cache_helper.rb b/actionpack/lib/action_view/helpers/cache_helper.rb
+index f544a9d..ea8851d 100644
+--- a/actionpack/lib/action_view/helpers/cache_helper.rb
++++ b/actionpack/lib/action_view/helpers/cache_helper.rb
+@@ -52,9 +52,16 @@ module ActionView
+           # VIEW TODO: Make #capture usable outside of ERB
+           # This dance is needed because Builder can't use capture
+           pos = output_buffer.length
+-          yield
+-          fragment = output_buffer.slice!(pos..-1)
+-          controller.write_fragment(name, fragment, options)
++
++          # This particular dance is to determine what
++          # content_for was added/appended by this block
++          hash_to_cache = nil
++          cache_with_content_for do
++            yield
++            fragment = output_buffer.slice!(pos..-1)
++            hash_to_cache = {:layout => fragment}.merge(content_to_cache)
++          end
++          controller.write_fragment(name, hash_to_cache, options)
+         end
+       end
+     end
+diff --git a/actionpack/lib/action_view/helpers/capture_helper.rb b/actionpack/lib/action_view/helpers/capture_helper.rb
+index c88bd1e..d992e44 100644
+--- a/actionpack/lib/action_view/helpers/capture_helper.rb
++++ b/actionpack/lib/action_view/helpers/capture_helper.rb
+@@ -136,6 +136,7 @@ module ActionView
+       def content_for(name, content = nil, &block)
+         content = capture(&block) if block_given?
+         @_content_for[name] << content if content
++        @_subset_content_for[name] << content if content && @_subset_content_for
+         @_content_for[name] unless content
+       end
+ 
+@@ -175,6 +176,20 @@ module ActionView
+         self.output_buffer = old_buffer
+       end
+ 
++      # Added to support implementation of action caching
++      def cache_with_content_for #:nodoc:#
++        @_subset_content_for = Hash.new { |h,k| h[k] = ActiveSupport::SafeBuffer.new }
++        yield
++      ensure
++        @_subset_content_for = nil
++      end
++
++      # Added to support implementation of action caching
++      def content_to_cache #:nodoc:#
++        cache_this = @_subset_content_for || @_content_for.except(:layout)
++        cache_this.dup.tap {|h| h.default = nil }
++      end
++
+       # Add the output buffer to the response body and start a new one.
+       def flush_output_buffer #:nodoc:
+         if output_buffer && !output_buffer.empty?
+diff --git a/actionpack/test/controller/caching_test.rb b/actionpack/test/controller/caching_test.rb
+index 914ae56..c83728e 100644
+--- a/actionpack/test/controller/caching_test.rb
++++ b/actionpack/test/controller/caching_test.rb
+@@ -164,6 +164,7 @@ class ActionCachingTestController < CachingController
+   caches_action :show, :cache_path => 'http://test.host/custom/show'
+   caches_action :edit, :cache_path => Proc.new { |c| c.params[:id] ? "http://test.host/#{c.params[:id]};edit" : "http://test.host/edit" }
+   caches_action :with_layout
++  caches_action :with_content_for, :layout => false
+   caches_action :layout_false, :layout => false
+   caches_action :record_not_found, :four_oh_four, :simple_runtime_error
+ 
+@@ -174,6 +175,11 @@ class ActionCachingTestController < CachingController
+     render :text => @cache_this
+   end
+ 
++  def with_content_for
++    @first_time = MockTime.now.to_f.to_s
++    @second_time = MockTime.now.to_f.to_s
++  end
++
+   def redirected
+     redirect_to :action => 'index'
+   end
+@@ -323,6 +329,20 @@ class ActionCacheTest < ActionController::TestCase
+     assert_equal cached_time, body
+   end
+ 
++  def test_action_cache_layout_false_and_content_for
++    get :with_content_for
++    first_time = assigns(:first_time)
++    second_time = assigns(:second_time)
++    assert @response.body.include?(first_time)
++    assert @response.body.include?(second_time)
++    assert fragment_exist?('hostname.com/action_caching_test/with_content_for')
++    reset!
++
++    get :with_content_for
++    assert @response.body.include?(first_time)
++    assert @response.body.include?(second_time)
++  end
++
+   def test_action_cache_conditional_options
+     @request.env['HTTP_ACCEPT'] = 'application/json'
+     get :index
+@@ -722,14 +742,35 @@ This bit's fragment cached
+ CACHED
+     assert_equal expected_body, @response.body
+ 
+-    assert_equal "This bit's fragment cached", @store.read('views/test.host/functional_caching/fragment_cached')
++    assert_equal "This bit's fragment cached", @store.read('views/test.host/functional_caching/fragment_cached')[:layout]
++  end
++
++  def test_fragment_caching_with_content_for
++    get :fragment_cached_with_content_for
++    assert_response :success
++    expected_body = <<-CACHED
++Hello
++This bit's fragment cached
++CACHED
++    assert_equal expected_body, @response.body
++
++    assert_equal "This bit's fragment cached\n", @store.read('views/test.host/functional_caching/fragment_cached_with_content_for')[:layout]
++    assert_equal ": Enhanced", @store.read('views/test.host/functional_caching/fragment_cached_with_content_for')[:title]
++    assert_equal "Fancy caching", @store.read('views/test.host/functional_caching/fragment_cached_with_content_for')[:widget]
++    setup
++
++    get :fragment_cached_with_content_for
++    assert_response :success
++    assert_equal expected_body, @response.body
++    expected_hash = {:title => ": Enhanced", :widget => "Fancy caching", :layout => "This bit's fragment cached\n"}
++    assert_equal expected_hash, @store.read('views/test.host/functional_caching/fragment_cached_with_content_for')
+   end
+ 
+   def test_fragment_caching_in_partials
+     get :html_fragment_cached_with_partial
+     assert_response :success
+     assert_match(/Old fragment caching in a partial/, @response.body)
+-    assert_match("Old fragment caching in a partial", @store.read('views/test.host/functional_caching/html_fragment_cached_with_partial'))
++    assert_match "Old fragment caching in a partial", @store.read('views/test.host/functional_caching/html_fragment_cached_with_partial')[:layout]
+   end
+ 
+   def test_render_inline_before_fragment_caching
+@@ -737,14 +778,14 @@ CACHED
+     assert_response :success
+     assert_match(/Some inline content/, @response.body)
+     assert_match(/Some cached content/, @response.body)
+-    assert_match("Some cached content", @store.read('views/test.host/functional_caching/inline_fragment_cached'))
++    assert_match("Some cached content", @store.read('views/test.host/functional_caching/inline_fragment_cached')[:layout])
+   end
+ 
+   def test_fragment_caching_in_rjs_partials
+     xhr :get, :js_fragment_cached_with_partial
+     assert_response :success
+     assert_match(/Old fragment caching in a partial/, @response.body)
+-    assert_match("Old fragment caching in a partial", @store.read('views/test.host/functional_caching/js_fragment_cached_with_partial'))
++    assert_match("Old fragment caching in a partial", @store.read('views/test.host/functional_caching/js_fragment_cached_with_partial')[:layout])
+   end
+ 
+   def test_html_formatted_fragment_caching
+@@ -754,7 +795,7 @@ CACHED
+ 
+     assert_equal expected_body, @response.body
+ 
+-    assert_equal "<p>ERB</p>", @store.read('views/test.host/functional_caching/formatted_fragment_cached')
++    assert_equal "<p>ERB</p>", @store.read('views/test.host/functional_caching/formatted_fragment_cached')[:layout]
+   end
+ 
+   def test_xml_formatted_fragment_caching
+@@ -764,6 +805,6 @@ CACHED
+ 
+     assert_equal expected_body, @response.body
+ 
+-    assert_equal "  <p>Builder</p>\n", @store.read('views/test.host/functional_caching/formatted_fragment_cached')
++    assert_equal "  <p>Builder</p>\n", @store.read('views/test.host/functional_caching/formatted_fragment_cached')[:layout]
+   end
+ end
+diff --git a/actionpack/test/fixtures/action_caching_test/with_content_for.html.erb b/actionpack/test/fixtures/action_caching_test/with_content_for.html.erb
+new file mode 100644
+index 0000000..7dc0798
+--- /dev/null
++++ b/actionpack/test/fixtures/action_caching_test/with_content_for.html.erb
+@@ -0,0 +1,2 @@
++<%= @first_time %><% content_for :second_time, @second_time %>
++<%= content_for :second_time %>
+diff --git a/actionpack/test/fixtures/functional_caching/fragment_cached_with_content_for.html.erb b/actionpack/test/fixtures/functional_caching/fragment_cached_with_content_for.html.erb
+new file mode 100644
+index 0000000..3776f8f
+--- /dev/null
++++ b/actionpack/test/fixtures/functional_caching/fragment_cached_with_content_for.html.erb
+@@ -0,0 +1,6 @@
++Hello<%- content_for :title, "My Awesome Title!" -%>
++<%- cache do -%>
++  <%- content_for :title, ": Enhanced" -%>
++  <%- content_for :widget, "Fancy caching" -%>
++This bit's fragment cached
++<%- end -%>
+diff --git a/actionpack/test/fixtures/layouts/talk_from_action.erb b/actionpack/test/fixtures/layouts/talk_from_action.erb
+index bf53fdb..935a3f0 100644
+--- a/actionpack/test/fixtures/layouts/talk_from_action.erb
++++ b/actionpack/test/fixtures/layouts/talk_from_action.erb
+@@ -1,2 +1,2 @@
+ <title><%= @title || yield(:title) %></title>
+-<%= yield -%>
+\ No newline at end of file
++<%= yield -%>
+diff --git a/actionpack/test/template/capture_helper_test.rb b/actionpack/test/template/capture_helper_test.rb
+index 0305048..574567b 100644
+--- a/actionpack/test/template/capture_helper_test.rb
++++ b/actionpack/test/template/capture_helper_test.rb
+@@ -117,6 +117,35 @@ class CaptureHelperTest < ActionView::TestCase
+     end
+   end
+ 
++  def test_content_to_cache_without_subset_only_with_layout
++    content_for :layout, 'body text'
++    assert_equal Hash.new, content_to_cache
++  end
++
++  def test_content_to_cache_without_subset
++    content_for :foo, 'body text'
++    assert_equal @_content_for, content_to_cache
++    assert_not_equal content_to_cache.object_id, @_content_for
++  end
++
++  def test_content_to_cache_with_subset
++    @_content_for = {:fizz => "bang"}
++    @_subset_content_for = {:foo => "bar"}
++    assert content_to_cache == {:foo => "bar"}
++  end
++
++  def test_cache_with_content_for
++    content_for(:uncached, "content")
++
++    cache_with_content_for do
++      assert_not_nil @_subset_content_for
++      content_for(:foo, "bar")
++      expected_hash = {:foo => "bar"}
++      assert_equal expected_hash, content_to_cache
++    end
++    assert_nil @_subset_content_for
++  end
++
+   def alt_encoding(output_buffer)
+     output_buffer.encoding == Encoding::US_ASCII ? Encoding::UTF_8 : Encoding::US_ASCII
+   end
+-- 
+1.7.3.2
+

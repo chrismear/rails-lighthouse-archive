@@ -1,0 +1,665 @@
+From c85c0b065e9cbd977468a205d80ebffbfb43009a Mon Sep 17 00:00:00 2001
+From: Emilio Tagua <miloops@gmail.com>
+Date: Wed, 15 Jul 2009 11:21:00 -0300
+Subject: [PATCH] Created ActiveRecord::Scoping module. This module has the scoping logic that was originally in AR::Base.
+
+---
+ activerecord/lib/active_record.rb         |    3 +-
+ activerecord/lib/active_record/base.rb    |  175 ++--------------------------
+ activerecord/lib/active_record/scoping.rb |  159 ++++++++++++++++++++++++++
+ activerecord/test/cases/base_test.rb      |   76 -------------
+ activerecord/test/cases/scoping_test.rb   |   85 ++++++++++++++
+ 5 files changed, 259 insertions(+), 239 deletions(-)
+ create mode 100644 activerecord/lib/active_record/scoping.rb
+ create mode 100644 activerecord/test/cases/scoping_test.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 7ffabc2..ea34133 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -29,7 +29,7 @@ begin
+   require 'active_model'
+ rescue LoadError
+   $:.unshift "#{File.dirname(__FILE__)}/../../activemodel/lib"
+-  require 'active_model'  
++  require 'active_model'
+ end
+ 
+ module ActiveRecord
+@@ -49,6 +49,7 @@ module ActiveRecord
+   autoload :AttributeMethods, 'active_record/attribute_methods'
+   autoload :AutosaveAssociation, 'active_record/autosave_association'
+   autoload :Base, 'active_record/base'
++  autoload :Scoping, 'active_record/scoping'
+   autoload :Batches, 'active_record/batches'
+   autoload :Calculations, 'active_record/calculations'
+   autoload :Callbacks, 'active_record/callbacks'
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index deab56e..95f33ad 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -420,7 +420,7 @@ module ActiveRecord #:nodoc:
+   # So it's possible to assign a logger to the class through <tt>Base.logger=</tt> which will then be used by all
+   # instances in the current object space.
+   class Base
+-    ##  
++    ##
+     # :singleton-method:
+     # Accepts a logger conforming to the interface of Log4r or the default Ruby 1.8+ Logger class, which is then passed
+     # on to any new database connections made and which can be retrieved on both a class and instance level by calling +logger+.
+@@ -454,11 +454,11 @@ module ActiveRecord #:nodoc:
+     # as a Hash.
+     #
+     # For example, the following database.yml...
+-    # 
++    #
+     #   development:
+     #     adapter: sqlite3
+     #     database: db/development.sqlite3
+-    #   
++    #
+     #   production:
+     #     adapter: sqlite3
+     #     database: db/production.sqlite3
+@@ -546,10 +546,6 @@ module ActiveRecord #:nodoc:
+     superclass_delegating_accessor :store_full_sti_class
+     self.store_full_sti_class = false
+ 
+-    # Stores the default scope for the class
+-    class_inheritable_accessor :default_scoping, :instance_writer => false
+-    self.default_scoping = []
+-
+     class << self # Class methods
+       # Find operates with four different retrieval approaches:
+       #
+@@ -1376,7 +1372,7 @@ module ActiveRecord #:nodoc:
+       def self_and_descendants_from_active_record#nodoc:
+         klass = self
+         classes = [klass]
+-        while klass != klass.base_class  
++        while klass != klass.base_class
+           classes << klass = klass.superclass
+         end
+         classes
+@@ -1983,7 +1979,7 @@ module ActiveRecord #:nodoc:
+                   attributes = construct_attributes_from_arguments( #   attributes = construct_attributes_from_arguments(
+                     [:#{attribute_names.join(',:')}], args          #     [:user_name, :password], args
+                   )                                                 #   )
+-                                                                    # 
++                                                                    #
+                   scoped(:conditions => attributes)                 #   scoped(:conditions => attributes)
+                 end                                                 # end
+               }, __FILE__, __LINE__
+@@ -2072,156 +2068,11 @@ module ActiveRecord #:nodoc:
+         end
+ 
+       protected
+-        # Scope parameters to method calls within the block.  Takes a hash of method_name => parameters hash.
+-        # method_name may be <tt>:find</tt> or <tt>:create</tt>. <tt>:find</tt> parameters may include the <tt>:conditions</tt>, <tt>:joins</tt>,
+-        # <tt>:include</tt>, <tt>:offset</tt>, <tt>:limit</tt>, and <tt>:readonly</tt> options. <tt>:create</tt> parameters are an attributes hash.
+-        #
+-        #   class Article < ActiveRecord::Base
+-        #     def self.create_with_scope
+-        #       with_scope(:find => { :conditions => "blog_id = 1" }, :create => { :blog_id => 1 }) do
+-        #         find(1) # => SELECT * from articles WHERE blog_id = 1 AND id = 1
+-        #         a = create(1)
+-        #         a.blog_id # => 1
+-        #       end
+-        #     end
+-        #   end
+-        #
+-        # In nested scopings, all previous parameters are overwritten by the innermost rule, with the exception of
+-        # <tt>:conditions</tt>, <tt>:include</tt>, and <tt>:joins</tt> options in <tt>:find</tt>, which are merged.
+-        #
+-        # <tt>:joins</tt> options are uniqued so multiple scopes can join in the same table without table aliasing
+-        # problems.  If you need to join multiple tables, but still want one of the tables to be uniqued, use the
+-        # array of strings format for your joins.
+-        #
+-        #   class Article < ActiveRecord::Base
+-        #     def self.find_with_scope
+-        #       with_scope(:find => { :conditions => "blog_id = 1", :limit => 1 }, :create => { :blog_id => 1 }) do
+-        #         with_scope(:find => { :limit => 10 })
+-        #           find(:all) # => SELECT * from articles WHERE blog_id = 1 LIMIT 10
+-        #         end
+-        #         with_scope(:find => { :conditions => "author_id = 3" })
+-        #           find(:all) # => SELECT * from articles WHERE blog_id = 1 AND author_id = 3 LIMIT 1
+-        #         end
+-        #       end
+-        #     end
+-        #   end
+-        #
+-        # You can ignore any previous scopings by using the <tt>with_exclusive_scope</tt> method.
+-        #
+-        #   class Article < ActiveRecord::Base
+-        #     def self.find_with_exclusive_scope
+-        #       with_scope(:find => { :conditions => "blog_id = 1", :limit => 1 }) do
+-        #         with_exclusive_scope(:find => { :limit => 10 })
+-        #           find(:all) # => SELECT * from articles LIMIT 10
+-        #         end
+-        #       end
+-        #     end
+-        #   end
+-        #
+-        # *Note*: the +:find+ scope also has effect on update and deletion methods,
+-        # like +update_all+ and +delete_all+.
+-        def with_scope(method_scoping = {}, action = :merge, &block)
+-          method_scoping = method_scoping.method_scoping if method_scoping.respond_to?(:method_scoping)
+-
+-          # Dup first and second level of hash (method and params).
+-          method_scoping = method_scoping.inject({}) do |hash, (method, params)|
+-            hash[method] = (params == true) ? params : params.dup
+-            hash
+-          end
+-
+-          method_scoping.assert_valid_keys([ :find, :create ])
+-
+-          if f = method_scoping[:find]
+-            f.assert_valid_keys(VALID_FIND_OPTIONS)
+-            set_readonly_option! f
+-          end
+-
+-          # Merge scopings
+-          if [:merge, :reverse_merge].include?(action) && current_scoped_methods
+-            method_scoping = current_scoped_methods.inject(method_scoping) do |hash, (method, params)|
+-              case hash[method]
+-                when Hash
+-                  if method == :find
+-                    (hash[method].keys + params.keys).uniq.each do |key|
+-                      merge = hash[method][key] && params[key] # merge if both scopes have the same key
+-                      if key == :conditions && merge
+-                        if params[key].is_a?(Hash) && hash[method][key].is_a?(Hash)
+-                          hash[method][key] = merge_conditions(hash[method][key].deep_merge(params[key]))
+-                        else
+-                          hash[method][key] = merge_conditions(params[key], hash[method][key])
+-                        end
+-                      elsif key == :include && merge
+-                        hash[method][key] = merge_includes(hash[method][key], params[key]).uniq
+-                      elsif key == :joins && merge
+-                        hash[method][key] = merge_joins(params[key], hash[method][key])
+-                      else
+-                        hash[method][key] = hash[method][key] || params[key]
+-                      end
+-                    end
+-                  else
+-                    if action == :reverse_merge
+-                      hash[method] = hash[method].merge(params)
+-                    else
+-                      hash[method] = params.merge(hash[method])
+-                    end
+-                  end
+-                else
+-                  hash[method] = params
+-              end
+-              hash
+-            end
+-          end
+-
+-          self.scoped_methods << method_scoping
+-          begin
+-            yield
+-          ensure
+-            self.scoped_methods.pop
+-          end
+-        end
+-
+-        # Works like with_scope, but discards any nested properties.
+-        def with_exclusive_scope(method_scoping = {}, &block)
+-          with_scope(method_scoping, :overwrite, &block)
+-        end
+-
+         def subclasses #:nodoc:
+           @@subclasses[self] ||= []
+           @@subclasses[self] + extra = @@subclasses[self].inject([]) {|list, subclass| list + subclass.subclasses }
+         end
+ 
+-        # Sets the default options for the model. The format of the
+-        # <tt>options</tt> argument is the same as in find.
+-        #
+-        #   class Person < ActiveRecord::Base
+-        #     default_scope :order => 'last_name, first_name'
+-        #   end
+-        def default_scope(options = {})
+-          self.default_scoping << { :find => options, :create => options[:conditions].is_a?(Hash) ? options[:conditions] : {} }
+-        end
+-
+-        # Test whether the given method and optional key are scoped.
+-        def scoped?(method, key = nil) #:nodoc:
+-          if current_scoped_methods && (scope = current_scoped_methods[method])
+-            !key || !scope[key].nil?
+-          end
+-        end
+-
+-        # Retrieve the scope for the given method and optional key.
+-        def scope(method, key = nil) #:nodoc:
+-          if current_scoped_methods && (scope = current_scoped_methods[method])
+-            key ? scope[key] : scope
+-          end
+-        end
+-
+-        def scoped_methods #:nodoc:
+-          Thread.current[:"#{self}_scoped_methods"] ||= self.default_scoping.dup
+-        end
+-
+-        def current_scoped_methods #:nodoc:
+-          scoped_methods.last
+-        end
+-
+         # Returns the class type of the record using the current module as a prefix. So descendants of
+         # MyApp::Business::Account would appear as MyApp::Business::AccountSubclass.
+         def compute_type(type_name)
+@@ -2503,7 +2354,7 @@ module ActiveRecord #:nodoc:
+       #       name
+       #     end
+       #   end
+-      #   
++      #
+       #   user = User.find_by_name('Phusion')
+       #   user_path(user)  # => "/users/Phusion"
+       def to_param
+@@ -2558,12 +2409,12 @@ module ActiveRecord #:nodoc:
+       # If +perform_validation+ is true validations run. If any of them fail
+       # the action is cancelled and +save+ returns +false+. If the flag is
+       # false validations are bypassed altogether. See
+-      # ActiveRecord::Validations for more information. 
++      # ActiveRecord::Validations for more information.
+       #
+       # There's a series of callbacks associated with +save+. If any of the
+       # <tt>before_*</tt> callbacks return +false+ the action is cancelled and
+       # +save+ returns +false+. See ActiveRecord::Callbacks for further
+-      # details. 
++      # details.
+       def save
+         create_or_update
+       end
+@@ -2575,12 +2426,12 @@ module ActiveRecord #:nodoc:
+       #
+       # With <tt>save!</tt> validations always run. If any of them fail
+       # ActiveRecord::RecordInvalid gets raised. See ActiveRecord::Validations
+-      # for more information. 
++      # for more information.
+       #
+       # There's a series of callbacks associated with <tt>save!</tt>. If any of
+       # the <tt>before_*</tt> callbacks return +false+ the action is cancelled
+       # and <tt>save!</tt> raises ActiveRecord::RecordNotSaved. See
+-      # ActiveRecord::Callbacks for further details. 
++      # ActiveRecord::Callbacks for further details.
+       def save!
+         create_or_update || raise(RecordNotSaved)
+       end
+@@ -2751,12 +2602,12 @@ module ActiveRecord #:nodoc:
+       #   class User < ActiveRecord::Base
+       #     attr_protected :is_admin
+       #   end
+-      #   
++      #
+       #   user = User.new
+       #   user.attributes = { :username => 'Phusion', :is_admin => true }
+       #   user.username   # => "Phusion"
+       #   user.is_admin?  # => false
+-      #   
++      #
+       #   user.send(:attributes=, { :username => 'Phusion', :is_admin => true }, false)
+       #   user.is_admin?  # => true
+       def attributes=(new_attributes, guard_protected_attributes = true)
+@@ -3178,7 +3029,7 @@ module ActiveRecord #:nodoc:
+     include AttributeMethods
+     include Dirty
+     include Callbacks, ActiveModel::Observing, Timestamp
+-    include Associations, AssociationPreload, NamedScope
++    include Associations, AssociationPreload, Scoping, NamedScope
+ 
+     # AutosaveAssociation needs to be included before Transactions, because we want
+     # #save_with_autosave_associations to be wrapped inside a transaction.
+diff --git a/activerecord/lib/active_record/scoping.rb b/activerecord/lib/active_record/scoping.rb
+new file mode 100644
+index 0000000..9df028d
+--- /dev/null
++++ b/activerecord/lib/active_record/scoping.rb
+@@ -0,0 +1,159 @@
++module ActiveRecord #:nodoc:
++  module Scoping
++    extend ActiveSupport::Concern
++
++    included do
++      # Stores the default scope for the class
++      class_inheritable_accessor :default_scoping, :instance_writer => false
++      self.default_scoping = []
++    end
++
++    module ClassMethods
++      protected
++      # Scope parameters to method calls within the block.  Takes a hash of method_name => parameters hash.
++      # method_name may be <tt>:find</tt> or <tt>:create</tt>. <tt>:find</tt> parameters may include the <tt>:conditions</tt>, <tt>:joins</tt>,
++      # <tt>:include</tt>, <tt>:offset</tt>, <tt>:limit</tt>, and <tt>:readonly</tt> options. <tt>:create</tt> parameters are an attributes hash.
++      #
++      #   class Article < ActiveRecord::Base
++      #     def self.create_with_scope
++      #       with_scope(:find => { :conditions => "blog_id = 1" }, :create => { :blog_id => 1 }) do
++      #         find(1) # => SELECT * from articles WHERE blog_id = 1 AND id = 1
++      #         a = create(1)
++      #         a.blog_id # => 1
++      #       end
++      #     end
++      #   end
++      #
++      # In nested scopings, all previous parameters are overwritten by the innermost rule, with the exception of
++      # <tt>:conditions</tt>, <tt>:include</tt>, and <tt>:joins</tt> options in <tt>:find</tt>, which are merged.
++      #
++      # <tt>:joins</tt> options are uniqued so multiple scopes can join in the same table without table aliasing
++      # problems.  If you need to join multiple tables, but still want one of the tables to be uniqued, use the
++      # array of strings format for your joins.
++      #
++      #   class Article < ActiveRecord::Base
++      #     def self.find_with_scope
++      #       with_scope(:find => { :conditions => "blog_id = 1", :limit => 1 }, :create => { :blog_id => 1 }) do
++      #         with_scope(:find => { :limit => 10 })
++      #           find(:all) # => SELECT * from articles WHERE blog_id = 1 LIMIT 10
++      #         end
++      #         with_scope(:find => { :conditions => "author_id = 3" })
++      #           find(:all) # => SELECT * from articles WHERE blog_id = 1 AND author_id = 3 LIMIT 1
++      #         end
++      #       end
++      #     end
++      #   end
++      #
++      # You can ignore any previous scopings by using the <tt>with_exclusive_scope</tt> method.
++      #
++      #   class Article < ActiveRecord::Base
++      #     def self.find_with_exclusive_scope
++      #       with_scope(:find => { :conditions => "blog_id = 1", :limit => 1 }) do
++      #         with_exclusive_scope(:find => { :limit => 10 })
++      #           find(:all) # => SELECT * from articles LIMIT 10
++      #         end
++      #       end
++      #     end
++      #   end
++      #
++      # *Note*: the +:find+ scope also has effect on update and deletion methods,
++      # like +update_all+ and +delete_all+.
++      def with_scope(method_scoping = {}, action = :merge, &block)
++        method_scoping = method_scoping.method_scoping if method_scoping.respond_to?(:method_scoping)
++
++        # Dup first and second level of hash (method and params).
++        method_scoping = method_scoping.inject({}) do |hash, (method, params)|
++          hash[method] = (params == true) ? params : params.dup
++          hash
++        end
++
++        method_scoping.assert_valid_keys([ :find, :create ])
++
++        if f = method_scoping[:find]
++          validate_find_options(f)
++          set_readonly_option! f
++        end
++
++        # Merge scopings
++        if [:merge, :reverse_merge].include?(action) && current_scoped_methods
++          method_scoping = current_scoped_methods.inject(method_scoping) do |hash, (method, params)|
++            case hash[method]
++              when Hash
++                if method == :find
++                  (hash[method].keys + params.keys).uniq.each do |key|
++                    merge = hash[method][key] && params[key] # merge if both scopes have the same key
++                    if key == :conditions && merge
++                      if params[key].is_a?(Hash) && hash[method][key].is_a?(Hash)
++                        hash[method][key] = merge_conditions(hash[method][key].deep_merge(params[key]))
++                      else
++                        hash[method][key] = merge_conditions(params[key], hash[method][key])
++                      end
++                    elsif key == :include && merge
++                      hash[method][key] = merge_includes(hash[method][key], params[key]).uniq
++                    elsif key == :joins && merge
++                      hash[method][key] = merge_joins(params[key], hash[method][key])
++                    else
++                      hash[method][key] = hash[method][key] || params[key]
++                    end
++                  end
++                else
++                  if action == :reverse_merge
++                    hash[method] = hash[method].merge(params)
++                  else
++                    hash[method] = params.merge(hash[method])
++                  end
++                end
++              else
++                hash[method] = params
++            end
++            hash
++          end
++        end
++
++        self.scoped_methods << method_scoping
++        begin
++          yield
++        ensure
++          self.scoped_methods.pop
++        end
++      end
++
++      # Works like with_scope, but discards any nested properties.
++      def with_exclusive_scope(method_scoping = {}, &block)
++        with_scope(method_scoping, :overwrite, &block)
++      end
++
++      # Sets the default options for the model. The format of the
++      # <tt>options</tt> argument is the same as in find.
++      #
++      #   class Person < ActiveRecord::Base
++      #     default_scope :order => 'last_name, first_name'
++      #   end
++      def default_scope(options = {})
++        self.default_scoping << { :find => options, :create => options[:conditions].is_a?(Hash) ? options[:conditions] : {} }
++      end
++
++      # Test whether the given method and optional key are scoped.
++      def scoped?(method, key = nil) #:nodoc:
++        if current_scoped_methods && (scope = current_scoped_methods[method])
++          !key || !scope[key].nil?
++        end
++      end
++
++      # Retrieve the scope for the given method and optional key.
++      def scope(method, key = nil) #:nodoc:
++        if current_scoped_methods && (scope = current_scoped_methods[method])
++          key ? scope[key] : scope
++        end
++      end
++
++      def scoped_methods #:nodoc:
++        Thread.current[:"#{self}_scoped_methods"] ||= self.default_scoping.dup
++      end
++
++      def current_scoped_methods #:nodoc:
++        scoped_methods.last
++      end
++    end
++  end
++end
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index f9ac37c..63db2fa 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1705,75 +1705,6 @@ class BasicsTest < ActiveRecord::TestCase
+     assert_nothing_raised { Category.new.send(:interpolate_sql, 'foo bar} baz') }
+   end
+ 
+-  def test_scoped_find_conditions
+-    scoped_developers = Developer.with_scope(:find => { :conditions => 'salary > 90000' }) do
+-      Developer.find(:all, :conditions => 'id < 5')
+-    end
+-    assert !scoped_developers.include?(developers(:david)) # David's salary is less than 90,000
+-    assert_equal 3, scoped_developers.size
+-  end
+-
+-  def test_scoped_find_limit_offset
+-    scoped_developers = Developer.with_scope(:find => { :limit => 3, :offset => 2 }) do
+-      Developer.find(:all, :order => 'id')
+-    end
+-    assert !scoped_developers.include?(developers(:david))
+-    assert !scoped_developers.include?(developers(:jamis))
+-    assert_equal 3, scoped_developers.size
+-
+-    # Test without scoped find conditions to ensure we get the whole thing
+-    developers = Developer.find(:all, :order => 'id')
+-    assert_equal Developer.count, developers.size
+-  end
+-
+-  def test_scoped_find_order
+-    # Test order in scope
+-    scoped_developers = Developer.with_scope(:find => { :limit => 1, :order => 'salary DESC' }) do
+-      Developer.find(:all)
+-    end
+-    assert_equal 'Jamis', scoped_developers.first.name
+-    assert scoped_developers.include?(developers(:jamis))
+-    # Test scope without order and order in find
+-    scoped_developers = Developer.with_scope(:find => { :limit => 1 }) do
+-      Developer.find(:all, :order => 'salary DESC')
+-    end
+-    # Test scope order + find order, find has priority
+-    scoped_developers = Developer.with_scope(:find => { :limit => 3, :order => 'id DESC' }) do
+-      Developer.find(:all, :order => 'salary ASC')
+-    end
+-    assert scoped_developers.include?(developers(:poor_jamis))
+-    assert scoped_developers.include?(developers(:david))
+-    assert scoped_developers.include?(developers(:dev_10))
+-    # Test without scoped find conditions to ensure we get the right thing
+-    developers = Developer.find(:all, :order => 'id', :limit => 1)
+-    assert scoped_developers.include?(developers(:david))
+-  end
+-
+-  def test_scoped_find_limit_offset_including_has_many_association
+-    topics = Topic.with_scope(:find => {:limit => 1, :offset => 1, :include => :replies}) do
+-      Topic.find(:all, :order => "topics.id")
+-    end
+-    assert_equal 1, topics.size
+-    assert_equal 2, topics.first.id
+-  end
+-
+-  def test_scoped_find_order_including_has_many_association
+-    developers = Developer.with_scope(:find => { :order => 'developers.salary DESC', :include => :projects }) do
+-      Developer.find(:all)
+-    end
+-    assert developers.size >= 2
+-    for i in 1...developers.size
+-      assert developers[i-1].salary >= developers[i].salary
+-    end
+-  end
+-
+-  def test_scoped_find_with_group_and_having
+-    developers = Developer.with_scope(:find => { :group => 'developers.salary', :having => "SUM(salary) > 10000", :select => "SUM(salary) as salary" }) do
+-      Developer.find(:all)
+-    end
+-    assert_equal 3, developers.size
+-  end
+-
+   def test_find_last
+     last  = Developer.find :last
+     assert_equal last, Developer.find(:first, :order => 'id desc')
+@@ -1807,13 +1738,6 @@ class BasicsTest < ActiveRecord::TestCase
+     assert_equal last, Developer.find(:all, :order => :salary).last
+   end
+ 
+-  def test_find_scoped_ordered_last
+-    last_developer = Developer.with_scope(:find => { :order => 'developers.salary ASC' }) do
+-      Developer.find(:last)
+-    end
+-    assert_equal last_developer, Developer.find(:all, :order => 'developers.salary ASC').last
+-  end
+-
+   def test_abstract_class
+     assert !ActiveRecord::Base.abstract_class?
+     assert LoosePerson.abstract_class?
+diff --git a/activerecord/test/cases/scoping_test.rb b/activerecord/test/cases/scoping_test.rb
+new file mode 100644
+index 0000000..c602113
+--- /dev/null
++++ b/activerecord/test/cases/scoping_test.rb
+@@ -0,0 +1,85 @@
++require "cases/helper"
++require 'models/developer'
++require 'models/topic'
++require 'models/reply'
++require 'models/project'
++
++class ScopingTest < ActiveRecord::TestCase
++  fixtures :developers, :projects, :topics
++
++  def test_scoped_find_conditions
++    scoped_developers = Developer.with_scope(:find => { :conditions => 'salary > 90000' }) do
++      Developer.find(:all, :conditions => 'id < 5')
++    end
++    assert !scoped_developers.include?(developers(:david)) # David's salary is less than 90,000
++    assert_equal 3, scoped_developers.size
++  end
++
++  def test_scoped_find_limit_offset
++    scoped_developers = Developer.with_scope(:find => { :limit => 3, :offset => 2 }) do
++      Developer.find(:all, :order => 'id')
++    end
++    assert !scoped_developers.include?(developers(:david))
++    assert !scoped_developers.include?(developers(:jamis))
++    assert_equal 3, scoped_developers.size
++
++    # Test without scoped find conditions to ensure we get the whole thing
++    developers = Developer.find(:all, :order => 'id')
++    assert_equal Developer.count, developers.size
++  end
++
++  def test_scoped_find_order
++    # Test order in scope
++    scoped_developers = Developer.with_scope(:find => { :limit => 1, :order => 'salary DESC' }) do
++      Developer.find(:all)
++    end
++    assert_equal 'Jamis', scoped_developers.first.name
++    assert scoped_developers.include?(developers(:jamis))
++    # Test scope without order and order in find
++    scoped_developers = Developer.with_scope(:find => { :limit => 1 }) do
++      Developer.find(:all, :order => 'salary DESC')
++    end
++    # Test scope order + find order, find has priority
++    scoped_developers = Developer.with_scope(:find => { :limit => 3, :order => 'id DESC' }) do
++      Developer.find(:all, :order => 'salary ASC')
++    end
++    assert scoped_developers.include?(developers(:poor_jamis))
++    assert scoped_developers.include?(developers(:david))
++    assert scoped_developers.include?(developers(:dev_10))
++    # Test without scoped find conditions to ensure we get the right thing
++    developers = Developer.find(:all, :order => 'id', :limit => 1)
++    assert scoped_developers.include?(developers(:david))
++  end
++
++  def test_scoped_find_limit_offset_including_has_many_association
++    topics = Topic.with_scope(:find => {:limit => 1, :offset => 1, :include => :replies}) do
++      Topic.find(:all, :order => "topics.id")
++    end
++    assert_equal 1, topics.size
++    assert_equal 2, topics.first.id
++  end
++
++  def test_scoped_find_order_including_has_many_association
++    developers = Developer.with_scope(:find => { :order => 'developers.salary DESC', :include => :projects }) do
++      Developer.find(:all)
++    end
++    assert developers.size >= 2
++    for i in 1...developers.size
++      assert developers[i-1].salary >= developers[i].salary
++    end
++  end
++
++  def test_scoped_find_with_group_and_having
++    developers = Developer.with_scope(:find => { :group => 'developers.salary', :having => "SUM(salary) > 10000", :select => "SUM(salary) as salary" }) do
++      Developer.find(:all)
++    end
++    assert_equal 3, developers.size
++  end
++
++  def test_find_scoped_ordered_last
++    last_developer = Developer.with_scope(:find => { :order => 'developers.salary ASC' }) do
++      Developer.find(:last)
++    end
++    assert_equal last_developer, Developer.find(:all, :order => 'developers.salary ASC').last
++  end
++end
+-- 
+1.6.0.4
+

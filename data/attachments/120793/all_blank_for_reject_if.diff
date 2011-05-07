@@ -1,0 +1,121 @@
+From 4d60c1fb2f5ec39c2a97d6e20c9fd57632da6991 Mon Sep 17 00:00:00 2001
+From: Mike Breen <hardbap@gmail.com>
+Date: Sat, 9 May 2009 22:11:11 -0400
+Subject: [PATCH] Allows you to pass :all_blank to :reject_if option to automatically create a Proc that will reject any record with blank attributes.
+
+---
+ .../lib/active_record/nested_attributes.rb         |   13 ++++++++++++-
+ activerecord/test/cases/nested_attributes_test.rb  |   20 ++++++++++++++++++--
+ activerecord/test/models/pirate.rb                 |    2 ++
+ activerecord/test/schema/schema.rb                 |    1 +
+ 4 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index e3122d1..488120f 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -180,10 +180,14 @@ module ActiveRecord
+       #   and the Proc should return either +true+ or +false+. When no Proc
+       #   is specified a record will be built for all attribute hashes that
+       #   do not have a <tt>_delete</tt> that evaluates to true.
++      #   Passing <tt>:all_blank</tt> instead of a Proc will create a proc
++      #   that will reject a record where all the attributes are blank. 
+       #
+       # Examples:
+       #   # creates avatar_attributes=
+       #   accepts_nested_attributes_for :avatar, :reject_if => proc { |attributes| attributes['name'].blank? }
++      #   # creates avatar_attributes=
++      #   accepts_nested_attributes_for :avatar, :reject_if => :all_blank
+       #   # creates avatar_attributes= and posts_attributes=
+       #   accepts_nested_attributes_for :avatar, :posts, :allow_destroy => true
+       def accepts_nested_attributes_for(*attr_names)
+@@ -201,7 +205,14 @@ module ActiveRecord
+             end
+ 
+             reflection.options[:autosave] = true
+-            self.reject_new_nested_attributes_procs[association_name.to_sym] = options[:reject_if]
++                          
++            if options[:reject_if] == :all_blank
++              reject_proc = proc { |attributes| attributes.all? {|k,v| v.blank?} }
++            else
++              reject_proc = options[:reject_if]
++            end
++            
++            self.reject_new_nested_attributes_procs[association_name.to_sym] = reject_proc
+ 
+             # def pirate_attributes=(attributes)
+             #   assign_nested_attributes_for_one_to_one_association(:pirate, attributes, false)
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index cd6277c..e73ef01 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -31,10 +31,26 @@ class TestNestedAttributesInGeneral < ActiveRecord::TestCase
+   end
+ 
+   def test_should_add_a_proc_to_reject_new_nested_attributes_procs
+-    [:parrots, :birds].each do |name|
++    [:parrots, :birds, :birds_with_reject_all_blank].each do |name|
+       assert_instance_of Proc, Pirate.reject_new_nested_attributes_procs[name]
+     end
+   end
++  
++  def test_should_not_build_a_new_record_if_reject_all_blank_returns_false
++    pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    pirate.birds_with_reject_all_blank_attributes = [{:name => '', :color => ''}] 
++    pirate.save!
++    
++    assert pirate.birds_with_reject_all_blank.empty?
++  end
++  
++  def test_should_build_a_new_record_if_reject_all_blank_does_not_return_false
++    pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
++    pirate.birds_with_reject_all_blank_attributes = [{:name => 'Tweetie', :color => ''}] 
++    pirate.save!
++    
++    assert_equal 1, pirate.birds_with_reject_all_blank.count
++  end
+ 
+   def test_should_raise_an_ArgumentError_for_non_existing_associations
+     assert_raise_with_message ArgumentError, "No association found for name `honesty'. Has it been defined yet?" do
+@@ -92,7 +108,7 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+ 
+     assert_nil @pirate.ship
+   end
+-
++      
+   def test_should_replace_an_existing_record_if_there_is_no_id
+     @pirate.reload.ship_attributes = { :name => 'Davy Jones Gold Dagger' }
+ 
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 238917b..acf53fc 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -28,11 +28,13 @@ class Pirate < ActiveRecord::Base
+     :after_add      => proc {|p,b| p.ship_log << "after_adding_proc_bird_#{b.id || '<new>'}"},
+     :before_remove  => proc {|p,b| p.ship_log << "before_removing_proc_bird_#{b.id}"},
+     :after_remove   => proc {|p,b| p.ship_log << "after_removing_proc_bird_#{b.id}"}
++  has_many :birds_with_reject_all_blank, :class_name => "Bird"
+ 
+   accepts_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+   accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+   accepts_nested_attributes_for :parrots_with_method_callbacks, :parrots_with_proc_callbacks,
+     :birds_with_method_callbacks, :birds_with_proc_callbacks, :allow_destroy => true
++  accepts_nested_attributes_for :birds_with_reject_all_blank, :reject_if => :all_blank
+ 
+   validates_presence_of :catchphrase
+ 
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 3b0e17c..6fb918c 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -57,6 +57,7 @@ ActiveRecord::Schema.define do
+ 
+   create_table :birds, :force => true do |t|
+     t.string :name
++    t.string :color
+     t.integer :pirate_id
+   end
+ 
+-- 
+1.6.1.3
+

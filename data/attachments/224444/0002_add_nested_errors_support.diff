@@ -1,0 +1,358 @@
+From 77df35a29c998b9bbb48663b4493486f9c9b1314 Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Jos=C3=A9=20Valim?= <jose.valim@gmail.com>
+Date: Sun, 19 Jul 2009 13:54:09 +0200
+Subject: [PATCH] Make nested attributes create nested errors that are now properly handled by ActiveRecord::Errors.
+
+---
+ .../lib/active_record/autosave_association.rb      |    7 +-
+ activerecord/lib/active_record/validations.rb      |  104 ++++++++++++++++++--
+ .../test/cases/autosave_association_test.rb        |   16 ++--
+ activerecord/test/cases/validations_i18n_test.rb   |    2 +-
+ activerecord/test/cases/validations_test.rb        |   75 ++++++++++++++
+ 5 files changed, 181 insertions(+), 23 deletions(-)
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index ffa9f29..9251fb5 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -250,10 +250,7 @@ module ActiveRecord
+ 
+       unless valid = association.valid?
+         if reflection.options[:autosave]
+-          association.errors.each do |attribute, message|
+-            attribute = "#{reflection.name}_#{attribute}"
+-            errors.add(attribute, message) unless errors.on(attribute)
+-          end
++          errors.add(reflection.name, association.errors)
+         else
+           errors.add(reflection.name)
+         end
+@@ -355,4 +352,4 @@ module ActiveRecord
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index d2d12b8..0466df3 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -138,9 +138,18 @@ module ActiveRecord
+     #   company.errors.on(:email)     # => "can't be blank"
+     #   company.errors.on(:address)   # => nil
+     def on(attribute)
+-      errors = @errors[attribute.to_s]
+-      return nil if errors.nil?
+-      errors.size == 1 ? errors.first : errors
++      return nil unless @errors[attribute.to_s]
++
++      messages = []
++      @errors[attribute.to_s].each do |error|
++        if error.is_a?(ActiveRecord::Errors)
++          messages |= error.full_messages
++        else
++          messages << error
++        end
++      end
++
++      messages.size == 1 ? messages.first : messages
+     end
+ 
+     alias :[] :on
+@@ -193,13 +202,62 @@ module ActiveRecord
+     #   company = Company.create(:address => '123 First St.')
+     #   company.errors.full_messages # =>
+     #     ["Name is too short (minimum is 5 characters)", "Name can't be blank", "Address can't be blank"]
+-    def full_messages(options = {})
++    def full_messages
++      to_a
++    end
++
++    # Returns all the full error messages in an array. Opposite to full_messages,
++    # this method accepts an options hash that accepts :associations as option.
++    #
++    # Example:
++    #
++    #   class Project < ActiveRecord::Base
++    #     validates_presence_of :title
++    #     accepts_nested_attributes_for :tasks
++    #   end
++    #
++    #   class Task < ActiveRecord::Base
++    #     validates_presence_of :name
++    #   end
++    #
++    #   # Start a new project
++    #   project = Project.new
++    #
++    #   # Build two tasks
++    #   project.tasks.build
++    #   project.tasks.build
++    #
++    #   # Project is invalid since both itself and tasks are invalid
++    #   project.valid?
++    #
++    #   project.errors.full_messages
++    #   # => ["Title can't be blank", "Name can't be blank"]
++    #
++    #   project.errors.to_a
++    #   # => ["Title can't be blank", "Name can't be blank"]
++    #
++    #   project.errors.to_a(:associations => :tasks)
++    #   # => [
++    #   #    "Title can't be blank",
++    #   #    :tasks => [
++    #   #      "Name can't be blank"
++    #   #    ]
++    #   # ]
++    def to_a(options={})
+       full_messages = []
++      associations  = options[:associations]
+ 
+       @errors.each_key do |attr|
++        association_errors = []
++
+         @errors[attr].each do |message|
+           next unless message
+ 
++          if message.is_a?(ActiveRecord::Errors)
++            association_errors << message
++            next
++          end
++
+           if attr == "base"
+             full_messages << message
+           else
+@@ -207,9 +265,11 @@ module ActiveRecord
+             full_messages << attr_name + I18n.t('activerecord.errors.format.separator', :default => ' ') + message
+           end
+         end
++
++        include_association_errors(attr.to_sym, full_messages, association_errors, associations)
+       end
+       full_messages
+-    end 
++    end
+ 
+     # Returns true if no errors have been added.
+     def empty?
+@@ -221,9 +281,18 @@ module ActiveRecord
+       @errors = {}
+     end
+ 
+-    # Returns the total number of errors added. Two errors added to the same attribute will be counted as such.
++    # Returns the total number of errors added. Two errors added to the same attribute
++    # will be counted as such and it also takes into account associated errors.
+     def size
+-      @errors.values.inject(0) { |error_count, attribute| error_count + attribute.size }
++      @errors.values.inject(0) do |count, errors|
++        count + errors.inject(0) do |child_count, error|
++          if error.is_a?(ActiveRecord::Errors)
++            child_count + error.size
++          else
++            child_count + 1
++          end
++        end
++      end
+     end
+ 
+     alias_method :count, :size
+@@ -254,7 +323,26 @@ module ActiveRecord
+         full_messages.each { |msg| e.error(msg) }
+       end
+     end
+-    
++
++    protected
++
++      def include_association_errors(association, messages, errors, associations=nil)
++        return if errors.empty?
++
++        inclusion = associations.is_a?(Hash) ? associations[association] : nil
++        errors.map!{ |e| e.to_a(:associations => inclusion) }
++        errors.flatten!
++        errors.uniq!
++
++        if (associations.is_a?(Hash) && associations.key?(association)) ||
++           (associations.is_a?(Array) && associations.include?(association)) ||
++           associations == association
++          messages << { association => errors }
++        else
++          messages.concat errors
++        end
++      end
++
+   end
+ 
+ 
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 75d40fb..b040ce7 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -750,14 +750,14 @@ class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @pirate.ship.name = ''
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
++    assert !@pirate.errors.on(:ship).blank?
+   end
+ 
+   def test_should_merge_errors_on_the_associated_models_onto_the_parent_even_if_it_is_not_valid
+     @pirate.ship.name   = nil
+     @pirate.catchphrase = nil
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
++    assert !@pirate.errors.on(:ship).blank?
+     assert !@pirate.errors.on(:catchphrase).blank?
+   end
+ 
+@@ -840,7 +840,7 @@ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @ship.pirate.catchphrase = ''
+     assert !@ship.valid?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert !@ship.errors.on(:pirate).blank?
+   end
+ 
+   def test_should_merge_errors_on_the_associated_model_onto_the_parent_even_if_it_is_not_valid
+@@ -848,7 +848,7 @@ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+     @ship.pirate.catchphrase = nil
+     assert !@ship.valid?
+     assert !@ship.errors.on(:name).blank?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert !@ship.errors.on(:pirate).blank?
+   end
+ 
+   def test_should_still_allow_to_bypass_validations_on_the_associated_model
+@@ -910,16 +910,14 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.send(@association_name).each { |child| child.name = '' }
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
+-    assert @pirate.errors.on(@association_name).blank?
++    assert_equal "Name can't be blank", @pirate.errors.on(@association_name)
+   end
+ 
+   def test_should_not_use_default_invalid_error_on_associated_models
+     @pirate.send(@association_name).build(:name => '')
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
+-    assert @pirate.errors.on(@association_name).blank?
++    assert_equal "Name can't be blank", @pirate.errors.on(@association_name)
+   end
+ 
+   def test_should_merge_errors_on_the_associated_models_onto_the_parent_even_if_it_is_not_valid
+@@ -927,8 +925,8 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.catchphrase = nil
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
+     assert !@pirate.errors.on(:catchphrase).blank?
++    assert_equal "Name can't be blank", @pirate.errors.on(@association_name)
+   end
+ 
+   def test_should_allow_to_bypass_validations_on_the_associated_models_on_update
+diff --git a/activerecord/test/cases/validations_i18n_test.rb b/activerecord/test/cases/validations_i18n_test.rb
+index 6698234..a24a2ab 100644
+--- a/activerecord/test/cases/validations_i18n_test.rb
++++ b/activerecord/test/cases/validations_i18n_test.rb
+@@ -163,7 +163,7 @@ class ActiveRecordValidationsI18nTests < ActiveSupport::TestCase
+   def test_errors_full_messages_translates_human_attribute_name_for_model_attributes
+     @topic.errors.instance_variable_set :@errors, { 'title' => ['empty'] }
+     I18n.expects(:translate).with(:"topic.title", :default => ['Title'], :scope => [:activerecord, :attributes], :count => 1).returns('Title')
+-    @topic.errors.full_messages :locale => 'en'
++    @topic.errors.full_messages
+   end
+ 
+   # ActiveRecord::Validations
+diff --git a/activerecord/test/cases/validations_test.rb b/activerecord/test/cases/validations_test.rb
+index c20f5ae..b7fa5c9 100644
+--- a/activerecord/test/cases/validations_test.rb
++++ b/activerecord/test/cases/validations_test.rb
+@@ -1464,6 +1464,81 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ end
+ 
++class AssociatedErrorsTest < ActiveRecord::TestCase
++  repair_validations(Topic)
++
++  def setup
++    Topic.validates_presence_of(:title)
++
++    @reply = Reply.new
++    @reply.title = "Wrong Create"
++    @reply.valid?
++
++    @topic = Topic.new
++    @topic.valid?
++
++    @topic.errors.add(:reply, @reply.errors)
++  end
++
++  def test_associated_errors_are_flattened_on_full_messages
++    errors = @topic.errors.full_messages.sort
++
++    assert_equal "Content Empty", errors[0]
++    assert_equal "Title can't be blank", errors[1]
++    assert_equal "Title is Wrong Create", errors[2]
++    assert_equal 3, @topic.errors.count
++  end
++
++  def test_associated_errors_are_not_flattened_if_given_as_association
++    errors = @topic.errors.to_a(:associations => :reply)
++
++    reply_errors = nested_errors_for(:reply, errors)
++    assert_equal ["Title is Wrong Create", "Content Empty"], reply_errors
++  end
++
++  def test_associated_errors_can_be_given_as_array
++    @topic.errors.add(:second_reply, @reply.errors)
++    errors = @topic.errors.to_a(:associations => [:reply, :second_reply])
++
++    second_reply_errors = nested_errors_for(:second_reply, errors)
++    assert_equal ["Title is Wrong Create", "Content Empty"], second_reply_errors
++  end
++
++  def test_nested_associated_errors
++    @reply_reply = Reply.new
++    @reply_reply.title = "Wrong Create"
++    @reply_reply.valid?
++
++    @reply.errors.add(:reply_reply, @reply_reply.errors)
++    errors = @topic.errors.to_a(:associations => { :reply => :reply_reply })
++
++    reply_errors = nested_errors_for :reply, errors
++    reply_reply_errors = nested_errors_for :reply_reply, reply_errors
++
++    assert_equal ["Title is Wrong Create", "Content Empty"], reply_reply_errors
++  end
++
++  def test_equal_errors_for_associations_are_not_duplicated
++    @topic.errors.add(:reply, @reply.errors)
++    @topic.errors.add(:reply, @reply.errors)
++    @topic.errors.add(:reply, @reply.errors)
++
++    errors = @topic.errors.to_a(:associations => :reply)
++
++    reply_errors = nested_errors_for(:reply, errors)
++    assert_equal ["Title is Wrong Create", "Content Empty"], reply_errors
++    assert_equal 9, @topic.errors.count
++  end
++
++  def test_associated_errors_are_shown_as_full_messages_with_errors_on
++    assert_equal ["Title is Wrong Create", "Content Empty"], @topic.errors.on(:reply)
++  end
++
++  protected
++    def nested_errors_for(key, errors)
++      errors.find { |error| error.is_a?(Hash) && error.key?(key) }[key]
++    end
++end
+ 
+ class ValidatesNumericalityTest < ActiveRecord::TestCase
+   NIL = [nil]
+-- 
+1.5.4.3
+

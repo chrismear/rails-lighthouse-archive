@@ -1,0 +1,704 @@
+From f2bd8bd136b206c6ff48b8c2633e8ab8ca224eb1 Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Tue, 13 Apr 2010 10:45:44 -0400
+Subject: [PATCH] New predicates, including Not (Unary), Any/All (Polyadic), and NotMatch/NotIn (Binary)
+
+This patch adds support for some new types of predicates and
+cleans up a few small things. Tests are included.
+
+It adds a unary predicate, Not. Predicate#not will negate the predicate
+on which it's called.
+
+For example, users[:name].eq('Bob').or(users[:name].eq('Joe')).not will
+match users not named Joe or Bob.
+
+In Ruby 1.9 only, there is experimental support for alternate not syntax
+in which you can instead write:
+
+  !users[:name].eq('Bob').or(users[:name].eq('Joe'))
+
+or
+
+  not(users[:name].eq('Bob').or(users[:name].eq('Joe')))
+
+Each predicate defines a complement method, which is what #! and #not make use of.
+!predicate will return the predicate's complement, rather than a boolean
+value, so repeated nots toggle the selection. For example:
+
+ruby-head > articles[:title].eq('Hello').to_sql
+ => "\"articles\".\"title\" = 'Hello'"
+ruby-head > (!articles[:title].eq('Hello')).to_sql
+ => "\"articles\".\"title\" != 'Hello'"
+ruby-head > (!!articles[:title].eq('Hello')).to_sql
+ => "\"articles\".\"title\" = 'Hello'"
+
+Polyadic predicates are _any and _all variations on the other operations,
+allowing multiple right-hand operands.
+
+For example, users[:name].matches_any('%Joe%', '%Bob%') will match
+users with names containing Joe or Bob.
+
+There is also a cleaner implementation of support for ranges with
+excluded end, and a refactor to the way that predication methods are
+defined. While the con to the way they're defined is that they would
+be hard to eventually document, the pro, as I see it, is that it causes
+someone to think twice before creating predications with one-off
+behavior, and instead encourages engine-specific behavior (as with the
+previous "range with excluded end" implementation) to be pushed to the
+engine instead.
+---
+ lib/arel/algebra/attributes/attribute.rb          |   68 +++++----
+ lib/arel/algebra/predicates.rb                    |  164 ++++++++++++++++++++-
+ lib/arel/engines/memory/predicates.rb             |   60 +++++++-
+ lib/arel/engines/sql/core_extensions/array.rb     |    4 +
+ lib/arel/engines/sql/core_extensions/nil_class.rb |    4 +
+ lib/arel/engines/sql/core_extensions/object.rb    |    4 +
+ lib/arel/engines/sql/core_extensions/range.rb     |    4 +
+ lib/arel/engines/sql/predicates.rb                |   50 ++++++-
+ lib/arel/engines/sql/primitives.rb                |    8 +
+ lib/arel/engines/sql/relations/relation.rb        |    4 +
+ spec/relations/join_spec.rb                       |    6 +-
+ spec/relations/relation_spec.rb                   |    2 +-
+ spec/shared/relation_spec.rb                      |   39 ++++-
+ 13 files changed, 365 insertions(+), 52 deletions(-)
+
+diff --git a/lib/arel/algebra/attributes/attribute.rb b/lib/arel/algebra/attributes/attribute.rb
+index afcbdd8..1ef383d 100644
+--- a/lib/arel/algebra/attributes/attribute.rb
++++ b/lib/arel/algebra/attributes/attribute.rb
+@@ -82,40 +82,44 @@ module Arel
+     include Congruence
+ 
+     module Predications
+-      def eq(other)
+-        Predicates::Equality.new(self, other)
+-      end
+-
+-      def not(other)
+-        Predicates::Not.new(self, other)
+-      end
+-
+-      def lt(other)
+-        Predicates::LessThan.new(self, other)
+-      end
+-
+-      def lteq(other)
+-        Predicates::LessThanOrEqualTo.new(self, other)
+-      end
+-
+-      def gt(other)
+-        Predicates::GreaterThan.new(self, other)
+-      end
+-
+-      def gteq(other)
+-        Predicates::GreaterThanOrEqualTo.new(self, other)
+-      end
+-
+-      def matches(regexp)
+-        Predicates::Match.new(self, regexp)
++      methods = {
++        :eq => "Equality",
++        :noteq => "Inequality",
++        :lt => "LessThan",
++        :lteq => "LessThanOrEqualTo",
++        :gt => "GreaterThan",
++        :gteq => "GreaterThanOrEqualTo",
++        :matches => "Match",
++        :notmatches => "NotMatch",
++        :in => "In",
++        :notin => "NotIn"
++      }
++      
++      def self.predication(name, klass)
++        methods = {
++          :operator => "
++            def #{name}(other)
++              Predicates::#{klass}.new(self, other)
++            end
++          ",
++          :any => "
++            def #{name}_any(*others)
++              Predicates::Any.build(Predicates::#{klass}, self, *others)
++            end
++          ",
++          :all => "
++            def #{name}_all(*others)
++              Predicates::All.build(Predicates::#{klass}, self, *others)
++            end
++          "
++        }
++        [:operator, :any, :all].each do |method_name|
++          module_eval methods[method_name], __FILE__, __LINE__
++        end
+       end
+ 
+-      def in(array)
+-        if array.is_a?(Range) && array.exclude_end?
+-          [Predicates::GreaterThanOrEqualTo.new(self, array.begin), Predicates::LessThan.new(self, array.end)]
+-        else
+-          Predicates::In.new(self, array)
+-        end
++      methods.each_pair do |method_name, class_name|
++        predication(method_name, class_name)
+       end
+     end
+     include Predications
+diff --git a/lib/arel/algebra/predicates.rb b/lib/arel/algebra/predicates.rb
+index 700cd6a..2da37af 100644
+--- a/lib/arel/algebra/predicates.rb
++++ b/lib/arel/algebra/predicates.rb
+@@ -8,6 +8,92 @@ module Arel
+       def and(other_predicate)
+         And.new(self, other_predicate)
+       end
++      
++      def complement
++        Not.new(self)
++      end
++      
++      def not
++        complement
++      end
++      
++      if respond_to?('!') # Nice! We're running Ruby 1.9 and can override the inherited BasicObject#!
++        def empty?        # Need to define empty? to keep Object#blank? from going haywire
++          false
++        end
++        
++        define_method('!') do
++          self.complement
++        end
++      end
++    end
++    
++    class Polyadic < Predicate
++      attributes :predicates
++      
++      def initialize(*predicates)
++        @predicates = predicates
++      end
++      
++      # Build a Polyadic predicate based on:
++      # * <tt>operator</tt> - The Predicate subclass that defines the type of operation
++      #   (LessThan, Equality, etc)
++      # * <tt>operand1</tt> - The left-hand operand (normally an Arel::Attribute)
++      # * <tt>additional_operands</tt> - All possible right-hand operands
++      def self.build(operator, operand1, *additional_operands)
++        new(
++          *additional_operands.uniq.inject([]) do |predicates, operand|
++            predicates << operator.new(operand1, operand)
++          end
++        )
++      end
++      
++      def ==(other)
++        same_elements?(@predicates, other.predicates)
++      end
++      
++      def bind(relation)
++        self.class.new(
++          *predicates.map {|p| p.find_correlate_in(relation)}
++        )
++      end
++      
++      private
++      
++      def same_elements?(a1, a2)
++        [:select, :inject, :size].each do |m|
++          return false unless [a1, a2].each {|a| a.respond_to?(m) }
++        end
++        a1.inject({}) { |h,e| h[e] = a1.select { |i| i == e }.size; h } ==
++        a2.inject({}) { |h,e| h[e] = a2.select { |i| i == e }.size; h }
++      end
++    end
++    
++    class Any < Polyadic
++      def complement
++        All.new(*predicates.map {|p| p.complement})
++      end
++    end
++    
++    class All < Polyadic
++      def complement
++        Any.new(*predicates.map {|p| p.complement})
++      end
++    end
++    
++    class Unary < Predicate
++      attributes :operand
++      deriving :initialize, :==
++      
++      def bind(relation)
++        self.class.new(operand.find_correlate_in(relation))
++      end
++    end
++    
++    class Not < Unary
++      def complement
++        operand
++      end
+     end
+ 
+     class Binary < Predicate
+@@ -24,6 +110,20 @@ module Arel
+         self.class.new(operand1.find_correlate_in(relation), operand2.find_correlate_in(relation))
+       end
+     end
++    
++    class CompoundPredicate < Binary; end
++
++    class And < CompoundPredicate
++      def complement
++        Or.new(operand1.complement, operand2.complement)
++      end
++    end
++    
++    class Or < CompoundPredicate
++      def complement
++        And.new(operand1.complement, operand2.complement)
++      end
++    end
+ 
+     class Equality < Binary
+       def ==(other)
+@@ -31,14 +131,64 @@ module Arel
+           ((operand1 == other.operand1 and operand2 == other.operand2) or
+            (operand1 == other.operand2 and operand2 == other.operand1))
+       end
++      
++      def complement
++        Inequality.new(operand1, operand2)
++      end
+     end
+ 
+-    class Not                   < Binary; end
+-    class GreaterThanOrEqualTo  < Binary; end
+-    class GreaterThan           < Binary; end
+-    class LessThanOrEqualTo     < Binary; end
+-    class LessThan              < Binary; end
+-    class Match                 < Binary; end
+-    class In                    < Binary; end
++    class Inequality  < Equality
++      def complement
++        Equality.new(operand1, operand2)
++      end
++    end
++    
++    class GreaterThanOrEqualTo < Binary
++      def complement
++        LessThan.new(operand1, operand2)
++      end
++    end
++    
++    class GreaterThan < Binary
++      def complement
++        LessThanOrEqualTo.new(operand1, operand2)
++      end
++    end
++    
++    class LessThanOrEqualTo < Binary
++      def complement
++        GreaterThan.new(operand1, operand2)
++      end
++    end
++    
++    class LessThan < Binary
++      def complement
++        GreaterThanOrEqualTo.new(operand1, operand2)
++      end
++    end
++    
++    class Match < Binary
++      def complement
++        NotMatch.new(operand1, operand2)
++      end
++    end
++    
++    class NotMatch < Binary
++      def complement
++        Match.new(operand1, operand2)
++      end
++    end
++    
++    class In < Binary
++      def complement
++        NotIn.new(operand1, operand2)
++      end
++    end
++    
++    class NotIn < Binary
++      def complement
++        In.new(operand1, operand2)
++      end
++    end
+   end
+ end
+diff --git a/lib/arel/engines/memory/predicates.rb b/lib/arel/engines/memory/predicates.rb
+index f87bf68..0e88810 100644
+--- a/lib/arel/engines/memory/predicates.rb
++++ b/lib/arel/engines/memory/predicates.rb
+@@ -5,12 +5,54 @@ module Arel
+         operand1.eval(row).send(operator, operand2.eval(row))
+       end
+     end
++    
++    class Unary < Predicate
++      def eval(row)
++        operand.eval(row).send(operator)
++      end
++    end
++    
++    class Not < Unary
++      def eval(row)
++        !operand.eval(row)
++      end
++    end
++    
++    class Polyadic < Predicate
++      def eval(row)
++        predicates.send(compounder) do |operation|
++          operation.eval(row)
++        end
++      end
++    end
++    
++    class Any < Polyadic
++      def compounder; :any? end
++    end
++    
++    class All < Polyadic
++      def compounder; :all? end
++    end
++    
++    class CompoundPredicate < Binary
++      def eval(row)
++        eval "operand1.eval(row) #{operator} operand2.eval(row)"
++      end
++    end
++
++    class Or < CompoundPredicate
++      def operator; :or end
++    end
++
++    class And < CompoundPredicate
++      def operator; :and end
++    end
+ 
+     class Equality < Binary
+       def operator; :== end
+     end
+ 
+-    class Not < Binary
++    class Inequality < Equality
+       def eval(row)
+         operand1.eval(row) != operand2.eval(row)
+       end
+@@ -35,9 +77,23 @@ module Arel
+     class Match < Binary
+       def operator; :=~ end
+     end
++    
++    class NotMatch < Binary
++      def eval(row)
++        operand1.eval(row) !~ operand2.eval(row)
++      end
++    end
+ 
+     class In < Binary
+-      def operator; :include? end
++      def eval(row)
++        operand2.eval(row).include?(operand1.eval(row))
++      end
++    end
++    
++    class NotIn < Binary
++      def eval(row)
++        !(operand2.eval(row).include?(operand1.eval(row)))
++      end
+     end
+   end
+ end
+diff --git a/lib/arel/engines/sql/core_extensions/array.rb b/lib/arel/engines/sql/core_extensions/array.rb
+index 72f579b..412479d 100644
+--- a/lib/arel/engines/sql/core_extensions/array.rb
++++ b/lib/arel/engines/sql/core_extensions/array.rb
+@@ -12,6 +12,10 @@ module Arel
+       def inclusion_predicate_sql
+         "IN"
+       end
++      
++      def exclusion_predicate_sql
++        "NOT IN"
++      end
+ 
+       Array.send(:include, self)
+     end
+diff --git a/lib/arel/engines/sql/core_extensions/nil_class.rb b/lib/arel/engines/sql/core_extensions/nil_class.rb
+index c3dbc8c..ab990d6 100644
+--- a/lib/arel/engines/sql/core_extensions/nil_class.rb
++++ b/lib/arel/engines/sql/core_extensions/nil_class.rb
+@@ -4,6 +4,10 @@ module Arel
+       def equality_predicate_sql
+         'IS'
+       end
++      
++      def inequality_predicate_sql
++        'IS NOT'
++      end
+ 
+       NilClass.send(:include, self)
+     end
+diff --git a/lib/arel/engines/sql/core_extensions/object.rb b/lib/arel/engines/sql/core_extensions/object.rb
+index 9f15dff..01c3c54 100644
+--- a/lib/arel/engines/sql/core_extensions/object.rb
++++ b/lib/arel/engines/sql/core_extensions/object.rb
+@@ -8,6 +8,10 @@ module Arel
+       def equality_predicate_sql
+         '='
+       end
++      
++      def inequality_predicate_sql
++        '!='
++      end
+ 
+       Object.send(:include, self)
+     end
+diff --git a/lib/arel/engines/sql/core_extensions/range.rb b/lib/arel/engines/sql/core_extensions/range.rb
+index 46124f8..b5b1534 100644
+--- a/lib/arel/engines/sql/core_extensions/range.rb
++++ b/lib/arel/engines/sql/core_extensions/range.rb
+@@ -8,6 +8,10 @@ module Arel
+       def inclusion_predicate_sql
+         "BETWEEN"
+       end
++      
++      def exclusion_predicate_sql
++        "NOT BETWEEN"
++      end
+ 
+       Range.send(:include, self)
+     end
+diff --git a/lib/arel/engines/sql/predicates.rb b/lib/arel/engines/sql/predicates.rb
+index 3756231..df8700a 100644
+--- a/lib/arel/engines/sql/predicates.rb
++++ b/lib/arel/engines/sql/predicates.rb
+@@ -5,6 +5,16 @@ module Arel
+         "#{operand1.to_sql} #{predicate_sql} #{operand1.format(operand2)}"
+       end
+     end
++    
++    class Unary < Predicate
++      def to_sql(formatter = nil)
++        "#{predicate_sql} (#{operand.to_sql(formatter)})"
++      end
++    end
++    
++    class Not < Unary
++      def predicate_sql; "NOT" end
++    end
+ 
+     class CompoundPredicate < Binary
+       def to_sql(formatter = nil)
+@@ -19,6 +29,22 @@ module Arel
+     class And < CompoundPredicate
+       def predicate_sql; "AND" end
+     end
++    
++    class Polyadic < Predicate
++      def to_sql(formatter = nil)
++        "(" + 
++          predicates.map {|p| p.to_sql(formatter)}.join(" #{predicate_sql} ") +
++        ")"
++      end
++    end
++    
++    class Any < Polyadic
++      def predicate_sql; "OR" end
++    end
++    
++    class All < Polyadic
++      def predicate_sql; "AND" end
++    end
+ 
+     class Equality < Binary
+       def predicate_sql
+@@ -26,8 +52,10 @@ module Arel
+       end
+     end
+ 
+-    class Not < Binary
+-      def predicate_sql; '!=' end
++    class Inequality < Equality
++      def predicate_sql
++        operand2.inequality_predicate_sql
++      end
+     end
+ 
+     class GreaterThanOrEqualTo < Binary
+@@ -49,9 +77,27 @@ module Arel
+     class Match < Binary
+       def predicate_sql; 'LIKE' end
+     end
++    
++    class NotMatch < Binary
++      def predicate_sql; 'NOT LIKE' end
++    end
+ 
+     class In < Binary
++      def to_sql(formatter = nil)
++        if operand2.is_a?(Range) && operand2.exclude_end?
++          GreaterThanOrEqualTo.new(operand1, operand2.begin).and(
++            LessThan.new(operand1, operand2.end)
++          ).to_sql(formatter)
++        else
++          super
++        end
++      end
++      
+       def predicate_sql; operand2.inclusion_predicate_sql end
+     end
++    
++    class NotIn < Binary
++      def predicate_sql; operand2.exclusion_predicate_sql end
++    end
+   end
+ end
+diff --git a/lib/arel/engines/sql/primitives.rb b/lib/arel/engines/sql/primitives.rb
+index 6665793..15a27b2 100644
+--- a/lib/arel/engines/sql/primitives.rb
++++ b/lib/arel/engines/sql/primitives.rb
+@@ -29,10 +29,18 @@ module Arel
+     def inclusion_predicate_sql
+       value.inclusion_predicate_sql
+     end
++    
++    def exclusion_predicate_sql
++      value.exclusion_predicate_sql
++    end
+ 
+     def equality_predicate_sql
+       value.equality_predicate_sql
+     end
++    
++    def inequality_predicate_sql
++      value.inequality_predicate_sql
++    end
+ 
+     def to_sql(formatter = Sql::WhereCondition.new(relation))
+       formatter.value value
+diff --git a/lib/arel/engines/sql/relations/relation.rb b/lib/arel/engines/sql/relations/relation.rb
+index f372589..fc353fe 100644
+--- a/lib/arel/engines/sql/relations/relation.rb
++++ b/lib/arel/engines/sql/relations/relation.rb
+@@ -21,6 +21,10 @@ module Arel
+     def inclusion_predicate_sql
+       "IN"
+     end
++    
++    def exclusion_predicate_sql
++      "NOT IN"
++    end
+ 
+     def primary_key
+       connection_id = engine.connection.object_id
+diff --git a/spec/relations/join_spec.rb b/spec/relations/join_spec.rb
+index 47e468a..3894d17 100644
+--- a/spec/relations/join_spec.rb
++++ b/spec/relations/join_spec.rb
+@@ -13,6 +13,7 @@ describe "Arel" do
+ 
+       r.attribute :id,       Arel::Attributes::Integer
+       r.attribute :owner_id, Arel::Attributes::Integer
++      r.attribute :name,     Arel::Attributes::String
+       r.attribute :age,      Arel::Attributes::Integer
+     end
+   end
+@@ -28,9 +29,10 @@ describe "Arel" do
+         8.times do |i|
+           thing_id = owner_id * 8 + i
+           age      = 2 * thing_id
++          name     = "Name#{thing_id}"
+ 
+-          @thing.insert([thing_id, owner_id, age])
+-          @expected << Arel::Row.new(@relation, [thing_id, owner_id, age, owner_id])
++          @thing.insert([thing_id, owner_id, name, age])
++          @expected << Arel::Row.new(@relation, [thing_id, owner_id, name, age, owner_id])
+         end
+       end
+     end
+diff --git a/spec/relations/relation_spec.rb b/spec/relations/relation_spec.rb
+index 808ddf1..0381f87 100644
+--- a/spec/relations/relation_spec.rb
++++ b/spec/relations/relation_spec.rb
+@@ -14,7 +14,7 @@ describe "Arel" do
+ 
+   describe "Relation" do
+     before :all do
+-      @expected = (1..20).map { |i| @relation.insert([i, nil, 2 * i]) }
++      @expected = (1..20).map { |i| @relation.insert([i, "Name#{i}", 2 * i]) }
+     end
+ 
+     it_should_behave_like 'A Relation'
+diff --git a/spec/shared/relation_spec.rb b/spec/shared/relation_spec.rb
+index 5f0ae4b..dabbde2 100644
+--- a/spec/shared/relation_spec.rb
++++ b/spec/shared/relation_spec.rb
+@@ -35,9 +35,9 @@ share_examples_for 'A Relation' do
+       @relation.where(@relation[:age].eq(@pivot[@relation[:age]])).should have_rows(expected)
+     end
+ 
+-    it "finds rows with a not predicate" do
++    it "finds rows with a noteq predicate" do
+       expected = @expected.select { |r| r[@relation[:age]] != @pivot[@relation[:age]] }
+-      @relation.where(@relation[:age].not(@pivot[@relation[:age]])).should have_rows(expected)
++      @relation.where(@relation[:age].noteq(@pivot[@relation[:age]])).should have_rows(expected)
+     end
+ 
+     it "finds rows with a less than predicate" do
+@@ -60,12 +60,39 @@ share_examples_for 'A Relation' do
+       @relation.where(@relation[:age].gteq(@pivot[@relation[:age]])).should have_rows(expected)
+     end
+ 
+-    it "finds rows with a matches predicate"
++    it "finds rows with a matches predicate" do
++      expected = @expected.select { |r| r[@relation[:name]] =~ /#{@pivot[@relation[:name]]}/ }
++      @relation.where(@relation[:name].matches(/#{@pivot[@relation[:name]]}/)).should have_rows(expected)
++    end
++    
++    it "finds rows with a not matches predicate" do
++      expected = @expected.select { |r| r[@relation[:name]] !~ /#{@pivot[@relation[:name]]}/ }
++      @relation.where(@relation[:name].notmatches(/#{@pivot[@relation[:name]]}/)).should have_rows(expected)
++    end
+ 
+     it "finds rows with an in predicate" do
+-      pending
+-      set = @expected[1..(@expected.length/2+1)]
+-      @relation.all(:id.in => set.map { |r| r.id }).should have_resources(set)
++      expected = @expected.select {|r| r[@relation[:age]] >=3 && r[@relation[:age]] <= 20}
++      @relation.where(@relation[:age].in(3..20)).should have_rows(expected)
++    end
++    
++    it "finds rows with a not in predicate" do
++      expected = @expected.select {|r| !(r[@relation[:age]] >=3 && r[@relation[:age]] <= 20)}
++      @relation.where(@relation[:age].notin(3..20)).should have_rows(expected)
++    end
++    
++    it "finds rows with a not predicate" do
++      expected = @expected.select {|r| !(r[@relation[:age]] >= 3 && r[@relation[:age]] <= 20)}
++      @relation.where(@relation[:age].in(3..20).not).should have_rows(expected)
++    end
++    
++    it "finds rows with a grouped predicate of class Any" do
++      expected = @expected.select {|r| [2,4,8,16].include?(r[@relation[:age]])}
++      @relation.where(@relation[:age].in_any([2,4], [8, 16])).should have_rows(expected)
++    end
++    
++    it "finds rows with a grouped predicate of class All" do
++      expected = @expected.select {|r| r[@relation[:name]] =~ /Name/ && r[@relation[:name]] =~ /1/}
++      @relation.where(@relation[:name].matches_all(/Name/, /1/)).should have_rows(expected)
+     end
+   end
+ 
+-- 
+1.6.4.4
+

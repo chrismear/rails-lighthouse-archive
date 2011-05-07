@@ -1,0 +1,181 @@
+From 29fafaa7935e42fdda0644400cd7ba9d2997cb1e Mon Sep 17 00:00:00 2001
+From: Piotr Chmolowski <piotr@chmolowski.pl>
+Date: Sun, 17 Oct 2010 12:34:26 +0200
+Subject: [PATCH] Implement 'increment' and 'decrement' for ActiveRecord::Relation [#5614 state:resolved]
+
+---
+ activerecord/lib/active_record/base.rb        |    2 +-
+ activerecord/lib/active_record/persistence.rb |    4 ++
+ activerecord/lib/active_record/relation.rb    |   44 +++++++++++++++++++++++++
+ activerecord/test/cases/persistence_test.rb   |   44 +++++++++++++++++++++++++
+ 4 files changed, 93 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 78b3507..81d996c 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -421,7 +421,7 @@ module ActiveRecord #:nodoc:
+     self.serialized_attributes = {}
+ 
+     class << self # Class methods
+-      delegate :find, :first, :last, :all, :destroy, :destroy_all, :exists?, :delete, :delete_all, :update, :update_all, :to => :scoped
++      delegate :find, :first, :last, :all, :destroy, :destroy_all, :exists?, :delete, :delete_all, :update, :update_all, :increment, :decrement, :to => :scoped
+       delegate :find_each, :find_in_batches, :to => :scoped
+       delegate :select, :group, :order, :except, :limit, :offset, :joins, :where, :preload, :eager_load, :includes, :from, :lock, :readonly, :having, :create_with, :to => :scoped
+       delegate :count, :average, :minimum, :maximum, :sum, :calculate, :to => :scoped
+diff --git a/activerecord/lib/active_record/persistence.rb b/activerecord/lib/active_record/persistence.rb
+index 707c1a0..1ca2c04 100644
+--- a/activerecord/lib/active_record/persistence.rb
++++ b/activerecord/lib/active_record/persistence.rb
+@@ -140,6 +140,8 @@ module ActiveRecord
+     # Initializes +attribute+ to zero if +nil+ and adds the value passed as +by+ (default is 1).
+     # The increment is performed directly on the underlying attribute, no setter is invoked.
+     # Only makes sense for number-based attributes. Returns +self+.
++    #
++    # Note: see also ActiveRecord::Relation#increment
+     def increment(attribute, by = 1)
+       self[attribute] ||= 0
+       self[attribute] += by
+@@ -157,6 +159,8 @@ module ActiveRecord
+     # Initializes +attribute+ to zero if +nil+ and subtracts the value passed as +by+ (default is 1).
+     # The decrement is performed directly on the underlying attribute, no setter is invoked.
+     # Only makes sense for number-based attributes. Returns +self+.
++    #
++    # Note: see also ActiveRecord::Relation#decrement
+     def decrement(attribute, by = 1)
+       self[attribute] ||= 0
+       self[attribute] -= by
+diff --git a/activerecord/lib/active_record/relation.rb b/activerecord/lib/active_record/relation.rb
+index f129b54..2761c5f 100644
+--- a/activerecord/lib/active_record/relation.rb
++++ b/activerecord/lib/active_record/relation.rb
+@@ -297,6 +297,50 @@ module ActiveRecord
+       where(@klass.primary_key => id_or_array).delete_all
+     end
+ 
++    # Updates a record (or multiple records) by adding the value passed as +by+ (default is 1) to the attribute
++    # referenced in +attr_name+.
++    #
++    # This method differs from ActiveRecord::Persistence#increment in that it constructs a single SQL UPDATE
++    # statement and sends it straight to the database. It is completely unaware of the previous value, it does
++    # not instantiate the involved models and it does not trigger Active Record callbacks or validations.
++    # This method is the equivalent of executing the following statement in raw SQL:
++    #
++    #   UPDATE articles SET comment_count = comment_count + 1 WHERE id = 1
++    #
++    # ==== Examples
++    #
++    #   # Update a single row
++    #   Article.increment(1, :counter)
++    #
++    #   # Update multiple rows
++    #   Article.increment([1, 2, 3], :counter)
++    def increment(id_or_array, attr_name, by = 1)
++      raise ArgumentError, "#{attr_name} is not a valid attribute" unless @klass.attribute_method?(attr_name.to_sym)
++      where(@klass.primary_key => id_or_array).update_all(["#{attr_name} = #{attr_name} + %d", by])
++    end
++
++    # Updates a record (or multiple records) by subtracting the value passed as +by+ (default is 1) from the
++    # attribute referenced in +attr_name+.
++    #
++    # This method differs from ActiveRecord::Persistence#decrement in that it constructs a single SQL UPDATE
++    # statement and sends it straight to the database. It is completely unaware of the previous value, it does
++    # not instantiate the involved models and it does not trigger Active Record callbacks or validations.
++    # This method is the equivalent of executing the following statement in raw SQL:
++    #
++    #   UPDATE articles SET comment_count = comment_count - 1 WHERE id = 1
++    #
++    # ==== Examples
++    #
++    #   # Update a single row
++    #   Article.decrement(1, :counter)
++    #
++    #   # Update multiple rows
++    #   Article.decrement([1, 2, 3], :counter)
++    def decrement(id_or_array, attr_name, by = 1)
++      raise ArgumentError, "#{attr_name} is not a valid attribute" unless @klass.attribute_method?(attr_name.to_sym)
++      where(@klass.primary_key => id_or_array).update_all(["#{attr_name} = #{attr_name} - %d", by])
++    end
++
+     def reload
+       reset
+       to_a # force reload
+diff --git a/activerecord/test/cases/persistence_test.rb b/activerecord/test/cases/persistence_test.rb
+index ffe6fb9..b4baa10 100644
+--- a/activerecord/test/cases/persistence_test.rb
++++ b/activerecord/test/cases/persistence_test.rb
+@@ -69,6 +69,10 @@ class PersistencesTest < ActiveRecord::TestCase
+ 
+     accounts(:signals37).increment(:credit_limit).increment!(:credit_limit)
+     assert_equal 53, accounts(:signals37, :reload).credit_limit
++
++    Account.increment(accounts(:signals37).id, :credit_limit)
++    assert_equal 54, accounts(:signals37).reload.credit_limit
++    assert_raise(ArgumentError) { Account.increment(accounts(:signals37).id, :non_existing_attr) }
+   end
+ 
+   def test_increment_nil_attribute
+@@ -84,6 +88,24 @@ class PersistencesTest < ActiveRecord::TestCase
+ 
+     accounts(:signals37).increment(:credit_limit, 1).increment!(:credit_limit, 3)
+     assert_equal 59, accounts(:signals37, :reload).credit_limit
++
++    Account.increment(accounts(:signals37).id, :credit_limit, 10)
++    assert_equal 69, accounts(:signals37).reload.credit_limit
++  end
++
++  def test_increment_many
++    assert_equal 50, accounts(:signals37).credit_limit
++    assert_equal 53, accounts(:odegy_account).credit_limit
++
++    Account.increment([accounts(:signals37).id, accounts(:odegy_account).id], :credit_limit)
++
++    assert_equal 51, accounts(:signals37).reload.credit_limit
++    assert_equal 54, accounts(:odegy_account).reload.credit_limit
++
++    Account.increment([accounts(:signals37).id, accounts(:odegy_account).id], :credit_limit, 5)
++
++    assert_equal 56, accounts(:signals37).reload.credit_limit
++    assert_equal 59, accounts(:odegy_account).reload.credit_limit
+   end
+ 
+   def test_destroy_all
+@@ -122,6 +144,10 @@ class PersistencesTest < ActiveRecord::TestCase
+ 
+     accounts(:signals37).decrement(:credit_limit).decrement!(:credit_limit)
+     assert_equal 47, accounts(:signals37, :reload).credit_limit
++
++    Account.decrement(accounts(:signals37).id, :credit_limit)
++    assert_equal 46, accounts(:signals37).reload.credit_limit
++    assert_raise(ArgumentError) { Account.decrement(accounts(:signals37).id, :non_existing_attr) }
+   end
+ 
+   def test_decrement_attribute_by
+@@ -131,6 +157,24 @@ class PersistencesTest < ActiveRecord::TestCase
+ 
+     accounts(:signals37).decrement(:credit_limit, 1).decrement!(:credit_limit, 3)
+     assert_equal 41, accounts(:signals37, :reload).credit_limit
++
++    Account.decrement(accounts(:signals37).id, :credit_limit, 10)
++    assert_equal 31, accounts(:signals37).reload.credit_limit
++  end
++
++  def test_decrement_many
++    assert_equal 50, accounts(:signals37).credit_limit
++    assert_equal 53, accounts(:odegy_account).credit_limit
++
++    Account.decrement([accounts(:signals37).id, accounts(:odegy_account).id], :credit_limit)
++
++    assert_equal 49, accounts(:signals37).reload.credit_limit
++    assert_equal 52, accounts(:odegy_account).reload.credit_limit
++
++    Account.decrement([accounts(:signals37).id, accounts(:odegy_account).id], :credit_limit, 5)
++
++    assert_equal 44, accounts(:signals37).reload.credit_limit
++    assert_equal 47, accounts(:odegy_account).reload.credit_limit
+   end
+ 
+   def test_create
+-- 
+1.6.4.2
+

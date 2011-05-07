@@ -1,0 +1,169 @@
+From 28be383396a44e99c0bc72f8682b8fbc3fb7dbc0 Mon Sep 17 00:00:00 2001
+From: Santiago Pastorino <santiago@wyeworks.com>
+Date: Tue, 25 May 2010 02:38:23 -0300
+Subject: [PATCH] translation_helper refactor
+
+[#4705 state:committed]
+---
+ .../lib/action_view/helpers/translation_helper.rb  |   63 +++++++++++--------
+ .../test/template/translation_helper_test.rb       |   16 +++---
+ 2 files changed, 44 insertions(+), 35 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/translation_helper.rb b/actionpack/lib/action_view/helpers/translation_helper.rb
+index f700eee..940e0f6 100644
+--- a/actionpack/lib/action_view/helpers/translation_helper.rb
++++ b/actionpack/lib/action_view/helpers/translation_helper.rb
+@@ -10,25 +10,19 @@ module ActionView
+       # people/index.html.erb template, you'll actually be calling I18n.translate("people.index.foo"). This makes it less repetitive
+       # to translate many keys within the same partials and gives you a simple framework for scoping them consistently. If you don't
+       # prepend the key with a period, nothing is converted.
+-      def translate(keys, options = {})
+-        if multiple_keys = keys.is_a?(Array)
+-          ActiveSupport::Deprecation.warn "Giving an array to translate is deprecated, please give a symbol or a string instead", caller
+-        end
+-
+-        options[:raise] = true
+-        keys = scope_keys_by_partial(keys)
+-
+-        translations = I18n.translate(keys, options)
+-        translations = [translations] if !multiple_keys && translations.size > 1
+-        translations = html_safe_translation_keys(keys, translations)
+-
+-        if multiple_keys || translations.size > 1
+-          translations
++      def translate(key, options = {})
++        if key.is_a?(Array)
++          deprecated_translate(key, options)
+         else
+-          translations.first
++          translation = I18n.translate(scope_key_by_partial(key), options.merge!(:raise => true))
++          if html_safe_translation_key?(key) && translation.respond_to?(:html_safe)
++            translation.html_safe
++          else
++            translation
++          end
+         end
+       rescue I18n::MissingTranslationData => e
+-        keys = I18n.send(:normalize_translation_keys, e.locale, e.key, e.options[:scope])
++        keys = I18n.normalize_keys(e.locale, e.key, e.options[:scope])
+         content_tag('span', keys.join(', '), :class => 'translation_missing')
+       end
+       alias :t :translate
+@@ -39,23 +33,38 @@ module ActionView
+       end
+       alias :l :localize
+ 
+-
+       private
+-        def scope_keys_by_partial(keys)
+-          Array.wrap(keys).map do |key|
+-            key = key.to_s
++        def scope_key_by_partial(key)
++          if key.to_s.first == "."
++            template.path_without_format_and_extension.gsub(%r{/_?}, ".") + key.to_s
++          else
++            key
++          end
++        end
+ 
+-            if key.first == "."
+-              template.path_without_format_and_extension.gsub(%r{/_?}, ".") + key
+-            else
+-              key
+-            end
++        def html_safe_translation_key?(key)
++          key.to_s =~ /(\b|_|\.)html$/
++        end
++
++        def deprecated_translate(keys, options = {})
++          ActiveSupport::Deprecation.warn "Giving an array to translate is deprecated, please give a symbol or a string instead", caller
++          keys = deprecated_scope_keys_by_partial(keys)
++
++          translations = I18n.translate(keys, options.merge!(:raise => true))
++          translations = deprecated_html_safe_translation_keys(keys, translations)
++
++          translations.size > 1 ? translations : translations.first
++        end
++
++        def deprecated_scope_keys_by_partial(keys)
++          keys.map do |key|
++            scope_key_by_partial(key)
+           end
+         end
+ 
+-        def html_safe_translation_keys(keys, translations)
++        def deprecated_html_safe_translation_keys(keys, translations)
+           keys.zip(translations).map do |key, translation|
+-            if key =~ /(\b|_|\.)html$/ && translation.respond_to?(:html_safe)
++            if html_safe_translation_key?(key) && translation.respond_to?(:html_safe)
+               translation.html_safe
+             else
+               translation
+diff --git a/actionpack/test/template/translation_helper_test.rb b/actionpack/test/template/translation_helper_test.rb
+index 6555eaa..a83194d 100644
+--- a/actionpack/test/template/translation_helper_test.rb
++++ b/actionpack/test/template/translation_helper_test.rb
+@@ -9,7 +9,7 @@ class TranslationHelperTest < ActiveSupport::TestCase
+   end
+ 
+   def test_delegates_to_i18n_setting_the_raise_option
+-    I18n.expects(:translate).with(['foo'], :locale => 'en', :raise => true).returns([""])
++    I18n.expects(:translate).with(:foo, :locale => 'en', :raise => true).returns([""])
+     translate :foo, :locale => 'en'
+   end
+ 
+@@ -19,7 +19,7 @@ class TranslationHelperTest < ActiveSupport::TestCase
+   end
+ 
+   def test_translation_returning_an_array
+-    I18n.expects(:translate).with(["foo"], :raise => true).returns(["foo", "bar"])
++    I18n.expects(:translate).with(:foo, :raise => true).returns(["foo", "bar"])
+     assert_equal ["foo", "bar"], translate(:foo)
+   end
+ 
+@@ -54,7 +54,7 @@ class TranslationHelperTest < ActiveSupport::TestCase
+   end
+ 
+   def test_scoping_by_partial
+-    I18n.expects(:translate).with(["test.translation.helper"], :raise => true).returns(["helper"])
++    I18n.expects(:translate).with("test.translation.helper", :raise => true).returns("helper")
+     @view = ActionView::Base.new(ActionController::Base.view_paths, {})
+     assert_equal "helper", @view.render(:file => "test/translation")
+   end
+@@ -68,28 +68,28 @@ class TranslationHelperTest < ActiveSupport::TestCase
+   end
+ 
+   def test_translate_works_with_symbols
+-    I18n.expects(:translate).with(["hello"], :raise => true).returns(["Hello World"])
++    I18n.expects(:translate).with(:hello, :raise => true).returns("Hello World")
+     assert_equal "Hello World", translate(:hello)
+   end
+ 
+ 
+   def test_translate_does_not_mark_plain_text_as_safe_html
+-    I18n.expects(:translate).with(["hello"], :raise => true).returns(["Hello World"])
++    I18n.expects(:translate).with("hello", :raise => true).returns(["Hello World"])
+     assert_equal false, translate("hello").html_safe?
+   end
+ 
+   def test_translate_marks_translations_named_html_as_safe_html
+-    I18n.expects(:translate).with(["html"], :raise => true).returns(["<a>Hello World</a>"])
++    I18n.expects(:translate).with("html", :raise => true).returns("<a>Hello World</a>")
+     assert translate("html").html_safe?
+   end
+ 
+   def test_translate_marks_translations_with_a_html_suffix_as_safe_html
+-    I18n.expects(:translate).with(["hello_html"], :raise => true).returns(["<a>Hello World</a>"])
++    I18n.expects(:translate).with("hello_html", :raise => true).returns("<a>Hello World</a>")
+     assert translate("hello_html").html_safe?
+   end
+ 
+   def test_translation_returning_an_array_ignores_html_suffix
+-    I18n.expects(:translate).with(["foo_html"], :raise => true).returns(["foo", "bar"])
++    I18n.expects(:translate).with(:foo_html, :raise => true).returns(["foo", "bar"])
+     assert_equal ["foo", "bar"], translate(:foo_html)
+   end
+ end
+-- 
+1.7.1
+

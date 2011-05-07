@@ -1,0 +1,338 @@
+From 3c9c6ac3bd070d456643ba20ac9d689379bb0d8d Mon Sep 17 00:00:00 2001
+From: Mike Perham <mperham@gmail.com>
+Date: Wed, 7 Apr 2010 16:19:55 -0500
+Subject: [PATCH] Initial changes to support Fibers in 1.9 [#4337]
+
+---
+ Gemfile                                            |    1 +
+ .../abstract/connection_pool.rb                    |  118 ++++++++++++++++----
+ activerecord/test/cases/connection_pool_test.rb    |   93 +++++++++++++++-
+ railties/lib/rails/application/configuration.rb    |   12 ++-
+ 4 files changed, 196 insertions(+), 28 deletions(-)
+
+diff --git a/Gemfile b/Gemfile
+index dd26a9d..1684fef 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -7,6 +7,7 @@ gem "rake",  ">= 0.8.7"
+ gem "mocha", ">= 0.9.8"
+ 
+ group :mri do
++  gem "eventmachine", ">= 0.12.10" if RUBY_VERSION >= '1.9.0'
+   if RUBY_VERSION < '1.9'
+     gem "system_timer"
+     gem "ruby-debug", ">= 0.10.3"
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+index bf8c546..526903f 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+@@ -63,17 +63,16 @@ module ActiveRecord
+       # host name, username, password, etc), as well as the maximum size for
+       # this ConnectionPool.
+       #
++      # Concurrency model determines whether this Rails application is using
++      # threads or fibers for concurrent operations.
++      #
+       # The default ConnectionPool maximum size is 5.
+-      def initialize(spec)
++      def initialize(spec, model=:threaded)
+         @spec = spec
+ 
+         # The cache of reserved connections mapped to threads
+         @reserved_connections = {}
+ 
+-        # The mutex used to synchronize pool access
+-        @connection_mutex = Monitor.new
+-        @queue = @connection_mutex.new_cond
+-
+         # default 5 second timeout unless on ruby 1.9
+         @timeout =
+           if RUBY_VERSION < '1.9'
+@@ -85,6 +84,15 @@ module ActiveRecord
+ 
+         @connections = []
+         @checked_out = []
++
++        if defined?(Rails::Application)
++          concurrency_model = Rails::Application.config.concurrency_model
++        else
++          concurrency_model = model
++        end
++
++        @connection_mutex = Monitor.new
++        self.extend(concurrency_model == :fibered ? FiberedPool : ThreadedPool)
+       end
+ 
+       # Retrieve the connection associated with the current thread, or call
+@@ -226,24 +234,6 @@ module ActiveRecord
+         ActiveRecord::Base.send(spec.adapter_method, spec.config)
+       end
+ 
+-      def current_connection_id #:nodoc:
+-        Thread.current.object_id
+-      end
+-
+-      # Remove stale threads from the cache.
+-      def remove_stale_cached_threads!(cache, &block)
+-        keys = Set.new(cache.keys)
+-
+-        Thread.list.each do |thread|
+-          keys.delete(thread.object_id) if thread.alive?
+-        end
+-        keys.each do |key|
+-          next unless cache.has_key?(key)
+-          block.call(key, cache[key])
+-          cache.delete(key)
+-        end
+-      end
+-
+       def checkout_new_connection
+         c = new_connection
+         @connections << c
+@@ -256,9 +246,9 @@ module ActiveRecord
+       end
+ 
+       def checkout_and_verify(c)
++        @checked_out << c
+         c.run_callbacks :checkout do
+           c.verify!
+-          @checked_out << c
+         end
+         c
+       end
+@@ -371,5 +361,85 @@ module ActiveRecord
+         end
+       end
+     end
++
++    module ThreadedPool
++      def self.extended(base)
++        base.instance_eval do
++          @queue = @connection_mutex.new_cond
++        end
++      end
++
++      private
++      def current_connection_id #:nodoc:
++        Thread.current.object_id
++      end
++
++      # Remove stale threads from the cache.
++      def remove_stale_cached_threads!(cache, &block)
++        keys = Set.new(cache.keys)
++
++        Thread.list.each do |thread|
++          keys.delete(thread.object_id) if thread.alive?
++        end
++        keys.each do |key|
++          next unless cache.has_key?(key)
++          block.call(key, cache[key])
++          cache.delete(key)
++        end
++      end
++    end
++
++    module FiberedPool
++      class Queue
++        def initialize
++          @queue = []
++        end
++
++        def wait(timeout)
++          t = timeout || 5
++          fiber = Fiber.current
++          x = EM::Timer.new(t) do
++            @queue.delete(fiber)
++            fiber.resume(false)
++          end
++          @queue << fiber
++          ret = Fiber.yield
++          x.cancel
++          ret
++        end
++
++        def signal
++          fiber = @queue.pop
++          fiber.resume(true) if fiber
++        end
++      end
++
++      def self.extended(base)
++        base.instance_eval do
++          @queue = Queue.new
++        end
++      end
++
++      private
++      def current_connection_id #:nodoc:
++        Fiber.current.object_id
++      end
++
++      # Remove stale threads from the cache.
++      def remove_stale_cached_threads!(cache, &block)
++        keys = Set.new(cache.keys)
++        # TODO We have no way to enumerate all Fibers in the system
++        # except through ObjectSpace.  There's no Fiber.list method.
++        Thread.list.each do |thread|
++          keys.delete(thread.object_id) if thread.alive?
++        end
++        keys.each do |key|
++          next unless cache.has_key?(key)
++          block.call(key, cache[key])
++          cache.delete(key)
++        end
++      end
++    end
++
+   end
+ end
+diff --git a/activerecord/test/cases/connection_pool_test.rb b/activerecord/test/cases/connection_pool_test.rb
+index cc9b2a4..d16bde2 100644
+--- a/activerecord/test/cases/connection_pool_test.rb
++++ b/activerecord/test/cases/connection_pool_test.rb
+@@ -5,21 +5,108 @@ class ConnectionManagementTest < ActiveRecord::TestCase
+     @env = {}
+     @app = stub('App')
+     @management = ActiveRecord::ConnectionAdapters::ConnectionManagement.new(@app)
+-    
++
+     @connections_cleared = false
+     ActiveRecord::Base.stubs(:clear_active_connections!).with { @connections_cleared = true }
+   end
+-  
++
+   test "clears active connections after each call" do
+     @app.expects(:call).with(@env)
+     @management.call(@env)
+     assert @connections_cleared
+   end
+-  
++
+   test "doesn't clear active connections when running in a test case" do
+     @env['rack.test'] = true
+     @app.expects(:call).with(@env)
+     @management.call(@env)
+     assert !@connections_cleared
+   end
++end
++
++class PoolConcurrencyTest < ActiveRecord::TestCase
++  class ThreadedAdapter < ActiveRecord::ConnectionAdapters::AbstractAdapter
++    def exec(sql)
++      sleep rand
++    end
++  end
++  class FiberedAdapter < ActiveRecord::ConnectionAdapters::AbstractAdapter
++    def exec(sql)
++      Fiber.sleep rand
++    end
++  end
++
++  def setup
++    spec = ActiveRecord::Base::ConnectionSpecification.new({}, 'fake')
++    @threaded_pool = ActiveRecord::ConnectionAdapters::ConnectionPool.new(spec)
++    @fibered_pool = ActiveRecord::ConnectionAdapters::ConnectionPool.new(spec, :fibered)
++
++    adapters = [ThreadedAdapter, FiberedAdapter].map { |cls| x=[];5.times { x << cls.new(nil) }; x }
++    @threaded_pool.stubs(:new_connection).returns(*adapters.shift).then.raises(ArgumentError)
++    @fibered_pool.stubs(:new_connection).returns(*adapters.shift).then.raises(ArgumentError)
++  end
++
++  if RUBY_VERSION >= '1.9.0'
++    require 'fiber'
++    require 'eventmachine'
++    class ::Fiber
++      def self.sleep(time)
++        fiber = Fiber.current
++        EM.add_timer(time) do
++          fiber.resume
++        end
++        Fiber.yield
++      end
++    end
++
++    test "fibered pool concurrent operations" do
++      EM.run do
++        count = 0
++        fibers = []
++        10.times do
++          f = Fiber.new do
++            begin
++              c1 = @fibered_pool.connection
++              c1.exec('not executed')
++              c2 = @fibered_pool.connection
++              assert_equal c1, c2
++              c2.exec('still not executed')
++              assert_equal 5, @fibered_pool.connections.size
++            rescue Exception => ex
++              puts ex.message
++              puts ex.backtrace.join("\n")
++            ensure
++              @fibered_pool.release_connection
++              count += 1
++              EM.stop if count == 10
++            end
++          end
++          fibers << f
++        end
++        fibers.each { |f| f.resume }
++      end
++    end
++  end
++
++  test "threaded pool concurrent operations" do
++    t = []
++    10.times do
++      t << Thread.new do
++        begin
++          c1 = @threaded_pool.connection
++          c1.exec('not executed')
++          c2 = @threaded_pool.connection
++          assert_equal c1, c2
++          c2.exec('still not executed')
++          assert_equal 5, @threaded_pool.connections.size
++        rescue Exception => ex
++          puts ex.message
++          puts ex.backtrace.join("\n")
++        ensure
++          @threaded_pool.release_connection
++        end
++      end
++    end
++    t.each { |t| t.join }
++  end
+ end
+\ No newline at end of file
+diff --git a/railties/lib/rails/application/configuration.rb b/railties/lib/rails/application/configuration.rb
+index f9f47ef..a73c03d 100644
+--- a/railties/lib/rails/application/configuration.rb
++++ b/railties/lib/rails/application/configuration.rb
+@@ -9,7 +9,8 @@ module Rails
+                     :encoding, :consider_all_requests_local, :dependency_loading,
+                     :filter_parameters,  :log_level, :logger, :metals,
+                     :plugins, :preload_frameworks, :reload_engines, :reload_plugins,
+-                    :secret_token, :serve_static_assets, :time_zone, :whiny_nils
++                    :secret_token, :serve_static_assets, :time_zone, :whiny_nils,
++                    :concurrency_model
+ 
+       def initialize(*)
+         super
+@@ -71,6 +72,15 @@ module Rails
+         self.cache_classes = true
+         self.dependency_loading = false
+         self.allow_concurrency = true
++        self.concurrency_model = :threaded
++        self
++      end
++
++      # Fibers do not have the same safety issues that Threads do so there's no reason
++      # to force any preloading or class caching.
++      def fibersafe!
++        self.allow_concurrency = true
++        self.concurrency_model = :fibered
+         self
+       end
+ 
+-- 
+1.6.4.1
+

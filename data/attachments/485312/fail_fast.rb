@@ -1,0 +1,2 @@
+module FailFast
+end

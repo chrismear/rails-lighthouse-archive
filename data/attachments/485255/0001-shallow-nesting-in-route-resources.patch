@@ -1,0 +1,163 @@
+From 2cfb141290179db7d1d94630d4dee897a42a6507 Mon Sep 17 00:00:00 2001
+From: Balazs Nagy <julsevern@gmail.com>
+Date: Fri, 16 Apr 2010 12:35:09 +0200
+Subject: [PATCH] Shallow nesting in route resources
+
+Allowing :shallow => true for resources. This option makes all subsequent resources to defer creating their collection resources to their parents, and prevents deeper nesting like this:
+
+resources :outer, :shallow => true do
+  resources :middle do
+    resources :inner
+end
+
+returns as
+
+resources :outer do
+  resources :middle, :only => [:index, :create, :new]
+end
+resources :middle, :only => [:show, :update, :destroy, :edit] do
+  resources :inner, :only => [:index, :create, :new]
+end
+resources :inner, :only => [:show, :update, :destroy, :edit]
+
+Signed-off-by: Balazs Nagy <julsevern@gmail.com>
+---
+ actionpack/lib/action_dispatch/routing/mapper.rb |   43 ++++++++++++++++++----
+ actionpack/test/dispatch/routing_test.rb         |   40 ++++++++++++++++++++
+ 2 files changed, 76 insertions(+), 7 deletions(-)
+
+diff --git a/actionpack/lib/action_dispatch/routing/mapper.rb b/actionpack/lib/action_dispatch/routing/mapper.rb
+index 5358574..5fbbbe8 100644
+--- a/actionpack/lib/action_dispatch/routing/mapper.rb
++++ b/actionpack/lib/action_dispatch/routing/mapper.rb
+@@ -578,19 +578,36 @@ module ActionDispatch
+             return self
+           end
+ 
++          shallow_root = options.delete(:shallow) == true
++          if shallow_root
++            raise ArgumentError, "can't use nested shallow scopes" if @scope[:shallow]
++            @scope[:shallow] = true
++          end
++
++          if @scope.has_key?(:shallow)
++            shallow, @scope[:shallow] = @scope[:shallow], []
++            yield if block_given?
++            deferred, @scope[:shallow] = @scope[:shallow], shallow
++          end
++
+           resource = Resource.new(resources.pop, options)
+ 
+           scope(:path => resource.path, :controller => resource.controller) do
+             with_scope_level(:resources, resource) do
+-              yield if block_given?
+-
+-              with_scope_level(:collection) do
+-                scope(resource.collection_options) do
+-                  get  :index if resource.actions.include?(:index)
+-                  post :create if resource.actions.include?(:create)
+-                  get  :new, :as => resource.singular if resource.actions.include?(:new)
++              if shallow
++                nested do
++                  deferred.each do |res|
++                    scope(:path => res.path, :controller => res.controller) do
++                      with_scope_level(:resources, res) do
++                        collection_scope_for(res)
++                      end
++                    end
++                  end
+                 end
++                @scope[:shallow] << resource unless shallow_root
+               end
++              yield if block_given? and !shallow
++              collection_scope_for(resource) if !shallow or shallow_root
+ 
+               with_scope_level(:member) do
+                 scope(':id') do
+@@ -605,6 +622,8 @@ module ActionDispatch
+             end
+           end
+ 
++          @scope.delete(:shallow) if shallow_root
++
+           self
+         end
+ 
+@@ -726,6 +745,16 @@ module ActionDispatch
+             false
+           end
+ 
++          def collection_scope_for(resource)
++            with_scope_level(:collection) do
++              scope(resource.collection_options) do
++                get  :index if resource.actions.include?(:index)
++                post :create if resource.actions.include?(:create)
++                get  :new, :as => resource.singular if resource.actions.include?(:new)
++              end
++            end
++          end
++
+           def with_exclusive_name_prefix(prefix)
+             begin
+               old_name_prefix = @scope[:name_prefix]
+diff --git a/actionpack/test/dispatch/routing_test.rb b/actionpack/test/dispatch/routing_test.rb
+index 8940990..03a3956 100644
+--- a/actionpack/test/dispatch/routing_test.rb
++++ b/actionpack/test/dispatch/routing_test.rb
+@@ -199,6 +199,21 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+       end
+ 
+       match "whatever/:controller(/:action(/:id))"
++
++      # http://guides.rubyonrails.org/routing.html#shallow-nesting
++      resources :publishers, :shallow => true do
++        resources :magazines do
++          resources :photos
++        end
++      end
++      resources :hosts do
++        resources :publishers, :shallow => true do
++          resources :magazines do
++            resources :photos
++            resources :columns
++          end
++        end
++      end
+     end
+   end
+ 
+@@ -991,6 +1006,31 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  # http://guides.rails.info/routing.html#shallow-nesting with a twist
++  def test_shallow_nesting
++    with_test_routes do
++      assert_equal '/publishers', publishers_path
++      assert_equal '/publishers/1', publisher_path(1)
++      assert_equal '/publishers/1/magazines', publisher_magazines_path(1)
++      assert_equal '/magazines/2', magazine_path(2)
++      assert_equal '/magazines/2/photos', magazine_photos_path(2)
++      assert_equal '/photos/3', photo_path(3)
++    end
++  end
++  def test_shallow_nesting_with_a_twist
++    with_test_routes do
++      assert_equal '/hosts/1', host_path(1)
++      assert_equal '/hosts/1/publishers', host_publishers_path(1)
++      assert_equal '/hosts/1/publishers/1', host_publisher_path(1, 1)
++      assert_equal '/hosts/1/publishers/1/magazines', host_publisher_magazines_path(1, 1)
++      assert_equal '/hosts/1/magazines/2', host_magazine_path(1, 2)
++      assert_equal '/hosts/1/magazines/2/photos', host_magazine_photos_path(1, 2)
++      assert_equal '/hosts/1/magazines/2/columns', host_magazine_columns_path(1, 2)
++      assert_equal '/hosts/1/photos/3', host_photo_path(1, 3)
++      assert_equal '/hosts/1/columns/4', host_column_path(1, 4)
++    end
++  end
++
+   private
+     def with_test_routes
+       yield
+-- 
+1.7.0.4
+

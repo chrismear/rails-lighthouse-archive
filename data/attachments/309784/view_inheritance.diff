@@ -1,0 +1,400 @@
+From 9746c9d87314b2ac7a36f6df1bf060a555229d5e Mon Sep 17 00:00:00 2001
+From: artemave <artemave@gmail.com>
+Date: Sun, 4 Oct 2009 18:12:27 -0400
+Subject: [PATCH] view inheritance; based on http://dev.rubyonrails.org/ticket/7076
+
+---
+ actionpack/lib/action_controller/base.rb           |   38 +++++++++++++---
+ actionpack/lib/action_view/partials.rb             |    4 +-
+ .../test/controller/partial_inheritance_test.rb    |   46 ++++++++++++++++++++
+ .../test/controller/view_inheritance_test.rb       |   46 ++++++++++++++++++++
+ actionpack/test/fixtures/test/_partial_parent.erb  |    1 +
+ .../test/inheritance/_partial_overridden.erb       |    1 +
+ .../fixtures/test/inheritance/overridden.rhtml     |    1 +
+ actionpack/test/fixtures/test/overridden.rhtml     |    1 +
+ .../test/fixtures/test/template_to_partial.erb     |    1 +
+ 9 files changed, 130 insertions(+), 9 deletions(-)
+ create mode 100644 actionpack/test/controller/partial_inheritance_test.rb
+ create mode 100644 actionpack/test/controller/view_inheritance_test.rb
+ create mode 100644 actionpack/test/fixtures/test/_partial_parent.erb
+ create mode 100644 actionpack/test/fixtures/test/inheritance/_partial_overridden.erb
+ create mode 100644 actionpack/test/fixtures/test/inheritance/overridden.rhtml
+ create mode 100644 actionpack/test/fixtures/test/overridden.rhtml
+ create mode 100644 actionpack/test/fixtures/test/template_to_partial.erb
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index 1d8cc14..c1f592b 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -687,6 +687,27 @@ module ActionController #:nodoc:
+         @template.view_paths.push(*path)
+       end
+ 
++      def find_template_inheritable
++        klass = self.class
++        parent_controllers_classes = []
++        until klass == ActionController::Base
++          parent_controllers_classes << klass
++          klass = klass.superclass
++        end
++
++        template = nil
++        last_exc = nil
++        [self.class, parent_controllers_classes].flatten.each do |cc|
++          begin
++            template = yield cc
++            return template if template
++          rescue ActionView::MissingTemplate
++            last_exc = $!
++          end
++        end
++        raise last_exc #FIXME this exception should contain all path sets, not only the last one
++      end
++
+     protected
+       # Renders the content that will be returned to the browser as the response body.
+       #
+@@ -1386,17 +1407,18 @@ module ActionController #:nodoc:
+       end
+ 
+       def default_template(action_name = self.action_name)
+-        self.view_paths.find_template(default_template_name(action_name), default_template_format)
++        find_template_inheritable do |cc|
++          self.view_paths.find_template(default_template_name(action_name, cc), default_template_format)
++        end
+       end
+ 
+-      def default_template_name(action_name = self.action_name)
+-        if action_name
+-          action_name = action_name.to_s
+-          if action_name.include?('/') && template_path_includes_controller?(action_name)
+-            action_name = strip_out_controller(action_name)
+-          end
++      def default_template_name(action_name = self.action_name, klass = self.class)
++        action_name = action_name.to_s
++        if action_name.include?('/') && template_path_includes_controller?(action_name)
++          action_name = strip_out_controller(action_name)
+         end
+-        "#{self.controller_path}/#{action_name}"
++
++        "#{klass.controller_path}/#{action_name}"
+       end
+ 
+       def strip_out_controller(path)
+diff --git a/actionpack/lib/action_view/partials.rb b/actionpack/lib/action_view/partials.rb
+index 9e5e0f7..4d6f5a9 100644
+--- a/actionpack/lib/action_view/partials.rb
++++ b/actionpack/lib/action_view/partials.rb
+@@ -228,7 +228,9 @@ module ActionView
+         if partial_path.include?('/')
+           path = File.join(File.dirname(partial_path), "_#{File.basename(partial_path)}")
+         elsif controller
+-          path = "#{controller.class.controller_path}/_#{partial_path}"
++          return controller.find_template_inheritable do |cc|
++            self.view_paths.find_template("#{cc.controller_path}/_#{partial_path}", self.template_format)
++          end
+         else
+           path = "_#{partial_path}"
+         end
+diff --git a/actionpack/test/controller/partial_inheritance_test.rb b/actionpack/test/controller/partial_inheritance_test.rb
+new file mode 100644
+index 0000000..31063c3
+--- /dev/null
++++ b/actionpack/test/controller/partial_inheritance_test.rb
+@@ -0,0 +1,46 @@
++require 'abstract_unit'
++
++class ParentTestController < ActionController::Base
++  def self.controller_name; "test"; end
++  def self.controller_path; "test"; end
++  
++  def do_partial
++    render :partial => params[:partialname]
++  end
++  
++end
++
++class InheritedTestController < ParentTestController
++  def self.controller_name; "test_inherited"; end
++  def self.controller_path; "test/inheritance"; end
++  
++end
++
++ParentTestController.view_paths = File.dirname(__FILE__) + "/../fixtures/"
++InheritedTestController.view_paths = File.dirname(__FILE__) + "/../fixtures/"
++
++
++class ViewInheritanceTest < ActionController::TestCase
++  tests InheritedTestController
++
++  def test_inherited
++    get :do_partial, :partialname => 'partial_parent'
++    assert_equal "_partial parent", @response.body
++  end
++  
++  def test_inherited_thru_template
++    get :template_to_partial, :partialname => 'partial_parent'
++    assert_equal "_partial parent", @response.body
++  end
++
++  def test_overridden
++    get :do_partial, :partialname => 'partial_overridden'
++    assert_equal "_partial_overridden inherited", @response.body
++  end
++  
++  def test_overridden_thru_template
++    get :template_to_partial, :partialname => 'partial_overridden'
++    assert_equal "_partial_overridden inherited", @response.body
++  end
++
++end
+diff --git a/actionpack/test/controller/view_inheritance_test.rb b/actionpack/test/controller/view_inheritance_test.rb
+new file mode 100644
+index 0000000..375d91e
+--- /dev/null
++++ b/actionpack/test/controller/view_inheritance_test.rb
+@@ -0,0 +1,46 @@
++require 'abstract_unit'
++
++class ParentTestController < ActionController::Base
++  def self.controller_name; "test"; end
++  def self.controller_path; "test"; end
++  
++  layout "layouts/standard"
++  
++  def hello_world
++  end
++  
++  def overridden
++  end
++end
++
++class InheritedTestController < ParentTestController
++  def self.controller_name; "test_inherited"; end
++  def self.controller_path; "test/inheritance"; end
++  
++  def another_hello_world
++    render :action => :hello_world
++  end
++end
++
++ParentTestController.view_paths = File.dirname(__FILE__) + "/../fixtures/"
++InheritedTestController.view_paths = File.dirname(__FILE__) + "/../fixtures/"
++
++
++class ViewInheritanceTest < ActionController::TestCase
++  tests InheritedTestController
++
++  def test_view_inheritance
++    get :hello_world
++    assert_template "test/hello_world"
++  end
++  
++  def test_view_inheritance_with_explicit_render
++    get :another_hello_world
++    assert_template "test/hello_world"
++  end
++  
++  def test_view_overriding
++    get :overridden
++    assert_template "test/inheritance/overridden"
++  end
++end
+diff --git a/actionpack/test/fixtures/test/_partial_parent.erb b/actionpack/test/fixtures/test/_partial_parent.erb
+new file mode 100644
+index 0000000..4418212
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_partial_parent.erb
+@@ -0,0 +1 @@
++_partial parent
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/inheritance/_partial_overridden.erb b/actionpack/test/fixtures/test/inheritance/_partial_overridden.erb
+new file mode 100644
+index 0000000..5bfa873
+--- /dev/null
++++ b/actionpack/test/fixtures/test/inheritance/_partial_overridden.erb
+@@ -0,0 +1 @@
++_partial_overridden inherited
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/inheritance/overridden.rhtml b/actionpack/test/fixtures/test/inheritance/overridden.rhtml
+new file mode 100644
+index 0000000..7d85798
+--- /dev/null
++++ b/actionpack/test/fixtures/test/inheritance/overridden.rhtml
+@@ -0,0 +1 @@
++This is an overridden view of an inherited action.
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/overridden.rhtml b/actionpack/test/fixtures/test/overridden.rhtml
+new file mode 100644
+index 0000000..ffda019
+--- /dev/null
++++ b/actionpack/test/fixtures/test/overridden.rhtml
+@@ -0,0 +1 @@
++This view is supposed to be overridden by inheriting controllers.
+diff --git a/actionpack/test/fixtures/test/template_to_partial.erb b/actionpack/test/fixtures/test/template_to_partial.erb
+new file mode 100644
+index 0000000..9d469ff
+--- /dev/null
++++ b/actionpack/test/fixtures/test/template_to_partial.erb
+@@ -0,0 +1 @@
++<%= render :partial => params[:partialname] %>
+\ No newline at end of file
+-- 
+1.5.6.6
+
+
+From 8b3d698d59f57078a99320dedc4aa3fc789891b9 Mon Sep 17 00:00:00 2001
+From: artemave <artemave@gmail.com>
+Date: Thu, 8 Oct 2009 17:53:49 -0400
+Subject: [PATCH] find_template_inheritable moved to private; format awareness test added
+
+---
+ actionpack/lib/action_controller/base.rb           |   34 +++++++------------
+ actionpack/lib/action_view/partials.rb             |    8 +++--
+ .../test/controller/view_inheritance_test.rb       |    5 +++
+ actionpack/test/fixtures/test/html_action.erb      |    1 +
+ .../fixtures/test/inheritance/html_action.js.rjs   |    1 +
+ .../test/fixtures/test/inheritance/overridden.erb  |    1 +
+ .../fixtures/test/inheritance/overridden.rhtml     |    1 -
+ actionpack/test/fixtures/test/overridden.erb       |    1 +
+ actionpack/test/fixtures/test/overridden.rhtml     |    1 -
+ 9 files changed, 27 insertions(+), 26 deletions(-)
+ create mode 100644 actionpack/test/fixtures/test/html_action.erb
+ create mode 100644 actionpack/test/fixtures/test/inheritance/html_action.js.rjs
+ create mode 100644 actionpack/test/fixtures/test/inheritance/overridden.erb
+ delete mode 100644 actionpack/test/fixtures/test/inheritance/overridden.rhtml
+ create mode 100644 actionpack/test/fixtures/test/overridden.erb
+ delete mode 100644 actionpack/test/fixtures/test/overridden.rhtml
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index c1f592b..6af06dd 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -687,27 +687,6 @@ module ActionController #:nodoc:
+         @template.view_paths.push(*path)
+       end
+ 
+-      def find_template_inheritable
+-        klass = self.class
+-        parent_controllers_classes = []
+-        until klass == ActionController::Base
+-          parent_controllers_classes << klass
+-          klass = klass.superclass
+-        end
+-
+-        template = nil
+-        last_exc = nil
+-        [self.class, parent_controllers_classes].flatten.each do |cc|
+-          begin
+-            template = yield cc
+-            return template if template
+-          rescue ActionView::MissingTemplate
+-            last_exc = $!
+-          end
+-        end
+-        raise last_exc #FIXME this exception should contain all path sets, not only the last one
+-      end
+-
+     protected
+       # Renders the content that will be returned to the browser as the response body.
+       #
+@@ -1421,6 +1400,19 @@ module ActionController #:nodoc:
+         "#{klass.controller_path}/#{action_name}"
+       end
+ 
++      def find_template_inheritable
++        k = self.class
++        last_exc = nil
++        begin
++          template = yield k
++          return template if template
++        rescue ActionView::MissingTemplate => e
++          last_exc = e
++        end while (k = k.superclass) < ActionController::Base
++
++        raise last_exc #FIXME this exception should contain all path sets, not only the last one
++      end
++
+       def strip_out_controller(path)
+         path.split('/', 2).last
+       end
+diff --git a/actionpack/lib/action_view/partials.rb b/actionpack/lib/action_view/partials.rb
+index 4d6f5a9..e4ef5b6 100644
+--- a/actionpack/lib/action_view/partials.rb
++++ b/actionpack/lib/action_view/partials.rb
+@@ -228,9 +228,11 @@ module ActionView
+         if partial_path.include?('/')
+           path = File.join(File.dirname(partial_path), "_#{File.basename(partial_path)}")
+         elsif controller
+-          return controller.find_template_inheritable do |cc|
+-            self.view_paths.find_template("#{cc.controller_path}/_#{partial_path}", self.template_format)
+-          end
++          return (
++            controller.send :find_template_inheritable do |cc|
++              self.view_paths.find_template("#{cc.controller_path}/_#{partial_path}", self.template_format)
++            end
++          )
+         else
+           path = "_#{partial_path}"
+         end
+diff --git a/actionpack/test/controller/view_inheritance_test.rb b/actionpack/test/controller/view_inheritance_test.rb
+index 375d91e..f17fd39 100644
+--- a/actionpack/test/controller/view_inheritance_test.rb
++++ b/actionpack/test/controller/view_inheritance_test.rb
+@@ -43,4 +43,9 @@ class ViewInheritanceTest < ActionController::TestCase
+     get :overridden
+     assert_template "test/inheritance/overridden"
+   end
++
++  def test_format_aware_view_inheritance
++    get :html_action
++    assert_template "test/html_action"
++  end
+ end
+diff --git a/actionpack/test/fixtures/test/html_action.erb b/actionpack/test/fixtures/test/html_action.erb
+new file mode 100644
+index 0000000..2b4c57b
+--- /dev/null
++++ b/actionpack/test/fixtures/test/html_action.erb
+@@ -0,0 +1 @@
++I am supposed to be picked over inheritance/html_action.js.rjs
+diff --git a/actionpack/test/fixtures/test/inheritance/html_action.js.rjs b/actionpack/test/fixtures/test/inheritance/html_action.js.rjs
+new file mode 100644
+index 0000000..8b13789
+--- /dev/null
++++ b/actionpack/test/fixtures/test/inheritance/html_action.js.rjs
+@@ -0,0 +1 @@
++
+diff --git a/actionpack/test/fixtures/test/inheritance/overridden.erb b/actionpack/test/fixtures/test/inheritance/overridden.erb
+new file mode 100644
+index 0000000..7d85798
+--- /dev/null
++++ b/actionpack/test/fixtures/test/inheritance/overridden.erb
+@@ -0,0 +1 @@
++This is an overridden view of an inherited action.
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/inheritance/overridden.rhtml b/actionpack/test/fixtures/test/inheritance/overridden.rhtml
+deleted file mode 100644
+index 7d85798..0000000
+--- a/actionpack/test/fixtures/test/inheritance/overridden.rhtml
++++ /dev/null
+@@ -1 +0,0 @@
+-This is an overridden view of an inherited action.
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/test/overridden.erb b/actionpack/test/fixtures/test/overridden.erb
+new file mode 100644
+index 0000000..ffda019
+--- /dev/null
++++ b/actionpack/test/fixtures/test/overridden.erb
+@@ -0,0 +1 @@
++This view is supposed to be overridden by inheriting controllers.
+diff --git a/actionpack/test/fixtures/test/overridden.rhtml b/actionpack/test/fixtures/test/overridden.rhtml
+deleted file mode 100644
+index ffda019..0000000
+--- a/actionpack/test/fixtures/test/overridden.rhtml
++++ /dev/null
+@@ -1 +0,0 @@
+-This view is supposed to be overridden by inheriting controllers.
+-- 
+1.5.6.6
+

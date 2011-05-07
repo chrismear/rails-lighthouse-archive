@@ -1,0 +1,386 @@
+From a8ef37b4f219b5ed8b39b63b3033201a71db53bb Mon Sep 17 00:00:00 2001
+From: Hugo Peixoto <hugo.peixoto@gmail.com>
+Date: Sat, 5 Mar 2011 23:06:29 +0000
+Subject: [PATCH 1/2] Fixes rails bug #6459.
+
+Adds the ability to specify an 'offset' clause to the UpdateManager.
+Propagates it when subquerying is triggered on the UpdateManager.
+---
+ lib/arel/crud.rb                   |    1 +
+ lib/arel/nodes/update_statement.rb |    3 ++-
+ lib/arel/update_manager.rb         |    5 +++++
+ lib/arel/visitors/sqlite.rb        |    4 ++++
+ lib/arel/visitors/to_sql.rb        |    5 +++--
+ test/test_select_manager.rb        |   30 ++++++++++++++++++++++++++++++
+ test/test_update_manager.rb        |   19 +++++++++++++++++++
+ test/visitors/test_sqlite.rb       |   10 +++++++++-
+ 8 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/lib/arel/crud.rb b/lib/arel/crud.rb
+index bedfb8c..e0b26bf 100644
+--- a/lib/arel/crud.rb
++++ b/lib/arel/crud.rb
+@@ -13,6 +13,7 @@ module Arel
+       um.table relation
+       um.set values
+       um.take @ast.limit.expr if @ast.limit
++      um.skip @ast.offset.expr if @ast.offset
+       um.order(*@ast.orders)
+       um.wheres = @ctx.wheres
+       um
+diff --git a/lib/arel/nodes/update_statement.rb b/lib/arel/nodes/update_statement.rb
+index c08f1b2..33a0f07 100644
+--- a/lib/arel/nodes/update_statement.rb
++++ b/lib/arel/nodes/update_statement.rb
+@@ -1,7 +1,7 @@
+ module Arel
+   module Nodes
+     class UpdateStatement < Arel::Nodes::Node
+-      attr_accessor :relation, :wheres, :values, :orders, :limit
++      attr_accessor :relation, :wheres, :values, :orders, :limit, :offset
+       attr_accessor :key
+
+       def initialize
+@@ -10,6 +10,7 @@ module Arel
+         @values   = []
+         @orders   = []
+         @limit    = nil
++        @offset   = nil
+         @key      = nil
+       end
+
+diff --git a/lib/arel/update_manager.rb b/lib/arel/update_manager.rb
+index f13aeb0..c35ef50 100644
+--- a/lib/arel/update_manager.rb
++++ b/lib/arel/update_manager.rb
+@@ -11,6 +11,11 @@ module Arel
+       self
+     end
+
++    def skip offset
++      @ast.offset = Nodes::Offset.new(offset) if offset
++      self
++    end
++
+     def key= key
+       @ast.key = key
+     end
+diff --git a/lib/arel/visitors/sqlite.rb b/lib/arel/visitors/sqlite.rb
+index 237ae91..aaa3167 100644
+--- a/lib/arel/visitors/sqlite.rb
++++ b/lib/arel/visitors/sqlite.rb
+@@ -6,6 +6,10 @@ module Arel
+         o.limit = Arel::Nodes::Limit.new(-1) if o.offset && !o.limit
+         super
+       end
++      def visit_Arel_Nodes_UpdateStatement o
++        o.limit = Arel::Nodes::Limit.new(-1) if o.offset && !o.limit
++        super
++      end
+     end
+   end
+ end
+diff --git a/lib/arel/visitors/to_sql.rb b/lib/arel/visitors/to_sql.rb
+index f76c149..9de4268 100644
+--- a/lib/arel/visitors/to_sql.rb
++++ b/lib/arel/visitors/to_sql.rb
+@@ -37,12 +37,13 @@ module Arel
+         core.froms       = o.relation
+         core.projections = [key]
+         stmt.limit       = o.limit
++        stmt.offset      = o.offset
+         stmt.orders      = o.orders
+         stmt
+       end
+
+       def visit_Arel_Nodes_UpdateStatement o
+-        if o.orders.empty? && o.limit.nil?
++        if o.orders.empty? && o.limit.nil? && o.offset.nil?
+           wheres = o.wheres
+         else
+           key = o.key
+diff --git a/test/test_select_manager.rb b/test/test_select_manager.rb
+index 2fe43aa..536fbcc 100644
+--- a/test/test_select_manager.rb
++++ b/test/test_select_manager.rb
+@@ -675,6 +675,36 @@ module Arel
+         }
+       end
+
++      it 'copies offsets' do
++        table   = Table.new :users
++        manager = Arel::SelectManager.new Table.engine
++        manager.from table
++        manager.skip 1
++        stmt = manager.compile_update(SqlLiteral.new('foo = bar'))
++        stmt.key = table['id']
++
++        stmt.to_sql.must_be_like %{
++          UPDATE "users" SET foo = bar
++          WHERE "users"."id" IN (SELECT "users"."id" FROM "users" OFFSET 1)
++        }
++      end
++
++      it 'copies both limits and offsets' do
++        engine  = EngineProxy.new Table.engine
++        table   = Table.new :users
++        manager = Arel::SelectManager.new engine
++        manager.from table
++        manager.take 42
++        manager.skip 1
++        stmt = manager.compile_update(SqlLiteral.new('foo = bar'))
++        stmt.key = table['id']
++
++        stmt.to_sql.must_be_like %{
++          UPDATE "users" SET foo = bar
++          WHERE "users"."id" IN (SELECT "users"."id" FROM "users" LIMIT 42 OFFSET 1)
++        }
++      end
++
+       it 'copies order' do
+         engine  = EngineProxy.new Table.engine
+         table   = Table.new :users
+diff --git a/test/test_update_manager.rb b/test/test_update_manager.rb
+index 62a2ecc..cff08ef 100644
+--- a/test/test_update_manager.rb
++++ b/test/test_update_manager.rb
+@@ -17,6 +17,25 @@ module Arel
+       assert_match(/LIMIT 10/, um.to_sql)
+     end
+
++    it 'handles offset properly' do
++      table = Table.new(:users)
++      um = Arel::UpdateManager.new Table.engine
++      um.skip 10
++      um.table table
++      um.set [[table[:name], nil]]
++      assert_match(/OFFSET 10/, um.to_sql)
++    end
++
++    it 'handles limit and offset properly' do
++      table = Table.new(:users)
++      um = Arel::UpdateManager.new Table.engine
++      um.skip 10
++      um.take 20
++      um.table table
++      um.set [[table[:name], nil]]
++      assert_match(/LIMIT 20 OFFSET 10/, um.to_sql)
++    end
++
+     describe 'set' do
+       it "updates with null" do
+         table = Table.new(:users)
+diff --git a/test/visitors/test_sqlite.rb b/test/visitors/test_sqlite.rb
+index fb8392c..7c7a8a2 100644
+--- a/test/visitors/test_sqlite.rb
++++ b/test/visitors/test_sqlite.rb
+@@ -7,12 +7,20 @@ module Arel
+         @visitor = SQLite.new Table.engine
+       end
+
+-      it 'defaults limit to -1' do
++      it 'defaults limit to -1 in select' do
+         stmt = Nodes::SelectStatement.new
+         stmt.offset = Nodes::Offset.new(1)
+         sql = @visitor.accept(stmt)
+         sql.must_be_like "SELECT LIMIT -1 OFFSET 1"
+       end
++
++      it 'defaults limit to -1 in update' do
++        stmt = Nodes::UpdateStatement.new
++        stmt.key = 'id'
++        stmt.offset = Nodes::Offset.new(1)
++        sql = @visitor.accept(stmt)
++        sql.must_be_like "UPDATE NULL WHERE 'id' IN (SELECT 'id' LIMIT -1 OFFSET 1)"
++      end
+     end
+   end
+ end
+--
+1.7.1
+
+
+From 050f5afaa1ef0fc6c3923cfb50db712be26d3fa1 Mon Sep 17 00:00:00 2001
+From: Hugo Peixoto <hugo.peixoto@gmail.com>
+Date: Sun, 6 Mar 2011 01:43:02 +0000
+Subject: [PATCH 2/2] Fixes rails bug #6459.
+
+Adds a new node, NamedSubselect, that allows for subqueries in FROM clauses.
+Adds a specific behaviour to the MySQL visitor when the OFFSET clause is
+specified in an UPDATE statement.
+---
+ lib/arel/nodes.rb                  |    1 +
+ lib/arel/nodes/named_subselect.rb  |    8 ++++++
+ lib/arel/nodes/select_statement.rb |    4 +++
+ lib/arel/visitors/mysql.rb         |   43 ++++++++++++++++++++++++++++++------
+ lib/arel/visitors/to_sql.rb        |    4 +++
+ test/test_select_manager.rb        |   14 +++++++++++
+ test/visitors/test_mysql.rb        |   18 +++++++++++++++
+ test/visitors/test_to_sql.rb       |   10 ++++++++
+ 8 files changed, 95 insertions(+), 7 deletions(-)
+ create mode 100644 lib/arel/nodes/named_subselect.rb
+
+diff --git a/lib/arel/nodes.rb b/lib/arel/nodes.rb
+index 442b313..afce0a0 100644
+--- a/lib/arel/nodes.rb
++++ b/lib/arel/nodes.rb
+@@ -18,6 +18,7 @@ require 'arel/nodes/join_source'
+ require 'arel/nodes/ordering'
+ require 'arel/nodes/delete_statement'
+ require 'arel/nodes/table_alias'
++require 'arel/nodes/named_subselect'
+
+ # nary
+ require 'arel/nodes/and'
+diff --git a/lib/arel/nodes/named_subselect.rb b/lib/arel/nodes/named_subselect.rb
+new file mode 100644
+index 0000000..b28eab1
+--- /dev/null
++++ b/lib/arel/nodes/named_subselect.rb
+@@ -0,0 +1,8 @@
++module Arel
++  module Nodes
++    class NamedSubselect < Arel::Nodes::Binary
++      alias :subselect :left
++      alias :name :right
++    end
++  end
++end
+diff --git a/lib/arel/nodes/select_statement.rb b/lib/arel/nodes/select_statement.rb
+index c99842f..5399ff9 100644
+--- a/lib/arel/nodes/select_statement.rb
++++ b/lib/arel/nodes/select_statement.rb
+@@ -19,6 +19,10 @@ module Arel
+         @cores  = @cores.map { |x| x.clone }
+         @orders = @orders.map { |x| x.clone }
+       end
++
++      def as name
++        NamedSubselect.new(self, name)
++      end
+     end
+   end
+ end
+diff --git a/lib/arel/visitors/mysql.rb b/lib/arel/visitors/mysql.rb
+index 4f02924..ee9b5e1 100644
+--- a/lib/arel/visitors/mysql.rb
++++ b/lib/arel/visitors/mysql.rb
+@@ -19,14 +19,43 @@ module Arel
+         super
+       end
+
++      ###
++      # :'((
++      # Although mysql supports LIMIT directly on the UPDATE statement,
++      # it does not support OFFSET. Besides, you cannot specify LIMIT/OFFSET
++      # in an IN subquery. This leads to the following fix:
++      #
++      # http://forums.mysql.com/read.php?86,14788,239000#msg-239000
+       def visit_Arel_Nodes_UpdateStatement o
+-        [
+-          "UPDATE #{visit o.relation}",
+-          ("SET #{o.values.map { |value| visit value }.join ', '}" unless o.values.empty?),
+-          ("WHERE #{o.wheres.map { |x| visit x }.join ' AND '}" unless o.wheres.empty?),
+-          ("ORDER BY #{o.orders.map { |x| visit x }.join(', ')}" unless o.orders.empty?),
+-          (visit(o.limit) if o.limit),
+-        ].compact.join ' '
++        if o.offset
++          key = o.key
++          unless key
++            warn(<<-eowarn) if $VERBOSE
++(#{caller.first}) Using UpdateManager without setting UpdateManager#key is
++deprecated and support will be removed in ARel 3.0.0.  Please set the primary
++key on UpdateManager using UpdateManager#key=
++            eowarn
++            key = o.relation.primary_key
++          end
++
++          subquery = Nodes::SelectStatement.new
++          subquery.cores.first.froms = Nodes::NamedSubselect.new(build_subselect(key, o), "alias")
++          subquery.cores.first.projections = [key]
++          wheres = [Nodes::In.new(key, [subquery])]
++          [
++            "UPDATE #{visit o.relation}",
++            ("SET #{o.values.map { |value| visit value }.join ', '}" unless o.values.empty?),
++            ("WHERE #{wheres.map { |x| visit x }.join ' AND '}" unless wheres.empty?),
++          ].compact.join ' '
++        else
++          [
++            "UPDATE #{visit o.relation}",
++            ("SET #{o.values.map { |value| visit value }.join ', '}" unless o.values.empty?),
++            ("WHERE #{o.wheres.map { |x| visit x }.join ' AND '}" unless o.wheres.empty?),
++            ("ORDER BY #{o.orders.map { |x| visit x }.join(', ')}" unless o.orders.empty?),
++            (visit(o.limit) if o.limit),
++          ].compact.join ' '
++        end
+       end
+
+     end
+diff --git a/lib/arel/visitors/to_sql.rb b/lib/arel/visitors/to_sql.rb
+index 9de4268..6c08985 100644
+--- a/lib/arel/visitors/to_sql.rb
++++ b/lib/arel/visitors/to_sql.rb
+@@ -223,6 +223,10 @@ key on UpdateManager using UpdateManager#key=
+         "#{visit o.relation} #{quote_table_name o.name}"
+       end
+
++      def visit_Arel_Nodes_NamedSubselect o
++        "(#{visit o.subselect}) #{quote_table_name o.name}"
++      end
++
+       def visit_Arel_Nodes_Between o
+         "#{visit o.left} BETWEEN #{visit o.right}"
+       end
+diff --git a/test/visitors/test_mysql.rb b/test/visitors/test_mysql.rb
+index 3c15c21..d1f3fea 100644
+--- a/test/visitors/test_mysql.rb
++++ b/test/visitors/test_mysql.rb
+@@ -23,6 +23,24 @@ module Arel
+         assert_equal("UPDATE NULL LIMIT 'omg'", @visitor.accept(sc))
+       end
+
++      ###
++      # :'((
++      #
++      # Although mysql supports LIMIT directly on the UPDATE statement,
++      # it does not support OFFSET. Besides, you cannot specify LIMIT/OFFSET
++      # in an IN subquery. This leads to the following fix:
++      #
++      # http://forums.mysql.com/read.php?86,14788,239000#msg-239000
++      it 'supports offset when updating' do
++        stmt = Nodes::UpdateStatement.new
++        stmt.offset = Nodes::Offset.new(1)
++        stmt.key = 'id'
++        stmt.relation = 'users'
++        sql = @visitor.accept(stmt)
++        sql.must_be_like "UPDATE 'users' WHERE 'id' IN (SELECT 'id' FROM (SELECT 'id' FROM 'users' LIMIT 18446744073709551615 OFFSET 1) \"alias\" )"
++
++      end
++
+       it 'uses DUAL for empty from' do
+         stmt = Nodes::SelectStatement.new
+         sql = @visitor.accept(stmt)
+diff --git a/test/visitors/test_to_sql.rb b/test/visitors/test_to_sql.rb
+index 2d5549c..498eeef 100644
+--- a/test/visitors/test_to_sql.rb
++++ b/test/visitors/test_to_sql.rb
+@@ -268,6 +268,16 @@ module Arel
+           }
+         end
+       end
++
++      describe 'NamedSubselect' do
++        it "should " do
++          sc = Nodes::SelectStatement.new
++          test = sc.as("derp")
++          @visitor.accept(test).must_be_like %{
++            (SELECT ) "derp"
++          }
++        end
++      end
+     end
+   end
+ end
+--
+1.7.1
+

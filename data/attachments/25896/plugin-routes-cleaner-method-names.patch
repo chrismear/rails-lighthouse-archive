@@ -1,0 +1,203 @@
+From 9030e94bb71d51f7e122c9bedad3824a8cc08ecd Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <cavanaugh@fatjam.com>
+Date: Mon, 2 Jun 2008 07:36:04 -0400
+Subject: [PATCH] Add RouteSet#draw_for_plugin which takes a key and a block. The key is a symbol that simply identifies the plugin. The block should use the same syntax as the block in routes.rb.
+ Add Mapper#plugin_routes which works as follows:
+   map.plugin_routes
+   map.plugin_routes :all # alias of the above call
+   map.plugin_routes :hobo, :active_scaffold, :restful_authentication
+   map.plugin_routes :except => [:hobo, :something]
+ Mapper#plugin_routes should be called in routes.rb where ever you would like plugin routes to initialize.
+
+---
+ .../lib/action_controller/routing/route_set.rb     |   23 +++++++++++++++++--
+ 1 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index 5bc13cf..3d5567f 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -49,7 +49,19 @@ module ActionController
+             with_options({:path_prefix => name, :name_prefix => "#{name}_", :namespace => "#{name}/" }.merge(options), &block)
+           end
+         end
+-
++        
++        def plugin_routes(*args)
++          options = args.extract_options!
++          
++          route_plugins = (args.empty? || args.first.eql?(:all)) ? @set.plugin_blocks.keys : args
++          
++          route_plugins.reject! {|name| options[:except].member? name } if options[:except]
++          
++          route_plugins.each do |plugin_name|
++            @set.plugin_blocks[plugin_name].call(self)
++          end
++        end
++        
+         def method_missing(route_name, *args, &proc) #:nodoc:
+           super unless args.length >= 1 && proc.nil?
+           @set.add_named_route(route_name, *args)
+@@ -189,11 +201,12 @@ module ActionController
+           end
+       end
+ 
+-      attr_accessor :routes, :named_routes, :configuration_file
++      attr_accessor :routes, :named_routes, :configuration_file, :plugin_blocks
+ 
+       def initialize
+         self.routes = []
+         self.named_routes = NamedRouteCollection.new
++        self.plugin_blocks = {}
+       end
+ 
+       # Subclasses and plugins may override this method to specify a different
+@@ -207,7 +220,11 @@ module ActionController
+         yield Mapper.new(self)
+         install_helpers
+       end
+-
++      
++      def draw_for_plugin(plugin_name, &block)
++        self.plugin_blocks[plugin_name] = block
++      end
++      
+       def clear!
+         routes.clear
+         named_routes.clear
+-- 
+1.5.5.1
+
+
+From e182255d34a286874a25fc5a91a1548af841b17d Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <cavanaugh@fatjam.com>
+Date: Tue, 3 Jun 2008 21:14:19 -0400
+Subject: [PATCH] Added #draw_for to the config exposed to a plugin's init.rb.
+ Exposed the currently loading plugin to the configuration for purposes of automatically setting the name to the currently loading plugin's name.
+
+---
+ .../lib/action_controller/routing/route_set.rb     |    2 +
+ railties/lib/initializer.rb                        |   29 +++++++++++++++++++-
+ railties/lib/rails/plugin.rb                       |    2 +
+ 3 files changed, 32 insertions(+), 1 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index 3d5567f..7b012db 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -50,6 +50,8 @@ module ActionController
+           end
+         end
+         
++        # Enables registering plugin routes while maintaing complete
++        # control over order and what is registered.
+         def plugin_routes(*args)
+           options = args.extract_options!
+           
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index dd6a0c6..f3f8269 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -635,6 +635,33 @@ module Rails
+       @gems << Rails::GemDependency.new(name, options)
+     end
+     
++    # When a plugin is loading currently_loading_plugin is the appropriate
++    # Rails::Plugin instance for the plugin currently being loaded by
++    # Rails::Plugin::Loader. currently_loading_plugin is nil when no plugin
++    # is in the process of being loaded.
++    attr_accessor :currently_loading_plugin
++    
++    # Adds a block to be loaded later in config/routes.rb. This should
++    # be used by plugins to register routes for themselves. The parameter
++    # name should be a unique and descriptive name for the routes 
++    # being registered. If it is not set the plugin's name is used.
++    # 
++    #   # vendor/plugins/example_plugin/init.rb
++    # 
++    #   config.draw_for do |map|
++    #     map.connect '/', ...
++    #   end
++    # 
++    #   # or
++    # 
++    #   config.draw_for :example_plugin_admin do |map|
++    #     map.connect '/', ...
++    #   end
++    def draw_for(name=nil, &block)
++      name ||= currently_loading_plugin.name
++      ActionController::Routing::Routes.draw_for_plugin(name.to_sym, &block)
++    end
++    
+     # Deprecated options:
+     def breakpoint_server(_ = nil)
+       $stderr.puts %(
+@@ -671,7 +698,7 @@ module Rails
+       self.database_configuration_file  = default_database_configuration_file
+       self.routes_configuration_file    = default_routes_configuration_file
+       self.gems                         = default_gems
+-
++      
+       for framework in default_frameworks
+         self.send("#{framework}=", Rails::OrderedOptions.new)
+       end
+diff --git a/railties/lib/rails/plugin.rb b/railties/lib/rails/plugin.rb
+index 256f4b0..4d9e824 100644
+--- a/railties/lib/rails/plugin.rb
++++ b/railties/lib/rails/plugin.rb
+@@ -41,8 +41,10 @@ module Rails
+     def load(initializer)
+       return if loaded?
+       report_nonexistant_or_empty_plugin! unless valid?
++      initializer.configuration.currently_loading_plugin = self
+       evaluate_init_rb(initializer)
+       @loaded = true
++      initializer.configuration.currently_loading_plugin = nil
+     end
+     
+     def loaded?
+-- 
+1.5.5.1
+
+
+From a19905d82b0f056c3747aac06d129dd3da1730a3 Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <cavanaugh@fatjam.com>
+Date: Wed, 4 Jun 2008 12:54:44 -0400
+Subject: [PATCH] cleanup the method naming a bit
+
+---
+ railties/lib/initializer.rb |    8 +++++---
+ 1 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index f3f8269..54c769c 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -648,19 +648,21 @@ module Rails
+     # 
+     #   # vendor/plugins/example_plugin/init.rb
+     # 
+-    #   config.draw_for do |map|
++    #   config.plugin_routes do |map|
+     #     map.connect '/', ...
+     #   end
+     # 
+-    #   # or
++    # The alias #draw_for is also provided for more natural pattern
++    # when passing a name for the route block.
+     # 
+     #   config.draw_for :example_plugin_admin do |map|
+     #     map.connect '/', ...
+     #   end
+-    def draw_for(name=nil, &block)
++    def plugin_routes(name=nil, &block)
+       name ||= currently_loading_plugin.name
+       ActionController::Routing::Routes.draw_for_plugin(name.to_sym, &block)
+     end
++    alias_method :draw_for, :plugin_routes
+     
+     # Deprecated options:
+     def breakpoint_server(_ = nil)
+-- 
+1.5.5.1
+

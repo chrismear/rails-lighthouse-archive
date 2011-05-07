@@ -1,0 +1,260 @@
+From 04a9627ac0ee57e063f0363bb7f488484a81af98 Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Thu, 13 May 2010 10:42:53 +1000
+Subject: [PATCH] Cache increment/decrement with initialization when missing value
+
+---
+ activesupport/lib/active_support/cache.rb          |   20 ++++++--
+ .../lib/active_support/cache/file_store.rb         |    8 +++
+ .../lib/active_support/cache/mem_cache_store.rb    |   54 ++++++++++++++++----
+ .../lib/active_support/cache/memory_store.rb       |    8 +++
+ activesupport/test/caching_test.rb                 |   23 ++++++++
+ 5 files changed, 98 insertions(+), 15 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index 2605a3f..4c59087 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -389,16 +389,26 @@ module ActiveSupport
+       #
+       # Options are passed to the underlying cache implementation.
+       #
+-      # Not all implementations may support +delete_matched+.
++      # If there is no data in the cache with the given key then nil will be returned.
++      # However, if a block has been passed, then that block will be run in the event
++      # of a cache miss. The return value of the block will then be incremented, and
++      # that value will be written to the cache and returned.
++      #
++      # Not all implementations may support +increment+.
+       def increment(name, amount = 1, options = nil)
+         raise NotImplementedError.new("#{self.class.name} does not support increment")
+       end
+ 
+-      # Increment an integer value in the cache.
++      # Decrement an integer value in the cache.
+       #
+       # Options are passed to the underlying cache implementation.
+       #
+-      # Not all implementations may support +delete_matched+.
++      # If there is no data in the cache with the given key then nil will be returned.
++      # However, if a block has been passed, then that block will be run in the event
++      # of a cache miss. The return value of the block will then be decremented, and
++      # that value will be written to the cache and returned.
++      #
++      # Not all implementations may support +decrement+.
+       def decrement(name, amount = 1, options = nil)
+         raise NotImplementedError.new("#{self.class.name} does not support decrement")
+       end
+@@ -408,7 +418,7 @@ module ActiveSupport
+       #
+       # Options are passed to the underlying cache implementation.
+       #
+-      # Not all implementations may support +delete_matched+.
++      # Not all implementations may support +cleanup+.
+       def cleanup(options = nil)
+         raise NotImplementedError.new("#{self.class.name} does not support cleanup")
+       end
+@@ -419,7 +429,7 @@ module ActiveSupport
+       #
+       # Options are passed to the underlying cache implementation.
+       #
+-      # Not all implementations may support +delete_matched+.
++      # Not all implementations may support +clear+.
+       def clear(options = nil)
+         raise NotImplementedError.new("#{self.class.name} does not support clear")
+       end
+diff --git a/activesupport/lib/active_support/cache/file_store.rb b/activesupport/lib/active_support/cache/file_store.rb
+index fc225e7..2627c00 100644
+--- a/activesupport/lib/active_support/cache/file_store.rb
++++ b/activesupport/lib/active_support/cache/file_store.rb
+@@ -40,6 +40,10 @@ module ActiveSupport
+             num = num.to_i + amount
+             write(name, num, options)
+             num
++          elsif block_given?
++            num = yield.to_i + amount
++            write(name, num, options)
++            num
+           else
+             nil
+           end
+@@ -54,6 +58,10 @@ module ActiveSupport
+             num = num.to_i - amount
+             write(name, num, options)
+             num
++          elsif block_given?
++            num = yield.to_i - amount
++            write(name, num, options)
++            num
+           else
+             nil
+           end
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index d8377a2..8decafc 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -81,28 +81,50 @@ module ActiveSupport
+ 
+       # Increment a cached value. This method uses the memcached incr atomic
+       # operator and can only be used on values written with the :raw option.
+-      # Calling it on a value not stored with :raw will initialize that value
+-      # to zero.
++      #
++      # To initialize a missing value a block can be used. For example:
++      #
++      #   hits = Rails.cache.increment("hits") { PageHit.count }
++      #
++      # The value of +hits+ will then be PageHit.count + 1
++      #
+       def increment(name, amount = 1, options = nil) # :nodoc:
++        # See "Proper use of incr or decr"
++        # http://code.google.com/p/memcached/wiki/NewProgramming#Proper_Use_of_incr_or_%60decr
+         options = merged_options(options)
+-        response = instrument(:increment, name, :amount => amount) do
+-          @data.incr(escape_key(namespaced_key(name, options)), amount)
++        response = incr(name, amount, options)
++        if response.nil? && block_given?
++          response = yield.to_i + amount
++          unless write(name, response, :unless_exist => true, :raw => true)
++            response = incr(name, amount, options)
++          end
+         end
+-        response == Response::NOT_FOUND ? nil : response.to_i
++        response.nil? || response == Response::NOT_FOUND ? nil : response.to_i
+       rescue MemCache::MemCacheError
+         nil
+       end
+ 
+       # Decrement a cached value. This method uses the memcached decr atomic
+       # operator and can only be used on values written with the :raw option.
+-      # Calling it on a value not stored with :raw will initialize that value
+-      # to zero.
++      #
++      # To initialize a missing value a block can be used. For example:
++      #
++      #   allowed_hits = Rails.cache.decrement("allowed_hits") { user.find_allowed_hits }
++      #
++      # The value of +allowed_hits+ will then be user.find_allowed_hits - 1
++      #
+       def decrement(name, amount = 1, options = nil) # :nodoc:
++        # See "Proper use of incr or decr"
++        # http://code.google.com/p/memcached/wiki/NewProgramming#Proper_Use_of_incr_or_%60decr
+         options = merged_options(options)
+-        response = instrument(:decrement, name, :amount => amount) do
+-          @data.decr(escape_key(namespaced_key(name, options)), amount)
++        response = decr(name, amount, options)
++        if response.nil? && block_given?
++          response = yield.to_i - amount
++          unless write(name, response, :unless_exist => true, :raw => true)
++            response = decr(name, amount, options)
++          end
+         end
+-        response == Response::NOT_FOUND ? nil : response.to_i
++        response.nil? || response == Response::NOT_FOUND ? nil : response.to_i
+       rescue MemCache::MemCacheError
+         nil
+       end
+@@ -168,6 +190,18 @@ module ActiveSupport
+           end
+         end
+ 
++        def incr(name, amount, options)
++          instrument(:increment, name, :amount => amount) do
++            @data.incr(escape_key(namespaced_key(name, options)), amount)
++          end
++        end
++
++        def decr(name, amount, options)
++          instrument(:decrement, name, :amount => amount) do
++            @data.decr(escape_key(namespaced_key(name, options)), amount)
++          end
++        end
++
+       # Provide support for raw values in the local cache strategy.
+       module LocalCacheWithRaw # :nodoc:
+         protected
+diff --git a/activesupport/lib/active_support/cache/memory_store.rb b/activesupport/lib/active_support/cache/memory_store.rb
+index b1d14a0..26d3d60 100644
+--- a/activesupport/lib/active_support/cache/memory_store.rb
++++ b/activesupport/lib/active_support/cache/memory_store.rb
+@@ -80,6 +80,10 @@ module ActiveSupport
+             num = num.to_i + amount
+             write(name, num, options)
+             num
++          elsif block_given?
++            num = yield.to_i + amount
++            write(name, num, options)
++            num
+           else
+             nil
+           end
+@@ -94,6 +98,10 @@ module ActiveSupport
+             num = num.to_i - amount
+             write(name, num, options)
+             num
++          elsif block_given?
++            num = yield.to_i - amount
++            write(name, num, options)
++            num
+           else
+             nil
+           end
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index d9ff120..a2f47b7 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -321,6 +321,7 @@ end
+ 
+ module CacheIncrementDecrementBehavior
+   def test_increment
++    assert_nil @cache.increment('foo')
+     @cache.write('foo', 1, :raw => true)
+     assert_equal 1, @cache.read('foo').to_i
+     assert_equal 2, @cache.increment('foo')
+@@ -329,7 +330,13 @@ module CacheIncrementDecrementBehavior
+     assert_equal 3, @cache.read('foo').to_i
+   end
+ 
++  def test_increment_with_initialization
++    assert_equal 10, @cache.increment('foo') { 9 }
++    assert_equal 11, @cache.increment('foo') { 9 }
++  end
++
+   def test_decrement
++    assert_nil @cache.decrement('foo')
+     @cache.write('foo', 3, :raw => true)
+     assert_equal 3, @cache.read('foo').to_i
+     assert_equal 2, @cache.decrement('foo')
+@@ -337,6 +344,11 @@ module CacheIncrementDecrementBehavior
+     assert_equal 1, @cache.decrement('foo')
+     assert_equal 1, @cache.read('foo').to_i
+   end
++
++  def test_decrement_with_initialization
++    assert_equal 8, @cache.decrement('foo') { 9 }
++    assert_equal 7, @cache.decrement('foo') { 9 }
++  end
+ end
+ 
+ module LocalCacheBehavior
+@@ -581,6 +593,17 @@ uses_memcached 'memcached backed store' do
+         assert_equal "2", cache.read("foo")
+       end
+     end
++
++    def test_increment_and_decrement_with_race
++      cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :raw => true)
++      cache.clear
++      cache.expects(:write).returns(false).twice  # Simulate that another process already added the value
++      cache.expects(:incr).returns(nil).twice
++      cache.expects(:decr).returns(nil).twice
++      assert_equal nil, cache.increment('foo') { 9 }
++      assert_equal nil, cache.decrement('bar') { 9 }
++    end
++
+   end
+ 
+   class CompressedMemCacheStore < ActiveSupport::TestCase
+-- 
+1.7.0
+

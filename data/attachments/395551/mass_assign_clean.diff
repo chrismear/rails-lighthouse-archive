@@ -1,0 +1,662 @@
+From fddb6efd1162688720d0b4a3ceadc4b8729bc8b6 Mon Sep 17 00:00:00 2001
+From: Eric Chapweske <ericis@gmail.com>
+Date: Fri, 29 Jan 2010 17:02:12 -0800
+Subject: [PATCH] Mass assignment security refactoring
+
+---
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/base.rb             |  130 +---------------
+ .../lib/active_record/mass_assignment_security.rb  |  161 ++++++++++++++++++++
+ .../mass_assignment_security/permission_set.rb     |   44 ++++++
+ .../mass_assignment_security/sanitizer.rb          |   28 ++++
+ activerecord/test/cases/base_test.rb               |   26 ++--
+ .../mass_assignment_security/black_list_test.rb    |   29 ++++
+ .../permission_set_test.rb                         |   31 ++++
+ .../mass_assignment_security/sanitizer_test.rb     |   37 +++++
+ .../mass_assignment_security/white_list_test.rb    |   29 ++++
+ 10 files changed, 377 insertions(+), 139 deletions(-)
+ create mode 100644 activerecord/lib/active_record/mass_assignment_security.rb
+ create mode 100644 activerecord/lib/active_record/mass_assignment_security/permission_set.rb
+ create mode 100644 activerecord/lib/active_record/mass_assignment_security/sanitizer.rb
+ create mode 100644 activerecord/test/cases/mass_assignment_security/black_list_test.rb
+ create mode 100644 activerecord/test/cases/mass_assignment_security/permission_set_test.rb
+ create mode 100644 activerecord/test/cases/mass_assignment_security/sanitizer_test.rb
+ create mode 100644 activerecord/test/cases/mass_assignment_security/white_list_test.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index cc0accf..35d838e 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -62,6 +62,7 @@ module ActiveRecord
+     autoload :Callbacks
+     autoload :DynamicFinderMatch
+     autoload :DynamicScopeMatch
++    autoload :MassAssignmentSecurity
+     autoload :Migration
+     autoload :Migrator, 'active_record/migration'
+     autoload :NamedScope
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 12feef4..413821b 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -739,102 +739,6 @@ module ActiveRecord #:nodoc:
+         update_counters(id, counter_name => -1)
+       end
+ 
+-      # Attributes named in this macro are protected from mass-assignment,
+-      # such as <tt>new(attributes)</tt>,
+-      # <tt>update_attributes(attributes)</tt>, or
+-      # <tt>attributes=(attributes)</tt>.
+-      #
+-      # Mass-assignment to these attributes will simply be ignored, to assign
+-      # to them you can use direct writer methods. This is meant to protect
+-      # sensitive attributes from being overwritten by malicious users
+-      # tampering with URLs or forms.
+-      #
+-      #   class Customer < ActiveRecord::Base
+-      #     attr_protected :credit_rating
+-      #   end
+-      #
+-      #   customer = Customer.new("name" => David, "credit_rating" => "Excellent")
+-      #   customer.credit_rating # => nil
+-      #   customer.attributes = { "description" => "Jolly fellow", "credit_rating" => "Superb" }
+-      #   customer.credit_rating # => nil
+-      #
+-      #   customer.credit_rating = "Average"
+-      #   customer.credit_rating # => "Average"
+-      #
+-      # To start from an all-closed default and enable attributes as needed,
+-      # have a look at +attr_accessible+.
+-      #
+-      # If the access logic of your application is richer you can use <tt>Hash#except</tt>
+-      # or <tt>Hash#slice</tt> to sanitize the hash of parameters before they are
+-      # passed to Active Record.
+-      #
+-      # For example, it could be the case that the list of protected attributes
+-      # for a given model depends on the role of the user:
+-      #
+-      #   # Assumes plan_id is not protected because it depends on the role.
+-      #   params[:account] = params[:account].except(:plan_id) unless admin?
+-      #   @account.update_attributes(params[:account])
+-      #
+-      # Note that +attr_protected+ is still applied to the received hash. Thus,
+-      # with this technique you can at most _extend_ the list of protected
+-      # attributes for a particular mass-assignment call.
+-      def attr_protected(*attributes)
+-        write_inheritable_attribute(:attr_protected, Set.new(attributes.map {|a| a.to_s}) + (protected_attributes || []))
+-      end
+-
+-      # Returns an array of all the attributes that have been protected from mass-assignment.
+-      def protected_attributes # :nodoc:
+-        read_inheritable_attribute(:attr_protected)
+-      end
+-
+-      # Specifies a white list of model attributes that can be set via
+-      # mass-assignment, such as <tt>new(attributes)</tt>,
+-      # <tt>update_attributes(attributes)</tt>, or
+-      # <tt>attributes=(attributes)</tt>
+-      #
+-      # This is the opposite of the +attr_protected+ macro: Mass-assignment
+-      # will only set attributes in this list, to assign to the rest of
+-      # attributes you can use direct writer methods. This is meant to protect
+-      # sensitive attributes from being overwritten by malicious users
+-      # tampering with URLs or forms. If you'd rather start from an all-open
+-      # default and restrict attributes as needed, have a look at
+-      # +attr_protected+.
+-      #
+-      #   class Customer < ActiveRecord::Base
+-      #     attr_accessible :name, :nickname
+-      #   end
+-      #
+-      #   customer = Customer.new(:name => "David", :nickname => "Dave", :credit_rating => "Excellent")
+-      #   customer.credit_rating # => nil
+-      #   customer.attributes = { :name => "Jolly fellow", :credit_rating => "Superb" }
+-      #   customer.credit_rating # => nil
+-      #
+-      #   customer.credit_rating = "Average"
+-      #   customer.credit_rating # => "Average"
+-      #
+-      # If the access logic of your application is richer you can use <tt>Hash#except</tt>
+-      # or <tt>Hash#slice</tt> to sanitize the hash of parameters before they are
+-      # passed to Active Record.
+-      #
+-      # For example, it could be the case that the list of accessible attributes
+-      # for a given model depends on the role of the user:
+-      #
+-      #   # Assumes plan_id is accessible because it depends on the role.
+-      #   params[:account] = params[:account].except(:plan_id) unless admin?
+-      #   @account.update_attributes(params[:account])
+-      #
+-      # Note that +attr_accessible+ is still applied to the received hash. Thus,
+-      # with this technique you can at most _narrow_ the list of accessible
+-      # attributes for a particular mass-assignment call.
+-      def attr_accessible(*attributes)
+-        write_inheritable_attribute(:attr_accessible, Set.new(attributes.map(&:to_s)) + (accessible_attributes || []))
+-      end
+-
+-      # Returns an array of all the attributes that have been made accessible to mass-assignment.
+-      def accessible_attributes # :nodoc:
+-        read_inheritable_attribute(:attr_accessible)
+-      end
+-
+        # Attributes listed as readonly can be set for a new record, but will be ignored in database updates afterwards.
+        def attr_readonly(*attributes)
+          write_inheritable_attribute(:attr_readonly, Set.new(attributes.map(&:to_s)) + (readonly_attributes || []))
+@@ -2155,27 +2059,6 @@ module ActiveRecord #:nodoc:
+         end
+       end
+ 
+-      def remove_attributes_protected_from_mass_assignment(attributes)
+-        safe_attributes =
+-          if self.class.accessible_attributes.nil? && self.class.protected_attributes.nil?
+-            attributes.reject { |key, value| attributes_protected_by_default.include?(key.gsub(/\(.+/, "")) }
+-          elsif self.class.protected_attributes.nil?
+-            attributes.reject { |key, value| !self.class.accessible_attributes.include?(key.gsub(/\(.+/, "")) || attributes_protected_by_default.include?(key.gsub(/\(.+/, "")) }
+-          elsif self.class.accessible_attributes.nil?
+-            attributes.reject { |key, value| self.class.protected_attributes.include?(key.gsub(/\(.+/,"")) || attributes_protected_by_default.include?(key.gsub(/\(.+/, "")) }
+-          else
+-            raise "Declare either attr_protected or attr_accessible for #{self.class}, but not both."
+-          end
+-
+-        removed_attributes = attributes.keys - safe_attributes.keys
+-
+-        if removed_attributes.any?
+-          log_protected_attribute_removal(removed_attributes)
+-        end
+-
+-        safe_attributes
+-      end
+-
+       # Removes attributes which have been marked as readonly.
+       def remove_readonly_attributes(attributes)
+         unless self.class.readonly_attributes.nil?
+@@ -2185,16 +2068,10 @@ module ActiveRecord #:nodoc:
+         end
+       end
+ 
+-      def log_protected_attribute_removal(*attributes)
+-        if logger
+-          logger.debug "WARNING: Can't mass-assign these protected attributes: #{attributes.join(', ')}"
+-        end
+-      end
+-
+       # The primary key and inheritance column can never be set by mass-assignment for security reasons.
+-      def attributes_protected_by_default
+-        default = [ self.class.primary_key, self.class.inheritance_column ]
+-        default << 'id' unless self.class.primary_key.eql? 'id'
++      def self.attributes_protected_by_default
++        default = [ primary_key, inheritance_column ]
++        default << 'id' unless primary_key.eql? 'id'
+         default
+       end
+ 
+@@ -2378,6 +2255,7 @@ module ActiveRecord #:nodoc:
+     extend ActiveModel::Naming
+     extend QueryCache::ClassMethods
+     extend ActiveSupport::Benchmarkable
++    extend MassAssignmentSecurity
+ 
+     include Validations
+     include Locking::Optimistic, Locking::Pessimistic
+diff --git a/activerecord/lib/active_record/mass_assignment_security.rb b/activerecord/lib/active_record/mass_assignment_security.rb
+new file mode 100644
+index 0000000..a66baf4
+--- /dev/null
++++ b/activerecord/lib/active_record/mass_assignment_security.rb
+@@ -0,0 +1,161 @@
++require 'active_record/mass_assignment_security/permission_set'
++
++module ActiveRecord
++  module MassAssignmentSecurity
++    # Mass assignment security provides an interface for protecting attributes
++    # from end-user assignment. For more complex permissions, mass assignment security 
++    # may be handled outside the model by extending a non-ActiveRecord class,
++    # such as a controller, with this behavior.
++    #
++    # For example, a logged in user may need to assign additional attributes depending
++    # on their role:
++    # 
++    # class AccountsController < ApplicationController
++    #   extend ActiveRecord::MassAssignmentSecurity
++    #    
++    #   attr_accessible :first_name, :last_name
++    #
++    #   def self.admin_accessible_attributes
++    #     accessible_attributes + [ :plan_id ]
++    #   end
++    # 
++    #   def update
++    #     ...
++    #     @account.update_attributes(account_params)
++    #     ...
++    #   end
++    #     
++    #   protected  
++    # 
++    #   def account_params
++    #     remove_attributes_protected_from_mass_assignment(params[:account])
++    #   end
++    #
++    #   def mass_assignment_authorizer
++    #     admin ? admin_accessible_attributes : super
++    #   end
++    #   
++    # end
++    #
++    def self.extended(base)
++      base.send(:include, InstanceMethods)
++    end
++    
++    module InstanceMethods
++      
++      protected
++      
++        def remove_attributes_protected_from_mass_assignment(attributes)
++          mass_assignment_authorizer.sanitize(attributes)
++        end
++        
++        def mass_assignment_authorizer
++          self.class.mass_assignment_authorizer
++        end
++      
++    end
++                
++    # Attributes named in this macro are protected from mass-assignment,
++    # such as <tt>new(attributes)</tt>,
++    # <tt>update_attributes(attributes)</tt>, or
++    # <tt>attributes=(attributes)</tt>.
++    #
++    # Mass-assignment to these attributes will simply be ignored, to assign
++    # to them you can use direct writer methods. This is meant to protect
++    # sensitive attributes from being overwritten by malicious users
++    # tampering with URLs or forms.
++    #
++    #   class Customer < ActiveRecord::Base
++    #     attr_protected :credit_rating
++    #   end
++    #
++    #   customer = Customer.new("name" => David, "credit_rating" => "Excellent")
++    #   customer.credit_rating # => nil
++    #   customer.attributes = { "description" => "Jolly fellow", "credit_rating" => "Superb" }
++    #   customer.credit_rating # => nil
++    #
++    #   customer.credit_rating = "Average"
++    #   customer.credit_rating # => "Average"
++    #
++    # To start from an all-closed default and enable attributes as needed,
++    # have a look at +attr_accessible+.
++    #
++    # Note that using <tt>Hash#except</tt> or <tt>Hash#slice</tt> in place of +attr_protected+ 
++    # to sanitize attributes won't provide sufficient protection.
++    def attr_protected(*keys)
++      use_authorizer(:protected_attributes)
++      protected_attributes.merge(keys)
++    end
++    
++    # Specifies a white list of model attributes that can be set via
++    # mass-assignment, such as <tt>new(attributes)</tt>,
++    # <tt>update_attributes(attributes)</tt>, or
++    # <tt>attributes=(attributes)</tt>
++    #
++    # This is the opposite of the +attr_protected+ macro: Mass-assignment
++    # will only set attributes in this list, to assign to the rest of
++    # attributes you can use direct writer methods. This is meant to protect
++    # sensitive attributes from being overwritten by malicious users
++    # tampering with URLs or forms. If you'd rather start from an all-open
++    # default and restrict attributes as needed, have a look at
++    # +attr_protected+.
++    #
++    #   class Customer < ActiveRecord::Base
++    #     attr_accessible :name, :nickname
++    #   end
++    #
++    #   customer = Customer.new(:name => "David", :nickname => "Dave", :credit_rating => "Excellent")
++    #   customer.credit_rating # => nil
++    #   customer.attributes = { :name => "Jolly fellow", :credit_rating => "Superb" }
++    #   customer.credit_rating # => nil
++    #
++    #   customer.credit_rating = "Average"
++    #   customer.credit_rating # => "Average"
++    #
++    # Note that using <tt>Hash#except</tt> or <tt>Hash#slice</tt> in place of +attr_accessible+ 
++    # to sanitize attributes won't provide sufficient protection.
++    def attr_accessible(*keys)
++      use_authorizer(:accessible_attributes)
++      accessible_attributes.merge(keys)
++    end
++    
++    # Returns an array of all the attributes that have been protected from mass-assignment.
++    def protected_attributes
++      read_inheritable_attribute(:protected_attributes) || begin
++        authorizer = BlackList.new
++        authorizer += attributes_protected_by_default
++        authorizer.logger = logger
++        write_inheritable_attribute(:protected_attributes, authorizer)
++      end
++    end
++    
++    # Returns an array of all the attributes that have been made accessible to mass-assignment.
++    def accessible_attributes
++      read_inheritable_attribute(:accessible_attributes) || begin
++        authorizer = WhiteList.new
++        authorizer.logger = logger
++        write_inheritable_attribute(:accessible_attributes, authorizer)
++      end
++    end
++    
++    def mass_assignment_authorizer
++      protected_attributes
++    end
++    
++    private
++    
++      # Sets the active authorizer, (attr_protected or attr_accessible). Subsequent calls 
++      # will raise an exception when using a different authorizer_id.
++      def use_authorizer(authorizer_id) # :nodoc:
++        if active_authorizer_id = read_inheritable_attribute(:active_authorizer_id)
++          unless authorizer_id == active_authorizer_id
++            raise("Already using #{active_authorizer_id}, cannot use #{authorizer_id}")
++          end
++        else
++          write_inheritable_attribute(:active_authorizer_id, authorizer_id)
++        end
++      end
++    
++  end
++end
++
+diff --git a/activerecord/lib/active_record/mass_assignment_security/permission_set.rb b/activerecord/lib/active_record/mass_assignment_security/permission_set.rb
+new file mode 100644
+index 0000000..4a055e2
+--- /dev/null
++++ b/activerecord/lib/active_record/mass_assignment_security/permission_set.rb
+@@ -0,0 +1,44 @@
++require 'active_record/mass_assignment_security/sanitizer' 
++
++module ActiveRecord
++  module MassAssignmentSecurity
++    class PermissionSet < Set
++      
++      attr_accessor :logger
++      
++      def merge(values)
++        super(values.map(&:to_s))
++      end
++      
++      def include?(key)
++        super(remove_multiparameter_id(key))
++      end
++      
++      protected
++            
++        def remove_multiparameter_id(key)
++          key.gsub(/\(.+/, '')
++        end
++      
++    end
++    
++    class WhiteList < PermissionSet
++      include Sanitizer
++      
++      def deny?(key)
++        !include?(key)
++      end
++      
++    end
++      
++    class BlackList < PermissionSet
++      include Sanitizer
++      
++      def deny?(key) 
++        include?(key)
++      end
++    
++    end
++      
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/mass_assignment_security/sanitizer.rb b/activerecord/lib/active_record/mass_assignment_security/sanitizer.rb
+new file mode 100644
+index 0000000..ec38656
+--- /dev/null
++++ b/activerecord/lib/active_record/mass_assignment_security/sanitizer.rb
+@@ -0,0 +1,28 @@
++module ActiveRecord
++  module MassAssignmentSecurity
++    module Sanitizer
++
++      # Returns all attributes not denied by the authorizer.
++      def sanitize(attributes)
++        sanitized_attributes = attributes.reject { |key, value| deny?(key) }
++        debug_protected_attribute_removal(attributes, sanitized_attributes) if debug?
++        sanitized_attributes
++      end
++
++      protected
++
++        def debug_protected_attribute_removal(attributes, sanitized_attributes)
++          removed_keys = attributes.keys - sanitized_attributes.keys
++          if removed_keys.any?
++            logger.debug "WARNING: Can't mass-assign protected attributes: #{removed_keys.join(', ')}"
++          end
++        end
++        
++        def debug?
++          logger.present?
++        end 
++
++    end 
++  end
++end
++
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 1441b42..8d04e4a 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -71,9 +71,8 @@ class Task < ActiveRecord::Base
+   attr_protected :starting
+ end
+ 
+-class TopicWithProtectedContentAndAccessibleAuthorName < ActiveRecord::Base
++class TopicWithProtectedContent < ActiveRecord::Base
+   self.table_name = 'topics'
+-  attr_accessible :author_name
+   attr_protected  :content
+ end
+ 
+@@ -980,9 +979,9 @@ class BasicsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_mass_assignment_should_raise_exception_if_accessible_and_protected_attribute_writers_are_both_used
+-    topic = TopicWithProtectedContentAndAccessibleAuthorName.new
+-    assert_raise(RuntimeError) { topic.attributes = { "author_name" => "me" } }
+-    assert_raise(RuntimeError) { topic.attributes = { "content" => "stuff" } }
++    assert_raise(RuntimeError) do
++      TopicWithProtectedContent.attr_accessible :author_name
++    end
+   end
+ 
+   def test_mass_assignment_protection
+@@ -1045,19 +1044,20 @@ class BasicsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_mass_assignment_protection_inheritance
+-    assert_nil LoosePerson.accessible_attributes
+-    assert_equal Set.new([ 'credit_rating', 'administrator' ]), LoosePerson.protected_attributes
++    assert LoosePerson.accessible_attributes.blank?
++    assert_equal Set.new([ 'credit_rating', 'administrator', *LoosePerson.attributes_protected_by_default ]), LoosePerson.protected_attributes
+ 
+-    assert_nil LooseDescendant.accessible_attributes
+-    assert_equal Set.new([ 'credit_rating', 'administrator', 'phone_number' ]), LooseDescendant.protected_attributes
++    assert LooseDescendant.accessible_attributes.blank?
++    assert_equal Set.new([ 'credit_rating', 'administrator', 'phone_number', *LoosePerson.attributes_protected_by_default ]), LooseDescendant.protected_attributes
+ 
+-    assert_nil LooseDescendantSecond.accessible_attributes
+-    assert_equal Set.new([ 'credit_rating', 'administrator', 'phone_number', 'name' ]), LooseDescendantSecond.protected_attributes, 'Running attr_protected twice in one class should merge the protections'
++    assert LooseDescendantSecond.accessible_attributes.blank?
++    assert_equal Set.new([ 'credit_rating', 'administrator', 'phone_number', 'name', *LoosePerson.attributes_protected_by_default ]), LooseDescendantSecond.protected_attributes,
++      'Running attr_protected twice in one class should merge the protections'
+ 
+-    assert_nil TightPerson.protected_attributes
++    assert (TightPerson.protected_attributes - TightPerson.attributes_protected_by_default).blank?
+     assert_equal Set.new([ 'name', 'address' ]), TightPerson.accessible_attributes
+ 
+-    assert_nil TightDescendant.protected_attributes
++    assert (TightDescendant.protected_attributes - TightDescendant.attributes_protected_by_default).blank?
+     assert_equal Set.new([ 'name', 'address', 'phone_number' ]), TightDescendant.accessible_attributes
+   end
+ 
+diff --git a/activerecord/test/cases/mass_assignment_security/black_list_test.rb b/activerecord/test/cases/mass_assignment_security/black_list_test.rb
+new file mode 100644
+index 0000000..7642b3b
+--- /dev/null
++++ b/activerecord/test/cases/mass_assignment_security/black_list_test.rb
+@@ -0,0 +1,29 @@
++require "cases/helper"
++
++class BlackListTest < ActiveRecord::TestCase
++
++  def setup
++    @black_list   = ActiveRecord::MassAssignmentSecurity::BlackList.new
++    @included_key = 'admin'
++    @black_list  += [ @included_key ]
++  end
++
++  test "deny? is true for included items" do
++    assert_equal true, @black_list.deny?(@included_key)
++  end
++
++  test "deny? is false for non-included items" do
++    assert_equal false, @black_list.deny?('first_name')
++  end
++
++  test "sanitize attributes" do
++    original_attributes = { 'first_name' => 'allowed', 'admin' => 'denied', 'admin(1)' => 'denied' }
++    attributes = @black_list.sanitize(original_attributes)
++
++    assert attributes.key?('first_name'), "Allowed key shouldn't be rejected"
++    assert !attributes.key?('admin'),     "Denied key should be rejected"
++    assert !attributes.key?('admin(1)'),  "Multi-parameter key should be detected"
++  end
++
++end
++
+diff --git a/activerecord/test/cases/mass_assignment_security/permission_set_test.rb b/activerecord/test/cases/mass_assignment_security/permission_set_test.rb
+new file mode 100644
+index 0000000..d3e1b7b
+--- /dev/null
++++ b/activerecord/test/cases/mass_assignment_security/permission_set_test.rb
+@@ -0,0 +1,31 @@
++require "cases/helper"
++
++class PermissionSetTest < ActiveRecord::TestCase
++
++  def setup
++    @permission_list = ActiveRecord::MassAssignmentSecurity::PermissionSet.new
++  end
++
++  test "+ stringifies added collection values" do
++    symbol_collection = [ :admin ]
++    @permission_list += symbol_collection
++
++    assert @permission_list.include?('admin'), "did not add collection to #{@permission_list.inspect}}"
++  end
++
++  test "include? normalizes multi-parameter keys" do
++    multi_param_key = 'admin(1)'
++    @permission_list += [ 'admin' ]
++
++    assert_equal true, @permission_list.include?(multi_param_key), "#{multi_param_key} not found in #{@permission_list.inspect}"
++  end
++
++  test "include? normal keys" do
++    normal_key = 'admin'
++    @permission_list +=  [ normal_key ]
++
++    assert_equal true,  @permission_list.include?(normal_key), "#{normal_key} not found in #{@permission_list.inspect}"
++  end
++
++end
++
+diff --git a/activerecord/test/cases/mass_assignment_security/sanitizer_test.rb b/activerecord/test/cases/mass_assignment_security/sanitizer_test.rb
+new file mode 100644
+index 0000000..4090111
+--- /dev/null
++++ b/activerecord/test/cases/mass_assignment_security/sanitizer_test.rb
+@@ -0,0 +1,37 @@
++require "cases/helper"
++
++class SanitizerTest < ActiveRecord::TestCase
++
++  class SanitizingAuthorizer
++    include ActiveRecord::MassAssignmentSecurity::Sanitizer
++
++    attr_accessor :logger
++
++    def deny?(key)
++       [ 'admin' ].include?(key)
++    end
++
++  end
++
++  def setup
++    @sanitizer = SanitizingAuthorizer.new
++  end
++
++  test "sanitize attributes" do
++    original_attributes = { 'first_name' => 'allowed', 'admin' => 'denied' }
++    attributes = @sanitizer.sanitize(original_attributes)
++
++    assert attributes.key?('first_name'), "Allowed key shouldn't be rejected"
++    assert !attributes.key?('admin'),     "Denied key should be rejected"
++  end
++
++  test "debug mass assignment removal" do
++    original_attributes = { 'first_name' => 'allowed', 'admin' => 'denied' }
++    log = StringIO.new
++    @sanitizer.logger = Logger.new(log)
++    @sanitizer.sanitize(original_attributes)
++    assert (log.string =~ /admin/), "Should log removed attributes: #{log.string}"
++  end
++
++end
++
+diff --git a/activerecord/test/cases/mass_assignment_security/white_list_test.rb b/activerecord/test/cases/mass_assignment_security/white_list_test.rb
+new file mode 100644
+index 0000000..5901047
+--- /dev/null
++++ b/activerecord/test/cases/mass_assignment_security/white_list_test.rb
+@@ -0,0 +1,29 @@
++require "cases/helper"
++
++class WhiteListTest < ActiveRecord::TestCase
++
++  def setup
++    @white_list   = ActiveRecord::MassAssignmentSecurity::WhiteList.new
++    @included_key = 'first_name'
++    @white_list  += [ @included_key ]
++  end
++
++  test "deny? is false for included items" do
++    assert_equal false, @white_list.deny?(@included_key)
++  end
++
++  test "deny? is true for non-included items" do
++    assert_equal true, @white_list.deny?('admin')
++  end
++
++  test "sanitize attributes" do
++    original_attributes = { 'first_name' => 'allowed', 'admin' => 'denied', 'admin(1)' => 'denied' }
++    attributes = @white_list.sanitize(original_attributes)
++
++    assert attributes.key?('first_name'), "Allowed key shouldn't be rejected"
++    assert !attributes.key?('admin'),     "Denied key should be rejected"
++    assert !attributes.key?('admin(1)'),  "Multi-parameter key should be detected"
++  end
++
++end
++
+-- 
+1.6.5.3
+

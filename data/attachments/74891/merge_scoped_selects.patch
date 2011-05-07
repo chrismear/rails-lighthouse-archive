@@ -1,0 +1,77 @@
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index cca012e..0b65105 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1662,7 +1662,7 @@ module ActiveRecord #:nodoc:
+ 
+         def construct_finder_sql(options)
+           scope = scope(:find)
+-          sql  = "SELECT #{options[:select] || (scope && scope[:select]) || default_select(options[:joins] || (scope && scope[:joins]))} "
++          sql = "SELECT #{merge_selects(options[:select], (scope && scope[:select])) || default_select(options[:joins] || (scope && scope[:joins]))} "
+           sql << "FROM #{(scope && scope[:from]) || options[:from] || quoted_table_name} "
+ 
+           add_joins!(sql, options[:joins], scope)
+@@ -1681,6 +1681,13 @@ module ActiveRecord #:nodoc:
+          (safe_to_array(first) + safe_to_array(second)).uniq
+         end
+ 
++        # Merges selects so that the result is a joined list of them
++        # Be aware that this may not work for more complex DISTINCT ON statements with subselects in them
++        def merge_selects(first, second)
++          segments = "#{first},#{second}".split(',').delete_if(&:blank?).map(&:strip).uniq
++          segments.blank? ? nil : segments.join(', ')
++        end
++
+         def merge_joins(*joins)
+           if joins.any?{|j| j.is_a?(String) || array_of_strings?(j) }
+             joins = joins.collect do |join|
+@@ -2085,7 +2092,9 @@ module ActiveRecord #:nodoc:
+                   if method == :find
+                     (hash[method].keys + params.keys).uniq.each do |key|
+                       merge = hash[method][key] && params[key] # merge if both scopes have the same key
+-                      if key == :conditions && merge
++                      if key == :select && merge
++                        hash[method][key] = merge_selects(params[key], hash[method][key])
++                      elsif key == :conditions && merge
+                         hash[method][key] = merge_conditions(params[key], hash[method][key])
+                       elsif key == :include && merge
+                         hash[method][key] = merge_includes(hash[method][key], params[key]).uniq
+diff --git a/activerecord/test/cases/method_scoping_test.rb b/activerecord/test/cases/method_scoping_test.rb
+index 80a0611..396d584 100644
+--- a/activerecord/test/cases/method_scoping_test.rb
++++ b/activerecord/test/cases/method_scoping_test.rb
+@@ -77,11 +77,12 @@ class MethodScopingTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  def test_options_select_replaces_scope_select
++  def test_scoped_find_combines_select
+     Developer.with_scope(:find => { :select => "id, name" }) do
+       developer = Developer.find(:first, :select => 'id, salary', :conditions => "name = 'David'")
++      
++      assert developer.has_attribute?(:name)
+       assert_equal 80000, developer.salary
+-      assert !developer.has_attribute?(:name)
+     end
+   end
+ 
+@@ -186,6 +187,17 @@ class MethodScopingTest < ActiveRecord::TestCase
+     assert_equal authors(:david).attributes, scoped_authors.first.attributes
+   end
+ 
++  def test_scoped_find_merges_selects
++    author = Author.find(:first)
++    scoped_authors = Author.with_scope(:find => { :select => 'authors.name'}) do
++      Author.with_scope(:find => { :select => 'authors.id'}) do
++        Author.find(:all, :conditions => {:id => author.id})
++      end
++    end
++    assert_equal 1, scoped_authors.size
++    assert_equal author.attributes.delete_if{|k,v| !['name', 'id'].include?(k)}, scoped_authors.first.attributes
++  end
++
+   def test_scoped_count_include
+     # with the include, will retrieve only developers for the given project
+     Developer.with_scope(:find => { :include => :projects }) do
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index bab842c..87fd420 100644

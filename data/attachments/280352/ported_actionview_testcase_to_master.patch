@@ -1,0 +1,460 @@
+From 700636690a28ade67a75579e6e2594e3c4bf3a5b Mon Sep 17 00:00:00 2001
+From: Erik Ostrom <erik@echographia.com>
+Date: Mon, 28 Sep 2009 20:01:46 +0200
+Subject: [PATCH] Ported the new ActionView::TestCase from 2-3-stable to master.
+
+The test case now mimicks the template environment more closely, so it's
+possible to use render, load helper dependencies.
+
+This also fixes assert_select, and similar assertions. Because view tests
+and helpers generally don't render full templates assert_select looks
+first in rendered and then in output_buffer to find the rendered output.
+
+Additional `master'-only changes: Made the Action Pack Rakefile run the
+ActionView::TestCase tests, and made ActionView::Rendering#_render_text
+always return a string.
+
+Signed-off-by: Eloy Duran <eloy.de.enige@gmail.com>
+---
+ actionpack/Rakefile                                |    2 +-
+ .../lib/action_controller/testing/test_case.rb     |    2 +-
+ actionpack/lib/action_view/render/rendering.rb     |    1 +
+ actionpack/lib/action_view/test_case.rb            |  125 ++++++++++++---
+ actionpack/test/fixtures/test/_from_helper.erb     |    1 +
+ .../test/template/active_record_helper_test.rb     |    2 +-
+ actionpack/test/template/benchmark_helper_test.rb  |   12 +-
+ actionpack/test/view/test_case_test.rb             |  171 +++++++++++++++++++-
+ 8 files changed, 278 insertions(+), 38 deletions(-)
+ create mode 100644 actionpack/test/fixtures/test/_from_helper.erb
+
+diff --git a/actionpack/Rakefile b/actionpack/Rakefile
+index 97ffd27..af39175 100644
+--- a/actionpack/Rakefile
++++ b/actionpack/Rakefile
+@@ -34,7 +34,7 @@ end
+ desc "Run all unit tests"
+ task :test => [:test_action_pack, :test_active_record_integration]
+ 
+-TESTS_GLOB = "test/{abstract,controller,dispatch,new_base,template,html-scanner}/**/*_test.rb"
++TESTS_GLOB = "test/{abstract,controller,dispatch,new_base,template,html-scanner,view}/**/*_test.rb"
+ 
+ Rake::TestTask.new(:test_action_pack) do |t|
+   t.libs << 'test'
+diff --git a/actionpack/lib/action_controller/testing/test_case.rb b/actionpack/lib/action_controller/testing/test_case.rb
+index c378981..178e347 100644
+--- a/actionpack/lib/action_controller/testing/test_case.rb
++++ b/actionpack/lib/action_controller/testing/test_case.rb
+@@ -10,7 +10,7 @@ module ActionController
+       self.session_options = TestSession::DEFAULT_OPTIONS.merge(:id => ActiveSupport::SecureRandom.hex(16))
+     end
+ 
+-    def assign_parameters(controller_path, action, parameters)
++    def assign_parameters(controller_path, action, parameters = {})
+       parameters = parameters.symbolize_keys.merge(:controller => controller_path, :action => action)
+       extra_keys = ActionController::Routing::Routes.extra_keys(parameters)
+       non_path_parameters = get? ? query_parameters : request_parameters
+diff --git a/actionpack/lib/action_view/render/rendering.rb b/actionpack/lib/action_view/render/rendering.rb
+index 8b0d4cc..0cab035 100644
+--- a/actionpack/lib/action_view/render/rendering.rb
++++ b/actionpack/lib/action_view/render/rendering.rb
+@@ -89,6 +89,7 @@ module ActionView
+ 
+     def _render_text(text, layout, options)
+       text = layout.render(self, options[:locals]) { text } if layout
++      text
+     end
+ 
+     # This is the API to render a ViewContext's template from a controller.
+diff --git a/actionpack/lib/action_view/test_case.rb b/actionpack/lib/action_view/test_case.rb
+index c2ccd1d..441f462 100644
+--- a/actionpack/lib/action_view/test_case.rb
++++ b/actionpack/lib/action_view/test_case.rb
+@@ -1,4 +1,5 @@
+ require 'active_support/test_case'
++require 'action_controller/testing/test_case'
+ 
+ module ActionView
+   class Base
+@@ -23,12 +24,52 @@ module ActionView
+   end
+ 
+   class TestCase < ActiveSupport::TestCase
++    class TestController < ActionController::Base
++      attr_accessor :request, :response, :params
++
++      def self.controller_path
++        ''
++      end
++
++      def initialize
++        @request = ActionController::TestRequest.new
++        @response = ActionController::TestResponse.new
++
++        @params = {}
++      end
++    end
++
+     include ActionDispatch::Assertions
+     include ActionController::TestProcess
+     include ActionView::Context
+ 
++    include ActionController::PolymorphicRoutes
++    include ActionController::RecordIdentifier
++
++    include ActionView::Helpers
++    include ActionController::Helpers
++
+     class_inheritable_accessor :helper_class
+-    @@helper_class = nil
++    attr_accessor :controller, :output_buffer, :rendered
++
++    setup :setup_with_controller
++    def setup_with_controller
++      @controller = TestController.new
++      @output_buffer = ''
++      @rendered = ''
++
++      self.class.send(:include_helper_modules!)
++      make_test_case_available_to_view!
++    end
++
++    def render(options = {}, local_assigns = {}, &block)
++      @rendered << output = _view.render(options, local_assigns, &block)
++      output
++    end
++
++    def protect_against_forgery?
++      false
++    end
+ 
+     class << self
+       def tests(helper_class)
+@@ -48,41 +89,75 @@ module ActionView
+       rescue NameError
+         nil
+       end
+-    end
+ 
+-    include ActionView::Helpers
+-    include ActionController::PolymorphicRoutes
+-    include ActionController::RecordIdentifier
+-
+-    setup :setup_with_helper_class
+-
+-    def setup_with_helper_class
+-      if helper_class && !self.class.ancestors.include?(helper_class)
+-        self.class.send(:include, helper_class)
++      def helper_method(*methods)
++        # Almost a duplicate from ActionController::Helpers
++        methods.flatten.each do |method|
++          _helpers.module_eval <<-end_eval
++            def #{method}(*args, &block)                    # def current_user(*args, &block)
++              _test_case.send(%(#{method}), *args, &block)  #   test_case.send(%(current_user), *args, &block)
++            end                                             # end
++          end_eval
++        end
+       end
+ 
+-      self.output_buffer = ''
++      private
++        def include_helper_modules!
++          helper(helper_class) if helper_class
++          include _helpers
++        end
+     end
+ 
+-    class TestController < ActionController::Base
+-      attr_accessor :request, :response, :params
++    private
++      def make_test_case_available_to_view!
++        test_case_instance = self
++        _helpers.module_eval do
++          define_method(:_test_case) { test_case_instance }
++          private :_test_case
++        end
++      end
+ 
+-      def initialize
+-        @request = ActionController::TestRequest.new
+-        @response = ActionController::TestResponse.new
++      def _view
++        view = ActionView::Base.new(ActionController::Base.view_paths, _assigns, @controller)
++        view.class.send :include, _helpers
++        view
++      end
+ 
+-        @params = {}
++      # Support the selector assertions
++      #
++      # Need to experiment if this priority is the best one: rendered => output_buffer
++      def response_from_page_or_rjs
++        HTML::Document.new(rendered.blank? ? output_buffer : rendered).root
++      end
++
++      EXCLUDE_IVARS = %w{
++        @output_buffer
++        @fixture_cache
++        @method_name
++        @_result
++        @loaded_fixtures
++        @test_passed
++        @view
++      }
++
++      def _instance_variables
++        instance_variables - EXCLUDE_IVARS
+       end
+-    end
+ 
+-    protected
+-      attr_accessor :output_buffer
++      def _assigns
++        _instance_variables.inject({}) do |hash, var|
++          name = var[1..-1].to_sym
++          hash[name] = instance_variable_get(var)
++          hash
++        end
++      end
+ 
+-    private
+       def method_missing(selector, *args)
+-        controller = TestController.new
+-        return controller.__send__(selector, *args) if ActionController::Routing::Routes.named_routes.helpers.include?(selector)
+-        super
++        if ActionController::Routing::Routes.named_routes.helpers.include?(selector)
++          @controller.__send__(selector, *args)
++        else
++          super
++        end
+       end
+   end
+ end
+diff --git a/actionpack/test/fixtures/test/_from_helper.erb b/actionpack/test/fixtures/test/_from_helper.erb
+new file mode 100644
+index 0000000..16de7c0
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_from_helper.erb
+@@ -0,0 +1 @@
++<%= render_from_helper %>
+\ No newline at end of file
+diff --git a/actionpack/test/template/active_record_helper_test.rb b/actionpack/test/template/active_record_helper_test.rb
+index ec3384f..c149070 100644
+--- a/actionpack/test/template/active_record_helper_test.rb
++++ b/actionpack/test/template/active_record_helper_test.rb
+@@ -185,7 +185,7 @@ class ActiveRecordHelperTest < ActionView::TestCase
+   end
+ 
+   def test_form_with_action_option
+-    @response.body = form("post", :action => "sign")
++    output_buffer << form("post", :action => "sign")
+     assert_select "form[action=sign]" do |form|
+       assert_select "input[type=submit][value=Sign]"
+     end
+diff --git a/actionpack/test/template/benchmark_helper_test.rb b/actionpack/test/template/benchmark_helper_test.rb
+index 5d2af7c..ac31fc6 100644
+--- a/actionpack/test/template/benchmark_helper_test.rb
++++ b/actionpack/test/template/benchmark_helper_test.rb
+@@ -4,14 +4,14 @@ require 'action_view/helpers/benchmark_helper'
+ class BenchmarkHelperTest < ActionView::TestCase
+   tests ActionView::Helpers::BenchmarkHelper
+ 
+-  def teardown
+-    controller.logger.send(:clear_buffer)
++  def setup
++    super
++    controller.logger = ActiveSupport::BufferedLogger.new(StringIO.new)
++    controller.logger.auto_flushing = false
+   end
+ 
+-  def controller
+-    logger = ActiveSupport::BufferedLogger.new(StringIO.new)
+-    logger.auto_flushing = false
+-    @controller ||= Struct.new(:logger).new(logger)
++  def teardown
++    controller.logger.send(:clear_buffer)
+   end
+ 
+   def test_without_block
+diff --git a/actionpack/test/view/test_case_test.rb b/actionpack/test/view/test_case_test.rb
+index 9124198..3e974b8 100644
+--- a/actionpack/test/view/test_case_test.rb
++++ b/actionpack/test/view/test_case_test.rb
+@@ -1,8 +1,171 @@
+ require 'abstract_unit'
+ 
+-class TestCaseTest < ActionView::TestCase
+-  def test_should_have_current_url
+-    controller = TestController.new
+-    assert_nothing_raised(NoMethodError){ controller.url_for({:controller => "foo", :action => "index"}) }
++module ActionView
++  class TestCase
++    module ATestHelper
++    end
++
++    module AnotherTestHelper
++      def from_another_helper
++        'Howdy!'
++      end
++    end
++
++    module ASharedTestHelper
++      def from_shared_helper
++        'Holla!'
++      end
++    end
++    helper ASharedTestHelper
++
++    module SharedTests
++      def self.included(test_case)
++        test_case.class_eval do
++          test "helpers defined on ActionView::TestCase are available" do
++            assert test_case.ancestors.include?(ASharedTestHelper)
++            assert 'Holla!', from_shared_helper
++          end
++        end
++      end
++    end
++
++    class GeneralViewTest < ActionView::TestCase
++      include SharedTests
++      test_case = self
++
++      test "works without testing a helper module" do
++        assert_equal 'Eloy', render('developers/developer', :developer => stub(:name => 'Eloy'))
++      end
++
++      helper AnotherTestHelper
++      test "additional helper classes can be specified as in a controller" do
++        assert test_case.ancestors.include?(AnotherTestHelper)
++        assert 'Howdy!', from_another_helper
++      end
++    end
++
++    class ClassMethodsTest < ActionView::TestCase
++      include SharedTests
++      test_case = self
++
++      tests ATestHelper
++      test "tests the specified helper module" do
++        assert_equal ATestHelper, test_case.helper_class
++        assert test_case.ancestors.include?(ATestHelper)
++      end
++
++      helper AnotherTestHelper
++      test "additional helper classes can be specified as in a controller" do
++        assert test_case.ancestors.include?(AnotherTestHelper)
++        assert 'Howdy!', from_another_helper
++
++        test_case.helper_class.module_eval do
++          def render_from_helper
++            from_another_helper
++          end
++        end
++        assert 'Howdy!', render(:partial => 'test/from_helper')
++      end
++    end
++
++    class ATestHelperTest < ActionView::TestCase
++      include SharedTests
++      test_case = self
++
++      test "inflects the name of the helper module to test from the test case class" do
++        assert_equal ATestHelper, test_case.helper_class
++        assert test_case.ancestors.include?(ATestHelper)
++      end
++
++      test "a configured test controller is available" do
++        assert_kind_of ActionController::Base, controller
++        assert_equal '', controller.controller_path
++      end
++
++      test "helper class that is being tested is always included in view instance" do
++        self.class.helper_class.module_eval do
++          def render_from_helper
++            render :partial => 'customer', :collection => @customers
++          end
++        end
++
++        TestController.stubs(:controller_path).returns('test')
++
++        @customers = [stub(:name => 'Eloy'), stub(:name => 'Manfred')]
++        assert_match /Hello: EloyHello: Manfred/, render(:partial => 'test/from_helper')
++      end
++
++      test "no additional helpers should shared across test cases" do
++        assert !test_case.ancestors.include?(AnotherTestHelper)
++        assert_raise(NoMethodError) { send :from_another_helper }
++      end
++
++      test "is able to use routes" do
++        controller.request.assign_parameters('foo', 'index')
++        assert_equal '/foo', url_for
++        assert_equal '/bar', url_for(:controller => 'bar')
++      end
++
++      test "is able to use named routes" do
++        with_routing do |set|
++          set.draw { |map| map.resources :contents }
++          assert_equal 'http://test.host/contents/new', new_content_url
++          assert_equal 'http://test.host/contents/1',   content_url(:id => 1)
++        end
++      end
++
++      test "named routes can be used from helper included in view" do
++        with_routing do |set|
++          set.draw { |map| map.resources :contents }
++          _helpers.module_eval do
++            def render_from_helper
++              new_content_url
++            end
++          end
++
++          assert_equal 'http://test.host/contents/new', render(:partial => 'test/from_helper')
++        end
++      end
++
++      test "is able to render partials with local variables" do
++        assert_equal 'Eloy', render('developers/developer', :developer => stub(:name => 'Eloy'))
++        assert_equal 'Eloy', render(:partial => 'developers/developer',
++                                    :locals => { :developer => stub(:name => 'Eloy') })
++      end
++
++      test "is able to render partials from templates and also use instance variables" do
++        TestController.stubs(:controller_path).returns('test')
++
++        @customers = [stub(:name => 'Eloy'), stub(:name => 'Manfred')]
++        assert_match /Hello: EloyHello: Manfred/, render(:file => 'test/list')
++      end
++
++      test "is able to make methods available to the view" do
++        _helpers.module_eval do
++          def render_from_helper; from_test_case end
++        end
++        assert_equal 'Word!', render(:partial => 'test/from_helper')
++      end
++
++      def from_test_case; 'Word!'; end
++      helper_method :from_test_case
++    end
++
++    class AssertionsTest < ActionView::TestCase
++      def render_from_helper
++        form_tag('/foo') do
++          concat render(:text => '<ul><li>foo</li></ul>')
++        end
++      end
++      helper_method :render_from_helper
++
++      test "uses the output_buffer for assert_select" do
++        render(:partial => 'test/from_helper')
++
++        assert_select 'form' do
++          assert_select 'li', :text => 'foo'
++        end
++      end
++    end
+   end
+ end
+-- 
+1.6.4.4
+

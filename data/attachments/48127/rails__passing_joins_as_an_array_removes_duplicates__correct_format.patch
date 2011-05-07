@@ -1,0 +1,154 @@
+From fafe1a4e0c07b2a37148da0c28383984c02feba0 Mon Sep 17 00:00:00 2001
+From: Pivotal  Labs <contact@pivotallabs.com>
+Date: Tue, 23 Sep 2008 13:32:17 -0700
+Subject: [PATCH] ds/jp - Allowed passing arrays-of-strings to :join everywhere.  Merged duplicate join strings to avoid table aliasing problems.
+
+---
+ activerecord/lib/active_record/base.rb         |   34 ++++++++++++++---------
+ activerecord/test/cases/finder_test.rb         |   11 +++++++
+ activerecord/test/cases/method_scoping_test.rb |   30 +++++++++++++++++++++
+ activerecord/test/cases/named_scope_test.rb    |    6 ++++
+ 4 files changed, 68 insertions(+), 13 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 3aa8e55..77f8058 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1576,19 +1576,19 @@ module ActiveRecord #:nodoc:
+          (safe_to_array(first) + safe_to_array(second)).uniq
+         end
+ 
+-        def merge_joins(first, second)
+-          if first.is_a?(String) && second.is_a?(String)
+-            "#{first} #{second}"
+-          elsif first.is_a?(String) || second.is_a?(String)
+-            if first.is_a?(String)
+-              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, second, nil)
+-              "#{first} #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join}"
+-            else
+-              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, first, nil)
+-              "#{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} #{second}"
++        def merge_joins(*joins)
++          if joins.any?{|j| j.is_a?(String) || array_of_strings?(j) }
++            joins = joins.collect do |join|
++              join = [join] if join.is_a?(String)
++              unless array_of_strings?(join)
++                join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, join, nil)
++                join = join_dependency.join_associations.collect { |assoc| assoc.association_join }
++              end
++              join
+             end
++            joins.flatten.uniq
+           else
+-            (safe_to_array(first) + safe_to_array(second)).uniq
++            joins.collect{|j| safe_to_array(j)}.flatten.uniq
+           end
+         end
+ 
+@@ -1603,6 +1603,10 @@ module ActiveRecord #:nodoc:
+             [o]
+           end
+         end
++        
++        def array_of_strings?(o)
++          o.is_a?(Array) && o.all?{|obj| obj.is_a?(String)}
++        end
+ 
+         def add_order!(sql, order, scope = :auto)
+           scope = scope(:find) if :auto == scope
+@@ -1652,8 +1656,12 @@ module ActiveRecord #:nodoc:
+           merged_joins = scope && scope[:joins] && joins ? merge_joins(scope[:joins], joins) : (joins || scope && scope[:joins])
+           case merged_joins
+           when Symbol, Hash, Array
+-            join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, merged_joins, nil)
+-            sql << " #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} "
++            if array_of_strings?(merged_joins)
++              sql << merged_joins.join(' ') + " "
++            else
++              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, merged_joins, nil)
++              sql << " #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} "
++            end
+           when String
+             sql << " #{merged_joins} "
+           end
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index 10f6aa0..1e95cdf 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -934,6 +934,17 @@ class FinderTest < ActiveRecord::TestCase
+     )
+     assert_equal 1, first.id
+   end
++  
++  def test_joins_with_string_array
++    person_with_reader_and_post = Post.find(
++      :all,
++      :joins => [
++        "INNER JOIN categorizations ON categorizations.post_id = posts.id",
++        "INNER JOIN categories ON categories.id = categorizations.category_id AND categories.type = 'SpecialCategory'"
++      ]
++    )
++    assert_equal 1, person_with_reader_and_post.size
++  end
+ 
+   def test_find_by_id_with_conditions_with_or
+     assert_nothing_raised do
+diff --git a/activerecord/test/cases/method_scoping_test.rb b/activerecord/test/cases/method_scoping_test.rb
+index af6fcd3..a574542 100644
+--- a/activerecord/test/cases/method_scoping_test.rb
++++ b/activerecord/test/cases/method_scoping_test.rb
+@@ -137,6 +137,36 @@ class MethodScopingTest < ActiveRecord::TestCase
+     assert_equal 1, scoped_authors.size
+     assert_equal authors(:david).attributes, scoped_authors.first.attributes
+   end
++  
++  def test_scoped_find_merges_string_array_style_and_string_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => ["INNER JOIN posts ON posts.author_id = authors.id"]}) do
++      Author.find(:all, :select => 'DISTINCT authors.*', :joins => 'INNER JOIN comments ON posts.id = comments.post_id', :conditions => 'comments.id = 1')
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
++
++  def test_scoped_find_merges_string_array_style_and_hash_style_joins
++    scoped_authors = Author.with_scope(:find => { :joins => :posts}) do
++      Author.find(:all, :select => 'DISTINCT authors.*', :joins => ['INNER JOIN comments ON posts.id = comments.post_id'], :conditions => 'comments.id = 1')
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
++
++  def test_scoped_find_merges_joins_and_eliminates_duplicate_string_joins
++    scoped_authors = Author.with_scope(:find => { :joins => 'INNER JOIN posts ON posts.author_id = authors.id'}) do
++      Author.find(:all, :select => 'DISTINCT authors.*', :joins => ["INNER JOIN posts ON posts.author_id = authors.id", "INNER JOIN comments ON posts.id = comments.post_id"], :conditions => 'comments.id = 1')
++    end
++    assert scoped_authors.include?(authors(:david))
++    assert !scoped_authors.include?(authors(:mary))
++    assert_equal 1, scoped_authors.size
++    assert_equal authors(:david).attributes, scoped_authors.first.attributes
++  end
+ 
+   def test_scoped_count_include
+     # with the include, will retrieve only developers for the given project
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index 444debd..d095dc2 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -271,4 +271,10 @@ class NamedScopeTest < ActiveRecord::TestCase
+       topics.size # use loaded (no query)
+     end
+   end
++  
++  def test_chaining_with_duplicate_joins
++    join = "INNER JOIN comments ON comments.post_id = posts.id"
++    post = Post.find(1)
++    assert_equal post.comments.size, Post.scoped(:joins => join).scoped(:joins => join, :conditions => "posts.id = #{post.id}").size
++  end
+ end
+-- 
+1.6.0.1
+

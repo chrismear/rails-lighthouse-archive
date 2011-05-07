@@ -1,0 +1,314 @@
+From fd3b07f47741d836ca7aa26f2f1faae4f54f4591 Mon Sep 17 00:00:00 2001
+From: jastix <nik@jastix.me>
+Date: Sun, 9 Aug 2009 12:56:25 +0400
+Subject: [PATCH] #1874. PostgreSQL XML datatype support
+
+---
+ .../abstract/schema_definitions.rb                 |   15 +++++++++
+ .../connection_adapters/postgresql_adapter.rb      |   34 ++++++++++++-------
+ activerecord/test/cases/migration_test.rb          |   28 +++++++++++-----
+ activerecord/test/cases/schema_dumper_test.rb      |   12 ++++++-
+ .../test/schema/postgresql_specific_schema.rb      |   15 +++++++-
+ 5 files changed, 79 insertions(+), 25 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index f346e3e..520f3c8 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -315,6 +315,20 @@ module ActiveRecord
+         @base = base
+       end
+ 
++      #Handles non supported datatypes - e.g. XML
++      def method_missing(symbol, *args)
++        if symbol.to_s == 'xml'
++          xml_column_fallback(args)
++        end
++      end
++
++      def xml_column_fallback(*args)
++        case @base.adapter_name.downcase
++          when 'sqlite', 'mysql'
++            options = args.extract_options!
++            column(args[0], :text, options)
++          end
++        end
+       # Appends a primary key definition to the table definition.
+       # Can be called multiple times, but this is probably not a good idea.
+       def primary_key(name)
+@@ -705,3 +719,4 @@ module ActiveRecord
+ 
+   end
+ end
++
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index e77ae93..f00c61b 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -40,6 +40,12 @@ module ActiveRecord
+   end
+ 
+   module ConnectionAdapters
++    class TableDefinition
++      def xml(*args)
++        options = args.extract_options!
++        column(args[0], 'xml', options)
++      end
++    end
+     # PostgreSQL-specific extensions to column definitions in a table.
+     class PostgreSQLColumn < Column #:nodoc:
+       # Instantiates a new PostgreSQL column definition in a table.
+@@ -68,7 +74,7 @@ module ActiveRecord
+           # depending on the server specifics
+           super
+         end
+-  
++
+         # Maps PostgreSQL-specific data types to logical Rails types.
+         def simplified_type(field_type)
+           case field_type
+@@ -100,10 +106,10 @@ module ActiveRecord
+               :string
+             # XML type
+             when /^xml$/
+-              :string
++              :xml
+             # Arrays
+             when /^\D+\[\]$/
+-              :string              
++              :string
+             # Object identifier types
+             when /^oid$/
+               :integer
+@@ -112,7 +118,7 @@ module ActiveRecord
+               super
+           end
+         end
+-  
++
+         # Extracts the value from a PostgreSQL column default definition.
+         def self.extract_value_from_default(default)
+           case default
+@@ -195,7 +201,8 @@ module ActiveRecord
+         :time        => { :name => "time" },
+         :date        => { :name => "date" },
+         :binary      => { :name => "bytea" },
+-        :boolean     => { :name => "boolean" }
++        :boolean     => { :name => "boolean" },
++        :xml         => { :name => "xml" }
+       }
+ 
+       # Returns 'PostgreSQL' as adapter name for identification purposes.
+@@ -273,7 +280,7 @@ module ActiveRecord
+       def supports_ddl_transactions?
+         true
+       end
+-      
++
+       def supports_savepoints?
+         true
+       end
+@@ -365,7 +372,7 @@ module ActiveRecord
+         if value.kind_of?(String) && column && column.type == :binary
+           "#{quoted_string_prefix}'#{escape_bytea(value)}'"
+         elsif value.kind_of?(String) && column && column.sql_type =~ /^xml$/
+-          "xml '#{quote_string(value)}'"
++          "xml E'#{quote_string(value)}'"
+         elsif value.kind_of?(Numeric) && column && column.sql_type =~ /^money$/
+           # Not truly string input, so doesn't require (or allow) escape string syntax.
+           "'#{value.to_s}'"
+@@ -564,7 +571,7 @@ module ActiveRecord
+       def rollback_db_transaction
+         execute "ROLLBACK"
+       end
+-      
++
+       if defined?(PGconn::PQTRANS_IDLE)
+         # The ruby-pg driver supports inspecting the transaction status,
+         # while the ruby-postgres driver does not.
+@@ -909,18 +916,18 @@ module ActiveRecord
+         sql = "DISTINCT ON (#{columns}) #{columns}, "
+         sql << order_columns * ', '
+       end
+-      
++
+       # Returns an ORDER BY clause for the passed order option.
+-      # 
++      #
+       # PostgreSQL does not allow arbitrary ordering when using DISTINCT ON, so we work around this
+       # by wrapping the +sql+ string as a sub-select and ordering in that query.
+       def add_order_by_for_association_limiting!(sql, options) #:nodoc:
+         return sql if options[:order].blank?
+-        
++
+         order = options[:order].split(',').collect { |s| s.strip }.reject(&:blank?)
+         order.map! { |s| 'DESC' if s =~ /\bdesc$/i }
+         order = order.zip((0...order.size).to_a).map { |s,i| "id_list.alias_#{i} #{s}" }.join(', ')
+-        
++
+         sql.replace "SELECT * FROM (#{sql}) AS id_list ORDER BY #{order}"
+       end
+ 
+@@ -1044,7 +1051,7 @@ module ActiveRecord
+                 if res.ftype(cell_index) == MONEY_COLUMN_TYPE_OID
+                   # Because money output is formatted according to the locale, there are two
+                   # cases to consider (note the decimal separators):
+-                  #  (1) $12,345,678.12        
++                  #  (1) $12,345,678.12
+                   #  (2) $12.345.678,12
+                   case column = row[cell_index]
+                     when /^-?\D+[\d,]+\.\d{2}$/  # (1)
+@@ -1104,3 +1111,4 @@ module ActiveRecord
+     end
+   end
+ end
++
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index f0f2161..4bd3b05 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -396,7 +396,7 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert_equal 9, wealth_column.precision
+       assert_equal 7, wealth_column.scale
+     end
+-    
++
+     def test_native_types
+       Person.delete_all
+       Person.connection.add_column "people", "last_name", :string
+@@ -975,9 +975,9 @@ if ActiveRecord::Base.connection.supports_migrations?
+ 
+     def test_migrator_one_down
+       ActiveRecord::Migrator.up(MIGRATIONS_ROOT + "/valid")
+-    
++
+       ActiveRecord::Migrator.down(MIGRATIONS_ROOT + "/valid", 1)
+-    
++
+       Person.reset_column_information
+       assert Person.column_methods_hash.include?(:last_name)
+       assert !Reminder.table_exists?
+@@ -1118,20 +1118,20 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert Reminder.create("content" => "hello world", "remind_at" => Time.now)
+       assert_equal "hello world", Reminder.find(:first).content
+     end
+-    
++
+     def test_migrator_rollback
+       ActiveRecord::Migrator.migrate(MIGRATIONS_ROOT + "/valid")
+       assert_equal(3, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(2, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(1, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+     end
+@@ -1294,7 +1294,7 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+ 
+   end
+-  
++
+   class SexyMigrationsTest < ActiveRecord::TestCase
+     def test_references_column_type_adds_id
+       with_new_table do |t|
+@@ -1350,6 +1350,15 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    if current_adapter?(:PostgreSQLAdapter)
++      def test_xml_creates_xml_column
++        with_new_table do |t|
++          t.expects(:column).with(:data, 'xml', {})
++          t.xml :data
++        end
++      end
++    end
++
+     protected
+     def with_new_table
+       Person.connection.create_table :delete_me, :force => true do |t|
+@@ -1567,3 +1576,4 @@ if ActiveRecord::Base.connection.supports_migrations?
+     end
+   end
+ end
++
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index e6a77f6..1c43e3c 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -161,7 +161,7 @@ class SchemaDumperTest < ActiveRecord::TestCase
+     index_definition = standard_dump.split(/\n/).grep(/add_index.*companies/).first.strip
+     assert_equal 'add_index "companies", ["firm_id", "type", "rating", "ruby_type"], :name => "company_index"', index_definition
+   end
+-  
++
+   def test_schema_dump_should_honor_nonstandard_primary_keys
+     output = standard_dump
+     match = output.match(%r{create_table "movies"(.*)do})
+@@ -196,6 +196,15 @@ class SchemaDumperTest < ActiveRecord::TestCase
+     assert_match %r{:precision => 3,[[:space:]]+:scale => 2,[[:space:]]+:default => 2.78}, output
+   end
+ 
++  if current_adapter?(:PostgreSQLAdapter)
++    def test_schema_dump_includes_xml_shorthand_definition
++      output = standard_dump
++      if %r{create_table "postgresql_xml_data_type"} =~ output
++        assert_match %r{t.xml "data"}, output
++      end
++    end
++  end
++
+   def test_schema_dump_keeps_large_precision_integer_columns_as_decimal
+     output = standard_dump
+     # Oracle supports precision up to 38 and it identifies decimals with scale 0 as integers
+@@ -214,3 +223,4 @@ class SchemaDumperTest < ActiveRecord::TestCase
+     assert_match %r{t.string[[:space:]]+"id",[[:space:]]+:null => false$}, match[2], "non-primary key id column not preserved"
+   end
+ end
++
+diff --git a/activerecord/test/schema/postgresql_specific_schema.rb b/activerecord/test/schema/postgresql_specific_schema.rb
+index 576a4d0..3d8911b 100644
+--- a/activerecord/test/schema/postgresql_specific_schema.rb
++++ b/activerecord/test/schema/postgresql_specific_schema.rb
+@@ -1,7 +1,7 @@
+ ActiveRecord::Schema.define do
+ 
+   %w(postgresql_arrays postgresql_moneys postgresql_numbers postgresql_times postgresql_network_addresses postgresql_bit_strings
+-      postgresql_oids defaults geometrics).each do |table_name|
++      postgresql_oids postgresql_xml_data_type defaults geometrics).each do |table_name|
+     execute "DROP TABLE  IF EXISTS #{quote_table_name table_name}"
+   end
+ 
+@@ -100,4 +100,15 @@ _SQL
+     obj_id OID
+   );
+ _SQL
+-end
+\ No newline at end of file
++
++  begin
++    execute <<_SQL
++    CREATE TABLE postgresql_xml_data_type (
++    id SERIAL PRIMARY KEY,
++    data xml
++    );
++_SQL
++rescue #This version of PostgreSQL either has no XML support or is was not compiled with XML support: skipping table
++  end
++end
++
+-- 
+1.6.3.2
+

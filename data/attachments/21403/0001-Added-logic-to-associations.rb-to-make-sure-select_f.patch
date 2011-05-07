@@ -1,0 +1,95 @@
+From a35488c7125f62069fa02a0bb26c94164aa86eab Mon Sep 17 00:00:00 2001
+From: John Devine <johnjdevine@gmail.com>
+Date: Sat, 3 May 2008 22:49:18 -0500
+Subject: [PATCH] Added logic to associations.rb to make sure select_for_limited_ids
+includes joins that are needed to reach tables listed in the :order
+or :conditions options if they are not joined directly to the main
+active_record table.
+---
+ activerecord/lib/active_record/associations.rb |   25 +++++++++++++++++++++++-
+ activerecord/test/cases/finder_test.rb         |    9 ++++++++
+ 2 files changed, 33 insertions(+), 1 deletions(-)
+ mode change 100755 => 100644 activerecord/lib/active_record/associations.rb
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+old mode 100755
+new mode 100644
+index 7d27b06..83f83c3
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1446,6 +1446,12 @@ module ActiveRecord
+           tables_from_conditions = conditions_tables(options)
+           tables_from_order      = order_tables(options)
+           all_tables             = tables_from_conditions + tables_from_order
++          distinct_join_associations = all_tables.uniq.map{|table| 
++            join_dependency.joins_for_table_name(table)
++          }.flatten.compact.uniq
++
++
++
+ 
+           is_distinct = !options[:joins].blank? || include_eager_conditions?(options, tables_from_conditions) || include_eager_order?(options, tables_from_order)
+           sql = "SELECT "
+@@ -1457,7 +1463,7 @@ module ActiveRecord
+           sql << " FROM #{connection.quote_table_name table_name} "
+ 
+           if is_distinct
+-            sql << join_dependency.join_associations.reject{ |ja| !all_tables.include?(ja.table_name) }.collect(&:association_join).join
++            sql << distinct_join_associations.collect(&:association_join).join           
+             add_joins!(sql, options, scope)
+           end
+ 
+@@ -1617,6 +1623,23 @@ module ActiveRecord
+             end
+           end
+ 
++          def join_for_table_name(table_name)
++            @joins.select{|j|j.aliased_table_name == table_name.gsub(/^\"(.*)\"$/){$1} }.first rescue nil
++          end
++
++          def joins_for_table_name(table_name)
++            join = join_for_table_name(table_name)            
++            result = nil            
++            if join && join.is_a?(JoinAssociation)
++              result = [join]
++              if join.parent && join.parent.is_a?(JoinAssociation)
++                result = joins_for_table_name(join.parent.aliased_table_name) +             
++                         result
++              end
++            end
++            result
++          end
++
+           protected
+             def build(associations, parent = nil)
+               parent ||= @joins.last
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index b7f87fe..2acfe9b 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -8,6 +8,7 @@ require 'models/entrant'
+ require 'models/developer'
+ require 'models/post'
+ require 'models/customer'
++require 'models/job'
+ 
+ class FinderTest < ActiveRecord::TestCase
+   fixtures :companies, :topics, :entrants, :developers, :developers_projects, :posts, :comments, :accounts, :authors, :customers
+@@ -857,6 +858,14 @@ class FinderTest < ActiveRecord::TestCase
+       Company.connection.select_rows("SELECT id, name FROM companies WHERE id IN (1,2,3) ORDER BY id").map! {|i| i.map! {|j| j.to_s unless j.nil?}}
+   end
+ 
++  def test_find_with_order_on_included_associations_with_construct_finder_sql_for_association_limiting_and_is_distinct
++    assert_equal 2, Post.find(:all,:include=>{:authors=>:author_address},:order=>' author_addresses.id DESC ', :limit=>2).size
++
++    assert_equal 3, Post.find(:all,:include=>{:author=>:author_address,:authors=>:author_address},
++                              :order=>' author_addresses_authors.id DESC ', :limit=>3).size
++  end
++
++
+   protected
+     def bind(statement, *vars)
+       if vars.first.is_a?(Hash)
+-- 
+1.5.2.5
+

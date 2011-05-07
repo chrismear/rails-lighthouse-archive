@@ -1,0 +1,160 @@
+From 80af348fd807b0e13a8d5e7f81f62242eb8b7b7f Mon Sep 17 00:00:00 2001
+From: Mike Ragalie <ragalie@verbasoftware.com>
+Date: Thu, 2 Dec 2010 23:04:29 -0800
+Subject: [PATCH 1/2] Adding tests that show AR has_many/has_one associations #create incorrectly accepts the record id of the associated record.
+
+---
+ .../associations/has_many_associations_test.rb     |   16 ++++++++++++++++
+ .../associations/has_one_associations_test.rb      |   18 ++++++++++++++++++
+ 2 files changed, 34 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index fb772bb..86bd51b 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -498,6 +498,15 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert !companies(:first_firm).clients_of_firm.loaded?
+   end
+ 
++  def test_build_ignores_record_id_in_hash
++    company = companies(:first_firm)
++    new_client = company.clients_of_firm.build("name" => "Another Client", "firm_id" => company.id + 1)
++    new_client.save
++
++    assert_equal company, new_client.reload.firm
++    assert_equal new_client.id, companies(:first_firm).clients_of_firm.sort_by(&:id).last.id
++  end
++
+   def test_build_without_loading_association
+     first_topic = topics(:first)
+     Reply.column_names
+@@ -569,6 +578,13 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert !companies(:first_firm).clients_of_firm.loaded?
+   end
+ 
++  def test_create_ignores_record_id_in_hash
++    company = companies(:first_firm)
++    new_client = company.clients_of_firm.create("name" => "Another Client", "firm_id" => company.id + 1)
++    assert_equal company.id, company.clients_of_firm.last.firm_id
++    assert_equal company.id, new_client.reload.firm_id
++  end
++
+   def test_find_or_initialize
+     the_client = companies(:first_firm).clients.find_or_initialize_by_name("Yet another client")
+     assert_equal companies(:first_firm).id, the_client.firm_id
+diff --git a/activerecord/test/cases/associations/has_one_associations_test.rb b/activerecord/test/cases/associations/has_one_associations_test.rb
+index 64449df..e4f292f 100644
+--- a/activerecord/test/cases/associations/has_one_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_associations_test.rb
+@@ -202,12 +202,30 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     assert_equal count_of_account, Account.count
+   end
+ 
++  def test_build_ignores_associated_record_id_in_hash
++    firm = Firm.new("name" => "GlobalMegaCorp")
++    firm.save
++
++    account = firm.build_account("credit_limit" => 1000, "firm_id" => firm.id + 1)
++    account.save
++
++    assert_equal firm.id, account.reload.firm_id
++    assert_equal account, firm.account
++  end
++
+   def test_create_association
+     firm = Firm.create(:name => "GlobalMegaCorp")
+     account = firm.create_account(:credit_limit => 1000)
+     assert_equal account, firm.reload.account
+   end
+ 
++  def test_create_association_ignores_record_id_in_hash
++    firm = Firm.create(:name => "GlobalMegaCorp")
++    account = firm.create_account("credit_limit" => 1000, "firm_id" => firm.id + 1)
++    assert_equal firm.id, account.reload.firm_id
++    assert_equal account, firm.reload.account
++  end
++
+   def test_build
+     firm = Firm.new("name" => "GlobalMegaCorp")
+     firm.save
+-- 
+1.7.1
+
+
+From fa14ce83d484a7242683b776f5e29a28ff6a3d13 Mon Sep 17 00:00:00 2001
+From: Mike Ragalie <ragalie@verbasoftware.com>
+Date: Fri, 3 Dec 2010 00:07:45 -0800
+Subject: [PATCH 2/2] No longer allow has_one/has_many create/create! to accept an id for the associated record in the hash
+
+---
+ .../associations/association_collection.rb         |    2 ++
+ .../associations/has_one_association.rb            |   10 ++++++++--
+ .../associations/has_many_associations_test.rb     |    5 +++--
+ 3 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index abb17a1..dae3c8e 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -263,6 +263,7 @@ module ActiveRecord
+         else
+           create_record(attrs) do |record|
+             yield(record) if block_given?
++            set_belongs_to_association_for(record)
+             record.save
+           end
+         end
+@@ -271,6 +272,7 @@ module ActiveRecord
+       def create!(attrs = {})
+         create_record(attrs) do |record|
+           yield(record) if block_given?
++          set_belongs_to_association_for(record)
+           record.save!
+         end
+       end
+diff --git a/activerecord/lib/active_record/associations/has_one_association.rb b/activerecord/lib/active_record/associations/has_one_association.rb
+index c49fd6e..d4bc8fd 100644
+--- a/activerecord/lib/active_record/associations/has_one_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_association.rb
+@@ -5,14 +5,20 @@ module ActiveRecord
+       def create(attrs = {}, replace_existing = true)
+         new_record(replace_existing) do |reflection|
+           attrs = merge_with_conditions(attrs)
+-          reflection.create_association(attrs)
++          record = reflection.build_association(attrs)
++          set_belongs_to_association_for(record)
++          record.save
++          record
+         end
+       end
+ 
+       def create!(attrs = {}, replace_existing = true)
+         new_record(replace_existing) do |reflection|
+           attrs = merge_with_conditions(attrs)
+-          reflection.create_association!(attrs)
++          record = reflection.build_association(attrs)
++          set_belongs_to_association_for(record)
++          record.save!
++          record
+         end
+       end
+ 
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 86bd51b..03b2d90 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -581,8 +581,9 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+   def test_create_ignores_record_id_in_hash
+     company = companies(:first_firm)
+     new_client = company.clients_of_firm.create("name" => "Another Client", "firm_id" => company.id + 1)
+-    assert_equal company.id, company.clients_of_firm.last.firm_id
+-    assert_equal company.id, new_client.reload.firm_id
++
++    assert_equal company, new_client.reload.firm
++    assert_equal new_client.id, companies(:first_firm).clients_of_firm.sort_by(&:id).last.id
+   end
+ 
+   def test_find_or_initialize
+-- 
+1.7.1
+

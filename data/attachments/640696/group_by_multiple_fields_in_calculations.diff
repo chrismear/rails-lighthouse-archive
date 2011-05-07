@@ -1,0 +1,94 @@
+From e8198b98b6633dbf47ac0dab8b417b65c80e5f4c Mon Sep 17 00:00:00 2001
+From: Alexandru Catighera <acatighera@gmail.com>
+Date: Thu, 22 Jul 2010 17:30:02 -0400
+Subject: [PATCH] fix ActiveRecord calculations that group by multiple fields
+
+---
+ activerecord/lib/active_record/calculations.rb |   31 ++++++++++++++---------
+ activerecord/test/cases/calculations_test.rb   |    5 ++++
+ 2 files changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/activerecord/lib/active_record/calculations.rb b/activerecord/lib/active_record/calculations.rb
+index 0df2b6b..7ade4bb 100644
+--- a/activerecord/lib/active_record/calculations.rb
++++ b/activerecord/lib/active_record/calculations.rb
+@@ -187,7 +187,7 @@ module ActiveRecord
+           # A (slower) workaround if we're using a backend, like sqlite, that doesn't support COUNT DISTINCT.
+           sql = "SELECT COUNT(*) AS #{aggregate_alias}" if use_workaround
+ 
+-          sql << ", #{options[:group_field]} AS #{options[:group_alias]}" if options[:group]
++          options[:group_fields].each_index{|i| sql << ", #{options[:group_fields][i]} AS #{options[:group_aliases][i]}" } if options[:group]
+           if options[:from]
+             sql << " FROM #{options[:from]} "
+           elsif scope && scope[:from] && !use_workaround
+@@ -211,8 +211,8 @@ module ActiveRecord
+           add_limited_ids_condition!(sql, options, join_dependency) if join_dependency && !using_limitable_reflections?(join_dependency.reflections) && ((scope && scope[:limit]) || options[:limit])
+ 
+           if options[:group]
+-            group_key = connection.adapter_name == 'FrontBase' ?  :group_alias : :group_field
+-            sql << " GROUP BY #{options[group_key]} "
++            group_key = connection.adapter_name == 'FrontBase' ?  :group_aliases : :group_fields
++            sql << " GROUP BY #{options[group_key].join(',')} "
+           end
+ 
+           if options[:group] && options[:having]
+@@ -239,24 +239,31 @@ module ActiveRecord
+         end
+ 
+         def execute_grouped_calculation(operation, column_name, column, options) #:nodoc:
+-          group_attr      = options[:group].to_s
+-          association     = reflect_on_association(group_attr.to_sym)
+-          associated      = association && association.macro == :belongs_to # only count belongs_to associations
+-          group_field     = associated ? association.primary_key_name : group_attr
+-          group_alias     = column_alias_for(group_field)
+-          group_column    = column_for group_field
+-          sql             = construct_calculation_sql(operation, column_name, options.merge(:group_field => group_field, :group_alias => group_alias))
++          group_attr    = options[:group].to_s.scan(/[^\(\), ]+\([^\(\)]+\)|[^\(^), ]+/) # split fields by comma except if within SQL function
++          association   = reflect_on_association(group_attr.to_s.to_sym)
++          associated    = association && association.macro == :belongs_to # only count belongs_to associations
++          group_fields  = Array(associated ? association.primary_key_name : group_attr)
++          group_aliases = []
++          group_columns = {}
++          
++          group_fields.each do |field|
++            group_aliases << column_alias_for(field)
++            group_columns[column_alias_for(field)] = column_for(field)
++          end
++
++          sql             = construct_calculation_sql(operation, column_name, options.merge(:group_fields => group_fields, :group_aliases => group_aliases))
+           calculated_data = connection.select_all(sql)
+           aggregate_alias = column_alias_for(operation, column_name)
+ 
+           if association
+-            key_ids     = calculated_data.collect { |row| row[group_alias] }
++            key_ids     = calculated_data.collect { |row| row[group_aliases.first] }
+             key_records = association.klass.base_class.find(key_ids)
+             key_records = key_records.inject({}) { |hsh, r| hsh.merge(r.id => r) }
+           end
+ 
+           calculated_data.inject(ActiveSupport::OrderedHash.new) do |all, row|
+-            key   = type_cast_calculated_value(row[group_alias], group_column)
++            key   = group_aliases.map{|group_alias| type_cast_calculated_value(row[group_alias], group_columns[group_alias])}
++            key   = key.first if key.size == 1
+             key   = key_records[key] if associated
+             value = row[aggregate_alias]
+             all[key] = type_cast_calculated_value(value, column, operation)
+diff --git a/activerecord/test/cases/calculations_test.rb b/activerecord/test/cases/calculations_test.rb
+index 503b70a..c271a22 100644
+--- a/activerecord/test/cases/calculations_test.rb
++++ b/activerecord/test/cases/calculations_test.rb
+@@ -58,6 +58,11 @@ class CalculationsTest < ActiveRecord::TestCase
+     [1,6,2].each { |firm_id| assert c.keys.include?(firm_id) }
+   end
+ 
++  def test_should_group_by_multiple_fields
++    c = Account.count(:all, :group => 'firm_id, credit_limit')
++    [ [nil, 50], [1, 50], [6, 50], [6, 55], [9, 53], [2, 60] ].each { |firm_and_limit| assert c.keys.include?(firm_and_limit) }
++  end
++
+   def test_should_group_by_summed_field
+     c = Account.sum(:credit_limit, :group => :firm_id)
+     assert_equal 50,   c[1]
+-- 
+1.6.6
+

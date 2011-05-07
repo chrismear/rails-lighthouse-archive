@@ -1,0 +1,122 @@
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index e4ab69a..236e73e 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -183,13 +183,11 @@ module ActiveRecord
+         conditions = "t0.#{reflection.primary_key_name} #{in_or_equals_for_ids(ids)}"
+         conditions << append_conditions(reflection, preload_options)
+ 
+-        associated_records = reflection.klass.with_exclusive_scope do
+-          reflection.klass.find(:all, :conditions => [conditions, ids],
+-            :include => options[:include],
+-            :joins => "INNER JOIN #{connection.quote_table_name options[:join_table]} t0 ON #{reflection.klass.quoted_table_name}.#{reflection.klass.primary_key} = t0.#{reflection.association_foreign_key}",
+-            :select => "#{options[:select] || table_name+'.*'}, t0.#{reflection.primary_key_name} as the_parent_record_id",
+-            :order => options[:order])
+-        end
++        find_options = { :conditions => [conditions, ids], :include => options[:include], :order => options[:order],
++                         :joins => "INNER JOIN #{connection.quote_table_name options[:join_table]} t0 ON #{reflection.klass.quoted_table_name}.#{reflection.klass.primary_key} = t0.#{reflection.association_foreign_key}",
++                         :select => "#{options[:select] || table_name+'.*'}, t0.#{reflection.primary_key_name} as the_parent_record_id" }
++
++        associated_records = reflection.klass.send(reflection.klass == self ? :with_exclusive_scope : :with_scope, :find => find_options) { reflection.klass.all }
+         set_association_collection_records(id_to_record_map, reflection.name, associated_records, 'the_parent_record_id')
+       end
+ 
+@@ -334,13 +332,11 @@ module ActiveRecord
+           end
+           conditions = "#{table_name}.#{connection.quote_column_name(primary_key)} #{in_or_equals_for_ids(ids)}"
+           conditions << append_conditions(reflection, preload_options)
+-          associated_records = klass.with_exclusive_scope do
+-            klass.find(:all, :conditions => [conditions, ids],
+-                                          :include => options[:include],
+-                                          :select => options[:select],
+-                                          :joins => options[:joins],
+-                                          :order => options[:order])
+-          end
++
++          find_options = { :conditions => [conditions, ids], :include => options[:include],
++                           :select => options[:select], :joins => options[:joins], :order => options[:order] }
++
++          associated_records = klass.send(klass == self ? :with_exclusive_scope : :with_scope, :find => find_options) { klass.all }
+           set_association_single_records(id_map, reflection.name, associated_records, primary_key)
+         end
+       end
+@@ -358,15 +354,12 @@ module ActiveRecord
+ 
+         conditions << append_conditions(reflection, preload_options)
+ 
+-        reflection.klass.with_exclusive_scope do
+-          reflection.klass.find(:all,
+-                              :select => (preload_options[:select] || options[:select] || "#{table_name}.*"),
+-                              :include => preload_options[:include] || options[:include],
+-                              :conditions => [conditions, ids],
+-                              :joins => options[:joins],
+-                              :group => preload_options[:group] || options[:group],
+-                              :order => preload_options[:order] || options[:order])
+-        end
++        find_options = { :select => (preload_options[:select] || options[:select] || "#{table_name}.*"),
++                         :include => preload_options[:include] || options[:include], :conditions => [conditions, ids],
++                         :joins => options[:joins], :group => preload_options[:group] || options[:group],
++                         :order => preload_options[:order] || options[:order] }
++
++        reflection.klass.send(reflection.klass == self ? :with_exclusive_scope : :with_scope, :find => find_options) { reflection.klass.all }
+       end
+ 
+ 
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 4072381..0f53cd2 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -771,7 +771,7 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_equal author_addresses(:david_address), authors[0].author_address
+   end
+ 
+-  def test_preload_belongs_to_uses_exclusive_scope
++  def test_preload_self_referential_belongs_to_uses_exclusive_scope
+     people = Person.males.find(:all, :include => :primary_contact)
+     assert_not_equal people.length, 0
+     people.each do |person|
+@@ -780,13 +780,18 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  def test_preload_has_many_uses_exclusive_scope
++  def test_preload_self_referential_has_many_uses_exclusive_scope
+     people = Person.males.find :all, :include => :agents
+     people.each do |person|
+       assert_equal Person.find(person.id).agents, person.agents
+     end
+   end
+ 
++  def test_preload_non_self_referential_association_obeys_scope
++    assert_equal Project.find(1).ordered_by_salary_developers,
++                 Project.find(1, :include => :ordered_by_salary_developers).ordered_by_salary_developers
++  end
++
+   def test_preload_has_many_using_primary_key
+     expected = Firm.find(:first).clients_using_primary_key.to_a
+     firm = Firm.find :first, :include => :clients_using_primary_key
+diff --git a/activerecord/test/models/developer.rb b/activerecord/test/models/developer.rb
+index 92039a4..7875701 100644
+--- a/activerecord/test/models/developer.rb
++++ b/activerecord/test/models/developer.rb
+@@ -79,6 +79,8 @@ class DeveloperWithBeforeDestroyRaise < ActiveRecord::Base
+ end
+ 
+ class DeveloperOrderedBySalary < ActiveRecord::Base
++  has_and_belongs_to_many :projects
++
+   self.table_name = 'developers'
+   default_scope :order => 'salary DESC'
+   named_scope :by_name, :order => 'name DESC'
+diff --git a/activerecord/test/models/project.rb b/activerecord/test/models/project.rb
+index 550d4ae..a1cbe94 100644
+--- a/activerecord/test/models/project.rb
++++ b/activerecord/test/models/project.rb
+@@ -14,6 +14,7 @@ class Project < ActiveRecord::Base
+                             :before_remove => Proc.new {|o, r| o.developers_log << "before_removing#{r.id}"},
+                             :after_remove => Proc.new {|o, r| o.developers_log << "after_removing#{r.id}"}
+   has_and_belongs_to_many :well_payed_salary_groups, :class_name => "Developer", :group => "salary", :having => "SUM(salary) > 10000", :select => "SUM(salary) as salary"
++  has_and_belongs_to_many :ordered_by_salary_developers, :class_name => "DeveloperOrderedBySalary", :join_table => "developers_projects", :association_foreign_key => "developer_id"
+ 
+   attr_accessor :developers_log
+ 

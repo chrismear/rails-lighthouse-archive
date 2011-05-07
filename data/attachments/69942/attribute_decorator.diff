@@ -1,0 +1,2102 @@
+From 64dc359547f205eccf78c63540bcb0f8db91fc85 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Fri, 5 Dec 2008 13:22:23 +0100
+Subject: [PATCH] Updated for current HEAD.
+
+---
+ activerecord/lib/active_record.rb                  |    1 +
+ activerecord/lib/active_record/aggregations.rb     |    2 +
+ .../lib/active_record/attribute_decorator.rb       |  187 +++++++++++++++++
+ activerecord/lib/active_record/base.rb             |    2 +
+ activerecord/lib/active_record/reflection.rb       |   19 ++
+ activerecord/test/cases/aggregations_test.rb       |   16 +-
+ .../test/cases/attribute_decorator_test.rb         |  216 ++++++++++++++++++++
+ activerecord/test/cases/base_test.rb               |   20 ++
+ activerecord/test/cases/reflection_test.rb         |   25 +++
+ activerecord/test/models/artist.rb                 |   81 ++++++++
+ activerecord/test/models/customer.rb               |   12 +-
+ activerecord/test/models/developer.rb              |   14 +-
+ activerecord/test/schema/schema.rb                 |    8 +
+ 13 files changed, 589 insertions(+), 14 deletions(-)
+ create mode 100644 activerecord/lib/active_record/attribute_decorator.rb
+ create mode 100644 activerecord/test/cases/attribute_decorator_test.rb
+ create mode 100644 activerecord/test/models/artist.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 348e5b9..5aa3cac 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -41,6 +41,7 @@ module ActiveRecord
+   autoload :ConnectionNotEstablished, 'active_record/base'
+ 
+   autoload :Aggregations, 'active_record/aggregations'
++  autoload :AttributeDecorator, 'active_record/attribute_decorator'
+   autoload :AssociationPreload, 'active_record/association_preload'
+   autoload :Associations, 'active_record/associations'
+   autoload :AttributeMethods, 'active_record/attribute_methods'
+diff --git a/activerecord/lib/active_record/aggregations.rb b/activerecord/lib/active_record/aggregations.rb
+index 1eefebb..04a67ae 100644
+--- a/activerecord/lib/active_record/aggregations.rb
++++ b/activerecord/lib/active_record/aggregations.rb
+@@ -192,6 +192,8 @@ module ActiveRecord
+       #               :converter => Proc.new { |ip| ip.is_a?(Integer) ? IPAddr.new(ip, Socket::AF_INET) : IPAddr.new(ip.to_s) }
+       #
+       def composed_of(part_id, options = {}, &block)
++        ActiveSupport::Deprecation.warn("ActiveRecord::Aggregations::composed_of has been deprecated. Please use ActiveRecord::AttributeDecorator::attribute_decorator.")
++
+         options.assert_valid_keys(:class_name, :mapping, :allow_nil, :constructor, :converter)
+ 
+         name        = part_id.id2name
+diff --git a/activerecord/lib/active_record/attribute_decorator.rb b/activerecord/lib/active_record/attribute_decorator.rb
+new file mode 100644
+index 0000000..66ee4d8
+--- /dev/null
++++ b/activerecord/lib/active_record/attribute_decorator.rb
+@@ -0,0 +1,187 @@
++module ActiveRecord
++  module AttributeDecorator #:nodoc:
++    def self.included(klass)
++      klass.extend ClassMethods
++    end
++    
++    def clear_attribute_decorator_cache
++      self.class.reflect_on_all_attribute_decorators.each do |attribute_decorator|
++        instance_variable_set "@#{attribute_decorator.name}_before_type_cast", nil
++      end unless new_record?
++    end
++    
++    module ClassMethods
++      # Adds reader and writer methods for decorating one or more attributes:
++      # <tt>attribute_decorator :date_of_birth</tt> adds <tt>date_of_birth</tt> and <tt>date_of_birth=(new_date_of_birth)</tt> methods.
++      #
++      # Options are:
++      # * <tt>:class</tt> - specify the decorator class.
++      # * <tt>:class_name</tt> - specify the class name of the decorator class,
++      #   this should be used if, at the time of loading the model class, the decorator class is not yet available.
++      # * <tt>:decorates</tt> - specifies the attributes that should be wrapped by the decorator class.
++      #   Takes an array of attributes or a single attribute. If none is specified the same name as the name of the attribute_decorator is assumed.
++      #
++      # The decorator class should implement a class method called <tt>parse</tt>, which takes 1 argument.
++      # In that method your decorator class is responsible for returning an instance of itself with the attribute(s) parsed and assigned.
++      #
++      # Your decorator class’s initialize method should take as it’s arguments the attributes that were specified
++      # to the <tt>:decorates</tt> option and in the same order as they were specified.
++      # You should also implement a <tt>to_a</tt> method which should return the parsed values as an array,
++      # again in the same order as specified with the <tt>:decorates</tt> option.
++      #
++      # If you wish to use <tt>validates_decorator</tt>, your decorator class should also implement a <tt>valid?</tt> instance method,
++      # which is responsible for checking the validity of the value(s). See <tt>validates_decorator</tt> for more info.
++      #
++      #   class CompositeDate
++      #     attr_accessor :day, :month, :year
++      #     
++      #     # Gets the value from Artist#date_of_birth= and will return a CompositeDate instance with the :day, :month and :year attributes set.
++      #     def self.parse(value)
++      #       day, month, year = value.scan(/(\d+)-(\d+)-(\d{4})/).flatten.map { |x| x.to_i }
++      #       new(day, month, year)
++      #     end
++      #     
++      #     # Notice that the order of arguments is the same as specified with the :decorates option.
++      #     def initialize(day, month, year)
++      #       @day, @month, @year = day, month, year
++      #     end
++      #     
++      #     # Here we return the parsed values in the same order as specified with the :decorates option.
++      #     def to_a
++      #       [@day, @month, @year]
++      #     end
++      #     
++      #     # Here we return a string representation of the value, this will for instance be used by the form helpers.
++      #     def to_s
++      #       "#{@day}-#{@month}-#{@year}"
++      #     end
++      #     
++      #     # Returns wether or not this CompositeDate instance is valid.
++      #     def valid?
++      #       @day != 0 && @month != 0 && @year != 0
++      #     end
++      #   end
++      #
++      #   class Artist < ActiveRecord::Base
++      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorates => [:day, :month, :year]
++      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
++      #   end
++      #
++      # Option examples:
++      #   attribute_decorator :date_of_birth, :class => CompositeDate, :decorates => [:day, :month, :year]
++      #   attribute_decorator :gps_location, :class_name => 'GPSCoordinator', :decorates => :location
++      #   attribute_decorator :balance, :class_name => 'Money'
++      #   attribute_decorator :english_date_of_birth, :class => (Class.new(CompositeDate) do
++      #     # This is a anonymous subclass of CompositeDate that supports the date in English order
++      #     def to_s
++      #       "#{@month}/#{@day}/#{@year}"
++      #     end
++      #
++      #     def self.parse(value)
++      #       month, day, year = value.scan(/(\d+)\/(\d+)\/(\d{4})/).flatten.map { |x| x.to_i }
++      #       new(day, month, year)
++      #     end
++      #   end)
++      def attribute_decorator(attr, options)
++        options.assert_valid_keys(:class, :class_name, :decorates)
++        
++        if options[:decorates].nil?
++          options[:decorates] = [attr]
++        elsif !options[:decorates].is_a?(Array)
++          options[:decorates] = [options[:decorates]]
++        end
++        
++        define_attribute_decorator_reader(attr, options)
++        define_attribute_decorator_writer(attr, options)
++        
++        create_reflection(:attribute_decorator, attr, options, self)
++      end
++      
++      # Validates wether the decorated attribute is valid by sending the decorator instance the <tt>valid?</tt> message.
++      #
++      #   class CompositeDate
++      #     attr_accessor :day, :month, :year
++      #     
++      #     def self.parse(value)
++      #       day, month, year = value.scan(/(\d\d)-(\d\d)-(\d{4})/).flatten.map { |x| x.to_i }
++      #       new(day, month, year)
++      #     end
++      #     
++      #     def initialize(day, month, year)
++      #       @day, @month, @year = day, month, year
++      #     end
++      #     
++      #     def to_a
++      #       [@day, @month, @year]
++      #     end
++      #     
++      #     def to_s
++      #       "#{@day}-#{@month}-#{@year}"
++      #     end
++      #     
++      #     # Returns wether or not this CompositeDate instance is valid.
++      #     def valid?
++      #       @day != 0 && @month != 0 && @year != 0
++      #     end
++      #   end
++      #
++      #   class Artist < ActiveRecord::Base
++      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorates => [:day, :month, :year]
++      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
++      #   end
++      #
++      #   artist = Artist.new
++      #   artist.date_of_birth = '31-12-1999'
++      #   artist.valid? # => true
++      #   artist.date_of_birth = 'foo-bar-baz'
++      #   artist.valid? # => false
++      #   artist.errors.on(:date_of_birth) # => "is not a valid date"
++      #
++      # Configuration options:
++      # * <tt>:message</tt> - A custom error message (default is: "is invalid").
++      # * <tt>:on</tt> - Specifies when this validation is active (default is <tt>:save</tt>, other options <tt>:create</tt>, <tt>:update</tt>).
++      # * <tt>:if</tt> - Specifies a method, proc or string to call to determine if the validation should
++      #   occur (e.g. <tt>:if => :allow_validation</tt>, or <tt>:if => Proc.new { |user| user.signup_step > 2 }</tt>).  The
++      #   method, proc or string should return or evaluate to a true or false value.
++      # * <tt>:unless</tt> - Specifies a method, proc or string to call to determine if the validation should
++      #   not occur (e.g. <tt>:unless => :skip_validation</tt>, or <tt>:unless => Proc.new { |user| user.signup_step <= 2 }</tt>).  The
++      #   method, proc or string should return or evaluate to a true or false value.
++      def validates_decorator(*attrs)
++        configuration = { :message => I18n.translate('active_record.error_messages')[:invalid], :on => :save }
++        configuration.update attrs.extract_options!
++        
++        invalid_keys = configuration.keys.select { |key| key == :allow_nil || key == :allow_blank }
++        raise ArgumentError, "Unknown key(s): #{ invalid_keys.join(', ') }" unless invalid_keys.empty?
++        
++        validates_each(attrs, configuration) do |record, attr, value|
++          record.errors.add(attr, configuration[:message]) unless record.send(attr).valid?
++        end
++      end
++      
++      private
++      
++      def define_attribute_decorator_reader(attr, options)
++        class_eval do
++          define_method(attr) do
++            (options[:class] ||= options[:class_name].constantize).new(*options[:decorates].map { |attribute| read_attribute(attribute) })
++          end
++        end
++      end
++      
++      def define_attribute_decorator_writer(attr, options)
++        class_eval do
++          define_method("#{attr}_before_type_cast") do
++            instance_variable_get("@#{attr}_before_type_cast") || send(attr).to_s
++          end
++          
++          define_method("#{attr}=") do |value|
++            instance_variable_set("@#{attr}_before_type_cast", value)
++            values = (options[:class] ||= options[:class_name].constantize).parse(value).to_a
++            options[:decorates].each_with_index { |attribute, index| write_attribute attribute, values[index] }
++            value
++          end
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index a23518b..43b46f4 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -2578,6 +2578,7 @@ module ActiveRecord #:nodoc:
+       # an exclusive row lock.
+       def reload(options = nil)
+         clear_aggregation_cache
++        clear_attribute_decorator_cache
+         clear_association_cache
+         @attributes.update(self.class.find(self.id, options).instance_variable_get('@attributes'))
+         @attributes_cache = {}
+@@ -3014,6 +3015,7 @@ module ActiveRecord #:nodoc:
+     extend QueryCache
+     include Validations
+     include Locking::Optimistic, Locking::Pessimistic
++    include AttributeDecorator
+     include AttributeMethods
+     include Dirty
+     include Callbacks, Observing, Timestamp
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index dbff4f2..3f3d3a1 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -17,6 +17,8 @@ module ActiveRecord
+             reflection = klass.new(macro, name, options, active_record)
+           when :composed_of
+             reflection = AggregateReflection.new(macro, name, options, active_record)
++          when :attribute_decorator
++            reflection = AttributeDecoratorReflection.new(macro, name, options, active_record)
+         end
+         write_inheritable_hash :reflections, name => reflection
+         reflection
+@@ -45,6 +47,19 @@ module ActiveRecord
+         reflections[aggregation].is_a?(AggregateReflection) ? reflections[aggregation] : nil
+       end
+ 
++      # Returns an array of DecoratorReflection objects for all the attribute decorators in the class.
++      def reflect_on_all_attribute_decorators
++        reflections.values.select { |reflection| reflection.is_a?(AttributeDecoratorReflection) }
++      end
++
++      # Returns the DecoratorReflection object for the named <tt>attribute decorator</tt> (use the symbol). Example:
++      #
++      #   Account.reflect_on_decorator(:balance) # returns the balance DecoratorReflection
++      #
++      def reflect_on_attribute_decorator(attribute_decorator)
++        reflections[attribute_decorator].is_a?(AttributeDecoratorReflection) ? reflections[attribute_decorator] : nil
++      end
++
+       # Returns an array of AssociationReflection objects for all the associations in the class. If you only want to reflect on a
+       # certain association type, pass in the symbol (<tt>:has_many</tt>, <tt>:has_one</tt>, <tt>:belongs_to</tt>) for that as the first parameter.
+       # Example:
+@@ -133,6 +148,10 @@ module ActiveRecord
+     class AggregateReflection < MacroReflection #:nodoc:
+     end
+ 
++    # Holds all the meta-data about an aggregation as it was specified in the Active Record class.
++    class AttributeDecoratorReflection < MacroReflection #:nodoc:
++    end
++
+     # Holds all the meta-data about an association as it was specified in the Active Record class.
+     class AssociationReflection < MacroReflection #:nodoc:
+       # Returns the target association's class:
+diff --git a/activerecord/test/cases/aggregations_test.rb b/activerecord/test/cases/aggregations_test.rb
+index 4e0e1c7..62e27b3 100644
+--- a/activerecord/test/cases/aggregations_test.rb
++++ b/activerecord/test/cases/aggregations_test.rb
+@@ -1,5 +1,7 @@
+ require "cases/helper"
+-require 'models/customer'
++ActiveSupport::Deprecation.silence do
++  require 'models/customer'
++end
+ 
+ class AggregationsTest < ActiveRecord::TestCase
+   fixtures :customers
+@@ -152,12 +154,14 @@ class OverridingAggregationsTest < ActiveRecord::TestCase
+   class Name; end
+   class DifferentName; end
+ 
+-  class Person   < ActiveRecord::Base
+-    composed_of :composed_of, :mapping => %w(person_first_name first_name)
+-  end
++  ActiveSupport::Deprecation.silence do
++    class Person   < ActiveRecord::Base
++      composed_of :composed_of, :mapping => %w(person_first_name first_name)
++    end
+ 
+-  class DifferentPerson < Person
+-    composed_of :composed_of, :class_name => 'DifferentName', :mapping => %w(different_person_first_name first_name)
++    class DifferentPerson < Person
++      composed_of :composed_of, :class_name => 'DifferentName', :mapping => %w(different_person_first_name first_name)
++    end
+   end
+ 
+   def test_composed_of_aggregation_redefinition_reflections_should_differ_and_not_inherited
+diff --git a/activerecord/test/cases/attribute_decorator_test.rb b/activerecord/test/cases/attribute_decorator_test.rb
+new file mode 100644
+index 0000000..1527707
+--- /dev/null
++++ b/activerecord/test/cases/attribute_decorator_test.rb
+@@ -0,0 +1,216 @@
++require "cases/helper"
++require 'models/artist'
++
++class AttributeDecoratorClassMethodTest < ActiveRecord::TestCase
++  def test_should_take_a_name_for_the_decorator_and_define_a_reader_and_writer_method_for_it
++    %w{ date_of_birth date_of_birth= }.each { |method| assert Artist.instance_methods.include?(method) }
++  end
++  
++  def test_should_not_take_any_options_other_than_class_and_class_name_and_decorates
++    assert_raise(ArgumentError) do
++      Artist.class_eval do
++        attribute_decorator :foo, :some_other_option => true
++      end
++    end
++  end
++end
++
++class AttributeDecoratorInGeneralTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:day => 31, :month => 12, :year => 1999)
++  end
++  
++  def teardown
++    Artist.class_eval do
++      attribute_decorator :date_of_birth, :class_name => 'Decorators::CompositeDate', :decorates => [:day, :month, :year]
++    end
++  end
++  
++  uses_mocha('should_only_use_constantize_once_and_cache_the_result') do
++    def test_should_only_use_constantize_once_and_cache_the_result
++      klass_name_string = 'CompositeDate'
++      
++      Artist.class_eval do
++        attribute_decorator :date_of_birth, :class_name => klass_name_string, :decorates => [:day, :month, :year]
++      end
++      
++      klass_name_string.expects(:constantize).times(1).returns(Decorators::CompositeDate)
++      2.times { @artist.date_of_birth }
++    end
++  end
++  
++  def test_should_work_with_a_real_pointer_to_a_wrapper_class_instead_of_a_string
++    Artist.class_eval do
++      attribute_decorator :date_of_birth, :class => Decorators::CompositeDate, :decorates => [:day, :month, :year]
++    end
++    
++    assert_equal "31-12-1999", @artist.date_of_birth.to_s
++  end
++  
++  uses_mocha('should_also_work_with_an_anonymous_wrapper_class') do
++    def test_should_also_work_with_an_anonymous_wrapper_class
++      Artist.class_eval do
++        attribute_decorator :date_of_birth, :decorates => [:day, :month, :year], :class => (Class.new(Decorators::CompositeDate) do
++          # Reversed implementation of the super class.
++          def to_s
++            "#{@year}-#{@month}-#{@day}"
++          end
++        end)
++      end
++      
++      2.times { assert_equal "1999-12-31", @artist.date_of_birth.to_s }
++    end
++  end
++  
++  def test_should_reset_the_before_type_cast_values_on_reload
++    @artist.date_of_birth = '01-01-1111'
++    Artist.find(@artist.id).update_attribute(:day, 13)
++    @artist.reload
++    
++    assert_equal "13-12-1999", @artist.date_of_birth_before_type_cast
++  end
++end
++
++class AttributeDecoratorForMultipleAttributesTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:day => 31, :month => 12, :year => 1999)
++    @decorator = @artist.date_of_birth
++  end
++  
++  def test_should_return_an_instance_of_the_decorator_class_specified_by_the_class_name_option
++    assert_instance_of Decorators::CompositeDate, @artist.date_of_birth
++  end
++  
++  def test_should_have_assigned_values_to_decorate_to_the_decorator_instance
++    assert_equal 31,   @decorator.day
++    assert_equal 12,   @decorator.month
++    assert_equal 1999, @decorator.year
++  end
++  
++  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
++    @artist.date_of_birth = '01-02-2000'
++    assert_equal '01-02-2000', @artist.date_of_birth_before_type_cast
++  end
++  
++  def test_should_return_the_value_before_type_cast_when_the_value_was_just_read_from_the_database
++    date_of_birth_as_string = @artist.date_of_birth.to_s
++    @artist.reload
++    assert_equal date_of_birth_as_string, @artist.date_of_birth_before_type_cast
++  end
++  
++  def test_should_parse_the_value_assigned_through_the_setter_method_and_assign_them_to_the_model_instance
++    @artist.date_of_birth = '01-02-2000'
++    assert_equal 1,    @artist.day
++    assert_equal 2,    @artist.month
++    assert_equal 2000, @artist.year
++  end
++end
++
++class AttributeDecoratorForOneAttributeTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:location => 'amsterdam')
++  end
++  
++  def test_should_return_an_instance_of_the_decorator_class_specified_by_the_class_name_option
++    assert_instance_of Decorators::GPSCoordinator, @artist.gps_location
++  end
++  
++  def test_should_have_assigned_the_value_to_decorate_to_the_decorator_instance
++    assert_equal 'amsterdam', @artist.gps_location.location
++  end
++  
++  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
++    @artist.gps_location = 'rotterdam'
++    assert_equal 'rotterdam', @artist.gps_location_before_type_cast
++  end
++  
++  def test_should_return_the_value_before_type_cast_when_the_value_was_just_read_from_the_database
++    gps_location_as_string = @artist.gps_location.to_s
++    @artist.reload
++    assert_equal gps_location_as_string, @artist.gps_location_before_type_cast
++  end
++  
++  def test_should_parse_the_value_assigned_through_the_setter_method_and_assign_it_to_the_model_instance
++    @artist.gps_location = 'amsterdam'
++    assert_equal '+1, +1', @artist.location
++    
++    @artist.gps_location = 'rotterdam'
++    assert_equal '-1, -1', @artist.location
++  end
++end
++
++class AttributeDecoratorForAnAlreadyExistingAttributeTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:start_year => 1999)
++    @decorator = @artist.start_year
++  end
++  
++  def test_should_return_an_instance_of_the_decorator_class_specified_by_the_class_option
++    assert_instance_of Decorators::GPSCoordinator, @artist.gps_location
++  end
++  
++  def test_should_have_assigned_the_value_to_decorate_to_the_decorator_instance
++    assert_equal 1999, @decorator.start_year
++  end
++  
++  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
++    @artist.start_year = '40 bc'
++    assert_equal '40 bc', @artist.start_year_before_type_cast
++  end
++  
++  def test_should_parse_and_write_the_value_assigned_through_the_setter_method_and_assign_it_to_the_model_instance
++    @artist.start_year = '40 bc'
++    assert_equal -41, @artist.read_attribute(:start_year)
++  end
++end
++
++class AttributeDecoratorValidatorTest < ActiveRecord::TestCase
++  def teardown
++    Artist.instance_variable_set(:@validate_callbacks, [])
++    Artist.instance_variable_set(:@validate_on_update_callbacks, [])
++  end
++  
++  def test_should_delegate_validation_to_the_decorator
++    Artist.class_eval do
++      validates_decorator :date_of_birth, :start_year
++    end
++    
++    artist = Artist.create(:start_year => 1999)
++    
++    artist.start_year = 40
++    assert artist.valid?
++    
++    artist.start_year = 'abcde'
++    assert !artist.valid?
++    assert_equal "is invalid", artist.errors.on(:start_year)
++  end
++  
++  def test_should_take_a_options_hash_for_more_detailed_configuration
++    Artist.class_eval do
++      validates_decorator :start_year, :message => 'is not a valid date', :on => :update
++    end
++    
++    artist = Artist.new(:start_year => 'abcde')
++    assert artist.valid?
++    
++    artist.save!
++    assert !artist.valid?
++    assert_equal 'is not a valid date', artist.errors.on(:start_year)
++  end
++  
++  def test_should_not_take_the_allow_nil_option
++    assert_raise(ArgumentError) do
++      Artist.class_eval do
++        validates_decorator :start_year, :allow_nil => true
++      end
++    end
++  end
++  
++  def test_should_not_take_the_allow_blank_option
++    assert_raise(ArgumentError) do
++      Artist.class_eval do
++        validates_decorator :start_year, :allow_blank => true
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 5f54931..ebb7e72 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1245,6 +1245,26 @@ class BasicsTest < ActiveRecord::TestCase
+     assert clone.id != dev.id
+   end
+ 
++  def test_clone_with_attribute_decorator_of_same_name_as_attribute
++    dev = DeveloperWithAttributeDecorator.find(1)
++    assert_kind_of DeveloperSalaryDecorator, dev.salary
++
++    clone = nil
++    assert_nothing_raised { clone = dev.clone }
++    assert_kind_of DeveloperSalaryDecorator, clone.salary
++    assert_equal dev.salary.amount, clone.salary.amount
++    assert clone.new_record?
++    
++    # test if the attributes have been cloned
++    original_amount = clone.salary.amount
++    dev.salary.amount = 1
++    assert_equal original_amount, clone.salary.amount
++    
++    assert clone.save
++    assert !clone.new_record?
++    assert clone.id != dev.id
++  end
++
+   def test_clone_preserves_subtype
+     clone = nil
+     assert_nothing_raised { clone = Company.find(3).clone }
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index e0ed3e5..6a4836e 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -1,5 +1,6 @@
+ require "cases/helper"
+ require 'models/topic'
++require 'models/artist'
+ require 'models/customer'
+ require 'models/company'
+ require 'models/company_in_module'
+@@ -91,6 +92,30 @@ class ReflectionTest < ActiveRecord::TestCase
+     assert_equal Money, Customer.reflect_on_aggregation(:balance).klass
+   end
+ 
++  def test_attribute_decorator_reflection
++    reflection_for_date_of_birth = ActiveRecord::Reflection::AttributeDecoratorReflection.new(
++      :attribute_decorator, :date_of_birth, {
++        :class_name => 'Decorators::CompositeDate',
++        :decorates => [:day, :month, :year]
++      }, Artist
++    )
++    
++    reflection_for_gps_location = ActiveRecord::Reflection::AttributeDecoratorReflection.new(
++      :attribute_decorator, :gps_location, { :class_name => 'Decorators::GPSCoordinator', :decorates => :location }, Artist
++    )
++    
++    reflection_for_start_year = ActiveRecord::Reflection::AttributeDecoratorReflection.new(
++      :attribute_decorator, :start_year, { :class_name => 'Decorators::Year' }, Artist
++    )
++    
++    [reflection_for_date_of_birth, reflection_for_gps_location, reflection_for_start_year].each do |reflection|
++      assert Artist.reflect_on_all_attribute_decorators.include?(reflection)
++    end
++    
++    assert_equal reflection_for_date_of_birth, Artist.reflect_on_attribute_decorator(:date_of_birth)
++    assert_equal Decorators::CompositeDate, Artist.reflect_on_attribute_decorator(:date_of_birth).klass
++  end
++
+   def test_has_many_reflection
+     reflection_for_clients = ActiveRecord::Reflection::AssociationReflection.new(:has_many, :clients, { :order => "id", :dependent => :destroy }, Firm)
+ 
+diff --git a/activerecord/test/models/artist.rb b/activerecord/test/models/artist.rb
+new file mode 100644
+index 0000000..f2e4d1b
+--- /dev/null
++++ b/activerecord/test/models/artist.rb
+@@ -0,0 +1,81 @@
++class Artist < ActiveRecord::Base
++  # Defines a non existing attribute decorating multiple existing attributes
++  attribute_decorator :date_of_birth, :class_name => 'Decorators::CompositeDate', :decorates => [:day, :month, :year]
++  
++  # Defines a decorates for one attribute.
++  attribute_decorator :gps_location, :class_name => 'Decorators::GPSCoordinator', :decorates => :location
++  
++  # Defines a decorator for an existing attribute.
++  attribute_decorator :start_year, :class_name => 'Decorators::Year'
++  
++  # These validations are defined inline in the test cases. See attribute_decorator_test.rb.
++  #
++  # validates_decorator :date_of_birth, :start_year
++  # validates_decorator :start_year, :message => 'is not a valid date', :on => :update
++end
++
++module Decorators
++  class CompositeDate
++    attr_reader :day, :month, :year
++    
++    def self.parse(value)
++      new *value.scan(/(\d\d)-(\d\d)-(\d{4})/).flatten.map { |x| x.to_i }
++    end
++    
++    def initialize(day, month, year)
++      @day, @month, @year = day, month, year
++    end
++    
++    def valid?
++      true
++    end
++    
++    def to_a
++      [@day, @month, @year]
++    end
++    
++    def to_s
++      "#{@day}-#{@month}-#{@year}"
++    end
++  end
++  
++  class GPSCoordinator
++    attr_reader :location
++    
++    def self.parse(value)
++      new(value == 'amsterdam' ? '+1, +1' : '-1, -1')
++    end
++    
++    def initialize(location)
++      @location = location
++    end
++    
++    def to_a
++      [@location]
++    end
++    
++    def to_s
++      @location
++    end
++  end
++  
++  class Year
++    attr_reader :start_year
++    
++    def self.parse(value)
++      new(value == '40 bc' ? -41 : value.to_i)
++    end
++    
++    def initialize(start_year)
++      @start_year = start_year
++    end
++    
++    def valid?
++      @start_year != 0
++    end
++    
++    def to_a
++      [@start_year]
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/models/customer.rb b/activerecord/test/models/customer.rb
+index e258ccd..ba28793 100644
+--- a/activerecord/test/models/customer.rb
++++ b/activerecord/test/models/customer.rb
+@@ -1,8 +1,10 @@
+-class Customer < ActiveRecord::Base
+-  composed_of :address, :mapping => [ %w(address_street street), %w(address_city city), %w(address_country country) ], :allow_nil => true
+-  composed_of :balance, :class_name => "Money", :mapping => %w(balance amount), :converter => Proc.new { |balance| balance.to_money }
+-  composed_of :gps_location, :allow_nil => true
+-  composed_of :fullname, :mapping => %w(name to_s), :constructor => Proc.new { |name| Fullname.parse(name) }, :converter => :parse
++ActiveSupport::Deprecation.silence do
++  class Customer < ActiveRecord::Base
++    composed_of :address, :mapping => [ %w(address_street street), %w(address_city city), %w(address_country country) ], :allow_nil => true
++    composed_of :balance, :class_name => "Money", :mapping => %w(balance amount), :converter => Proc.new { |balance| balance.to_money }
++    composed_of :gps_location, :allow_nil => true
++    composed_of :fullname, :mapping => %w(name to_s), :constructor => Proc.new { |name| Fullname.parse(name) }, :converter => :parse
++  end
+ end
+ 
+ class Address
+diff --git a/activerecord/test/models/developer.rb b/activerecord/test/models/developer.rb
+index 92039a4..14357bc 100644
+--- a/activerecord/test/models/developer.rb
++++ b/activerecord/test/models/developer.rb
+@@ -62,10 +62,18 @@ class AuditLog < ActiveRecord::Base
+   belongs_to :unvalidated_developer, :class_name => 'Developer'
+ end
+ 
+-DeveloperSalary = Struct.new(:amount)
+-class DeveloperWithAggregate < ActiveRecord::Base
++ActiveSupport::Deprecation.silence do
++  DeveloperSalary = Struct.new(:amount)
++  class DeveloperWithAggregate < ActiveRecord::Base
++    self.table_name = 'developers'
++    composed_of :salary, :class_name => 'DeveloperSalary', :mapping => [%w(salary amount)]
++  end
++end
++
++DeveloperSalaryDecorator = Struct.new(:amount)
++class DeveloperWithAttributeDecorator < ActiveRecord::Base
+   self.table_name = 'developers'
+-  composed_of :salary, :class_name => 'DeveloperSalary', :mapping => [%w(salary amount)]
++  attribute_decorator :salary, :class => DeveloperSalaryDecorator
+ end
+ 
+ class DeveloperWithBeforeDestroyRaise < ActiveRecord::Base
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 6217e3b..a08ab25 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -26,6 +26,14 @@ ActiveRecord::Schema.define do
+     t.integer :credit_limit
+   end
+ 
++  create_table :artists, :force => true do |t|
++    t.integer :day
++    t.integer :month
++    t.integer :year
++    t.integer :start_year
++    t.string  :location
++  end
++
+   create_table :audit_logs, :force => true do |t|
+     t.column :message, :string, :null=>false
+     t.column :developer_id, :integer, :null=>false
+-- 
+1.5.5.3
+
+
+From 57273c7785805b943f38e362b8a54677bc00073b Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Wed, 10 Dec 2008 21:04:05 +0100
+Subject: [PATCH] Changed API as discussed on LH.
+
+Fixed whitespace.
+---
+ activerecord/lib/active_record.rb                  |    2 +-
+ .../lib/active_record/attribute_decorator.rb       |  187 -----------------
+ activerecord/lib/active_record/attribute_view.rb   |  189 +++++++++++++++++
+ activerecord/lib/active_record/base.rb             |    4 +-
+ activerecord/lib/active_record/reflection.rb       |   25 ++-
+ .../test/cases/attribute_decorator_test.rb         |  216 --------------------
+ activerecord/test/cases/attribute_view_test.rb     |  191 +++++++++++++++++
+ activerecord/test/cases/base_test.rb               |    6 +-
+ activerecord/test/cases/reflection_test.rb         |   24 +-
+ activerecord/test/models/artist.rb                 |   64 +++---
+ activerecord/test/models/developer.rb              |    6 +-
+ 11 files changed, 447 insertions(+), 467 deletions(-)
+ delete mode 100644 activerecord/lib/active_record/attribute_decorator.rb
+ create mode 100644 activerecord/lib/active_record/attribute_view.rb
+ delete mode 100644 activerecord/test/cases/attribute_decorator_test.rb
+ create mode 100644 activerecord/test/cases/attribute_view_test.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 5aa3cac..225e18a 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -41,10 +41,10 @@ module ActiveRecord
+   autoload :ConnectionNotEstablished, 'active_record/base'
+ 
+   autoload :Aggregations, 'active_record/aggregations'
+-  autoload :AttributeDecorator, 'active_record/attribute_decorator'
+   autoload :AssociationPreload, 'active_record/association_preload'
+   autoload :Associations, 'active_record/associations'
+   autoload :AttributeMethods, 'active_record/attribute_methods'
++  autoload :AttributeView, 'active_record/attribute_view'
+   autoload :Base, 'active_record/base'
+   autoload :Calculations, 'active_record/calculations'
+   autoload :Callbacks, 'active_record/callbacks'
+diff --git a/activerecord/lib/active_record/attribute_decorator.rb b/activerecord/lib/active_record/attribute_decorator.rb
+deleted file mode 100644
+index 66ee4d8..0000000
+--- a/activerecord/lib/active_record/attribute_decorator.rb
++++ /dev/null
+@@ -1,187 +0,0 @@
+-module ActiveRecord
+-  module AttributeDecorator #:nodoc:
+-    def self.included(klass)
+-      klass.extend ClassMethods
+-    end
+-    
+-    def clear_attribute_decorator_cache
+-      self.class.reflect_on_all_attribute_decorators.each do |attribute_decorator|
+-        instance_variable_set "@#{attribute_decorator.name}_before_type_cast", nil
+-      end unless new_record?
+-    end
+-    
+-    module ClassMethods
+-      # Adds reader and writer methods for decorating one or more attributes:
+-      # <tt>attribute_decorator :date_of_birth</tt> adds <tt>date_of_birth</tt> and <tt>date_of_birth=(new_date_of_birth)</tt> methods.
+-      #
+-      # Options are:
+-      # * <tt>:class</tt> - specify the decorator class.
+-      # * <tt>:class_name</tt> - specify the class name of the decorator class,
+-      #   this should be used if, at the time of loading the model class, the decorator class is not yet available.
+-      # * <tt>:decorates</tt> - specifies the attributes that should be wrapped by the decorator class.
+-      #   Takes an array of attributes or a single attribute. If none is specified the same name as the name of the attribute_decorator is assumed.
+-      #
+-      # The decorator class should implement a class method called <tt>parse</tt>, which takes 1 argument.
+-      # In that method your decorator class is responsible for returning an instance of itself with the attribute(s) parsed and assigned.
+-      #
+-      # Your decorator class’s initialize method should take as it’s arguments the attributes that were specified
+-      # to the <tt>:decorates</tt> option and in the same order as they were specified.
+-      # You should also implement a <tt>to_a</tt> method which should return the parsed values as an array,
+-      # again in the same order as specified with the <tt>:decorates</tt> option.
+-      #
+-      # If you wish to use <tt>validates_decorator</tt>, your decorator class should also implement a <tt>valid?</tt> instance method,
+-      # which is responsible for checking the validity of the value(s). See <tt>validates_decorator</tt> for more info.
+-      #
+-      #   class CompositeDate
+-      #     attr_accessor :day, :month, :year
+-      #     
+-      #     # Gets the value from Artist#date_of_birth= and will return a CompositeDate instance with the :day, :month and :year attributes set.
+-      #     def self.parse(value)
+-      #       day, month, year = value.scan(/(\d+)-(\d+)-(\d{4})/).flatten.map { |x| x.to_i }
+-      #       new(day, month, year)
+-      #     end
+-      #     
+-      #     # Notice that the order of arguments is the same as specified with the :decorates option.
+-      #     def initialize(day, month, year)
+-      #       @day, @month, @year = day, month, year
+-      #     end
+-      #     
+-      #     # Here we return the parsed values in the same order as specified with the :decorates option.
+-      #     def to_a
+-      #       [@day, @month, @year]
+-      #     end
+-      #     
+-      #     # Here we return a string representation of the value, this will for instance be used by the form helpers.
+-      #     def to_s
+-      #       "#{@day}-#{@month}-#{@year}"
+-      #     end
+-      #     
+-      #     # Returns wether or not this CompositeDate instance is valid.
+-      #     def valid?
+-      #       @day != 0 && @month != 0 && @year != 0
+-      #     end
+-      #   end
+-      #
+-      #   class Artist < ActiveRecord::Base
+-      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorates => [:day, :month, :year]
+-      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
+-      #   end
+-      #
+-      # Option examples:
+-      #   attribute_decorator :date_of_birth, :class => CompositeDate, :decorates => [:day, :month, :year]
+-      #   attribute_decorator :gps_location, :class_name => 'GPSCoordinator', :decorates => :location
+-      #   attribute_decorator :balance, :class_name => 'Money'
+-      #   attribute_decorator :english_date_of_birth, :class => (Class.new(CompositeDate) do
+-      #     # This is a anonymous subclass of CompositeDate that supports the date in English order
+-      #     def to_s
+-      #       "#{@month}/#{@day}/#{@year}"
+-      #     end
+-      #
+-      #     def self.parse(value)
+-      #       month, day, year = value.scan(/(\d+)\/(\d+)\/(\d{4})/).flatten.map { |x| x.to_i }
+-      #       new(day, month, year)
+-      #     end
+-      #   end)
+-      def attribute_decorator(attr, options)
+-        options.assert_valid_keys(:class, :class_name, :decorates)
+-        
+-        if options[:decorates].nil?
+-          options[:decorates] = [attr]
+-        elsif !options[:decorates].is_a?(Array)
+-          options[:decorates] = [options[:decorates]]
+-        end
+-        
+-        define_attribute_decorator_reader(attr, options)
+-        define_attribute_decorator_writer(attr, options)
+-        
+-        create_reflection(:attribute_decorator, attr, options, self)
+-      end
+-      
+-      # Validates wether the decorated attribute is valid by sending the decorator instance the <tt>valid?</tt> message.
+-      #
+-      #   class CompositeDate
+-      #     attr_accessor :day, :month, :year
+-      #     
+-      #     def self.parse(value)
+-      #       day, month, year = value.scan(/(\d\d)-(\d\d)-(\d{4})/).flatten.map { |x| x.to_i }
+-      #       new(day, month, year)
+-      #     end
+-      #     
+-      #     def initialize(day, month, year)
+-      #       @day, @month, @year = day, month, year
+-      #     end
+-      #     
+-      #     def to_a
+-      #       [@day, @month, @year]
+-      #     end
+-      #     
+-      #     def to_s
+-      #       "#{@day}-#{@month}-#{@year}"
+-      #     end
+-      #     
+-      #     # Returns wether or not this CompositeDate instance is valid.
+-      #     def valid?
+-      #       @day != 0 && @month != 0 && @year != 0
+-      #     end
+-      #   end
+-      #
+-      #   class Artist < ActiveRecord::Base
+-      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorates => [:day, :month, :year]
+-      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
+-      #   end
+-      #
+-      #   artist = Artist.new
+-      #   artist.date_of_birth = '31-12-1999'
+-      #   artist.valid? # => true
+-      #   artist.date_of_birth = 'foo-bar-baz'
+-      #   artist.valid? # => false
+-      #   artist.errors.on(:date_of_birth) # => "is not a valid date"
+-      #
+-      # Configuration options:
+-      # * <tt>:message</tt> - A custom error message (default is: "is invalid").
+-      # * <tt>:on</tt> - Specifies when this validation is active (default is <tt>:save</tt>, other options <tt>:create</tt>, <tt>:update</tt>).
+-      # * <tt>:if</tt> - Specifies a method, proc or string to call to determine if the validation should
+-      #   occur (e.g. <tt>:if => :allow_validation</tt>, or <tt>:if => Proc.new { |user| user.signup_step > 2 }</tt>).  The
+-      #   method, proc or string should return or evaluate to a true or false value.
+-      # * <tt>:unless</tt> - Specifies a method, proc or string to call to determine if the validation should
+-      #   not occur (e.g. <tt>:unless => :skip_validation</tt>, or <tt>:unless => Proc.new { |user| user.signup_step <= 2 }</tt>).  The
+-      #   method, proc or string should return or evaluate to a true or false value.
+-      def validates_decorator(*attrs)
+-        configuration = { :message => I18n.translate('active_record.error_messages')[:invalid], :on => :save }
+-        configuration.update attrs.extract_options!
+-        
+-        invalid_keys = configuration.keys.select { |key| key == :allow_nil || key == :allow_blank }
+-        raise ArgumentError, "Unknown key(s): #{ invalid_keys.join(', ') }" unless invalid_keys.empty?
+-        
+-        validates_each(attrs, configuration) do |record, attr, value|
+-          record.errors.add(attr, configuration[:message]) unless record.send(attr).valid?
+-        end
+-      end
+-      
+-      private
+-      
+-      def define_attribute_decorator_reader(attr, options)
+-        class_eval do
+-          define_method(attr) do
+-            (options[:class] ||= options[:class_name].constantize).new(*options[:decorates].map { |attribute| read_attribute(attribute) })
+-          end
+-        end
+-      end
+-      
+-      def define_attribute_decorator_writer(attr, options)
+-        class_eval do
+-          define_method("#{attr}_before_type_cast") do
+-            instance_variable_get("@#{attr}_before_type_cast") || send(attr).to_s
+-          end
+-          
+-          define_method("#{attr}=") do |value|
+-            instance_variable_set("@#{attr}_before_type_cast", value)
+-            values = (options[:class] ||= options[:class_name].constantize).parse(value).to_a
+-            options[:decorates].each_with_index { |attribute, index| write_attribute attribute, values[index] }
+-            value
+-          end
+-        end
+-      end
+-    end
+-  end
+-end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/attribute_view.rb b/activerecord/lib/active_record/attribute_view.rb
+new file mode 100644
+index 0000000..5e9968a
+--- /dev/null
++++ b/activerecord/lib/active_record/attribute_view.rb
+@@ -0,0 +1,189 @@
++module ActiveRecord
++  module AttributeView #:nodoc:
++    def self.included(klass)
++      klass.extend ClassMethods
++    end
++
++    private
++
++    def clear_attribute_view_cache
++      self.class.reflect_on_all_attribute_views.each do |attribute_view|
++        instance_variable_set "@#{attribute_view.name}_before_type_cast", nil
++      end unless new_record?
++    end
++
++    module ClassMethods
++      # Adds reader and writer methods for decorating one or more attributes:
++      # <tt>attribute_decorator :date_of_birth</tt> adds <tt>date_of_birth</tt> and <tt>date_of_birth=(new_date_of_birth)</tt> methods.
++      #
++      # Options are:
++      # * <tt>:class</tt> - specify the decorator class.
++      # * <tt>:class_name</tt> - specify the class name of the decorator class,
++      #   this should be used if, at the time of loading the model class, the decorator class is not yet available.
++      # * <tt>:decorating</tt> - specifies the attributes that should be wrapped by the decorator class.
++      #   Takes an array of attributes or a single attribute. If none is specified the same name as the name of the attribute_decorator is assumed.
++      #
++      # The decorator class should implement a class method called <tt>parse</tt>, which takes 1 argument.
++      # In that method your decorator class is responsible for returning an instance of itself with the attribute(s) parsed and assigned.
++      #
++      # Your decorator class’s initialize method should take as it’s arguments the attributes that were specified
++      # to the <tt>:decorating</tt> option and in the same order as they were specified.
++      # You should also implement a <tt>to_a</tt> method which should return the parsed values as an array,
++      # again in the same order as specified with the <tt>:decorating</tt> option.
++      #
++      # If you wish to use <tt>validates_decorator</tt>, your decorator class should also implement a <tt>valid?</tt> instance method,
++      # which is responsible for checking the validity of the value(s). See <tt>validates_decorator</tt> for more info.
++      #
++      #   class CompositeDate
++      #     attr_accessor :day, :month, :year
++      #     
++      #     # Gets the value from Artist#date_of_birth= and will return a CompositeDate instance with the :day, :month and :year attributes set.
++      #     def self.parse(value)
++      #       day, month, year = value.scan(/(\d+)-(\d+)-(\d{4})/).flatten.map { |x| x.to_i }
++      #       new(day, month, year)
++      #     end
++      #     
++      #     # Notice that the order of arguments is the same as specified with the :decorating option.
++      #     def initialize(day, month, year)
++      #       @day, @month, @year = day, month, year
++      #     end
++      #     
++      #     # Here we return the parsed values in the same order as specified with the :decorating option.
++      #     def to_a
++      #       [@day, @month, @year]
++      #     end
++      #     
++      #     # Here we return a string representation of the value, this will for instance be used by the form helpers.
++      #     def to_s
++      #       "#{@day}-#{@month}-#{@year}"
++      #     end
++      #     
++      #     # Returns wether or not this CompositeDate instance is valid.
++      #     def valid?
++      #       @day != 0 && @month != 0 && @year != 0
++      #     end
++      #   end
++      #
++      #   class Artist < ActiveRecord::Base
++      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorating => [:day, :month, :year]
++      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
++      #   end
++      #
++      # Option examples:
++      #   attribute_decorator :date_of_birth, :class => CompositeDate, :decorating => [:day, :month, :year]
++      #   attribute_decorator :gps_location, :class_name => 'GPSCoordinator', :decorating => :location
++      #   attribute_decorator :balance, :class_name => 'Money'
++      #   attribute_decorator :english_date_of_birth, :class => (Class.new(CompositeDate) do
++      #     # This is a anonymous subclass of CompositeDate that supports the date in English order
++      #     def to_s
++      #       "#{@month}/#{@day}/#{@year}"
++      #     end
++      #
++      #     def self.parse(value)
++      #       month, day, year = value.scan(/(\d+)\/(\d+)\/(\d{4})/).flatten.map { |x| x.to_i }
++      #       new(day, month, year)
++      #     end
++      #   end)
++      def view(attr, options)
++        options.assert_valid_keys(:as, :decorating)
++
++        if options[:decorating].nil?
++          options[:decorating] = [attr]
++        elsif !options[:decorating].is_a?(Array)
++          options[:decorating] = [options[:decorating]]
++        end
++
++        define_attribute_view_reader(attr, options)
++        define_attribute_view_writer(attr, options)
++
++        create_reflection(:view, attr, options, self)
++      end
++
++      # Validates wether the decorated attribute is valid by sending the decorator instance the <tt>valid?</tt> message.
++      #
++      #   class CompositeDate
++      #     attr_accessor :day, :month, :year
++      #     
++      #     def self.parse(value)
++      #       day, month, year = value.scan(/(\d\d)-(\d\d)-(\d{4})/).flatten.map { |x| x.to_i }
++      #       new(day, month, year)
++      #     end
++      #     
++      #     def initialize(day, month, year)
++      #       @day, @month, @year = day, month, year
++      #     end
++      #     
++      #     def to_a
++      #       [@day, @month, @year]
++      #     end
++      #     
++      #     def to_s
++      #       "#{@day}-#{@month}-#{@year}"
++      #     end
++      #     
++      #     # Returns wether or not this CompositeDate instance is valid.
++      #     def valid?
++      #       @day != 0 && @month != 0 && @year != 0
++      #     end
++      #   end
++      #
++      #   class Artist < ActiveRecord::Base
++      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorating => [:day, :month, :year]
++      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
++      #   end
++      #
++      #   artist = Artist.new
++      #   artist.date_of_birth = '31-12-1999'
++      #   artist.valid? # => true
++      #   artist.date_of_birth = 'foo-bar-baz'
++      #   artist.valid? # => false
++      #   artist.errors.on(:date_of_birth) # => "is not a valid date"
++      #
++      # Configuration options:
++      # * <tt>:message</tt> - A custom error message (default is: "is invalid").
++      # * <tt>:on</tt> - Specifies when this validation is active (default is <tt>:save</tt>, other options <tt>:create</tt>, <tt>:update</tt>).
++      # * <tt>:if</tt> - Specifies a method, proc or string to call to determine if the validation should
++      #   occur (e.g. <tt>:if => :allow_validation</tt>, or <tt>:if => Proc.new { |user| user.signup_step > 2 }</tt>).  The
++      #   method, proc or string should return or evaluate to a true or false value.
++      # * <tt>:unless</tt> - Specifies a method, proc or string to call to determine if the validation should
++      #   not occur (e.g. <tt>:unless => :skip_validation</tt>, or <tt>:unless => Proc.new { |user| user.signup_step <= 2 }</tt>).  The
++      #   method, proc or string should return or evaluate to a true or false value.
++      def validates_view(*attrs)
++        configuration = { :message => I18n.translate('active_record.error_messages')[:invalid], :on => :save }
++        configuration.update attrs.extract_options!
++
++        invalid_keys = configuration.keys.select { |key| key == :allow_nil || key == :allow_blank }
++        raise ArgumentError, "Unknown key(s): #{ invalid_keys.join(', ') }" unless invalid_keys.empty?
++
++        validates_each(attrs, configuration) do |record, attr, value|
++          record.errors.add(attr, configuration[:message]) unless record.send(attr).valid?
++        end
++      end
++
++      private
++
++      def define_attribute_view_reader(attr, options)
++        class_eval do
++          define_method(attr) do
++            options[:as].new(*options[:decorating].map { |attribute| read_attribute(attribute) })
++          end
++        end
++      end
++
++      def define_attribute_view_writer(attr, options)
++        class_eval do
++          define_method("#{attr}_before_type_cast") do
++            instance_variable_get("@#{attr}_before_type_cast") || send(attr).to_s
++          end
++
++          define_method("#{attr}=") do |value|
++            instance_variable_set("@#{attr}_before_type_cast", value)
++            values = options[:as].parse(value).to_a
++            options[:decorating].each_with_index { |attribute, index| write_attribute attribute, values[index] }
++            value
++          end
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 43b46f4..d01730e 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -2578,8 +2578,8 @@ module ActiveRecord #:nodoc:
+       # an exclusive row lock.
+       def reload(options = nil)
+         clear_aggregation_cache
+-        clear_attribute_decorator_cache
+         clear_association_cache
++        clear_attribute_view_cache
+         @attributes.update(self.class.find(self.id, options).instance_variable_get('@attributes'))
+         @attributes_cache = {}
+         self
+@@ -3015,8 +3015,8 @@ module ActiveRecord #:nodoc:
+     extend QueryCache
+     include Validations
+     include Locking::Optimistic, Locking::Pessimistic
+-    include AttributeDecorator
+     include AttributeMethods
++    include AttributeView
+     include Dirty
+     include Callbacks, Observing, Timestamp
+     include Associations, AssociationPreload, NamedScope
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 3f3d3a1..ea5cfd6 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -17,8 +17,8 @@ module ActiveRecord
+             reflection = klass.new(macro, name, options, active_record)
+           when :composed_of
+             reflection = AggregateReflection.new(macro, name, options, active_record)
+-          when :attribute_decorator
+-            reflection = AttributeDecoratorReflection.new(macro, name, options, active_record)
++          when :view
++            reflection = AttributeViewReflection.new(macro, name, options, active_record)
+         end
+         write_inheritable_hash :reflections, name => reflection
+         reflection
+@@ -47,17 +47,17 @@ module ActiveRecord
+         reflections[aggregation].is_a?(AggregateReflection) ? reflections[aggregation] : nil
+       end
+ 
+-      # Returns an array of DecoratorReflection objects for all the attribute decorators in the class.
+-      def reflect_on_all_attribute_decorators
+-        reflections.values.select { |reflection| reflection.is_a?(AttributeDecoratorReflection) }
++      # Returns an array of AttrbuteViewReflection objects for all the attribute views in the class.
++      def reflect_on_all_attribute_views
++        reflections.values.select { |reflection| reflection.is_a?(AttributeViewReflection) }
+       end
+ 
+-      # Returns the DecoratorReflection object for the named <tt>attribute decorator</tt> (use the symbol). Example:
++      # Returns the AttributeViewReflection object for the named <tt>view</tt> (use the symbol). Example:
+       #
+-      #   Account.reflect_on_decorator(:balance) # returns the balance DecoratorReflection
++      #   Account.reflect_on_attribute_view(:balance) # returns the balance AttributeViewReflection
+       #
+-      def reflect_on_attribute_decorator(attribute_decorator)
+-        reflections[attribute_decorator].is_a?(AttributeDecoratorReflection) ? reflections[attribute_decorator] : nil
++      def reflect_on_attribute_view(attribute_view)
++        reflections[attribute_view].is_a?(AttributeViewReflection) ? reflections[attribute_view] : nil
+       end
+ 
+       # Returns an array of AssociationReflection objects for all the associations in the class. If you only want to reflect on a
+@@ -148,8 +148,11 @@ module ActiveRecord
+     class AggregateReflection < MacroReflection #:nodoc:
+     end
+ 
+-    # Holds all the meta-data about an aggregation as it was specified in the Active Record class.
+-    class AttributeDecoratorReflection < MacroReflection #:nodoc:
++    # Holds all the meta-data about an attribute view as it was specified in the Active Record class.
++    class AttributeViewReflection < MacroReflection #:nodoc:
++      def klass
++        options[:as]
++      end
+     end
+ 
+     # Holds all the meta-data about an association as it was specified in the Active Record class.
+diff --git a/activerecord/test/cases/attribute_decorator_test.rb b/activerecord/test/cases/attribute_decorator_test.rb
+deleted file mode 100644
+index 1527707..0000000
+--- a/activerecord/test/cases/attribute_decorator_test.rb
++++ /dev/null
+@@ -1,216 +0,0 @@
+-require "cases/helper"
+-require 'models/artist'
+-
+-class AttributeDecoratorClassMethodTest < ActiveRecord::TestCase
+-  def test_should_take_a_name_for_the_decorator_and_define_a_reader_and_writer_method_for_it
+-    %w{ date_of_birth date_of_birth= }.each { |method| assert Artist.instance_methods.include?(method) }
+-  end
+-  
+-  def test_should_not_take_any_options_other_than_class_and_class_name_and_decorates
+-    assert_raise(ArgumentError) do
+-      Artist.class_eval do
+-        attribute_decorator :foo, :some_other_option => true
+-      end
+-    end
+-  end
+-end
+-
+-class AttributeDecoratorInGeneralTest < ActiveRecord::TestCase
+-  def setup
+-    @artist = Artist.create(:day => 31, :month => 12, :year => 1999)
+-  end
+-  
+-  def teardown
+-    Artist.class_eval do
+-      attribute_decorator :date_of_birth, :class_name => 'Decorators::CompositeDate', :decorates => [:day, :month, :year]
+-    end
+-  end
+-  
+-  uses_mocha('should_only_use_constantize_once_and_cache_the_result') do
+-    def test_should_only_use_constantize_once_and_cache_the_result
+-      klass_name_string = 'CompositeDate'
+-      
+-      Artist.class_eval do
+-        attribute_decorator :date_of_birth, :class_name => klass_name_string, :decorates => [:day, :month, :year]
+-      end
+-      
+-      klass_name_string.expects(:constantize).times(1).returns(Decorators::CompositeDate)
+-      2.times { @artist.date_of_birth }
+-    end
+-  end
+-  
+-  def test_should_work_with_a_real_pointer_to_a_wrapper_class_instead_of_a_string
+-    Artist.class_eval do
+-      attribute_decorator :date_of_birth, :class => Decorators::CompositeDate, :decorates => [:day, :month, :year]
+-    end
+-    
+-    assert_equal "31-12-1999", @artist.date_of_birth.to_s
+-  end
+-  
+-  uses_mocha('should_also_work_with_an_anonymous_wrapper_class') do
+-    def test_should_also_work_with_an_anonymous_wrapper_class
+-      Artist.class_eval do
+-        attribute_decorator :date_of_birth, :decorates => [:day, :month, :year], :class => (Class.new(Decorators::CompositeDate) do
+-          # Reversed implementation of the super class.
+-          def to_s
+-            "#{@year}-#{@month}-#{@day}"
+-          end
+-        end)
+-      end
+-      
+-      2.times { assert_equal "1999-12-31", @artist.date_of_birth.to_s }
+-    end
+-  end
+-  
+-  def test_should_reset_the_before_type_cast_values_on_reload
+-    @artist.date_of_birth = '01-01-1111'
+-    Artist.find(@artist.id).update_attribute(:day, 13)
+-    @artist.reload
+-    
+-    assert_equal "13-12-1999", @artist.date_of_birth_before_type_cast
+-  end
+-end
+-
+-class AttributeDecoratorForMultipleAttributesTest < ActiveRecord::TestCase
+-  def setup
+-    @artist = Artist.create(:day => 31, :month => 12, :year => 1999)
+-    @decorator = @artist.date_of_birth
+-  end
+-  
+-  def test_should_return_an_instance_of_the_decorator_class_specified_by_the_class_name_option
+-    assert_instance_of Decorators::CompositeDate, @artist.date_of_birth
+-  end
+-  
+-  def test_should_have_assigned_values_to_decorate_to_the_decorator_instance
+-    assert_equal 31,   @decorator.day
+-    assert_equal 12,   @decorator.month
+-    assert_equal 1999, @decorator.year
+-  end
+-  
+-  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
+-    @artist.date_of_birth = '01-02-2000'
+-    assert_equal '01-02-2000', @artist.date_of_birth_before_type_cast
+-  end
+-  
+-  def test_should_return_the_value_before_type_cast_when_the_value_was_just_read_from_the_database
+-    date_of_birth_as_string = @artist.date_of_birth.to_s
+-    @artist.reload
+-    assert_equal date_of_birth_as_string, @artist.date_of_birth_before_type_cast
+-  end
+-  
+-  def test_should_parse_the_value_assigned_through_the_setter_method_and_assign_them_to_the_model_instance
+-    @artist.date_of_birth = '01-02-2000'
+-    assert_equal 1,    @artist.day
+-    assert_equal 2,    @artist.month
+-    assert_equal 2000, @artist.year
+-  end
+-end
+-
+-class AttributeDecoratorForOneAttributeTest < ActiveRecord::TestCase
+-  def setup
+-    @artist = Artist.create(:location => 'amsterdam')
+-  end
+-  
+-  def test_should_return_an_instance_of_the_decorator_class_specified_by_the_class_name_option
+-    assert_instance_of Decorators::GPSCoordinator, @artist.gps_location
+-  end
+-  
+-  def test_should_have_assigned_the_value_to_decorate_to_the_decorator_instance
+-    assert_equal 'amsterdam', @artist.gps_location.location
+-  end
+-  
+-  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
+-    @artist.gps_location = 'rotterdam'
+-    assert_equal 'rotterdam', @artist.gps_location_before_type_cast
+-  end
+-  
+-  def test_should_return_the_value_before_type_cast_when_the_value_was_just_read_from_the_database
+-    gps_location_as_string = @artist.gps_location.to_s
+-    @artist.reload
+-    assert_equal gps_location_as_string, @artist.gps_location_before_type_cast
+-  end
+-  
+-  def test_should_parse_the_value_assigned_through_the_setter_method_and_assign_it_to_the_model_instance
+-    @artist.gps_location = 'amsterdam'
+-    assert_equal '+1, +1', @artist.location
+-    
+-    @artist.gps_location = 'rotterdam'
+-    assert_equal '-1, -1', @artist.location
+-  end
+-end
+-
+-class AttributeDecoratorForAnAlreadyExistingAttributeTest < ActiveRecord::TestCase
+-  def setup
+-    @artist = Artist.create(:start_year => 1999)
+-    @decorator = @artist.start_year
+-  end
+-  
+-  def test_should_return_an_instance_of_the_decorator_class_specified_by_the_class_option
+-    assert_instance_of Decorators::GPSCoordinator, @artist.gps_location
+-  end
+-  
+-  def test_should_have_assigned_the_value_to_decorate_to_the_decorator_instance
+-    assert_equal 1999, @decorator.start_year
+-  end
+-  
+-  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
+-    @artist.start_year = '40 bc'
+-    assert_equal '40 bc', @artist.start_year_before_type_cast
+-  end
+-  
+-  def test_should_parse_and_write_the_value_assigned_through_the_setter_method_and_assign_it_to_the_model_instance
+-    @artist.start_year = '40 bc'
+-    assert_equal -41, @artist.read_attribute(:start_year)
+-  end
+-end
+-
+-class AttributeDecoratorValidatorTest < ActiveRecord::TestCase
+-  def teardown
+-    Artist.instance_variable_set(:@validate_callbacks, [])
+-    Artist.instance_variable_set(:@validate_on_update_callbacks, [])
+-  end
+-  
+-  def test_should_delegate_validation_to_the_decorator
+-    Artist.class_eval do
+-      validates_decorator :date_of_birth, :start_year
+-    end
+-    
+-    artist = Artist.create(:start_year => 1999)
+-    
+-    artist.start_year = 40
+-    assert artist.valid?
+-    
+-    artist.start_year = 'abcde'
+-    assert !artist.valid?
+-    assert_equal "is invalid", artist.errors.on(:start_year)
+-  end
+-  
+-  def test_should_take_a_options_hash_for_more_detailed_configuration
+-    Artist.class_eval do
+-      validates_decorator :start_year, :message => 'is not a valid date', :on => :update
+-    end
+-    
+-    artist = Artist.new(:start_year => 'abcde')
+-    assert artist.valid?
+-    
+-    artist.save!
+-    assert !artist.valid?
+-    assert_equal 'is not a valid date', artist.errors.on(:start_year)
+-  end
+-  
+-  def test_should_not_take_the_allow_nil_option
+-    assert_raise(ArgumentError) do
+-      Artist.class_eval do
+-        validates_decorator :start_year, :allow_nil => true
+-      end
+-    end
+-  end
+-  
+-  def test_should_not_take_the_allow_blank_option
+-    assert_raise(ArgumentError) do
+-      Artist.class_eval do
+-        validates_decorator :start_year, :allow_blank => true
+-      end
+-    end
+-  end
+-end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/attribute_view_test.rb b/activerecord/test/cases/attribute_view_test.rb
+new file mode 100644
+index 0000000..3d60b1c
+--- /dev/null
++++ b/activerecord/test/cases/attribute_view_test.rb
+@@ -0,0 +1,191 @@
++require "cases/helper"
++require 'models/artist'
++
++class AttributeViewClassMethodTest < ActiveRecord::TestCase
++  def test_should_take_a_name_for_the_view_and_define_a_reader_and_writer_method_for_it
++    %w{ date_of_birth date_of_birth= }.each { |method| assert Artist.instance_methods.include?(method) }
++  end
++
++  def test_should_not_take_any_options_for_the_view_other_than_class_and_class_name_and_decorating
++    assert_raise(ArgumentError) do
++      Artist.class_eval do
++        view :foo, :some_other_option => true
++      end
++    end
++  end
++end
++
++class AttributeViewInGeneralTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:day => 31, :month => 12, :year => 1999)
++  end
++
++  def test_should_also_work_with_an_anonymous_wrapper_class
++    Artist.class_eval do
++      view :date_of_birth, :decorating => [:day, :month, :year], :as => (Class.new(AttributeViews::CompositeDate) do
++        # Reversed implementation of the super class.
++        def to_s
++          "#{@year}-#{@month}-#{@day}"
++        end
++      end)
++    end
++
++    2.times { assert_equal "1999-12-31", @artist.date_of_birth.to_s }
++
++    Artist.class_eval do
++      view :date_of_birth, :as => AttributeViews::CompositeDate, :decorating => [:day, :month, :year]
++    end
++  end
++
++  def test_should_reset_the_before_type_cast_values_on_reload
++    @artist.date_of_birth = '01-01-1111'
++    Artist.find(@artist.id).update_attribute(:day, 13)
++    @artist.reload
++
++    assert_equal "13-12-1999", @artist.date_of_birth_before_type_cast
++  end
++end
++
++class AttributeViewForMultipleAttributesTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:day => 31, :month => 12, :year => 1999)
++    @view = @artist.date_of_birth
++  end
++
++  def test_should_return_an_instance_of_the_view_class_specified_by_the_class_name_option
++    assert_instance_of AttributeViews::CompositeDate, @artist.date_of_birth
++  end
++
++  def test_should_have_assigned_the_values_it_decorates_to_the_view_instance
++    assert_equal 31,   @view.day
++    assert_equal 12,   @view.month
++    assert_equal 1999, @view.year
++  end
++
++  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
++    @artist.date_of_birth = '01-02-2000'
++    assert_equal '01-02-2000', @artist.date_of_birth_before_type_cast
++  end
++
++  def test_should_return_the_value_before_type_cast_when_the_value_was_just_read_from_the_database
++    date_of_birth_as_string = @artist.date_of_birth.to_s
++    @artist.reload
++    assert_equal date_of_birth_as_string, @artist.date_of_birth_before_type_cast
++  end
++
++  def test_should_parse_the_value_assigned_through_the_setter_method_and_assign_them_to_the_model_instance
++    @artist.date_of_birth = '01-02-2000'
++    assert_equal 1,    @artist.day
++    assert_equal 2,    @artist.month
++    assert_equal 2000, @artist.year
++  end
++end
++
++class AttributeViewForOneAttributeTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:location => 'amsterdam')
++  end
++
++  def test_should_return_an_instance_of_the_view_class_specified_by_the_as_option
++    assert_instance_of AttributeViews::GPSCoordinator, @artist.gps_location
++  end
++
++  def test_should_have_assigned_the_value_to_decorate_to_the_view_instance
++    assert_equal 'amsterdam', @artist.gps_location.location
++  end
++
++  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
++    @artist.gps_location = 'rotterdam'
++    assert_equal 'rotterdam', @artist.gps_location_before_type_cast
++  end
++
++  def test_should_return_the_value_before_type_cast_when_the_value_was_just_read_from_the_database
++    gps_location_as_string = @artist.gps_location.to_s
++    @artist.reload
++    assert_equal gps_location_as_string, @artist.gps_location_before_type_cast
++  end
++
++  def test_should_parse_the_value_assigned_through_the_setter_method_and_assign_it_to_the_model_instance
++    @artist.gps_location = 'amsterdam'
++    assert_equal '+1, +1', @artist.location
++
++    @artist.gps_location = 'rotterdam'
++    assert_equal '-1, -1', @artist.location
++  end
++end
++
++class AttributeViewForAnAlreadyExistingAttributeTest < ActiveRecord::TestCase
++  def setup
++    @artist = Artist.create(:start_year => 1999)
++    @view = @artist.start_year
++  end
++
++  def test_should_return_an_instance_of_the_view_class_specified_by_the_as_option
++    assert_instance_of AttributeViews::GPSCoordinator, @artist.gps_location
++  end
++
++  def test_should_have_assigned_the_value_to_decorate_to_the_view_instance
++    assert_equal 1999, @view.start_year
++  end
++
++  def test_should_return_the_value_before_type_cast_when_the_value_was_set_with_the_setter
++    @artist.start_year = '40 bc'
++    assert_equal '40 bc', @artist.start_year_before_type_cast
++  end
++
++  def test_should_parse_and_write_the_value_assigned_through_the_setter_method_and_assign_it_to_the_model_instance
++    @artist.start_year = '40 bc'
++    assert_equal -41, @artist.read_attribute(:start_year)
++  end
++end
++
++class AttributeViewValidatorTest < ActiveRecord::TestCase
++  def teardown
++    Artist.instance_variable_set(:@validate_callbacks, [])
++    Artist.instance_variable_set(:@validate_on_update_callbacks, [])
++  end
++
++  def test_should_delegate_validation_to_the_view
++    Artist.class_eval do
++      validates_view :date_of_birth, :start_year
++    end
++
++    artist = Artist.create(:start_year => 1999)
++
++    artist.start_year = 40
++    assert artist.valid?
++
++    artist.start_year = 'abcde'
++    assert !artist.valid?
++    assert_equal "is invalid", artist.errors.on(:start_year)
++  end
++
++  def test_should_take_an_options_hash_for_more_detailed_configuration
++    Artist.class_eval do
++      validates_view :start_year, :message => 'is not a valid date', :on => :update
++    end
++
++    artist = Artist.new(:start_year => 'abcde')
++    assert artist.valid?
++
++    artist.save!
++    assert !artist.valid?
++    assert_equal 'is not a valid date', artist.errors.on(:start_year)
++  end
++
++  def test_should_not_take_the_allow_nil_option
++    assert_raise(ArgumentError) do
++      Artist.class_eval do
++        validates_view :start_year, :allow_nil => true
++      end
++    end
++  end
++
++  def test_should_not_take_the_allow_blank_option
++    assert_raise(ArgumentError) do
++      Artist.class_eval do
++        validates_view :start_year, :allow_blank => true
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index ebb7e72..e95d7ab 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1246,12 +1246,12 @@ class BasicsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_clone_with_attribute_decorator_of_same_name_as_attribute
+-    dev = DeveloperWithAttributeDecorator.find(1)
+-    assert_kind_of DeveloperSalaryDecorator, dev.salary
++    dev = DeveloperWithAttributeView.find(1)
++    assert_kind_of DeveloperSalaryView, dev.salary
+ 
+     clone = nil
+     assert_nothing_raised { clone = dev.clone }
+-    assert_kind_of DeveloperSalaryDecorator, clone.salary
++    assert_kind_of DeveloperSalaryView, clone.salary
+     assert_equal dev.salary.amount, clone.salary.amount
+     assert clone.new_record?
+     
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 6a4836e..9cb7083 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -92,28 +92,28 @@ class ReflectionTest < ActiveRecord::TestCase
+     assert_equal Money, Customer.reflect_on_aggregation(:balance).klass
+   end
+ 
+-  def test_attribute_decorator_reflection
+-    reflection_for_date_of_birth = ActiveRecord::Reflection::AttributeDecoratorReflection.new(
+-      :attribute_decorator, :date_of_birth, {
+-        :class_name => 'Decorators::CompositeDate',
+-        :decorates => [:day, :month, :year]
++  def test_attribute_view_reflection
++    reflection_for_date_of_birth = ActiveRecord::Reflection::AttributeViewReflection.new(
++      :view, :date_of_birth, {
++        :as => AttributeViews::CompositeDate,
++        :decorating => [:day, :month, :year]
+       }, Artist
+     )
+     
+-    reflection_for_gps_location = ActiveRecord::Reflection::AttributeDecoratorReflection.new(
+-      :attribute_decorator, :gps_location, { :class_name => 'Decorators::GPSCoordinator', :decorates => :location }, Artist
++    reflection_for_gps_location = ActiveRecord::Reflection::AttributeViewReflection.new(
++      :view, :gps_location, { :as => AttributeViews::GPSCoordinator, :decorating => :location }, Artist
+     )
+     
+-    reflection_for_start_year = ActiveRecord::Reflection::AttributeDecoratorReflection.new(
+-      :attribute_decorator, :start_year, { :class_name => 'Decorators::Year' }, Artist
++    reflection_for_start_year = ActiveRecord::Reflection::AttributeViewReflection.new(
++      :view, :start_year, { :as => AttributeViews::Year }, Artist
+     )
+     
+     [reflection_for_date_of_birth, reflection_for_gps_location, reflection_for_start_year].each do |reflection|
+-      assert Artist.reflect_on_all_attribute_decorators.include?(reflection)
++      assert Artist.reflect_on_all_attribute_views.include?(reflection)
+     end
+     
+-    assert_equal reflection_for_date_of_birth, Artist.reflect_on_attribute_decorator(:date_of_birth)
+-    assert_equal Decorators::CompositeDate, Artist.reflect_on_attribute_decorator(:date_of_birth).klass
++    assert_equal reflection_for_date_of_birth, Artist.reflect_on_attribute_view(:date_of_birth)
++    assert_equal AttributeViews::CompositeDate, Artist.reflect_on_attribute_view(:date_of_birth).klass
+   end
+ 
+   def test_has_many_reflection
+diff --git a/activerecord/test/models/artist.rb b/activerecord/test/models/artist.rb
+index f2e4d1b..2a5f7a6 100644
+--- a/activerecord/test/models/artist.rb
++++ b/activerecord/test/models/artist.rb
+@@ -1,81 +1,81 @@
+-class Artist < ActiveRecord::Base
+-  # Defines a non existing attribute decorating multiple existing attributes
+-  attribute_decorator :date_of_birth, :class_name => 'Decorators::CompositeDate', :decorates => [:day, :month, :year]
+-  
+-  # Defines a decorates for one attribute.
+-  attribute_decorator :gps_location, :class_name => 'Decorators::GPSCoordinator', :decorates => :location
+-  
+-  # Defines a decorator for an existing attribute.
+-  attribute_decorator :start_year, :class_name => 'Decorators::Year'
+-  
+-  # These validations are defined inline in the test cases. See attribute_decorator_test.rb.
+-  #
+-  # validates_decorator :date_of_birth, :start_year
+-  # validates_decorator :start_year, :message => 'is not a valid date', :on => :update
+-end
+-
+-module Decorators
++module AttributeViews
+   class CompositeDate
+     attr_reader :day, :month, :year
+-    
++
+     def self.parse(value)
+       new *value.scan(/(\d\d)-(\d\d)-(\d{4})/).flatten.map { |x| x.to_i }
+     end
+-    
++
+     def initialize(day, month, year)
+       @day, @month, @year = day, month, year
+     end
+-    
++
+     def valid?
+       true
+     end
+-    
++
+     def to_a
+       [@day, @month, @year]
+     end
+-    
++
+     def to_s
+       "#{@day}-#{@month}-#{@year}"
+     end
+   end
+-  
++
+   class GPSCoordinator
+     attr_reader :location
+-    
++
+     def self.parse(value)
+       new(value == 'amsterdam' ? '+1, +1' : '-1, -1')
+     end
+-    
++
+     def initialize(location)
+       @location = location
+     end
+-    
++
+     def to_a
+       [@location]
+     end
+-    
++
+     def to_s
+       @location
+     end
+   end
+-  
++
+   class Year
+     attr_reader :start_year
+-    
++
+     def self.parse(value)
+       new(value == '40 bc' ? -41 : value.to_i)
+     end
+-    
++
+     def initialize(start_year)
+       @start_year = start_year
+     end
+-    
++
+     def valid?
+       @start_year != 0
+     end
+-    
++
+     def to_a
+       [@start_year]
+     end
+   end
++end
++
++class Artist < ActiveRecord::Base
++  # Defines a non existing attribute decorating multiple existing attributes
++  view :date_of_birth, :as => AttributeViews::CompositeDate, :decorating => [:day, :month, :year]
++
++  # Defines a decorates for one attribute.
++  view :gps_location, :as => AttributeViews::GPSCoordinator, :decorating => :location
++
++  # Defines a decorator for an existing attribute.
++  view :start_year, :as => AttributeViews::Year
++
++  # These validations are defined inline in the test cases. See attribute_decorator_test.rb.
++  #
++  # validates_view :date_of_birth, :start_year
++  # validates_view :start_year, :message => 'is not a valid date', :on => :update
+ end
+\ No newline at end of file
+diff --git a/activerecord/test/models/developer.rb b/activerecord/test/models/developer.rb
+index 14357bc..289bea2 100644
+--- a/activerecord/test/models/developer.rb
++++ b/activerecord/test/models/developer.rb
+@@ -70,10 +70,10 @@ ActiveSupport::Deprecation.silence do
+   end
+ end
+ 
+-DeveloperSalaryDecorator = Struct.new(:amount)
+-class DeveloperWithAttributeDecorator < ActiveRecord::Base
++DeveloperSalaryView = Struct.new(:amount)
++class DeveloperWithAttributeView < ActiveRecord::Base
+   self.table_name = 'developers'
+-  attribute_decorator :salary, :class => DeveloperSalaryDecorator
++  view :salary, :as => DeveloperSalaryView
+ end
+ 
+ class DeveloperWithBeforeDestroyRaise < ActiveRecord::Base
+-- 
+1.5.5.3
+
+
+From 553d02f2f05cd1a0a8d6a992828a874b7111d8a6 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Wed, 10 Dec 2008 21:43:18 +0100
+Subject: [PATCH] Updated documentation for the API update.
+
+---
+ activerecord/lib/active_record/attribute_view.rb |   47 +++++++++++-----------
+ activerecord/test/models/artist.rb               |    8 ++--
+ 2 files changed, 27 insertions(+), 28 deletions(-)
+
+diff --git a/activerecord/lib/active_record/attribute_view.rb b/activerecord/lib/active_record/attribute_view.rb
+index 5e9968a..a846309 100644
+--- a/activerecord/lib/active_record/attribute_view.rb
++++ b/activerecord/lib/active_record/attribute_view.rb
+@@ -13,26 +13,25 @@ module ActiveRecord
+     end
+ 
+     module ClassMethods
+-      # Adds reader and writer methods for decorating one or more attributes:
+-      # <tt>attribute_decorator :date_of_birth</tt> adds <tt>date_of_birth</tt> and <tt>date_of_birth=(new_date_of_birth)</tt> methods.
++      # Defines an attribute view, which adds a reader and a writer method for decorating one or more attributes:
++      # <tt>view :date_of_birth</tt> adds <tt>date_of_birth</tt> and <tt>date_of_birth=(new_date_of_birth)</tt> methods.
+       #
+       # Options are:
+-      # * <tt>:class</tt> - specify the decorator class.
+-      # * <tt>:class_name</tt> - specify the class name of the decorator class,
+-      #   this should be used if, at the time of loading the model class, the decorator class is not yet available.
+-      # * <tt>:decorating</tt> - specifies the attributes that should be wrapped by the decorator class.
+-      #   Takes an array of attributes or a single attribute. If none is specified the same name as the name of the attribute_decorator is assumed.
++      # * <tt>:as</tt> - specify the attribute view class.
++      # * <tt>:decorating</tt> - specifies the attributes that should be wrapped by the attribute view class.
++      #   Takes an array of attributes or a single attribute. If none is specified the same name as the name of the view is assumed.
+       #
+-      # The decorator class should implement a class method called <tt>parse</tt>, which takes 1 argument.
+-      # In that method your decorator class is responsible for returning an instance of itself with the attribute(s) parsed and assigned.
++      # The attribute view class should implement a class method called <tt>parse</tt>, which should take 1 argument.
++      # In that method your attribute view class is responsible for returning an instance of itself with the attribute(s) parsed and assigned.
+       #
+-      # Your decorator class’s initialize method should take as it’s arguments the attributes that were specified
+-      # to the <tt>:decorating</tt> option and in the same order as they were specified.
++      # Your attribute view class’s initialize method should take, as it’s arguments, the attributes that were specified
++      # with the <tt>:decorating</tt> option and in the same order as they were specified.
+       # You should also implement a <tt>to_a</tt> method which should return the parsed values as an array,
+       # again in the same order as specified with the <tt>:decorating</tt> option.
++      # Lastly, an implementation of <tt>to_s</tt> is needed which will be used by, for instance, the form helpers.
+       #
+-      # If you wish to use <tt>validates_decorator</tt>, your decorator class should also implement a <tt>valid?</tt> instance method,
+-      # which is responsible for checking the validity of the value(s). See <tt>validates_decorator</tt> for more info.
++      # If you wish to use <tt>validates_view</tt>, your attribute view class should also implement a <tt>valid?</tt> instance method,
++      # which is responsible for checking the validity of the value(s). See <tt>validates_view</tt> for more info.
+       #
+       #   class CompositeDate
+       #     attr_accessor :day, :month, :year
+@@ -53,7 +52,7 @@ module ActiveRecord
+       #       [@day, @month, @year]
+       #     end
+       #     
+-      #     # Here we return a string representation of the value, this will for instance be used by the form helpers.
++      #     # Here we return a string representation of the value, this will, for instance, be used by the form helpers.
+       #     def to_s
+       #       "#{@day}-#{@month}-#{@year}"
+       #     end
+@@ -65,16 +64,16 @@ module ActiveRecord
+       #   end
+       #
+       #   class Artist < ActiveRecord::Base
+-      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorating => [:day, :month, :year]
+-      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
++      #     view :date_of_birth, :as => CompositeDate, :decorating => [:day, :month, :year]
++      #     validates_view :date_of_birth, :message => 'is not a valid date'
+       #   end
+       #
+       # Option examples:
+-      #   attribute_decorator :date_of_birth, :class => CompositeDate, :decorating => [:day, :month, :year]
+-      #   attribute_decorator :gps_location, :class_name => 'GPSCoordinator', :decorating => :location
+-      #   attribute_decorator :balance, :class_name => 'Money'
+-      #   attribute_decorator :english_date_of_birth, :class => (Class.new(CompositeDate) do
+-      #     # This is a anonymous subclass of CompositeDate that supports the date in English order
++      #   view :date_of_birth, :as => CompositeDate, :decorating => [:day, :month, :year]
++      #   view :gps_location, :as => 'GPSCoordinator', :decorating => :location
++      #   view :balance, :as => Money
++      #   view :english_date_of_birth, :as => (Class.new(CompositeDate) do
++      #     # This is an anonymous subclass of CompositeDate that supports the date in English order
+       #     def to_s
+       #       "#{@month}/#{@day}/#{@year}"
+       #     end
+@@ -99,7 +98,7 @@ module ActiveRecord
+         create_reflection(:view, attr, options, self)
+       end
+ 
+-      # Validates wether the decorated attribute is valid by sending the decorator instance the <tt>valid?</tt> message.
++      # Validates wether the attribute view is valid by sending it the <tt>valid?</tt> message.
+       #
+       #   class CompositeDate
+       #     attr_accessor :day, :month, :year
+@@ -128,8 +127,8 @@ module ActiveRecord
+       #   end
+       #
+       #   class Artist < ActiveRecord::Base
+-      #     attribute_decorator :date_of_birth, :class => CompositeDate, :decorating => [:day, :month, :year]
+-      #     validates_decorator :date_of_birth, :message => 'is not a valid date'
++      #     view :date_of_birth, :as => CompositeDate, :decorating => [:day, :month, :year]
++      #     validates_view :date_of_birth, :message => 'is not a valid date'
+       #   end
+       #
+       #   artist = Artist.new
+diff --git a/activerecord/test/models/artist.rb b/activerecord/test/models/artist.rb
+index 2a5f7a6..02e1cce 100644
+--- a/activerecord/test/models/artist.rb
++++ b/activerecord/test/models/artist.rb
+@@ -65,16 +65,16 @@ module AttributeViews
+ end
+ 
+ class Artist < ActiveRecord::Base
+-  # Defines a non existing attribute decorating multiple existing attributes
++  # Defines an attribute view decorating multiple existing attributes
+   view :date_of_birth, :as => AttributeViews::CompositeDate, :decorating => [:day, :month, :year]
+ 
+-  # Defines a decorates for one attribute.
++  # Defines a view for one attribute.
+   view :gps_location, :as => AttributeViews::GPSCoordinator, :decorating => :location
+ 
+-  # Defines a decorator for an existing attribute.
++  # Defines a view for an existing attribute.
+   view :start_year, :as => AttributeViews::Year
+ 
+-  # These validations are defined inline in the test cases. See attribute_decorator_test.rb.
++  # These validations are defined inline in the test cases. See attribute_view_test.rb.
+   #
+   # validates_view :date_of_birth, :start_year
+   # validates_view :start_year, :message => 'is not a valid date', :on => :update
+-- 
+1.5.5.3
+
+
+From 87f51f38260974cab7d129c0cb116fad5c88ed71 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Wed, 10 Dec 2008 21:57:37 +0100
+Subject: [PATCH] Updated composed_of deprecation warning to point to ActiveRecord::AttributeView::view.
+
+---
+ activerecord/lib/active_record/aggregations.rb |    2 +-
+ activerecord/test/cases/base_test.rb           |    2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/aggregations.rb b/activerecord/lib/active_record/aggregations.rb
+index 04a67ae..94e1a4d 100644
+--- a/activerecord/lib/active_record/aggregations.rb
++++ b/activerecord/lib/active_record/aggregations.rb
+@@ -192,7 +192,7 @@ module ActiveRecord
+       #               :converter => Proc.new { |ip| ip.is_a?(Integer) ? IPAddr.new(ip, Socket::AF_INET) : IPAddr.new(ip.to_s) }
+       #
+       def composed_of(part_id, options = {}, &block)
+-        ActiveSupport::Deprecation.warn("ActiveRecord::Aggregations::composed_of has been deprecated. Please use ActiveRecord::AttributeDecorator::attribute_decorator.")
++        ActiveSupport::Deprecation.warn("ActiveRecord::Aggregations::composed_of has been deprecated. Please use ActiveRecord::AttributeView::view.")
+ 
+         options.assert_valid_keys(:class_name, :mapping, :allow_nil, :constructor, :converter)
+ 
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index e95d7ab..84a2ae3 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1245,7 +1245,7 @@ class BasicsTest < ActiveRecord::TestCase
+     assert clone.id != dev.id
+   end
+ 
+-  def test_clone_with_attribute_decorator_of_same_name_as_attribute
++  def test_clone_with_attribute_view_of_same_name_as_attribute
+     dev = DeveloperWithAttributeView.find(1)
+     assert_kind_of DeveloperSalaryView, dev.salary
+ 
+-- 
+1.5.5.3
+

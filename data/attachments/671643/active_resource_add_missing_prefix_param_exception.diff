@@ -1,0 +1,274 @@
+From e801fa74334a5ff9056da395a07495fa2e2df77b Mon Sep 17 00:00:00 2001
+From: Gaston Ramos <ramos.gaston@gmail.com>
+Date: Mon, 13 Sep 2010 17:05:52 -0300
+Subject: [PATCH 1/5] - elmenth_path raise an ActiveResource::MissingPrefixParam exception
+   when prefix_options does not has all required prefix_options
+   ex:
+     class StreetAddress < ActiveResource::Base
+      self.site = "http://37s.sunrise.i:3000/people/:person_id/"
+     end
+
+    StreetAddress.element_path(1)
+    # => ActiveResource::MissingPrefixParam
+---
+ activeresource/lib/active_resource/base.rb       |    6 ++++++
+ activeresource/lib/active_resource/exceptions.rb |    3 +++
+ activeresource/test/cases/base_test.rb           |   10 +++++++++-
+ activeresource/test/cases/finder_test.rb         |    3 ++-
+ 4 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 7963aa4..2d8a7be 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -621,6 +621,12 @@ module ActiveResource
+       #   # => /posts/5/comments/1.xml?active=1
+       #
+       def element_path(id, prefix_options = {}, query_options = nil)
++
++        p_options = HashWithIndifferentAccess.new(prefix_options)
++        prefix_parameters.each do |p|
++          raise MissingPrefixParam if p_options[p].blank?
++        end
++
+         prefix_options, query_options = split_options(prefix_options) if query_options.nil?
+         "#{prefix(prefix_options)}#{collection_name}/#{URI.escape id.to_s}.#{format.extension}#{query_string(query_options)}"
+       end
+diff --git a/activeresource/lib/active_resource/exceptions.rb b/activeresource/lib/active_resource/exceptions.rb
+index 0f4549f..6b953b2 100644
+--- a/activeresource/lib/active_resource/exceptions.rb
++++ b/activeresource/lib/active_resource/exceptions.rb
+@@ -36,6 +36,9 @@ module ActiveResource
+     def to_s; response['Location'] ? "#{super} => #{response['Location']}" : super; end
+   end
+ 
++  # Raised when ...
++  class MissingPrefixParam < ArgumentError; end # :nodoc:
++
+   # 4xx Client Error
+   class ClientError < ConnectionError; end # :nodoc:
+ 
+diff --git a/activeresource/test/cases/base_test.rb b/activeresource/test/cases/base_test.rb
+index 77135be..bac9203 100644
+--- a/activeresource/test/cases/base_test.rb
++++ b/activeresource/test/cases/base_test.rb
+@@ -566,6 +566,12 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal '/people/ann%20mary/addresses/ann%20mary.xml', StreetAddress.element_path(:'ann mary', 'person_id' => 'ann mary')
+   end
+ 
++  def test_custom_element_path_without_parent_id
++    assert_raise ActiveResource::MissingPrefixParam do
++      assert_equal '/people/1/addresses/1.xml', StreetAddress.element_path(1)
++    end
++  end
++
+   def test_module_element_path
+     assert_equal '/sounds/1.xml', Asset::Sound.element_path(1)
+   end
+@@ -651,6 +657,8 @@ class BaseTest < Test::Unit::TestCase
+       assert_equal Set.new([:the_param1]), person_class.prefix_parameters
+       person_class.prefix = "the_prefix/:the_param2"
+       assert_equal Set.new([:the_param2]), person_class.prefix_parameters
++      person_class.prefix = "the_prefix/:the_param1/other_prefix/:the_param2"
++      assert_equal Set.new([:the_param2, :the_param1]), person_class.prefix_parameters
+     end
+   end
+ 
+@@ -1041,7 +1049,7 @@ class BaseTest < Test::Unit::TestCase
+   ensure
+     Person.element_name = old_elem_name
+   end
+-  
++
+   def test_to_xml_with_private_method_name_as_attribute
+     assert_nothing_raised(ArgumentError) {
+       Customer.new(:test => true).to_xml
+diff --git a/activeresource/test/cases/finder_test.rb b/activeresource/test/cases/finder_test.rb
+index 1f52868..6b46d79 100644
+--- a/activeresource/test/cases/finder_test.rb
++++ b/activeresource/test/cases/finder_test.rb
+@@ -86,6 +86,7 @@ class FinderTest < Test::Unit::TestCase
+       mock.delete "/people/1/addresses/1.xml",    {}, nil, 200
+       mock.post   "/people/1/addresses.xml",      {}, nil, 201, 'Location' => '/people/1/addresses/5'
+       mock.get    "/people//addresses.xml",       {}, nil, 404
++      mock.get    "/people/1/addresses/99.xml",   {}, nil, 404
+       mock.get    "/people//addresses/1.xml",     {}, nil, 404
+       mock.put    "/people//addresses/1.xml",     {}, nil, 404
+       mock.delete "/people//addresses/1.xml",     {}, nil, 404
+@@ -178,7 +179,7 @@ class FinderTest < Test::Unit::TestCase
+ 
+   def test_find_by_id_not_found
+     assert_raise(ActiveResource::ResourceNotFound) { Person.find(99) }
+-    assert_raise(ActiveResource::ResourceNotFound) { StreetAddress.find(1) }
++    assert_raise(ActiveResource::ResourceNotFound) { StreetAddress.find(99, :params => {:person_id => 1}) }
+   end
+ 
+   def test_find_all_sub_objects
+-- 
+1.7.1
+
+
+From 8ad7175577c1365796290d69c01a26a47f88baf4 Mon Sep 17 00:00:00 2001
+From: Gaston Ramos <ramos.gaston@gmail.com>
+Date: Mon, 13 Sep 2010 17:14:37 -0300
+Subject: [PATCH 2/5] - refactoring, move prefix_options check to a custom method
+
+---
+ activeresource/lib/active_resource/base.rb |   14 +++++++++-----
+ 1 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 2d8a7be..9b8d89b 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -621,11 +621,7 @@ module ActiveResource
+       #   # => /posts/5/comments/1.xml?active=1
+       #
+       def element_path(id, prefix_options = {}, query_options = nil)
+-
+-        p_options = HashWithIndifferentAccess.new(prefix_options)
+-        prefix_parameters.each do |p|
+-          raise MissingPrefixParam if p_options[p].blank?
+-        end
++        check_prefix_options(prefix_options)
+ 
+         prefix_options, query_options = split_options(prefix_options) if query_options.nil?
+         "#{prefix(prefix_options)}#{collection_name}/#{URI.escape id.to_s}.#{format.extension}#{query_string(query_options)}"
+@@ -848,6 +844,14 @@ module ActiveResource
+       end
+ 
+       private
++
++        def check_prefix_options(prefix_options)
++          p_options = HashWithIndifferentAccess.new(prefix_options)
++          prefix_parameters.each do |p|
++            raise(MissingPrefixParam, "#{p} prefix_option is missing") if p_options[p].blank?
++          end
++        end
++
+         # Find every resource
+         def find_every(options)
+           begin
+-- 
+1.7.1
+
+
+From 73f0922958cb8d66b37770b611f594ecd9edcf8b Mon Sep 17 00:00:00 2001
+From: Gaston Ramos <ramos.gaston@gmail.com>
+Date: Mon, 13 Sep 2010 17:21:49 -0300
+Subject: [PATCH 3/5] - better name for prefix param test case
+
+---
+ activeresource/test/cases/base_test.rb |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/activeresource/test/cases/base_test.rb b/activeresource/test/cases/base_test.rb
+index bac9203..cebbbe2 100644
+--- a/activeresource/test/cases/base_test.rb
++++ b/activeresource/test/cases/base_test.rb
+@@ -566,7 +566,7 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal '/people/ann%20mary/addresses/ann%20mary.xml', StreetAddress.element_path(:'ann mary', 'person_id' => 'ann mary')
+   end
+ 
+-  def test_custom_element_path_without_parent_id
++  def test_custom_element_path_without_required_prefix_param
+     assert_raise ActiveResource::MissingPrefixParam do
+       assert_equal '/people/1/addresses/1.xml', StreetAddress.element_path(1)
+     end
+-- 
+1.7.1
+
+
+From b3e02c3f623cf6e41b5e594d1c5759e8cc9e8eb2 Mon Sep 17 00:00:00 2001
+From: Gaston Ramos <ramos.gaston@gmail.com>
+Date: Mon, 13 Sep 2010 17:33:58 -0300
+Subject: [PATCH 4/5] - check prefix options in collection_path
+
+---
+ activeresource/lib/active_resource/base.rb |    1 +
+ activeresource/test/cases/base_test.rb     |    8 +++++++-
+ 2 files changed, 8 insertions(+), 1 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 9b8d89b..1485df7 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -665,6 +665,7 @@ module ActiveResource
+       #   # => /posts/5/comments.xml?active=1
+       #
+       def collection_path(prefix_options = {}, query_options = nil)
++        check_prefix_options(prefix_options)
+         prefix_options, query_options = split_options(prefix_options) if query_options.nil?
+         "#{prefix(prefix_options)}#{collection_name}.#{format.extension}#{query_string(query_options)}"
+       end
+diff --git a/activeresource/test/cases/base_test.rb b/activeresource/test/cases/base_test.rb
+index cebbbe2..1c8c38e 100644
+--- a/activeresource/test/cases/base_test.rb
++++ b/activeresource/test/cases/base_test.rb
+@@ -568,7 +568,7 @@ class BaseTest < Test::Unit::TestCase
+ 
+   def test_custom_element_path_without_required_prefix_param
+     assert_raise ActiveResource::MissingPrefixParam do
+-      assert_equal '/people/1/addresses/1.xml', StreetAddress.element_path(1)
++      StreetAddress.element_path(1)
+     end
+   end
+ 
+@@ -610,6 +610,12 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal '/people/1/addresses/1.xml?type=work', StreetAddress.element_path(1, {:person_id => 1}, {:type => 'work'})
+   end
+ 
++  def test_custom_collection_path_without_required_prefix_param
++    assert_raise ActiveResource::MissingPrefixParam do
++      StreetAddress.collection_path
++    end
++  end
++
+   def test_custom_collection_path
+     assert_equal '/people/1/addresses.xml', StreetAddress.collection_path(:person_id => 1)
+     assert_equal '/people/1/addresses.xml', StreetAddress.collection_path('person_id' => 1)
+-- 
+1.7.1
+
+
+From 37a45a8c970edf1f93c36afee6d2f30082f49463 Mon Sep 17 00:00:00 2001
+From: Gaston Ramos <ramos.gaston@gmail.com>
+Date: Mon, 13 Sep 2010 19:34:46 -0300
+Subject: [PATCH 5/5] - update exceptions documentation
+
+---
+ activeresource/lib/active_resource/base.rb |   11 +++++++++++
+ 1 files changed, 11 insertions(+), 0 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 1485df7..ee37585 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -166,6 +166,7 @@ module ActiveResource
+   #   # GET http://api.people.com:3000/people/999.xml
+   #   ryan = Person.find(999) # 404, raises ActiveResource::ResourceNotFound
+   #
++  #
+   # <tt>404</tt> is just one of the HTTP error response codes that Active Resource will handle with its own exception. The
+   # following HTTP response codes will also result in these exceptions:
+   #
+@@ -194,6 +195,16 @@ module ActiveResource
+   #     redirect_to :action => 'new'
+   #   end
+   #
++  # When a GET is requested for a nested resource and you don't provide the prefix_param
++  # an ActiveResource::MissingPrefixParam will be raised.
++  #
++  #  class Comment < ActiveResource::Base
++  #   self.site = "http://someip.com/posts/:post_id/"
++  #  end
++  #
++  #  Comment.find(1)
++  #  # => ActiveResource::MissingPrefixParam: post_id prefix_option is missing
++  #
+   # === Validation errors
+   #
+   # Active Resource supports validations on resources and will return errors if any of these validations fail
+-- 
+1.7.1
+

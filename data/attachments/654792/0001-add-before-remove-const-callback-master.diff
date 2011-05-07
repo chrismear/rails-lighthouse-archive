@@ -1,0 +1,140 @@
+From d9801174f158ab7715c92300783c0460da0449be Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Wed, 1 Sep 2010 14:12:06 +0100
+Subject: [PATCH 1/2] Add before_remove_const callback to ActiveSupport::Dependencies.remove_unloadable_constants!
+
+---
+ activesupport/CHANGELOG                          |    2 +-
+ activesupport/lib/active_support/dependencies.rb |    8 +++++++-
+ activesupport/test/dependencies_test.rb          |   11 +++++++++++
+ 3 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/activesupport/CHANGELOG b/activesupport/CHANGELOG
+index 84cdc22..383cdbb 100644
+--- a/activesupport/CHANGELOG
++++ b/activesupport/CHANGELOG
+@@ -1,6 +1,6 @@
+ *Rails 3.1.0 (unreleased)*
+ 
+-* No changes
++* Added before_remove_const callback to ActiveSupport::Dependencies.remove_unloadable_constants! [Andrew White]
+ 
+ 
+ *Rails 3.0.0 (August 29, 2010)*
+diff --git a/activesupport/lib/active_support/dependencies.rb b/activesupport/lib/active_support/dependencies.rb
+index e6170b2..12e51b5 100644
+--- a/activesupport/lib/active_support/dependencies.rb
++++ b/activesupport/lib/active_support/dependencies.rb
+@@ -511,7 +511,12 @@ module ActiveSupport #:nodoc:
+     end
+ 
+     # Remove the constants that have been autoloaded, and those that have been
+-    # marked for unloading.
++    # marked for unloading. Before each constant is removed a callback is sent
++    # to the constant if it implements the <tt>before_remove_const method</tt>.
++    #
++    # Callbacks implementation should be restricted to cleaning up caches, etc.
++    # as the enviroment will be in an inconsistent state, e.g. other constants
++    # may have already been unloaded and not accessible.
+     def remove_unloadable_constants!
+       autoloaded_constants.each { |const| remove_constant const }
+       autoloaded_constants.clear
+@@ -636,6 +641,7 @@ module ActiveSupport #:nodoc:
+       parent = Inflector.constantize(names * '::')
+ 
+       log "removing constant #{const}"
++      constantize(const).before_remove_const if constantize(const).respond_to?(:before_remove_const)
+       parent.instance_eval { remove_const to_remove }
+ 
+       return true
+diff --git a/activesupport/test/dependencies_test.rb b/activesupport/test/dependencies_test.rb
+index 77b885d..bc7f597 100644
+--- a/activesupport/test/dependencies_test.rb
++++ b/activesupport/test/dependencies_test.rb
+@@ -574,6 +574,17 @@ class DependenciesTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_unloadable_constants_should_receive_callback
++    Object.const_set :C, Class.new
++    C.unloadable
++    C.expects(:before_remove_const).once
++    assert C.respond_to?(:before_remove_const)
++    ActiveSupport::Dependencies.clear
++    assert !defined?(C)
++  ensure
++    Object.class_eval { remove_const :C } if defined?(C)
++  end
++
+   def test_new_contants_in_without_constants
+     assert_equal [], (ActiveSupport::Dependencies.new_constants_in(Object) { })
+     assert ActiveSupport::Dependencies.constant_watch_stack.all? {|k,v| v.empty? }
+-- 
+1.7.1
+
+
+From c1c10cf4b720dc93e2b58a1b3f3d3795433c1adf Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Wed, 1 Sep 2010 15:09:04 +0100
+Subject: [PATCH 2/2] Reset default scope in Thread.current when class is unloaded [#5497 state:resolved]
+
+---
+ activerecord/lib/active_record/base.rb |    8 ++++++++
+ activerecord/test/cases/base_test.rb   |   15 +++++++++++++++
+ 2 files changed, 23 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index f465a38..c3a34ae 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -890,6 +890,10 @@ module ActiveRecord #:nodoc:
+         Thread.current[key] = Thread.current[key].presence || self.default_scoping.dup
+       end
+ 
++      def before_remove_const #:nodoc:
++        reset_scoped_methods
++      end
++
+       private
+ 
+         def relation #:nodoc:
+@@ -1174,6 +1178,10 @@ MSG
+           scoped_methods.last
+         end
+ 
++        def reset_scoped_methods #:nodoc:
++          Thread.current[:"#{self}_scoped_methods"] = nil
++        end
++
+         # Returns the class type of the record using the current module as a prefix. So descendants of
+         # MyApp::Business::Account would appear as MyApp::Business::AccountSubclass.
+         def compute_type(type_name)
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 55f0b1c..d58e302 100644
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1415,6 +1415,21 @@ class BasicsTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_default_scope_is_reset
++    Object.const_set :UnloadablePost, Class.new(ActiveRecord::Base)
++    UnloadablePost.table_name = 'posts'
++    UnloadablePost.class_eval do
++      default_scope order('posts.comments_count ASC')
++    end
++
++    UnloadablePost.unloadable
++    assert_not_nil Thread.current[:UnloadablePost_scoped_methods]
++    ActiveSupport::Dependencies.remove_unloadable_constants!
++    assert_nil Thread.current[:UnloadablePost_scoped_methods]
++  ensure
++    Object.class_eval{ remove_const :UnloadablePost } if defined?(UnloadablePost)
++  end
++
+   protected
+     def with_env_tz(new_tz = 'US/Eastern')
+       old_tz, ENV['TZ'] = ENV['TZ'], new_tz
+-- 
+1.7.1
+

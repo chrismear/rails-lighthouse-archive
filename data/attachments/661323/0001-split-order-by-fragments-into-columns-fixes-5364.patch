@@ -1,0 +1,96 @@
+From b531f49221c8db4de53dca0e03d61991049c2a31 Mon Sep 17 00:00:00 2001
+From: schreiber <schreiber@esda.com>
+Date: Tue, 7 Sep 2010 11:59:31 +0200
+Subject: [PATCH] Split order by fragments into columns. Fixes #5364
+
+---
+ .../connection_adapters/postgresql_adapter.rb      |   59 +++++++++++++++++++-
+ 1 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index a348318..d8d9937 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -890,7 +890,7 @@ module ActiveRecord
+ 
+         # Construct a clean list of column names from the ORDER BY clause, removing
+         # any ASC/DESC modifiers
+-        order_columns = order_by.split(',').collect { |s| s.split.first }
++        order_columns = split_order_by_fragment_at_comma(order_by)
+         order_columns.delete_if &:blank?
+         order_columns = order_columns.zip((0...order_columns.size).to_a).map { |s,i| "#{s} AS alias_#{i}" }
+ 
+@@ -907,7 +907,7 @@ module ActiveRecord
+       def add_order_by_for_association_limiting!(sql, options) #:nodoc:
+         return sql if options[:order].blank?
+ 
+-        order = options[:order].split(',').collect { |s| s.strip }.reject(&:blank?)
++        order = split_order_by_fragment_at_comma(options[:order]).reject(&:blank?)
+         order.map! { |s| 'DESC' if s =~ /\bdesc$/i }
+         order = order.zip((0...order.size).to_a).map { |s,i| "id_list.alias_#{i} #{s}" }.join(', ')
+ 
+@@ -1072,6 +1072,61 @@ module ActiveRecord
+             [match_data[1], (rest.length > 0 ? rest : nil)]
+           end
+         end
++
++        # this helper function is needed for splitting up order by fragments at
++        # columns, even if a column is a sql function call. It is needed
++        # because PostgreSQL expects the order by columns at DISTINCT ON
++        # statements
++        def split_order_by_fragment_at_comma(order_by)
++          start = order_by.index(/[',(]/)
++          return [order_by] if start.nil?
++          char = order_by[start].chr
++          case char
++          when ','
++            return [order_by[0..start].sub(/,$/, "").strip, split_order_by_fragment_at_comma(order_by[(start+1)..-1])].flatten
++          when '('
++            open, close = braces_bounds(order_by, start)
++            raise ActiveRecord::StatementInvalid, "parentheses do not match." if close.nil?
++            before = order_by[0..close]
++            result = split_order_by_fragment_at_comma(order_by[close+1..-1])
++            result[0] = before + result[0]
++            return result
++          when "'"
++            open, close = string_bounds(order_by, start)
++            raise ActiveRecord::StatementInvalid, "quotes do not match." if close.nil?
++            before = order_by[0..close].to_s
++            result = split_order_by_fragment_at_comma(order_by[close+1..-1])
++            result[0] = before + result[0].to_s
++            return result
++          end
++        end
++
++        def string_bounds(s, start=0)
++          open = s.index("'", start)
++          return [nil, nil] if open.nil?
++          close = s.index("'", open+1)
++          return [open, nil] if close.nil?
++          while s[close..(close+1)] == "''" or s[(close-1)..close] == "\\'" or s[(close-1)..close] == "''"
++            close = s.index("'", close+1)
++          end
++          [open,close]
++        end
++
++        def braces_bounds(s, start=0)
++          open  = s.index('(', start)
++          return [nil, nil] if open.nil?
++          close = s.index(')', open+1)
++          open2 = s.index("(", open+1)
++          if open2 and open2 < close
++            open2, close2 = braces_bounds(s, open2)
++            close = s.index(')', close2+1)
++          end  
++          string_start, string_ende = string_bounds(s, open)
++          if !string_start.nil? and !string_ende.nil?
++            close = s.index(')', string_ende+1) if close > string_start
++          end
++          return [open, close]
++        end
+     end
+   end
+ end
+-- 
+1.5.6.5
+

@@ -1,0 +1,124 @@
+diff --git a/activemodel/lib/active_model/errors.rb b/activemodel/lib/active_model/errors.rb
+index 1431228..efc7eb5 100644
+--- a/activemodel/lib/active_model/errors.rb
++++ b/activemodel/lib/active_model/errors.rb
+@@ -170,23 +170,58 @@ module ActiveModel
+       self
+     end
+ 
++    # Represents a full error message. The full_message is available in <tt>full_message</tt>
++    # and <tt>to_s</tt> returns the +message+ given to constructor, or +full_message+ if +message+ is nil.
++    class ErrorMessage < String
++      attr_reader :full_message
++      
++      def initialize(message, full_message)
++        super(message || full_message)
++        @full_message = full_message
++      end
++    end
++
+     # Adds +message+ to the error messages on +attribute+, which will be returned on a call to
+     # <tt>on(attribute)</tt> for the same attribute. More than one error can be added to the same
+     # +attribute+ in which case an array will be returned on a call to <tt>on(attribute)</tt>.
+     # If no +message+ is supplied, <tt>:invalid</tt> is assumed.
+     #
++    # If a <tt>:full_message</tt> option is specified, an ErrorMessage instance will be added to errors,
++    # which will be processed by <tt>full_messages</tt> as a full message (no concatenation with attribute names).
++    #
+     # If +message+ is a symbol, it will be translated using the appropriate scope (see +translate_error+).
+-    # If +message+ is a proc, it will be called, allowing for things like <tt>Time.now</tt> to be used within an error.
++    # If +message+ or +options[:message/:full_message]+ is a proc, it will be called with optional parameters,
++    # depending on proc arity, in the following order: instance (@base), +attribute+, +options+.
+     def add(attribute, message = nil, options = {})
+       message ||= :invalid
++      proc_args = [@base, attribute, options]
+ 
+-      if message.is_a?(Symbol)
+-        message = generate_message(attribute, message, options.except(*CALLBACKS_OPTIONS))
+-      elsif message.is_a?(Proc)
+-        message = message.call
++      if message.is_a? Proc
++        options = options.merge(:message => message)
++        ActiveSupport::Deprecation.warn \
++          "ActiveModel::Errors#add(attributes, proc, options) has been deprecated.\n" +
++          "Instead of passing the proc to message, add it to options[:message] or options[:full_message] instead."
++      end
++
++      message_options = options.except(:full_message, *CALLBACKS_OPTIONS)
++      messages = {}.tap{|m| m.merge! :message => message unless message.is_a? Symbol}
++      [:message, :full_message].each do |key|
++        messages[key] ||= options[key]
++        if (msg_proc = messages[key]).is_a?(Proc)
++          messages[key] = case msg_proc.arity
++            when  0: msg_proc.call
++            when -1: msg_proc.call(*proc_args)
++            else msg_proc.call(*proc_args[0..msg_proc.arity-1])
++          end
++        elsif message.is_a?(Symbol) && ((key == :message) || messages[:full_message])
++          opts = message_options
++          opts.merge! :message => messages[key] if messages[key]
++          messages[key] = generate_message attribute, message, opts #, key (temporarily disabled, to avoid changing the tests for now)
++        end
+       end
+ 
+-      self[attribute] << message
++      self[attribute] << (!messages[:full_message] ? messages[:message] :
++        ErrorMessage.new(messages[:message], messages[:full_message]))
+     end
+ 
+     # Will add an error message to each of the attributes in +attributes+ that is empty.
+@@ -224,12 +259,12 @@ module ActiveModel
+     #
+     #   class Company
+     #     validates_presence_of :name, :address, :email
+-    #     validates_length_of :name, :in => 5..30
++    #     validates_length_of :name, :in => 5..30, :full_message => 'You should specify a name between 5 and 30 characters'
+     #   end
+     #
+     #   company = Company.create(:address => '123 First St.')
+     #   company.errors.full_messages # =>
+-    #     ["Name is too short (minimum is 5 characters)", "Name can't be blank", "Address can't be blank"]
++    #     ["You should specify a name between 5 and 30 characters", "Name can't be blank", "Address can't be blank"]
+     def full_messages
+       full_messages = []
+ 
+@@ -245,7 +280,8 @@ module ActiveModel
+           options = { :default => "%{attribute} %{message}", :attribute => attr_name }
+ 
+           messages.each do |m|
+-            full_messages << I18n.t(:"errors.format", options.merge(:message => m))
++            full_messages << ((m.respond_to?(:full_message) && m.full_message) ?
++              m.full_message : I18n.t(:"errors.format", options.merge(:message => m)))
+           end
+         end
+       end
+@@ -259,8 +295,9 @@ module ActiveModel
+     # Error messages are first looked up in <tt>models.MODEL.attributes.ATTRIBUTE.MESSAGE</tt>,
+     # if it's not there, it's looked up in <tt>models.MODEL.MESSAGE</tt> and if that is not
+     # there also, it returns the translation of the default message
+-    # (e.g. <tt>activemodel.errors.messages.MESSAGE</tt>). The translated model name,
+-    # translated attribute name and the value are available for interpolation.
++    # (e.g. <tt>activemodel.errors.messages.MESSAGE</tt> or <tt>activemodel.errors.full_messages.MESSAGE</tt>,
++    # depending on the +translation_key+ param, which should be :message or :full_message).
++    # The translated model name, translated attribute name and the value are available for interpolation.
+     #
+     # When using inheritance in your models, it will check all the inherited
+     # models too, but only if the model itself hasn't been found. Say you have
+@@ -278,7 +315,7 @@ module ActiveModel
+     # <li><tt>errors.attributes.title.blank</tt></li>
+     # <li><tt>errors.messages.blank</tt></li>
+     # </ol>
+-    def generate_message(attribute, type = :invalid, options = {})
++    def generate_message(attribute, type = :invalid, options = {}, translation_key = :message)
+       type = options.delete(:message) if options[:message].is_a?(Symbol)
+ 
+       if options[:default]
+@@ -296,7 +333,7 @@ module ActiveModel
+       defaults << options.delete(:message)
+       defaults << :"#{@base.class.i18n_scope}.errors.messages.#{type}"
+       defaults << :"errors.attributes.#{attribute}.#{type}"
+-      defaults << :"errors.messages.#{type}"
++      defaults << :"errors.#{translation_key}s.#{type}"
+ 
+       defaults.compact!
+       defaults.flatten!

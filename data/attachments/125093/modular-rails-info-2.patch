@@ -1,0 +1,939 @@
+From 17e4d7008c0a037dfba6d42b13fdc0d467f5d33b Mon Sep 17 00:00:00 2001
+From: Michael Schuerig <michael@schuerig.de>
+Date: Wed, 20 May 2009 21:10:59 +0200
+Subject: [PATCH 1/3] Experimental: The mechanism used to collect the info properties shown by
+ /rails/info/properties and script/about is modularized also collects
+ properties from plugins if they provide a rails/properties.rb.
+ The Rails::Info#properties action now returns HTML or JSON just as
+ requested.
+ Added an option to script/about to output YAML.
+
+---
+ railties/builtin/rails_info/rails/info.rb          |  162 +++++---------------
+ railties/builtin/rails_info/rails/info/builtin.rb  |   91 +++++++++++
+ .../builtin/rails_info/rails/info/properties.rb    |   23 +++
+ .../rails_info/rails/info/properties_collection.rb |   44 ++++++
+ .../builtin/rails_info/rails/info_controller.rb    |    9 +-
+ railties/builtin/rails_info/rails/info_helper.rb   |   32 ++++
+ railties/lib/commands/about.rb                     |   34 ++++-
+ railties/lib/initializer.rb                        |    8 +-
+ railties/lib/rails/plugin.rb                       |   15 ++-
+ railties/lib/rails/plugin/loader.rb                |    4 +-
+ 10 files changed, 288 insertions(+), 134 deletions(-)
+ create mode 100644 railties/builtin/rails_info/rails/info/builtin.rb
+ create mode 100644 railties/builtin/rails_info/rails/info/properties.rb
+ create mode 100644 railties/builtin/rails_info/rails/info/properties_collection.rb
+
+diff --git a/railties/builtin/rails_info/rails/info.rb b/railties/builtin/rails_info/rails/info.rb
+index a20d9bf..df722a0 100644
+--- a/railties/builtin/rails_info/rails/info.rb
++++ b/railties/builtin/rails_info/rails/info.rb
+@@ -1,129 +1,43 @@
++
+ module Rails
+   module Info
+-    mattr_accessor :properties
+-    class << (@@properties = [])
+-      def names
+-        map &:first
+-      end
+-
+-      def value_for(property_name)
+-        if property = assoc(property_name)
+-          property.last
+-        end
+-      end
+-    end
+-
+-    class << self #:nodoc:
+-      def property(name, value = nil)
+-        value ||= yield
+-        properties << [name, value] if value
+-      rescue Exception
+-      end
+-
+-      def frameworks
+-        %w( active_record action_pack active_resource action_mailer active_support )
+-      end
+-
+-      def framework_version(framework)
+-        require "#{framework}/version"
+-        "#{framework.classify}::VERSION::STRING".constantize
+-      end
+-
+-      def edge_rails_revision(info = git_info)
+-        info[/commit ([a-z0-9-]+)/, 1] || freeze_edge_version
+-      end
+-
+-      def freeze_edge_version
+-        if File.exist?(rails_vendor_root)
+-          begin
+-            Dir[File.join(rails_vendor_root, 'REVISION_*')].first.scan(/_(\d+)$/).first.first
+-          rescue
+-            Dir[File.join(rails_vendor_root, 'TAG_*')].first.scan(/_(.+)$/).first.first rescue 'unknown'
+-          end
+-        end
+-      end
+-
+-      def to_s
+-        column_width = properties.names.map {|name| name.length}.max
+-        ["About your application's environment", *properties.map do |property|
+-          "%-#{column_width}s   %s" % property
+-        end] * "\n"
+-      end
+-
+-      alias inspect to_s
+-
+-      def to_html
+-        returning table = '<table>' do
+-          properties.each do |(name, value)|
+-            table << %(<tr><td class="name">#{CGI.escapeHTML(name.to_s)}</td>)
+-            table << %(<td class="value">#{CGI.escapeHTML(value.to_s)}</td></tr>)
+-          end
+-          table << '</table>'
+-        end
+-      end
+-
+-      protected
+-        def rails_vendor_root
+-          @rails_vendor_root ||= "#{RAILS_ROOT}/vendor/rails"
+-        end
+-
+-        def git_info
+-          env_lang, ENV['LC_ALL'] = ENV['LC_ALL'], 'C'
+-          Dir.chdir(rails_vendor_root) do
+-            silence_stderr { `git log -n 1` }
+-          end
+-        ensure
+-          ENV['LC_ALL'] = env_lang
+-        end
+-    end
+-
+-    # The Ruby version and platform, e.g. "1.8.2 (powerpc-darwin8.2.0)".
+-    property 'Ruby version', "#{RUBY_VERSION} (#{RUBY_PLATFORM})"
+-
+-    # The RubyGems version, if it's installed.
+-    property 'RubyGems version' do
+-      Gem::RubyGemsVersion
+-    end
+-
+-    property 'Rack version' do
+-      ::Rack.release
+-    end
+-
+-    # The Rails version.
+-    property 'Rails version' do
+-      Rails::VERSION::STRING
+-    end
+-
+-    # Versions of each Rails framework (Active Record, Action Pack,
+-    # Active Resource, Action Mailer, and Active Support).
+-    frameworks.each do |framework|
+-      property "#{framework.titlecase} version" do
+-        framework_version(framework)
+-      end
+-    end
+-
+-    # The Rails Git revision, if it's checked out into vendor/rails.
+-    property 'Edge Rails revision' do
+-      edge_rails_revision
+-    end
+-
+-    # The application's location on the filesystem.
+-    property 'Application root' do
+-      File.expand_path(RAILS_ROOT)
+-    end
+-
+-    # The current Rails environment (development, test, or production).
+-    property 'Environment' do
+-      RAILS_ENV
+-    end
+-
+-    # The name of the database adapter for the current environment.
+-    property 'Database adapter' do
+-      ActiveRecord::Base.configurations[RAILS_ENV]['adapter']
+-    end
+-
+-    property 'Database schema version' do
+-      ActiveRecord::Migrator.current_version rescue nil
++    def self.properties
++      ### TODO only load once
++      collection = load_properties_collection
++      collection.properties
++    end
++    
++    private
++    
++    def self.load_properties_collection
++      returning collection = PropertiesCollection.new do
++        load_builtin_properties(collection)
++        load_plugin_properties(collection)
++        load_app_properties(collection)
++      end
++    end
++
++    def self.load_builtin_properties(collection)
++      ### TODO avoid hard-coding such a longish path
++      collection.load_properties_file(
++        File.join(RAILS_ROOT, 'vendor/rails/railties/builtin/rails_info/rails/info/builtin.rb'),
++        :type  => :builtin,
++        :title => 'Built-in'
++      )
++    end
++    
++    def self.load_plugin_properties(collection)
++      Rails.configuration.loaded_plugins.each do |plugin|
++        collection.load_properties(
++          plugin.properties,
++          :type  => :plugin,
++          :title => plugin.name
++        )
++      end
++    end
++    
++    def self.load_app_properties(collection)
++      ### TODO
+     end
+   end
+ end
+diff --git a/railties/builtin/rails_info/rails/info/builtin.rb b/railties/builtin/rails_info/rails/info/builtin.rb
+new file mode 100644
+index 0000000..1a04f64
+--- /dev/null
++++ b/railties/builtin/rails_info/rails/info/builtin.rb
+@@ -0,0 +1,91 @@
++
++def rails_vendor_root
++  @rails_vendor_root ||= "#{RAILS_ROOT}/vendor/rails"
++end
++
++def git_info
++  env_lang, ENV['LC_ALL'] = ENV['LC_ALL'], 'C'
++  Dir.chdir(rails_vendor_root) do
++    silence_stderr { `git log -n 1` }
++  end
++ensure
++  ENV['LC_ALL'] = env_lang
++end
++
++def frameworks
++  %w( active_record action_pack active_resource action_mailer active_support )
++end
++
++def framework_version(framework)
++  require "#{framework}/version"
++  "#{framework.classify}::VERSION::STRING".constantize
++end
++
++def edge_rails_revision(info = git_info)
++  info[/commit ([a-z0-9-]+)/, 1] || freeze_edge_version
++end
++
++def freeze_edge_version
++  if File.exist?(rails_vendor_root)
++    begin
++      Dir[File.join(rails_vendor_root, 'REVISION_*')].first.scan(/_(\d+)$/).first.first
++    rescue
++      Dir[File.join(rails_vendor_root, 'TAG_*')].first.scan(/_(.+)$/).first.first rescue 'unknown'
++    end
++  end
++end
++
++# The Ruby version and platform, e.g. "1.8.2 (powerpc-darwin8.2.0)".
++property 'Ruby version', "#{RUBY_VERSION} (#{RUBY_PLATFORM})"
++
++# The RubyGems version, if it's installed.
++property 'RubyGems version' do
++  Gem::RubyGemsVersion
++end
++
++property 'Rack version' do
++  ::Rack.release
++end
++
++# The Rails version.
++property 'Rails version' do
++  Rails::VERSION::STRING
++end
++
++# Versions of each Rails framework (Active Record, Action Pack,
++# Active Resource, Action Mailer, and Active Support).
++frameworks.each do |framework|
++  property "#{framework.titlecase} version" do
++    framework_version(framework)
++  end
++end
++
++# The Rails Git revision, if it's checked out into vendor/rails.
++property 'Edge Rails revision' do
++  edge_rails_revision
++end
++
++# The application's location on the filesystem.
++property 'Application root' do
++  File.expand_path(RAILS_ROOT)
++end
++
++# The current Rails environment (development, test, or production).
++property 'Environment' do
++  RAILS_ENV
++end
++
++unless Rails.configuration.middleware.blank?
++  property 'Middleware' do
++    Rails.configuration.middleware.active.map(&:inspect)
++  end
++end
++
++# The name of the database adapter for the current environment.
++property 'Database adapter' do
++  ActiveRecord::Base.configurations[RAILS_ENV]['adapter']
++end
++
++property 'Database schema version' do
++  ActiveRecord::Migrator.current_version rescue nil
++end
+diff --git a/railties/builtin/rails_info/rails/info/properties.rb b/railties/builtin/rails_info/rails/info/properties.rb
+new file mode 100644
+index 0000000..c62f0a7
+--- /dev/null
++++ b/railties/builtin/rails_info/rails/info/properties.rb
+@@ -0,0 +1,23 @@
++
++module Rails # :nodoc:
++  module Info # :nodoc:
++    class Properties < BlankSlate
++      
++      def initialize
++        @_properties = []
++      end
++      
++      def property(key, value = nil, &block)
++        @_properties << [key, value, block]
++      end
++      
++      def _properties
++        @_properties
++      end
++      
++      def method_missing(sym, *args, &block)
++        Kernel.send(sym, *args, &block)
++      end
++    end
++  end
++end
+diff --git a/railties/builtin/rails_info/rails/info/properties_collection.rb b/railties/builtin/rails_info/rails/info/properties_collection.rb
+new file mode 100644
+index 0000000..ffcf8a5
+--- /dev/null
++++ b/railties/builtin/rails_info/rails/info/properties_collection.rb
+@@ -0,0 +1,44 @@
++
++module Rails # :nodoc:
++  module Info # :nodoc:
++    class PropertiesCollection
++      def initialize
++        @collection = []
++      end
++        
++      def load_properties(properties_spec, options = {})
++        unless properties_spec.blank?
++          props = Properties.new
++          props.instance_eval(properties_spec)
++          add(props, options)
++        end
++      end
++      
++      def load_properties_file(path, options = {})
++        if File.file?(path)
++          options[:title] ||= path 
++          load_properties(IO.read(path), options)
++        end
++      end
++
++      def properties
++        @collection.map { |(p, opts)|
++          opts.merge(:properties => eval_properties(p))
++        }
++      end
++      
++      private
++      
++      def add(properties, options)
++        @collection << [properties, options || {}]
++      end
++      
++      def eval_properties(properties_sandbox)
++        properties_sandbox._properties.inject({}) do |props, (key, value, block)|
++          props[key] = value || (block && block.call)
++          props
++        end
++      end
++    end
++  end
++end
+diff --git a/railties/builtin/rails_info/rails/info_controller.rb b/railties/builtin/rails_info/rails/info_controller.rb
+index 05745d6..ce1820e 100644
+--- a/railties/builtin/rails_info/rails/info_controller.rb
++++ b/railties/builtin/rails_info/rails/info_controller.rb
+@@ -1,9 +1,14 @@
+ class Rails::InfoController < ActionController::Base
++  include Rails::InfoHelper
+   def properties
+     if consider_all_requests_local || local_request?
+-      render :inline => Rails::Info.to_html
++      props = Rails::Info.properties
++      respond_to do |format|
++        format.html { render :inline => as_html(props) }
++        format.json { render :inline => as_json(props) }
++      end
+     else
+-      render :text => '<p>For security purposes, this information is only available to local requests.</p>', :status => 500
++      render :text => '<p>For security reasons, this information is only available to local requests.</p>', :status => 500
+     end
+   end
+ end
+diff --git a/railties/builtin/rails_info/rails/info_helper.rb b/railties/builtin/rails_info/rails/info_helper.rb
+index e5605a8..55bf599 100644
+--- a/railties/builtin/rails_info/rails/info_helper.rb
++++ b/railties/builtin/rails_info/rails/info_helper.rb
+@@ -1,2 +1,34 @@
+ module Rails::InfoHelper
++  def as_html(properties)
++    '<table>' +
++    properties.map { |props| properties_tbody(props) }.join +
++    '</table>'
++  end
++  
++  def as_json(properties)
++    ActiveSupport::JSON.encode(properties)
++  end
++  
++  def properties_tbody(props)
++    returning tbody = '<tbody>' do
++      tbody << %(<tr><th colspan="2">#{format_caption(props)}</th></tr>)
++      props[:properties].each do |(name, value)|
++        tbody << %(<tr><td class="name">#{CGI.escapeHTML(name.to_s)}</td>)
++        tbody << %(<td class="value">#{format_value(value)}</td></tr>)
++      end
++      tbody << '</tbody>'
++    end
++  end
++  
++  def format_caption(props)
++    type  = format_value(props[:type]).humanize
++    title = format_value(props[:title])
++    %{<span class="type">#{type}</span>: <span class="title">#{title}</span>}
++  end
++
++  def format_value(value)
++    value.kind_of?(Array) ?
++      "<ul>" + value.map { |v| "<li>#{format_value(v)}</li>" }.join + "</ul>" :
++      CGI.escapeHTML(value.to_s)
++  end
+ end
+diff --git a/railties/lib/commands/about.rb b/railties/lib/commands/about.rb
+index bc2cfcb..3e20bbf 100644
+--- a/railties/lib/commands/about.rb
++++ b/railties/lib/commands/about.rb
+@@ -1,3 +1,35 @@
+ require "#{RAILS_ROOT}/config/environment"
+ require 'rails/info'
+-puts Rails::Info
++
++def columnize(rows)
++  column_width = rows.map { |row| row.kind_of?(Array) ? row[0].length : 0 }.max
++  rows.map do |row|
++    case row
++    when Array
++      key, value = row
++      if value.kind_of?(Array)
++        value = value * ("\n   " + ' ' * column_width)
++      end
++      "%-#{column_width}s   %s" % [key, value]
++    else
++      row.to_s
++    end
++  end
++end
++
++case ARGV[0]
++when '-h', '--help'
++  $stderr.puts "Usage: about [options]"
++  $stderr.puts "    -y, --yaml                       Generate YAML output."
++  $stderr.puts "    -h, --help                       Show this help message."
++  exit
++when '-y', '--yaml'
++  puts Rails::Info.properties.to_yaml
++else
++  rows = ["About your application's environment"]
++  Rails::Info.properties.each do |props| 
++    rows << "" << "#{props[:type]}: #{props[:title]}"
++    rows += props[:properties].to_a 
++  end
++  puts columnize(rows)
++end
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 4d34b82..2b90679 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -93,9 +93,6 @@ module Rails
+     # The Configuration instance used by this Initializer instance.
+     attr_reader :configuration
+ 
+-    # The set of loaded plugins.
+-    attr_reader :loaded_plugins
+-
+     # Whether or not all the gem dependencies have been met
+     attr_reader :gems_dependencies_loaded
+ 
+@@ -118,7 +115,6 @@ module Rails
+     # instance.
+     def initialize(configuration)
+       @configuration = configuration
+-      @loaded_plugins = []
+     end
+ 
+     # Sequentially step through all of the available initialization routines,
+@@ -739,6 +735,9 @@ Run `rake gems:install` to install the missing gems.
+       @plugins = plugins.nil? ? nil : plugins.map { |p| p.to_sym }
+     end
+ 
++    # The set of loaded plugins.
++    attr_reader :loaded_plugins
++
+     # The list of metals to load. If this is set to <tt>nil</tt>, all metals will
+     # be loaded in alphabetical order. If this is set to <tt>[]</tt>, no metals will
+     # be loaded. Otherwise metals will be loaded in the order specified
+@@ -850,6 +849,7 @@ Run `rake gems:install` to install the missing gems.
+       self.plugin_paths                 = default_plugin_paths
+       self.plugin_locators              = default_plugin_locators
+       self.plugin_loader                = default_plugin_loader
++      @loaded_plugins                   = []
+       self.database_configuration_file  = default_database_configuration_file
+       self.routes_configuration_file    = default_routes_configuration_file
+       self.gems                         = default_gems
+diff --git a/railties/lib/rails/plugin.rb b/railties/lib/rails/plugin.rb
+index 80deb73..1e7ea6c 100644
+--- a/railties/lib/rails/plugin.rb
++++ b/railties/lib/rails/plugin.rb
+@@ -61,6 +61,10 @@ module Rails
+       @about ||= load_about_information
+     end
+ 
++    def properties
++      has_properties_file? ? IO.read(properties_path) : nil
++    end
++
+     # Engines are plugins with an app/ directory.
+     def engine?
+       has_app_directory?
+@@ -146,7 +150,16 @@ module Rails
+             eval(IO.read(init_path), binding, init_path)
+           end
+         end
+-      end               
++      end
++
++
++      def properties_path
++        File.join(directory, 'rails', 'properties.rb')
++      end
++
++      def has_properties_file?
++        File.file?(properties_path)
++      end
+   end
+ 
+   # This Plugin subclass represents a Gem plugin. Although RubyGems has already
+diff --git a/railties/lib/rails/plugin/loader.rb b/railties/lib/rails/plugin/loader.rb
+index 66e01d7..9897a98 100644
+--- a/railties/lib/rails/plugin/loader.rb
++++ b/railties/lib/rails/plugin/loader.rb
+@@ -105,7 +105,7 @@ module Rails
+         end
+ 
+         def register_plugin_as_loaded(plugin)
+-          initializer.loaded_plugins << plugin
++          configuration.loaded_plugins << plugin
+         end
+ 
+         def configuration
+@@ -174,7 +174,7 @@ module Rails
+         end
+ 
+         def loaded?(plugin_name)
+-          initializer.loaded_plugins.detect { |plugin| plugin.name == plugin_name.to_s }
++          configuration.loaded_plugins.detect { |plugin| plugin.name == plugin_name.to_s }
+         end
+ 
+         def ensure_all_registered_plugins_are_loaded!
+-- 
+1.6.3.1
+
+
+From 7090c0dfb64ae5d637f4f6ed0230584b2dfb89e7 Mon Sep 17 00:00:00 2001
+From: Michael Schuerig <michael@schuerig.de>
+Date: Thu, 21 May 2009 17:21:40 +0200
+Subject: [PATCH 2/3] A bit of code shuffling. Made controller tests pass. InfoTests fail and I'm not sure whether to make them pass or write new tests for a new interface.
+
+---
+ railties/builtin/rails_info/rails/info.rb          |   71 +++++++++++---------
+ .../builtin/rails_info/rails/info/properties.rb    |   23 ------
+ .../rails_info/rails/info/properties_collection.rb |   39 ++++++-----
+ .../rails_info/rails/info/properties_group.rb      |   23 ++++++
+ railties/builtin/rails_info/rails/info_helper.rb   |    6 +-
+ railties/test/rails_info_controller_test.rb        |   18 +++++-
+ 6 files changed, 106 insertions(+), 74 deletions(-)
+ delete mode 100644 railties/builtin/rails_info/rails/info/properties.rb
+ create mode 100644 railties/builtin/rails_info/rails/info/properties_group.rb
+
+diff --git a/railties/builtin/rails_info/rails/info.rb b/railties/builtin/rails_info/rails/info.rb
+index df722a0..8d7f88e 100644
+--- a/railties/builtin/rails_info/rails/info.rb
++++ b/railties/builtin/rails_info/rails/info.rb
+@@ -1,43 +1,52 @@
+ 
++require 'rails/info/properties_collection'
++
+ module Rails
+   module Info
++    BUILTIN_PROPERTIES_GROUP = { :type  => :builtin, :title => 'Built-in' }
++
++    def self.new_properties_group(type, title)
++      collection.new_group(:type => type.to_sym, :title => title.to_s)
++    end
++
+     def self.properties
+-      ### TODO only load once
+-      collection = load_properties_collection
+       collection.properties
+     end
+-    
++
+     private
+-    
+-    def self.load_properties_collection
+-      returning collection = PropertiesCollection.new do
+-        load_builtin_properties(collection)
+-        load_plugin_properties(collection)
+-        load_app_properties(collection)
+-      end
+-    end
+ 
+-    def self.load_builtin_properties(collection)
+       ### TODO avoid hard-coding such a longish path
+-      collection.load_properties_file(
+-        File.join(RAILS_ROOT, 'vendor/rails/railties/builtin/rails_info/rails/info/builtin.rb'),
+-        :type  => :builtin,
+-        :title => 'Built-in'
+-      )
+-    end
+-    
+-    def self.load_plugin_properties(collection)
+-      Rails.configuration.loaded_plugins.each do |plugin|
+-        collection.load_properties(
+-          plugin.properties,
+-          :type  => :plugin,
+-          :title => plugin.name
+-        )
++      BUILTIN_PROPERTIES_FILE = File.join(RAILS_ROOT, 'vendor/rails/railties/builtin/rails_info/rails/info/builtin.rb')
++
++      def self.collection
++        # note that with config.cache_classes == true this caching is ineffectual
++        @@collection ||= load_properties_collection
++      end
++
++      def self.load_properties_collection
++        returning collection = PropertiesCollection.new do
++          load_builtin_properties(collection)
++          load_plugin_properties(collection)
++          load_app_properties(collection)
++        end
++      end
++
++      def self.load_builtin_properties(collection)
++        collection.load_properties_file(BUILTIN_PROPERTIES_FILE, BUILTIN_PROPERTIES_GROUP)
++      end
++
++      def self.load_plugin_properties(collection)
++        Rails.configuration.loaded_plugins.each do |plugin|
++          collection.load_properties(
++            plugin.properties,
++            :type  => :plugin,
++            :title => plugin.name
++          )
++        end
++      end
++
++      def self.load_app_properties(collection)
++        ### TODO
+       end
+-    end
+-    
+-    def self.load_app_properties(collection)
+-      ### TODO
+-    end
+   end
+ end
+diff --git a/railties/builtin/rails_info/rails/info/properties.rb b/railties/builtin/rails_info/rails/info/properties.rb
+deleted file mode 100644
+index c62f0a7..0000000
+--- a/railties/builtin/rails_info/rails/info/properties.rb
++++ /dev/null
+@@ -1,23 +0,0 @@
+-
+-module Rails # :nodoc:
+-  module Info # :nodoc:
+-    class Properties < BlankSlate
+-      
+-      def initialize
+-        @_properties = []
+-      end
+-      
+-      def property(key, value = nil, &block)
+-        @_properties << [key, value, block]
+-      end
+-      
+-      def _properties
+-        @_properties
+-      end
+-      
+-      def method_missing(sym, *args, &block)
+-        Kernel.send(sym, *args, &block)
+-      end
+-    end
+-  end
+-end
+diff --git a/railties/builtin/rails_info/rails/info/properties_collection.rb b/railties/builtin/rails_info/rails/info/properties_collection.rb
+index ffcf8a5..d8015a6 100644
+--- a/railties/builtin/rails_info/rails/info/properties_collection.rb
++++ b/railties/builtin/rails_info/rails/info/properties_collection.rb
+@@ -1,23 +1,30 @@
+ 
++require 'rails/info/properties_group'
++
+ module Rails # :nodoc:
+   module Info # :nodoc:
+     class PropertiesCollection
+       def initialize
+         @collection = []
+       end
+-        
+-      def load_properties(properties_spec, options = {})
++
++      def new_group(group_options)
++        group = PropertiesGroup.new
++        add_group(group, group_options)
++        group
++      end
++
++      def load_properties(properties_spec, group_options)
+         unless properties_spec.blank?
+-          props = Properties.new
+-          props.instance_eval(properties_spec)
+-          add(props, options)
++          group = new_group(group_options)
++          group.instance_eval(properties_spec)
+         end
+       end
+-      
+-      def load_properties_file(path, options = {})
++
++      def load_properties_file(path, group_options)
+         if File.file?(path)
+-          options[:title] ||= path 
+-          load_properties(IO.read(path), options)
++          group_options[:title] ||= path
++          load_properties(IO.read(path), group_options)
+         end
+       end
+ 
+@@ -26,16 +33,16 @@ module Rails # :nodoc:
+           opts.merge(:properties => eval_properties(p))
+         }
+       end
+-      
++
+       private
+-      
+-      def add(properties, options)
+-        @collection << [properties, options || {}]
++
++      def add_group(properties_group, group_options)
++        @collection << [properties_group, group_options]
+       end
+-      
++
+       def eval_properties(properties_sandbox)
+-        properties_sandbox._properties.inject({}) do |props, (key, value, block)|
+-          props[key] = value || (block && block.call)
++        properties_sandbox._properties.inject({}) do |props, (key, value)|
++          props[key] = value.respond_to?(:call) ? value.call : value
+           props
+         end
+       end
+diff --git a/railties/builtin/rails_info/rails/info/properties_group.rb b/railties/builtin/rails_info/rails/info/properties_group.rb
+new file mode 100644
+index 0000000..ef2e25d
+--- /dev/null
++++ b/railties/builtin/rails_info/rails/info/properties_group.rb
+@@ -0,0 +1,23 @@
++
++module Rails # :nodoc:
++  module Info # :nodoc:
++    class PropertiesGroup < BlankSlate
++
++      def initialize
++        @_properties = []
++      end
++
++      def property(key, value = nil, &block)
++        @_properties << [key, value || block]
++      end
++
++      def _properties
++        @_properties
++      end
++
++      def method_missing(sym, *args, &block)
++        Kernel.send(sym, *args, &block)
++      end
++    end
++  end
++end
+diff --git a/railties/builtin/rails_info/rails/info_helper.rb b/railties/builtin/rails_info/rails/info_helper.rb
+index 55bf599..f625957 100644
+--- a/railties/builtin/rails_info/rails/info_helper.rb
++++ b/railties/builtin/rails_info/rails/info_helper.rb
+@@ -4,11 +4,11 @@ module Rails::InfoHelper
+     properties.map { |props| properties_tbody(props) }.join +
+     '</table>'
+   end
+-  
++
+   def as_json(properties)
+     ActiveSupport::JSON.encode(properties)
+   end
+-  
++
+   def properties_tbody(props)
+     returning tbody = '<tbody>' do
+       tbody << %(<tr><th colspan="2">#{format_caption(props)}</th></tr>)
+@@ -19,7 +19,7 @@ module Rails::InfoHelper
+       tbody << '</tbody>'
+     end
+   end
+-  
++
+   def format_caption(props)
+     type  = format_value(props[:type]).humanize
+     title = format_value(props[:title])
+diff --git a/railties/test/rails_info_controller_test.rb b/railties/test/rails_info_controller_test.rb
+index e274e1a..f8a0195 100644
+--- a/railties/test/rails_info_controller_test.rb
++++ b/railties/test/rails_info_controller_test.rb
+@@ -2,7 +2,16 @@ require 'abstract_unit'
+ require 'action_controller'
+ require 'action_controller/test_process'
+ 
+-module Rails; end
++module Rails
++  class MockConfiguration
++    def loaded_plugins
++      []
++    end
++  end
++  def self.configuration
++    @configuration ||= MockConfiguration.new
++  end
++end
+ require 'rails/info'
+ require 'rails/info_controller'
+ 
+@@ -41,6 +50,13 @@ class Rails::InfoControllerTest < ActionController::TestCase
+     assert_response :success
+   end
+   
++  def test_rails_info_json_rendered_for_local_request
++    Rails::InfoController.local_request = true
++    get :properties, :format => 'json'
++    assert 'application/json', @response.headers['Content-Type']
++    assert_response :success
++  end
++
+   def test_rails_info_properties_error_rendered_for_non_local_request
+     Rails::InfoController.local_request = false
+     ActionController::Base.consider_all_requests_local = false
+-- 
+1.6.3.1
+
+
+From 6d8b5eb7135a5a296a1e7379f0274730bd8d017d Mon Sep 17 00:00:00 2001
+From: Michael Schuerig <michael@schuerig.de>
+Date: Thu, 21 May 2009 17:35:04 +0200
+Subject: [PATCH 3/3] Add application-specific properties from lib/info/properties/*.rb.
+
+---
+ railties/builtin/rails_info/rails/info.rb |   24 +++++++++++++++++++-----
+ 1 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/railties/builtin/rails_info/rails/info.rb b/railties/builtin/rails_info/rails/info.rb
+index 8d7f88e..849923a 100644
+--- a/railties/builtin/rails_info/rails/info.rb
++++ b/railties/builtin/rails_info/rails/info.rb
+@@ -3,7 +3,7 @@ require 'rails/info/properties_collection'
+ 
+ module Rails
+   module Info
+-    BUILTIN_PROPERTIES_GROUP = { :type  => :builtin, :title => 'Built-in' }
++    BUILTIN_PROPERTIES_GROUP = { :type  => :builtin, :title => 'Built-in' }.freeze
+ 
+     def self.new_properties_group(type, title)
+       collection.new_group(:type => type.to_sym, :title => title.to_s)
+@@ -15,8 +15,14 @@ module Rails
+ 
+     private
+ 
+-      ### TODO avoid hard-coding such a longish path
+-      BUILTIN_PROPERTIES_FILE = File.join(RAILS_ROOT, 'vendor/rails/railties/builtin/rails_info/rails/info/builtin.rb')
++      def self.builtin_properties_path
++        ### TODO avoid hard-coding such a longish path
++        File.join(Rails.configuration.root_path, 'vendor/rails/railties/builtin/rails_info/rails/info/builtin.rb')
++      end
++
++      def self.application_properties_dir
++        File.join(Rails.configuration.root_path, 'lib/info/properties')
++      end
+ 
+       def self.collection
+         # note that with config.cache_classes == true this caching is ineffectual
+@@ -32,7 +38,7 @@ module Rails
+       end
+ 
+       def self.load_builtin_properties(collection)
+-        collection.load_properties_file(BUILTIN_PROPERTIES_FILE, BUILTIN_PROPERTIES_GROUP)
++        collection.load_properties_file(builtin_properties_path, BUILTIN_PROPERTIES_GROUP)
+       end
+ 
+       def self.load_plugin_properties(collection)
+@@ -46,7 +52,15 @@ module Rails
+       end
+ 
+       def self.load_app_properties(collection)
+-        ### TODO
++        if File.directory?(application_properties_dir)
++          Dir["#{application_properties_dir}/**/*.rb"].sort.each do |properties_file|
++            collection.load_properties_file(
++              properties_file,
++              :type => :application,
++              :title => File.basename(properties_file, '.rb')
++            )
++          end
++        end
+       end
+   end
+ end
+-- 
+1.6.3.1
+

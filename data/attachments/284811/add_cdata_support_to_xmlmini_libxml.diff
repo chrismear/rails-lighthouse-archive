@@ -1,0 +1,252 @@
+From b7f2e79a6c682433161491257eb5a9b905134d2a Mon Sep 17 00:00:00 2001
+From: Jacob Lauemoeller <jacob.lauemoeller@iteray.com>
+Date: Fri, 2 Oct 2009 16:34:28 +0200
+Subject: [PATCH] Added CDATA support to the XmlMini LibXML engine, adjusted whitespace handling to closer match that of the REXML engine, and added a LibXML engine test
+
+---
+ .../lib/active_support/xml_mini/libxml.rb          |   13 +-
+ activesupport/test/xml_mini/libxml_engine_test.rb  |  194 ++++++++++++++++++++
+ 2 files changed, 202 insertions(+), 5 deletions(-)
+ create mode 100644 activesupport/test/xml_mini/libxml_engine_test.rb
+
+diff --git a/activesupport/lib/active_support/xml_mini/libxml.rb b/activesupport/lib/active_support/xml_mini/libxml.rb
+index 2ae22c3..183580c 100644
+--- a/activesupport/lib/active_support/xml_mini/libxml.rb
++++ b/activesupport/lib/active_support/xml_mini/libxml.rb
+@@ -13,8 +13,6 @@ module ActiveSupport
+         data = StringIO.new(data || '')
+       end
+       
+-      LibXML::XML.default_keep_blanks = false
+-      
+       char = data.getc
+       if char.nil?
+         {}
+@@ -44,9 +42,9 @@ module LibXML #:nodoc:
+       # hash::
+       #   Hash to merge the converted element into.
+       def to_hash(hash={})
+-        if text?
+-          raise LibXML::XML::Error if content.length >= LIB_XML_LIMIT
+-          hash[CONTENT_ROOT] = content
++        if text? || cdata?
++          raise LibXML::XML::Error if hash[CONTENT_ROOT].to_s.length + content.length >= LIB_XML_LIMIT
++          hash[CONTENT_ROOT] = hash[CONTENT_ROOT].to_s + content
+         else
+           sub_hash = insert_name_into_hash(hash, name)
+           attributes_to_hash(sub_hash)
+@@ -88,6 +86,11 @@ module LibXML #:nodoc:
+         #   Hash to merge the children into.
+         def children_to_hash(hash={})
+           each { |child| child.to_hash(hash) }
++          
++          if hash.length > 1 && hash[CONTENT_ROOT].blank?
++            hash.delete(CONTENT_ROOT)
++          end
++          
+           attributes_to_hash(hash)
+           hash
+         end
+diff --git a/activesupport/test/xml_mini/libxml_engine_test.rb b/activesupport/test/xml_mini/libxml_engine_test.rb
+new file mode 100644
+index 0000000..c259bea
+--- /dev/null
++++ b/activesupport/test/xml_mini/libxml_engine_test.rb
+@@ -0,0 +1,194 @@
++require 'abstract_unit'
++require 'active_support/xml_mini'
++require 'active_support/core_ext/hash/conversions'
++
++begin
++  require 'libxml'
++rescue LoadError
++  # Skip libxml tests
++else
++
++class LibxmlEngineTest < Test::Unit::TestCase
++  include ActiveSupport
++
++  def setup
++    @default_backend = XmlMini.backend
++    XmlMini.backend = 'LibXML'
++
++    LibXML::XML::Error.set_handler(&lambda { |error| }) #silence libxml, exceptions will do
++  end
++
++  def teardown
++    XmlMini.backend = @default_backend
++  end
++
++  def test_exception_thrown_on_expansion_attack
++    assert_raise LibXML::XML::Error do
++      attack_xml = %{<?xml version="1.0" encoding="UTF-8"?>
++      <!DOCTYPE member [
++        <!ENTITY a "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
++        <!ENTITY b "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
++        <!ENTITY c "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">
++        <!ENTITY d "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;">
++        <!ENTITY e "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">
++        <!ENTITY f "&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;">
++        <!ENTITY g "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
++      ]>
++      <member>
++      &a;
++      </member>
++     }
++      Hash.from_xml(attack_xml)
++    end
++  end
++
++  def test_setting_libxml_as_backend
++    XmlMini.backend = 'LibXML'
++    assert_equal XmlMini_LibXML, XmlMini.backend
++  end
++
++  def test_blank_returns_empty_hash
++    assert_equal({}, XmlMini.parse(nil))
++    assert_equal({}, XmlMini.parse(''))
++  end
++
++  def test_array_type_makes_an_array
++    assert_equal_rexml(<<-eoxml)
++      <blog>
++        <posts type="array">
++          <post>a post</post>
++          <post>another post</post>
++        </posts>
++      </blog>
++    eoxml
++  end
++
++  def test_one_node_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products/>
++    eoxml
++  end
++
++  def test_one_node_with_attributes_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products foo="bar"/>
++    eoxml
++  end
++
++  def test_products_node_with_book_node_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++    </products>
++    eoxml
++  end
++
++  def test_products_node_with_two_book_nodes_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++      <book name="america" id="67890" />
++    </products>
++    eoxml
++  end
++
++  def test_single_node_with_content_as_hash
++    assert_equal_rexml(<<-eoxml)
++      <products>
++        hello world
++      </products>
++    eoxml
++  end
++
++  def test_children_with_children
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        <book name="america" id="67890" />
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello everyone
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_non_adjacent_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++  end
++
++  def test_parse_from_io
++    io = StringIO.new(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++    XmlMini.parse(io)
++  end
++
++  def test_children_with_simple_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>  
++         <![CDATA[cdatablock]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_multiple_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>  
++         <![CDATA[cdatablock1]]><![CDATA[cdatablock2]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_text_and_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello <![CDATA[cdatablock]]>
++        morning
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_blank_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>   </products>
++    </root>
++    eoxml
++  end
++
++  private
++  def assert_equal_rexml(xml)
++    hash = XmlMini.with_backend('REXML') { XmlMini.parse(xml) }
++    assert_equal(hash, XmlMini.parse(xml))
++  end
++end
++
++end
+-- 
+1.6.4.2
+

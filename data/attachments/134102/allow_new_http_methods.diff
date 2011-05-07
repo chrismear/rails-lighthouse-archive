@@ -1,0 +1,255 @@
+From c97cef2e96171dde3cca8a5f52c32a2f894012a5 Mon Sep 17 00:00:00 2001
+From: Rick DeNatale <rick.denatale@gmail.com>
+Date: Tue, 16 Jun 2009 16:08:52 -0400
+Subject: [PATCH] added support for controlled addition of new http methods
+
+---
+ actionpack/lib/action_controller/routing.rb        |   33 ++++++++++++-
+ .../lib/action_controller/routing/builder.rb       |    2 +-
+ .../routing/recognition_optimisation.rb            |    5 +-
+ actionpack/lib/action_dispatch/http/request.rb     |    7 +--
+ .../vendor/rack-1.1.pre/rack/methodoverride.rb     |    4 +-
+ actionpack/test/controller/routing_test.rb         |   52 ++++++++++++++++++++
+ actionpack/test/dispatch/request_test.rb           |   25 +++++++++
+ 7 files changed, 116 insertions(+), 12 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing.rb b/actionpack/lib/action_controller/routing.rb
+index ce59866..9fc3964 100644
+--- a/actionpack/lib/action_controller/routing.rb
++++ b/actionpack/lib/action_controller/routing.rb
+@@ -271,8 +271,6 @@ module ActionController
+   module Routing
+     SEPARATORS = %w( / . ? )
+ 
+-    HTTP_METHODS = [:get, :head, :post, :put, :delete, :options]
+-
+     ALLOWED_REQUIREMENTS_FOR_OPTIMISATION = [:controller, :action].to_set
+ 
+     # The root paths which may contain controller files
+@@ -371,6 +369,37 @@ module ActionController
+         else controller
+         end
+       end
++      
++      # Returns the valid http methods
++      def http_methods
++        @http_methods ||= [:get, :head, :post, :put, :delete, :options].freeze
++      end
++      
++      # Add one or more methods to the list of valid http_methods, each method should be a lowercase
++      # symbol version of the http method, e.g. to add the PROPFIND method needed for WebDAV use
++      # :propfind
++      #
++      # An application needing to support the WebDAV protocol might add the following to its environment.rb
++      #
++      #    ActionController::Routes.add_http_methods(:propfind, :proppatch, :mkcol, :copy, :move, :lock, :unlock)
++      #
++      # Added methods may then be used to generate routes
++      def add_http_methods(*meths)
++        @http_methods = (meths + http_methods).uniq.freeze
++        @http_method_lookup = nil
++      end
++      alias_method :add_http_method, :add_http_methods
++      
++      def remove_http_methods(*meths)
++        @http_methods = (http_methods.reject {|m| meths.include?(m)}).freeze
++        @http_method_lookup = nil
++      end
++      alias_method :remove_http_method, :remove_http_methods
++      
++      def http_method_lookup
++        @http_method_lookup ||= http_methods.inject({}) { |h, m| h[m.to_s] = h[m.to_s.upcase] = m.to_sym; h }
++      end
++      
+     end
+ 
+     Routes = RouteSet.new
+diff --git a/actionpack/lib/action_controller/routing/builder.rb b/actionpack/lib/action_controller/routing/builder.rb
+index 42ad12e..e6fa9a3 100644
+--- a/actionpack/lib/action_controller/routing/builder.rb
++++ b/actionpack/lib/action_controller/routing/builder.rb
+@@ -188,7 +188,7 @@ module ActionController
+                 raise ArgumentError, "HTTP method HEAD is invalid in route conditions. Rails processes HEAD requests the same as GETs, returning just the response headers"
+               end
+ 
+-              unless HTTP_METHODS.include?(m.to_sym)
++              unless Routing.http_methods.include?(m.to_sym)
+                 raise ArgumentError, "Invalid HTTP method specified in route conditions: #{conditions.inspect}"
+               end
+             end
+diff --git a/actionpack/lib/action_controller/routing/recognition_optimisation.rb b/actionpack/lib/action_controller/routing/recognition_optimisation.rb
+index 9bfebff..bd29ef6 100644
+--- a/actionpack/lib/action_controller/routing/recognition_optimisation.rb
++++ b/actionpack/lib/action_controller/routing/recognition_optimisation.rb
+@@ -56,9 +56,10 @@ module ActionController
+         result = recognize_optimized(path, environment) and return result
+ 
+         # Route was not recognized. Try to find out why (maybe wrong verb).
+-        allows = HTTP_METHODS.select { |verb| routes.find { |r| r.recognize(path, environment.merge(:method => verb)) } }
++        allowable_methods = Routing.http_methods
++        allows = allowable_methods.select { |verb| routes.find { |r| r.recognize(path, environment.merge(:method => verb)) } }
+ 
+-        if environment[:method] && !HTTP_METHODS.include?(environment[:method])
++        if environment[:method] && !allowable_methods.include?(environment[:method])
+           raise NotImplemented.new(*allows)
+         elsif !allows.empty?
+           raise MethodNotAllowed.new(*allows)
+diff --git a/actionpack/lib/action_dispatch/http/request.rb b/actionpack/lib/action_dispatch/http/request.rb
+index 140feb9..fb40db1 100755
+--- a/actionpack/lib/action_dispatch/http/request.rb
++++ b/actionpack/lib/action_dispatch/http/request.rb
+@@ -27,14 +27,13 @@ module ActionDispatch
+       @env.key?(key)
+     end
+ 
+-    HTTP_METHODS = %w(get head put post delete options)
+-    HTTP_METHOD_LOOKUP = HTTP_METHODS.inject({}) { |h, m| h[m] = h[m.upcase] = m.to_sym; h }
+ 
+     # Returns the true HTTP request \method as a lowercase symbol, such as
+-    # <tt>:get</tt>. If the request \method is not listed in the HTTP_METHODS
++    # <tt>:get</tt>. If the request \method is not included in ActionController::Routing.http_methods
+     # constant above, an UnknownHttpMethod exception is raised.
+     def request_method
+-      HTTP_METHOD_LOOKUP[super] || raise(ActionController::UnknownHttpMethod, "#{super}, accepted HTTP methods are #{HTTP_METHODS.to_sentence(:locale => :en)}")
++      ActionController::Routing.http_method_lookup[super] || 
++      raise(ActionController::UnknownHttpMethod, "#{super}, accepted HTTP methods are #{ActionController::Routing.http_methods.to_sentence(:locale => :en)}")
+     end
+ 
+     # Returns the HTTP request \method used for action processing as a
+diff --git a/actionpack/lib/action_dispatch/vendor/rack-1.1.pre/rack/methodoverride.rb b/actionpack/lib/action_dispatch/vendor/rack-1.1.pre/rack/methodoverride.rb
+index 0eed29f..edbee58 100644
+--- a/actionpack/lib/action_dispatch/vendor/rack-1.1.pre/rack/methodoverride.rb
++++ b/actionpack/lib/action_dispatch/vendor/rack-1.1.pre/rack/methodoverride.rb
+@@ -1,7 +1,5 @@
+ module Rack
+   class MethodOverride
+-    HTTP_METHODS = %w(GET HEAD PUT POST DELETE OPTIONS)
+-
+     METHOD_OVERRIDE_PARAM_KEY = "_method".freeze
+     HTTP_METHOD_OVERRIDE_HEADER = "HTTP_X_HTTP_METHOD_OVERRIDE".freeze
+ 
+@@ -15,7 +13,7 @@ module Rack
+         method = req.POST[METHOD_OVERRIDE_PARAM_KEY] ||
+           env[HTTP_METHOD_OVERRIDE_HEADER]
+         method = method.to_s.upcase
+-        if HTTP_METHODS.include?(method)
++        if ActionController::Routing.http_methods.include?(method)
+           env["rack.methodoverride.original_method"] = env["REQUEST_METHOD"]
+           env["REQUEST_METHOD"] = method
+         end
+diff --git a/actionpack/test/controller/routing_test.rb b/actionpack/test/controller/routing_test.rb
+index c2acc03..afe8d0a 100644
+--- a/actionpack/test/controller/routing_test.rb
++++ b/actionpack/test/controller/routing_test.rb
+@@ -1893,6 +1893,25 @@ class RouteSetTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_route_requirements_with_propfind_method_condition_is_invalid
++    assert_raise ArgumentError do
++      set.draw do |map|
++        map.connect 'valid/route', :controller => 'pages', :action => 'show', :conditions => {:method => :propfind}
++      end
++    end
++  end
++
++  def test_route_requirements_with_propfind_method_condition_is_valid_when_http_methods_have_been_changed
++    ActionController::Routing.add_http_method :propfind
++    assert_nothing_raised ArgumentError do
++      set.draw do |map|
++        map.connect 'valid/route', :controller => 'pages', :action => 'show', :conditions => {:method => :propfind}
++      end
++    end
++  ensure
++    ActionController::Routing.remove_http_method :propfind
++  end
++  
+   def test_non_path_route_requirements_match_all
+     set.draw do |map|
+       map.connect 'page/37s', :controller => 'pages', :action => 'show', :name => /(jamis|david)/
+@@ -1981,6 +2000,39 @@ class RouteSetTest < Test::Unit::TestCase
+   ensure
+     Object.send(:remove_const, :PeopleController)
+   end
++  
++  def test_recognize_with_conditions_involving_added_method
++    Object.const_set(:PeopleController, Class.new)
++    ActionController::Routing.add_http_method(:propfind)
++
++    set.draw do |map|
++      map.with_options(:controller => "people") do |people|
++        people.connect "/people",     :action => "create",  :conditions => { :method => :post }
++        people.connect "/people/:id", :action => "find_prop", :conditions => { :method => :propfind}
++      end
++    end
++
++    request.request_uri = "/people/5"
++
++    begin
++      request.env["REQUEST_METHOD"] = "POST"
++      set.recognize(request)
++      flunk 'Should have raised MethodNotAllowed'
++    rescue ActionController::MethodNotAllowed => e
++      assert_equal [:propfind], e.allowed_methods
++    end
++    request.recycle!
++    
++    request.env["REQUEST_METHOD"] = "PROPFIND"
++    assert_nothing_raised { set.recognize(request) }
++    assert_equal("find_prop", request.path_parameters[:action])
++    assert_equal("5", request.path_parameters[:id])
++    request.recycle!
++
++  ensure
++    Object.send(:remove_const, :PeopleController)
++    ActionController::Routing.remove_http_method(:propfind)
++  end
+ 
+   def test_recognize_with_alias_in_conditions
+     Object.const_set(:PeopleController, Class.new)
+diff --git a/actionpack/test/dispatch/request_test.rb b/actionpack/test/dispatch/request_test.rb
+index 3a85db8..682d4a7 100644
+--- a/actionpack/test/dispatch/request_test.rb
++++ b/actionpack/test/dispatch/request_test.rb
+@@ -290,6 +290,18 @@ class RequestTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "explicitly added http method does not raise exception" do
++    begin
++      ActionController::Routing.add_http_method(:random_method)
++      assert_nothing_raised(ActionController::UnknownHttpMethod) do
++        request = stub_request 'REQUEST_METHOD' => 'RANDOM_METHOD'
++        request.request_method
++      end
++    ensure
++      ActionController::Routing.remove_http_method(:random_method)
++    end
++  end
++
+   test "allow method hacking on post" do
+     [:get, :head, :options, :put, :post, :delete].each do |method|
+       request = stub_request "REQUEST_METHOD" => method.to_s.upcase
+@@ -312,6 +324,19 @@ class RequestTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "allow method hacking with added methods" do
++    begin
++      ActionController::Routing.add_http_method(:random_method)
++      [:get, :put, :delete, :random_method].each do |method|
++        request = stub_request 'REQUEST_METHOD' => method.to_s.upcase,
++        'action_dispatch.request.request_parameters' => { :_method => 'put' }
++        assert_equal method, request.method
++      end
++    ensure
++      ActionController::Routing.remove_http_method(:random_method)
++    end
++  end
++
+   test "head masquerading as get" do
+     request = stub_request 'REQUEST_METHOD' => 'HEAD'
+     assert_equal :get, request.method
+-- 
+1.6.3.1
+

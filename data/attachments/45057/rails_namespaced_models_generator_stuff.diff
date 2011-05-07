@@ -1,0 +1,382 @@
+From 201fced31e6f36b5346719fc3bc685ebd264744a Mon Sep 17 00:00:00 2001
+From: Harri Kauhanen <harri.kauhanen@gmail.com>
+Date: Wed, 10 Sep 2008 12:22:30 +0300
+Subject: [PATCH] Made generators generate namespaced models nicely (especially with 'scaffold')
+
+---
+ railties/lib/rails_generator/base.rb               |    7 +++-
+ railties/lib/rails_generator/commands.rb           |   27 ++++++++++++++-
+ .../components/controller/controller_generator.rb  |    3 +-
+ .../generators/components/model/model_generator.rb |    5 ++-
+ .../components/resource/resource_generator.rb      |    8 +++--
+ .../components/scaffold/scaffold_generator.rb      |    8 +++--
+ .../components/scaffold/templates/controller.rb    |   36 ++++++++++----------
+ .../scaffold/templates/functional_test.rb          |    8 ++--
+ .../scaffold/templates/view_edit.html.erb          |    2 +-
+ .../scaffold/templates/view_index.html.erb         |    4 +-
+ .../scaffold/templates/view_new.html.erb           |    2 +-
+ .../scaffold/templates/view_show.html.erb          |    4 +-
+ 12 files changed, 73 insertions(+), 41 deletions(-)
+
+diff --git a/railties/lib/rails_generator/base.rb b/railties/lib/rails_generator/base.rb
+index b5cfe79..e47d918 100644
+--- a/railties/lib/rails_generator/base.rb
++++ b/railties/lib/rails_generator/base.rb
+@@ -197,6 +197,7 @@ module Rails
+     class NamedBase < Base
+       attr_reader   :name, :class_name, :singular_name, :plural_name, :table_name
+       attr_reader   :class_path, :file_path, :class_nesting, :class_nesting_depth
++      attr_reader   :nesting_underscored, :nesting_path
+       alias_method  :file_name,  :singular_name
+       alias_method  :actions, :args
+ 
+@@ -229,12 +230,14 @@ module Rails
+           @name = name
+           base_name, @class_path, @file_path, @class_nesting, @class_nesting_depth = extract_modules(@name)
+           @class_name_without_nesting, @singular_name, @plural_name = inflect_names(base_name)
++          @nesting_path = '/' + @class_nesting.underscore
+           @table_name = (!defined?(ActiveRecord::Base) || ActiveRecord::Base.pluralize_table_names) ? plural_name : singular_name
+-          @table_name.gsub! '/', '_'
+           if @class_nesting.empty?
+             @class_name = @class_name_without_nesting
+           else
+-            @table_name = @class_nesting.underscore << "_" << @table_name
++            @tablename_nesting_double_underscrored = @class_nesting.underscore.gsub('/', '__') + '__'
++            @nesting_underscored =  @tablename_nesting_double_underscrored.gsub('__', '_')
++            @table_name = @tablename_nesting_double_underscrored << @table_name
+             @class_name = "#{@class_nesting}::#{@class_name_without_nesting}"
+           end
+         end
+diff --git a/railties/lib/rails_generator/commands.rb b/railties/lib/rails_generator/commands.rb
+index 59af730..294866c 100644
+--- a/railties/lib/rails_generator/commands.rb
++++ b/railties/lib/rails_generator/commands.rb
+@@ -354,19 +354,41 @@ HELP
+           template(relative_source, "#{relative_destination}/#{next_migration_string}_#{migration_file_name}.rb", template_options)
+         end
+ 
+-        def route_resources(*resources)
++        def route_resources(namespace, *resources)
+           resource_list = resources.map { |r| r.to_sym.inspect }.join(', ')
+           sentinel = 'ActionController::Routing::Routes.draw do |map|'
+ 
+           logger.route "map.resources #{resource_list}"
+           unless options[:pretend]
++            if namespace.length > 0
++              route_to_add = route_nested(namespace.split('::'), resource_list)
++            else
++              route_to_add = "  map.resources #{resource_list}"
++            end
+             gsub_file 'config/routes.rb', /(#{Regexp.escape(sentinel)})/mi do |match|
+-              "#{match}\n  map.resources #{resource_list}\n"
++              "#{match}\n#{route_to_add}\n"
+             end
+           end
+         end
+ 
+         private
++        
++          def route_nested(splitted_namespace, resource_list, parent_namespace = 'map', level = 1)
++            namespace = splitted_namespace.shift
++            route_to_add = tabulator(level) + "#{parent_namespace}.namespace :#{namespace.underscore} do |#{namespace.underscore}|\n"
++            if splitted_namespace.size > 0
++              route_to_add += route_nested(splitted_namespace, resource_list, namespace.underscore, level + 1)
++            else
++              route_to_add += tabulator(level + 1) + "#{namespace.underscore}.resources #{resource_list}\n"
++            end
++            route_to_add += tabulator(level) + "end\n"
++            return route_to_add
++          end
++        
++          def tabulator(level)
++            "  " * level
++          end
++        
+           def render_file(path, options = {})
+             File.open(path, 'rb') do |file|
+               if block_given?
+@@ -523,6 +545,7 @@ end_message
+           end
+         end
+ 
++        # TODO Should we do something about this as we changed it in Create module???
+         def route_resources(*resources)
+           resource_list = resources.map { |r| r.to_sym.inspect }.join(', ')
+           look_for = "\n  map.resources #{resource_list}\n"
+diff --git a/railties/lib/rails_generator/generators/components/controller/controller_generator.rb b/railties/lib/rails_generator/generators/components/controller/controller_generator.rb
+index c37ff45..dd799d1 100644
+--- a/railties/lib/rails_generator/generators/components/controller/controller_generator.rb
++++ b/railties/lib/rails_generator/generators/components/controller/controller_generator.rb
+@@ -2,7 +2,8 @@ class ControllerGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions class_path, "#{class_name}Controller", "#{class_name}ControllerTest", "#{class_name}Helper"
++      # TODO Is this change ok? We will get name collision with namespaced models if we include the 'class_path' as parameter
++      m.class_collisions "#{class_name}Controller", "#{class_name}ControllerTest", "#{class_name}Helper"
+ 
+       # Controller, helper, views, and test directories.
+       m.directory File.join('app/controllers', class_path)
+diff --git a/railties/lib/rails_generator/generators/components/model/model_generator.rb b/railties/lib/rails_generator/generators/components/model/model_generator.rb
+index 9be9cad..90b0f0f 100644
+--- a/railties/lib/rails_generator/generators/components/model/model_generator.rb
++++ b/railties/lib/rails_generator/generators/components/model/model_generator.rb
+@@ -4,7 +4,8 @@ class ModelGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions class_path, class_name, "#{class_name}Test"
++      # TODO Is this change ok? We will get name collision with namespaced models if we include the 'class_path' as parameter
++      m.class_collisions class_name, "#{class_name}Test"
+ 
+       # Model, test, and fixture directories.
+       m.directory File.join('app/models', class_path)
+@@ -16,7 +17,7 @@ class ModelGenerator < Rails::Generator::NamedBase
+       m.template 'unit_test.rb',  File.join('test/unit', class_path, "#{file_name}_test.rb")
+ 
+       unless options[:skip_fixture] 
+-       	m.template 'fixtures.yml',  File.join('test/fixtures', "#{table_name}.yml")
++        m.template 'fixtures.yml',  File.join('test/fixtures', "#{nesting_path}/#{file_name.pluralize}.yml")
+       end
+ 
+       unless options[:skip_migration]
+diff --git a/railties/lib/rails_generator/generators/components/resource/resource_generator.rb b/railties/lib/rails_generator/generators/components/resource/resource_generator.rb
+index d5491ec..766006a 100644
+--- a/railties/lib/rails_generator/generators/components/resource/resource_generator.rb
++++ b/railties/lib/rails_generator/generators/components/resource/resource_generator.rb
+@@ -30,8 +30,10 @@ class ResourceGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions(controller_class_path, "#{controller_class_name}Controller", "#{controller_class_name}Helper")
+-      m.class_collisions(class_path, "#{class_name}")
++      
++      # TODO Is this change ok? We will get name collision with namespaced models if we include the 'class_path' as parameter
++      m.class_collisions("#{controller_class_name}Controller", "#{controller_class_name}Helper")
++      m.class_collisions("#{class_name}")
+ 
+       # Controller, helper, views, and test directories.
+       m.directory(File.join('app/models', class_path))
+@@ -50,7 +52,7 @@ class ResourceGenerator < Rails::Generator::NamedBase
+       m.template('functional_test.rb', File.join('test/functional', controller_class_path, "#{controller_file_name}_controller_test.rb"))
+       m.template('helper.rb',          File.join('app/helpers',     controller_class_path, "#{controller_file_name}_helper.rb"))
+ 
+-      m.route_resources controller_file_name
++      m.route_resources @controller_class_nesting, controller_file_name
+     end
+   end
+ 
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb b/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb
+index 5fecfe0..1076dd5 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb
++++ b/railties/lib/rails_generator/generators/components/scaffold/scaffold_generator.rb
+@@ -36,8 +36,10 @@ class ScaffoldGenerator < Rails::Generator::NamedBase
+   def manifest
+     record do |m|
+       # Check for class naming collisions.
+-      m.class_collisions(controller_class_path, "#{controller_class_name}Controller", "#{controller_class_name}Helper")
+-      m.class_collisions(class_path, "#{class_name}")
++      
++      # TODO Is this change ok? We will get name collision with namespaced models if we include the 'class_path' as parameter
++      m.class_collisions("#{controller_class_name}Controller", "#{controller_class_name}Helper")
++      m.class_collisions("#{class_name}")
+ 
+       # Controller, helper, views, test and stylesheets directories.
+       m.directory(File.join('app/models', class_path))
+@@ -67,7 +69,7 @@ class ScaffoldGenerator < Rails::Generator::NamedBase
+       m.template('functional_test.rb', File.join('test/functional', controller_class_path, "#{controller_file_name}_controller_test.rb"))
+       m.template('helper.rb',          File.join('app/helpers',     controller_class_path, "#{controller_file_name}_helper.rb"))
+ 
+-      m.route_resources controller_file_name
++      m.route_resources @controller_class_nesting, controller_file_name
+ 
+       m.dependency 'model', [name] + @args, :collision => :skip
+     end
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb b/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb
+index cbfd88f..1ae3c8b 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/controller.rb
+@@ -1,17 +1,17 @@
+ class <%= controller_class_name %>Controller < ApplicationController
+-  # GET /<%= table_name %>
+-  # GET /<%= table_name %>.xml
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>.xml
+   def index
+-    @<%= table_name %> = <%= class_name %>.find(:all)
++    @<%= file_name.pluralize %> = <%= class_name %>.find(:all)
+ 
+     respond_to do |format|
+       format.html # index.html.erb
+-      format.xml  { render :xml => @<%= table_name %> }
++      format.xml  { render :xml => @<%= file_name.pluralize %> }
+     end
+   end
+ 
+-  # GET /<%= table_name %>/1
+-  # GET /<%= table_name %>/1.xml
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/1
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/1.xml
+   def show
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+ 
+@@ -21,8 +21,8 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # GET /<%= table_name %>/new
+-  # GET /<%= table_name %>/new.xml
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/new
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>new.xml
+   def new
+     @<%= file_name %> = <%= class_name %>.new
+ 
+@@ -32,15 +32,15 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # GET /<%= table_name %>/1/edit
++  # GET <%= nesting_path %>/<%= file_name.pluralize %>/1/edit
+   def edit
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+   end
+ 
+-  # POST /<%= table_name %>
+-  # POST /<%= table_name %>.xml
++  # POST <%= nesting_path %>/<%= file_name.pluralize %>
++  # POST<%= nesting_path %>/<%= file_name.pluralize %>.xml
+   def create
+-    @<%= file_name %> = <%= class_name %>.new(params[:<%= file_name %>])
++    @<%= file_name %> = <%= class_name %>.new(params[:<%= nesting_underscored %><%= file_name %>])
+ 
+     respond_to do |format|
+       if @<%= file_name %>.save
+@@ -54,13 +54,13 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # PUT /<%= table_name %>/1
+-  # PUT /<%= table_name %>/1.xml
++  # PUT <%= nesting_path %>/<%= file_name.pluralize %>/1
++  # PUT <%= nesting_path %>/<%= file_name.pluralize %>/1.xml
+   def update
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+ 
+     respond_to do |format|
+-      if @<%= file_name %>.update_attributes(params[:<%= file_name %>])
++      if @<%= file_name %>.update_attributes(params[:<%= nesting_underscored %><%= file_name %>])
+         flash[:notice] = '<%= class_name %> was successfully updated.'
+         format.html { redirect_to(@<%= file_name %>) }
+         format.xml  { head :ok }
+@@ -71,14 +71,14 @@ class <%= controller_class_name %>Controller < ApplicationController
+     end
+   end
+ 
+-  # DELETE /<%= table_name %>/1
+-  # DELETE /<%= table_name %>/1.xml
++  # DELETE <%= nesting_path %>/<%= file_name.pluralize %>/1
++  # DELETE <%= nesting_path %>/<%= file_name.pluralize %>/1.xml
+   def destroy
+     @<%= file_name %> = <%= class_name %>.find(params[:id])
+     @<%= file_name %>.destroy
+ 
+     respond_to do |format|
+-      format.html { redirect_to(<%= table_name %>_url) }
++      format.html { redirect_to(<%= nesting_underscored %><%= file_name.pluralize %>_url) }
+       format.xml  { head :ok }
+     end
+   end
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb b/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb
+index 2d9d635..b76c215 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/functional_test.rb
+@@ -4,7 +4,7 @@ class <%= controller_class_name %>ControllerTest < ActionController::TestCase
+   test "should get index" do
+     get :index
+     assert_response :success
+-    assert_not_nil assigns(:<%= table_name %>)
++    assert_not_nil assigns(:<%= file_name.pluralize %>)
+   end
+ 
+   test "should get new" do
+@@ -17,7 +17,7 @@ class <%= controller_class_name %>ControllerTest < ActionController::TestCase
+       post :create, :<%= file_name %> => { }
+     end
+ 
+-    assert_redirected_to <%= file_name %>_path(assigns(:<%= file_name %>))
++    assert_redirected_to <%= nesting_underscored %><%= file_name %>_path(assigns(:<%= file_name %>))
+   end
+ 
+   test "should show <%= file_name %>" do
+@@ -32,7 +32,7 @@ class <%= controller_class_name %>ControllerTest < ActionController::TestCase
+ 
+   test "should update <%= file_name %>" do
+     put :update, :id => <%= table_name %>(:one).id, :<%= file_name %> => { }
+-    assert_redirected_to <%= file_name %>_path(assigns(:<%= file_name %>))
++    assert_redirected_to <%= nesting_underscored %><%= file_name %>_path(assigns(:<%= file_name %>))
+   end
+ 
+   test "should destroy <%= file_name %>" do
+@@ -40,6 +40,6 @@ class <%= controller_class_name %>ControllerTest < ActionController::TestCase
+       delete :destroy, :id => <%= table_name %>(:one).id
+     end
+ 
+-    assert_redirected_to <%= table_name %>_path
++    assert_redirected_to <%= nesting_underscored %><%= file_name.pluralize %>_path
+   end
+ end
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb
+index e289975..7f19dfb 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_edit.html.erb
+@@ -15,4 +15,4 @@
+ <%% end %>
+ 
+ <%%= link_to 'Show', @<%= singular_name %> %> |
+-<%%= link_to 'Back', <%= plural_name %>_path %>
++<%%= link_to 'Back', <%= nesting_underscored %><%= plural_name %>_path %>
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb
+index e89757e..07088e9 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_index.html.erb
+@@ -13,7 +13,7 @@
+     <td><%%=h <%= singular_name %>.<%= attribute.name %> %></td>
+ <% end -%>
+     <td><%%= link_to 'Show', <%= singular_name %> %></td>
+-    <td><%%= link_to 'Edit', edit_<%= singular_name %>_path(<%= singular_name %>) %></td>
++    <td><%%= link_to 'Edit', edit_<%= nesting_underscored %><%= singular_name %>_path(<%= singular_name %>) %></td>
+     <td><%%= link_to 'Destroy', <%= singular_name %>, :confirm => 'Are you sure?', :method => :delete %></td>
+   </tr>
+ <%% end %>
+@@ -21,4 +21,4 @@
+ 
+ <br />
+ 
+-<%%= link_to 'New <%= singular_name %>', new_<%= singular_name %>_path %>
++<%%= link_to 'New <%= singular_name %>', new_<%= nesting_underscored %><%= singular_name %>_path %>
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb
+index c47e811..3b37cb0 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_new.html.erb
+@@ -14,4 +14,4 @@
+   </p>
+ <%% end %>
+ 
+-<%%= link_to 'Back', <%= plural_name %>_path %>
++<%%= link_to 'Back', <%= nesting_underscored %><%= plural_name %>_path %>
+diff --git a/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb b/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb
+index 9b6b11b..ac70689 100644
+--- a/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb
++++ b/railties/lib/rails_generator/generators/components/scaffold/templates/view_show.html.erb
+@@ -6,5 +6,5 @@
+ 
+ <% end -%>
+ 
+-<%%= link_to 'Edit', edit_<%= singular_name %>_path(@<%= singular_name %>) %> |
+-<%%= link_to 'Back', <%= plural_name %>_path %>
++<%%= link_to 'Edit', edit_<%= nesting_underscored %><%= singular_name %>_path(@<%= singular_name %>) %> |
++<%%= link_to 'Back', <%= nesting_underscored %><%= plural_name %>_path %>
+\ No newline at end of file
+-- 
+1.5.5.1
+

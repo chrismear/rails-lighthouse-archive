@@ -1,0 +1,245 @@
+From 4cb0d297a24cfc5101cf15c26a65306dd08bc130 Mon Sep 17 00:00:00 2001
+From: Luca Guidi <guidi.luca@gmail.com>
+Date: Tue, 10 Mar 2009 14:53:19 +0100
+Subject: [PATCH] Make sure autosaved association run callbacks
+
+---
+ .../associations/association_collection.rb         |   49 ++++++++++++--------
+ .../lib/active_record/autosave_association.rb      |    2 +-
+ activerecord/test/cases/nested_attributes_test.rb  |   49 ++++++++++++++++++++
+ activerecord/test/models/pirate.rb                 |   49 +++++++++++++++++++-
+ 4 files changed, 128 insertions(+), 21 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0fefec1..5f731fc 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -186,7 +186,6 @@ module ActiveRecord
+         end
+       end
+ 
+-
+       # Removes +records+ from this association calling +before_remove+ and
+       # +after_remove+ callbacks.
+       #
+@@ -195,22 +194,25 @@ module ActiveRecord
+       # are actually removed from the database, that depends precisely on
+       # +delete_records+. They are in any case removed from the collection.
+       def delete(*records)
+-        records = flatten_deeper(records)
+-        records.each { |record| raise_on_type_mismatch(record) }
+-        
+-        transaction do
+-          records.each { |record| callback(:before_remove, record) }
+-          
+-          old_records = records.reject {|r| r.new_record? }
++        remove_records(records) do |records, old_records|
+           delete_records(old_records) if old_records.any?
+-          
+-          records.each do |record|
+-            @target.delete(record)
+-            callback(:after_remove, record)
+-          end
++          records.each { |record| @target.delete(record) }
+         end
+       end
+ 
++      # Destroy +records+ and remove from this association calling +before_remove+
++      # and +after_remove+ callbacks.
++      #
++      # Note this method will always remove records from database ignoring the
++      # +:dependent+ option.
++      def destroy(*records)
++        remove_records(records) do |records, old_records|
++          old_records.each { |record| record.destroy }
++        end
++
++        load_target
++      end
++
+       # Removes all records from this association.  Returns +self+ so method calls may be chained.
+       def clear
+         return self if length.zero? # forces load_target if it hasn't happened already
+@@ -223,15 +225,12 @@ module ActiveRecord
+ 
+         self
+       end
+-      
+-      def destroy_all
+-        transaction do
+-          each { |record| record.destroy }
+-        end
+ 
++      def destroy_all
++        destroy(self)
+         reset_target!
+       end
+-      
++
+       def create(attrs = {})
+         if attrs.is_a?(Array)
+           attrs.collect { |attr| create(attr) }
+@@ -431,6 +430,18 @@ module ActiveRecord
+           record
+         end
+ 
++        def remove_records(*records)
++          records = flatten_deeper(records)
++          records.each { |record| raise_on_type_mismatch(record) }
++
++          transaction do
++            records.each { |record| callback(:before_remove, record) }
++            old_records = records.reject { |r| r.new_record? }
++            yield(records, old_records)
++            records.each { |record| callback(:after_remove, record) }
++          end
++        end
++
+         def callback(method, record)
+           callbacks_for(method).each do |callback|
+             ActiveSupport::Callbacks::Callback.new(method, callback, record).call(@owner, record)
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 1c3d056..7b1e275 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -283,7 +283,7 @@ module ActiveRecord
+         if records = associated_records_to_validate_or_save(association, @new_record_before_save, autosave)
+           records.each do |record|
+             if autosave && record.marked_for_destruction?
+-              record.destroy
++              association.destroy(record)
+             elsif @new_record_before_save || record.new_record?
+               if autosave
+                 association.send(:insert_record, record, false, false)
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index cd6277c..93941b4 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -61,6 +61,55 @@ class TestNestedAttributesInGeneral < ActiveRecord::TestCase
+   end
+ end
+ 
++class TestNestedAttributesMethodCallbacks < ActiveRecord::TestCase
++  def test_should_run_add_callbacks
++    pirate = Pirate.new :catchphrase => "Arr",
++      :birds_with_method_callbacks_attributes   => [{:name => "Polly Wanna Pinata"}],
++      :parrots_with_method_callbacks_attributes => [{:name => "Crowe the One-Eyed"}]
++    assert_equal ["before_adding_method_parrot_<new>", "after_adding_method_parrot_<new>",
++      "before_adding_method_bird_<new>", "after_adding_method_bird_<new>"], pirate.ship_log
++  end
++  
++  def test_should_run_remove_callbacks
++    pirate = Pirate.create! :catchphrase => "Arr Arr"
++    bird   = Bird.create!   :name => "Frank Big-hearted"
++    parrot = Parrot.create! :name => "Captain Morgan"
++    pirate.birds_with_method_callbacks << bird
++    pirate.parrots_with_method_callbacks << parrot
++    pirate.ship_log.clear
++
++    pirate.update_attributes :birds_with_method_callbacks_attributes => [{:id => bird.id, :_delete => true}],
++      :parrots_with_method_callbacks_attributes => [{:id => parrot.id, :_delete => true}]
++    assert_equal ["before_removing_method_parrot_#{parrot.id}", "after_removing_method_parrot_#{parrot.id}",
++      "before_removing_method_bird_#{bird.id}", "after_removing_method_bird_#{bird.id}"], pirate.ship_log
++  end
++end
++
++class TestNestedAttributesProcCallbacks < ActiveRecord::TestCase
++  def test_should_run_add_callbacks
++    pirate = Pirate.new :catchphrase => "To arr is pirate",
++      :birds_with_proc_callbacks_attributes   => [{:name => "General Lee"}],
++      :parrots_with_proc_callbacks_attributes => [{:name => "Disatrous John Straw"}]
++
++    assert_equal ["before_adding_proc_bird_<new>", "after_adding_proc_bird_<new>",
++      "before_adding_proc_parrot_<new>", "after_adding_proc_parrot_<new>"], pirate.ship_log
++  end
++
++  def test_should_run_remove_callbacks
++    pirate = Pirate.create! :catchphrase => "To err is human, to arr is pirate"
++    bird   = Bird.create!   :name => "Glowering Maggie"
++    parrot = Parrot.create! :name => "Barnacle Breath Amora"
++    pirate.birds_with_proc_callbacks << bird
++    pirate.parrots_with_proc_callbacks << parrot
++    pirate.ship_log.clear
++
++    pirate.update_attributes :birds_with_proc_callbacks_attributes => [{:id => bird.id, :_delete => true}],
++      :parrots_with_proc_callbacks_attributes => [{:id => parrot.id, :_delete => true}]
++    assert_equal ["before_removing_proc_parrot_#{parrot.id}", "after_removing_proc_parrot_#{parrot.id}",
++      "before_removing_proc_bird_#{bird.id}", "after_removing_proc_bird_#{bird.id}"], pirate.ship_log
++ end
++end
++
+ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+   def setup
+     @pirate = Pirate.create!(:catchphrase => "Don' botharrr talkin' like one, savvy?")
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 7bc50e0..6983ca9 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -1,16 +1,63 @@
+ class Pirate < ActiveRecord::Base
+   belongs_to :parrot
+   has_and_belongs_to_many :parrots
+-  has_many :treasures, :as => :looter
++  has_and_belongs_to_many :parrots_with_method_callbacks, :class_name => "Parrot",
++    :before_add    => :log_before_add,
++    :after_add     => :log_after_add,
++    :before_remove => :log_before_remove,
++    :after_remove  => :log_after_remove
++  has_and_belongs_to_many :parrots_with_proc_callbacks, :class_name => "Parrot",
++    :before_add    => proc {|p,pa| p.ship_log << "before_adding_proc_parrot_#{pa.id || '<new>'}"},
++    :after_add     => proc {|p,pa| p.ship_log << "after_adding_proc_parrot_#{pa.id || '<new>'}"},
++    :before_remove => proc {|p,pa| p.ship_log << "before_removing_proc_parrot_#{pa.id}"},
++    :after_remove  => proc {|p,pa| p.ship_log << "after_removing_proc_parrot_#{pa.id}"}
+ 
++  has_many :treasures, :as => :looter
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
+   # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
+   has_one :ship
+   has_many :birds
++  has_many :birds_with_method_callbacks, :class_name => "Bird",
++    :before_add    => :log_before_add,
++    :after_add     => :log_after_add,
++    :before_remove => :log_before_remove,
++    :after_remove  => :log_after_remove
++  has_many :birds_with_proc_callbacks, :class_name => "Bird",
++    :before_add     => proc {|p,b| p.ship_log << "before_adding_proc_bird_#{b.id || '<new>'}"},
++    :after_add      => proc {|p,b| p.ship_log << "after_adding_proc_bird_#{b.id || '<new>'}"},
++    :before_remove  => proc {|p,b| p.ship_log << "before_removing_proc_bird_#{b.id}"},
++    :after_remove   => proc {|p,b| p.ship_log << "after_removing_proc_bird_#{b.id}"}
+ 
+   accepts_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+   accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
++  accepts_nested_attributes_for :parrots_with_method_callbacks, :parrots_with_proc_callbacks,
++    :birds_with_method_callbacks, :birds_with_proc_callbacks, :allow_destroy => true
+ 
+   validates_presence_of :catchphrase
++
++  def ship_log
++    @ship_log ||= []
++  end
++
++  private
++    def log_before_add(record)
++      log(record, "before_adding_method")
++    end
++
++    def log_after_add(record)
++      log(record, "after_adding_method")
++    end
++
++    def log_before_remove(record)
++      log(record, "before_removing_method")
++    end
++
++    def log_after_remove(record)
++      log(record, "after_removing_method")
++    end
++    
++    def log(record, callback)
++      ship_log << "#{callback}_#{record.class.name.downcase}_#{record.id || '<new>'}"
++    end
+ end
+-- 
+1.5.4.5
+

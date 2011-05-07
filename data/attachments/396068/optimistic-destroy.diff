@@ -1,0 +1,158 @@
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 57785b4..b5df1d9 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1486,7 +1486,16 @@ module ActiveRecord
+               when :destroy
+                 method_name = "has_many_dependent_destroy_for_#{reflection.name}".to_sym
+                 define_method(method_name) do
+-                  send(reflection.name).each { |o| o.destroy }
++                  send(reflection.name).each do |o| 
++                    # No point in executing the counter update since we're going to destroy the parent anyway
++                    counter_method = ('belongs_to_counter_cache_before_destroy_for_' + self.class.name.downcase).to_sym
++                    if(o.respond_to? counter_method) then
++                      class << o
++                        self
++                      end.send(:define_method, counter_method, Proc.new {})
++                    end
++                    o.destroy
++                  end
+                 end
+                 before_destroy method_name
+               when :delete_all
+diff --git a/activerecord/lib/active_record/locking/optimistic.rb b/activerecord/lib/active_record/locking/optimistic.rb
+index 9044ca4..78ac2ad 100644
+--- a/activerecord/lib/active_record/locking/optimistic.rb
++++ b/activerecord/lib/active_record/locking/optimistic.rb
+@@ -23,6 +23,16 @@ module ActiveRecord
+     #   p2.first_name = "should fail"
+     #   p2.save # Raises a ActiveRecord::StaleObjectError
+     #
++    # Optimistic locking will also check for stale data when objects are destroyed.  Example:
++    #
++    #   p1 = Person.find(1)
++    #   p2 = Person.find(1)
++    #
++    #   p1.first_name = "Michael"
++    #   p1.save
++    #
++    #   p2.destroy # Raises a ActiveRecord::StaleObjectError
++    #
+     # You're then responsible for dealing with the conflict by rescuing the exception and either rolling back, merging,
+     # or otherwise apply the business logic needed to resolve the conflict.
+     #
+@@ -39,6 +49,7 @@ module ActiveRecord
+         self.lock_optimistically = true
+ 
+         alias_method_chain :update, :lock
++        alias_method_chain :destroy, :lock
+         alias_method_chain :attributes_from_column_definition, :lock
+ 
+         class << self
+@@ -100,6 +111,28 @@ module ActiveRecord
+           end
+         end
+ 
++	def destroy_with_lock #:nodoc:
++	  return destroy_without_lock unless locking_enabled?
++
++	  unless new_record?
++	    lock_col = self.class.locking_column
++	    previous_value = send(lock_col).to_i
++
++	    affected_rows = connection.delete(
++	      "DELETE FROM #{self.class.quoted_table_name} " +
++	      "WHERE #{connection.quote_column_name(self.class.primary_key)} = #{quoted_id} " +
++              "AND #{self.class.quoted_locking_column} = #{quote_value(previous_value)}",
++	      "#{self.class.name} Destroy"
++	    )
++
++            unless affected_rows == 1
++              raise ActiveRecord::StaleObjectError, "Attempted to delete a stale object"
++            end
++	  end
++
++	  freeze
++	end
++
+       module ClassMethods
+         DEFAULT_LOCKING_COLUMN = 'lock_version'
+ 
+diff --git a/activerecord/test/cases/locking_test.rb b/activerecord/test/cases/locking_test.rb
+index dfaecf3..d6f5c12 100644
+--- a/activerecord/test/cases/locking_test.rb
++++ b/activerecord/test/cases/locking_test.rb
+@@ -38,6 +38,25 @@ class OptimisticLockingTest < ActiveRecord::TestCase
+     assert_raise(ActiveRecord::StaleObjectError) { p2.save! }
+   end
+ 
++	# See Lighthouse ticket #1966
++  def test_lock_destroy
++    p1 = Person.find(1)
++    p2 = Person.find(1)
++    assert_equal 0, p1.lock_version
++    assert_equal 0, p2.lock_version
++
++    p1.first_name = 'stu'
++    p1.save!
++    assert_equal 1, p1.lock_version
++    assert_equal 0, p2.lock_version
++
++    assert_raises(ActiveRecord::StaleObjectError) { p2.destroy }
++
++    assert p1.destroy
++    assert_equal true, p1.frozen?
++    assert_raises(ActiveRecord::RecordNotFound) { Person.find(1) }
++  end
++
+   def test_lock_repeating
+     p1 = Person.find(1)
+     p2 = Person.find(1)
+@@ -150,6 +169,32 @@ class OptimisticLockingTest < ActiveRecord::TestCase
+       end
+     end
+   end
++
++  # See Lighthouse ticket #1966
++  def test_destroy_dependents
++    # Establish dependent relationship between People and LegacyThing
++    add_counter_column_to(Person, 'legacy_things_count')
++    LegacyThing.connection.add_column LegacyThing.table_name, 'person_id', :integer
++    LegacyThing.reset_column_information
++    LegacyThing.class_eval do
++      belongs_to :person, :counter_cache => true
++    end
++    Person.class_eval do
++      has_many :legacy_things, :dependent => :destroy
++    end
++
++    # Make sure that counter incrementing doesn't cause problems
++    p1 = Person.new(:first_name => 'fjord')
++    p1.save!
++    t = LegacyThing.new(:person => p1)
++    t.save!
++    p1.reload
++    assert_equal 1, p1.legacy_things_count
++    assert p1.destroy
++    assert_equal true, p1.frozen?
++    assert_raises(ActiveRecord::RecordNotFound) { Person.find(p1.id) }
++    assert_raises(ActiveRecord::RecordNotFound) { LegacyThing.find(t.id) }
++  end
+   
+   def test_quote_table_name
+     ref = references(:michael_magician)
+@@ -168,11 +213,11 @@ class OptimisticLockingTest < ActiveRecord::TestCase
+ 
+   private
+ 
+-    def add_counter_column_to(model)
+-      model.connection.add_column model.table_name, :test_count, :integer, :null => false, :default => 0
++    def add_counter_column_to(model, col='test_count')
++      model.connection.add_column model.table_name, col, :integer, :null => false, :default => 0
+       model.reset_column_information
+       # OpenBase does not set a value to existing rows when adding a not null default column
+-      model.update_all(:test_count => 0) if current_adapter?(:OpenBaseAdapter)
++      model.update_all(col => 0) if current_adapter?(:OpenBaseAdapter)
+     end
+ 
+     def remove_counter_column_from(model)

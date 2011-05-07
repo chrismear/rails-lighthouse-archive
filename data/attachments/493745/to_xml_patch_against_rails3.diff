@@ -1,0 +1,128 @@
+From 521b366e1d367cd9c037e18b79986d427c345a58 Mon Sep 17 00:00:00 2001
+From: Neeraj Singh <neerajdotname@gmail.com>
+Date: Thu, 22 Apr 2010 16:32:16 -0400
+Subject: [PATCH] [PATCH] model.to_xml should render array and hash properly [#458 state:resolved]
+
+---
+ activemodel/lib/active_model/serializers/xml.rb    |   17 +++++++++---
+ .../serializeration/xml_serialization_test.rb      |    8 ++++-
+ activemodel/test/models/contact.rb                 |    5 +++
+ .../active_support/core_ext/hash/conversions.rb    |   27 ++++++++++++++++++-
+ 4 files changed, 48 insertions(+), 9 deletions(-)
+
+diff --git a/activemodel/lib/active_model/serializers/xml.rb b/activemodel/lib/active_model/serializers/xml.rb
+index ee3e0ea..7fb2abd 100644
+--- a/activemodel/lib/active_model/serializers/xml.rb
++++ b/activemodel/lib/active_model/serializers/xml.rb
+@@ -170,11 +170,18 @@ module ActiveModel
+ 
+           def add_attributes
+             (serializable_attributes + serializable_method_attributes).each do |attribute|
+-              builder.tag!(
+-                reformat_name(attribute.name),
+-                attribute.value.to_s,
+-                attribute.decorations(!options[:skip_types])
+-              )
++              formatted_name = reformat_name(attribute.name)
++              if attribute.type == 'hash'
++                # tag! method cannot be used since bulider escapes the value. Also hash.to_xml produces
++                # root element. That root element was set to nil and the result is removed by  value.to_s[5..-6]
++                builder << '<'+attribute.name+ ' type="hash">' + attribute.value.to_s[5..-6] + '</'+attribute.name+'>'
++              else
++                builder.tag!(
++                  formatted_name,
++                  attribute.value.to_s,
++                  attribute.decorations(!options[:skip_types])
++                )
++              end
+             end
+           end
+ 
+diff --git a/activemodel/test/cases/serializeration/xml_serialization_test.rb b/activemodel/test/cases/serializeration/xml_serialization_test.rb
+index 6340aad..e8ed85e 100644
+--- a/activemodel/test/cases/serializeration/xml_serialization_test.rb
++++ b/activemodel/test/cases/serializeration/xml_serialization_test.rb
+@@ -92,8 +92,12 @@ class XmlSerializationTest < ActiveModel::TestCase
+     assert_match %r{<awesome type=\"boolean\">false</awesome>}, @contact.to_xml
+   end
+ 
+-  test "should serialize yaml" do
+-    assert_match %r{<preferences type=\"yaml\">--- \n:gem: ruby\n</preferences>}, @contact.to_xml
++  test "should serialize hash" do
++    assert_match %r{<preferences type=\"hash\">\s*<gem>ruby</gem>\s*</preferences>}, @contact.to_xml
++  end
++
++  test "should serialize array" do
++    assert_match %r{<social type=\"array\">\['flickr','github','twitter'\]</social>}, @contact.to_xml(:methods => :social)
+   end
+ 
+   test "should call proc on object" do
+diff --git a/activemodel/test/models/contact.rb b/activemodel/test/models/contact.rb
+index a9009fb..89aad77 100644
+--- a/activemodel/test/models/contact.rb
++++ b/activemodel/test/models/contact.rb
+@@ -10,4 +10,9 @@ class Contact
+   def persisted?
+     id
+   end
++
++  def social
++    %w(flickr github twitter)
++  end
++
+ end
+diff --git a/activesupport/lib/active_support/core_ext/hash/conversions.rb b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+index c882434..32d416c 100644
+--- a/activesupport/lib/active_support/core_ext/hash/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+@@ -29,7 +29,9 @@ class Hash
+     "FalseClass" => "boolean",
+     "Date"       => "date",
+     "DateTime"   => "datetime",
+-    "Time"       => "datetime"
++    "Time"       => "datetime",
++    "Array"      => "array",
++    "Hash"       => "hash"
+   } unless defined?(XML_TYPE_NAMES)
+ 
+   XML_FORMATTING = {
+@@ -37,7 +39,9 @@ class Hash
+     "date"     => Proc.new { |date| date.to_s(:db) },
+     "datetime" => Proc.new { |time| time.xmlschema },
+     "binary"   => Proc.new { |binary| ActiveSupport::Base64.encode64(binary) },
+-    "yaml"     => Proc.new { |yaml| yaml.to_yaml }
++    "yaml"     => Proc.new { |yaml| yaml.to_yaml },
++    "array"    => Proc.new { |array| array2xml(array) },
++    "hash"     => Proc.new { |hash| hash.to_xml(:skip_instruct => true, :root => nil) }
+   } unless defined?(XML_FORMATTING)
+ 
+   # TODO: use Time.xmlschema instead of Time.parse;
+@@ -189,6 +193,25 @@ class Hash
+   end
+ 
+   class << self
++
++    def array2xml(array)
++      values = array.inject([]) do |sum, elem|
++        sum << "'" + xml_value(elem) + "'"
++      end
++      "[#{values.join(',')}]"
++    end
++
++    def xml_value(input)
++      if input.class.name == 'String'
++        input
++      else
++        type = XML_TYPE_NAMES[input.class.name]
++        formatter = XML_FORMATTING[type]
++        value = formatter ? (input ? formatter.call(input) : nil) : input
++        value.blank? ? '' : value
++      end
++    end
++
+     def from_xml(xml)
+       typecast_xml_value(unrename_keys(ActiveSupport::XmlMini.parse(xml)))
+     end
+-- 
+1.6.5.2
+

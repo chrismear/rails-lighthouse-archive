@@ -1,0 +1,193 @@
+From a5a2548a9fa83d798d07c18c081110269bc5a657 Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Thu, 7 May 2009 01:03:52 +0100
+Subject: [PATCH 1/2] honour inverse_of when preloading associations
+
+---
+ .../lib/active_record/association_preload.rb       |    4 ++-
+ .../associations/inverse_associations_test.rb      |   33 ++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index e4ab69a..967fff4 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -126,6 +126,7 @@ module ActiveRecord
+           association_proxy = parent_record.send(reflection_name)
+           association_proxy.loaded
+           association_proxy.target.push(*[associated_record].flatten)
++          association_proxy.__send__(:set_inverse_instance, associated_record, parent_record)
+         end
+       end
+ 
+@@ -152,7 +153,8 @@ module ActiveRecord
+           seen_keys[associated_record[key].to_s] = true
+           mapped_records = id_to_record_map[associated_record[key].to_s]
+           mapped_records.each do |mapped_record|
+-            mapped_record.send("set_#{reflection_name}_target", associated_record)
++            association_proxy = mapped_record.send("set_#{reflection_name}_target", associated_record)
++            association_proxy.__send__(:set_inverse_instance, associated_record, mapped_record)
+           end
+         end
+       end
+diff --git a/activerecord/test/cases/associations/inverse_associations_test.rb b/activerecord/test/cases/associations/inverse_associations_test.rb
+index 616f8df..7a7f694 100644
+--- a/activerecord/test/cases/associations/inverse_associations_test.rb
++++ b/activerecord/test/cases/associations/inverse_associations_test.rb
+@@ -94,6 +94,17 @@ class InverseHasOneTests < ActiveRecord::TestCase
+     assert_equal m.name, f.man.name, "Name of man should be the same after changes to child-owned instance"
+   end
+ 
++
++  def test_parent_instance_should_be_shared_with_eager_loaded_child_on_find
++    m = Man.find(:first, :include => :face)
++    f = m.face
++    assert_equal m.name, f.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to parent instance"
++    f.man.name = 'Mungo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to child-owned instance"
++  end
++
+   def test_parent_instance_should_be_shared_with_newly_built_child
+     m = Man.find(:first)
+     f = m.build_face(:description => 'haunted')
+@@ -135,6 +146,18 @@ class InverseHasManyTests < ActiveRecord::TestCase
+       assert_equal m.name, i.man.name, "Name of man should be the same after changes to child-owned instance"
+     end
+   end
++  
++  def test_parent_instance_should_be_shared_with_eager_loaded_children
++    m = Man.find(:first, :include => :interests)
++    is = m.interests
++    is.each do |i|
++      assert_equal m.name, i.man.name, "Name of man should be the same before changes to parent instance"
++      m.name = 'Bongo'
++      assert_equal m.name, i.man.name, "Name of man should be the same after changes to parent instance"
++      i.man.name = 'Mungo'
++      assert_equal m.name, i.man.name, "Name of man should be the same after changes to child-owned instance"
++    end
++  end
+ 
+   def test_parent_instance_should_be_shared_with_newly_built_child
+     m = Man.find(:first)
+@@ -188,6 +211,16 @@ class InverseBelongsToTests < ActiveRecord::TestCase
+     assert_equal f.description, m.face.description, "Description of face should be the same after changes to parent-owned instance"
+   end
+ 
++  def test_eager_loaded_child_instance_should_be_shared_with_parent_on_find
++    f = Face.find(:first, :include => :man)
++    m = f.man
++    assert_equal f.description, m.face.description, "Description of face should be the same before changes to child instance"
++    f.description = 'gormless'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to child instance"
++    m.face.description = 'pleasing'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to parent-owned instance"
++  end
++
+   def test_child_instance_should_be_shared_with_newly_built_parent
+     f = Face.find(:first)
+     m = f.build_man(:name => 'Charles')
+-- 
+1.6.2.1
+
+
+From 7d20edf996feadddb69137ef2a3bddcca90bfd25 Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Thu, 7 May 2009 01:43:15 +0100
+Subject: [PATCH 2/2] honour :inverse_of for joins based include
+
+---
+ activerecord/lib/active_record/associations.rb     |   10 +++++-
+ .../associations/inverse_associations_test.rb      |   28 ++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 0952b08..e9ce642 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1916,20 +1916,26 @@ module ActiveRecord
+                   return nil if record.id.to_s != join.parent.record_id(row).to_s or row[join.aliased_primary_key].nil?
+                   association = join.instantiate(row)
+                   collection.target.push(association)
++                  collection.__send__(:set_inverse_instance, association, record)
+                 when :has_one
+                   return if record.id.to_s != join.parent.record_id(row).to_s
+                   return if record.instance_variable_defined?("@#{join.reflection.name}")
+                   association = join.instantiate(row) unless row[join.aliased_primary_key].nil?
+-                  record.send("set_#{join.reflection.name}_target", association)
++                  set_target_and_inverse(join, association, record)
+                 when :belongs_to
+                   return if record.id.to_s != join.parent.record_id(row).to_s or row[join.aliased_primary_key].nil?
+                   association = join.instantiate(row)
+-                  record.send("set_#{join.reflection.name}_target", association)
++                  set_target_and_inverse(join, association, record)
+                 else
+                   raise ConfigurationError, "unknown macro: #{join.reflection.macro}"
+               end
+               return association
+             end
++            
++            def set_target_and_inverse(join, association, record)
++              association_proxy = record.send("set_#{join.reflection.name}_target", association)
++              association_proxy.__send__(:set_inverse_instance, association, record)
++            end
+ 
+           class JoinBase # :nodoc:
+             attr_reader :active_record, :table_joins
+diff --git a/activerecord/test/cases/associations/inverse_associations_test.rb b/activerecord/test/cases/associations/inverse_associations_test.rb
+index 7a7f694..71eb7a6 100644
+--- a/activerecord/test/cases/associations/inverse_associations_test.rb
++++ b/activerecord/test/cases/associations/inverse_associations_test.rb
+@@ -103,6 +103,14 @@ class InverseHasOneTests < ActiveRecord::TestCase
+     assert_equal m.name, f.man.name, "Name of man should be the same after changes to parent instance"
+     f.man.name = 'Mungo'
+     assert_equal m.name, f.man.name, "Name of man should be the same after changes to child-owned instance"
++
++    m = Man.find(:first, :include => :face, :order => 'faces.id')
++    f = m.face
++    assert_equal m.name, f.man.name, "Name of man should be the same before changes to parent instance"
++    m.name = 'Bongo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to parent instance"
++    f.man.name = 'Mungo'
++    assert_equal m.name, f.man.name, "Name of man should be the same after changes to child-owned instance"
+   end
+ 
+   def test_parent_instance_should_be_shared_with_newly_built_child
+@@ -157,6 +165,17 @@ class InverseHasManyTests < ActiveRecord::TestCase
+       i.man.name = 'Mungo'
+       assert_equal m.name, i.man.name, "Name of man should be the same after changes to child-owned instance"
+     end
++    
++    m = Man.find(:first, :include => :interests, :order => 'interests.id')
++    is = m.interests
++    is.each do |i|
++      assert_equal m.name, i.man.name, "Name of man should be the same before changes to parent instance"
++      m.name = 'Bongo'
++      assert_equal m.name, i.man.name, "Name of man should be the same after changes to parent instance"
++      i.man.name = 'Mungo'
++      assert_equal m.name, i.man.name, "Name of man should be the same after changes to child-owned instance"
++    end
++    
+   end
+ 
+   def test_parent_instance_should_be_shared_with_newly_built_child
+@@ -219,6 +238,15 @@ class InverseBelongsToTests < ActiveRecord::TestCase
+     assert_equal f.description, m.face.description, "Description of face should be the same after changes to child instance"
+     m.face.description = 'pleasing'
+     assert_equal f.description, m.face.description, "Description of face should be the same after changes to parent-owned instance"
++
++
++    f = Face.find(:first, :include => :man, :order => 'men.id')
++    m = f.man
++    assert_equal f.description, m.face.description, "Description of face should be the same before changes to child instance"
++    f.description = 'gormless'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to child instance"
++    m.face.description = 'pleasing'
++    assert_equal f.description, m.face.description, "Description of face should be the same after changes to parent-owned instance"
+   end
+ 
+   def test_child_instance_should_be_shared_with_newly_built_parent
+-- 
+1.6.2.1
+

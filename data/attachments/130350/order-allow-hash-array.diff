@@ -1,0 +1,131 @@
+From 6388a269aa73af27916abfd1f613c958e1c9da67 Mon Sep 17 00:00:00 2001
+From: Paul Campbell <paul@rslw.com>
+Date: Sun, 7 Jun 2009 10:44:21 +0100
+Subject: [PATCH] Allow SQL :order param to accept a Hash or an Array
+
+---
+ activerecord/lib/active_record/base.rb |   19 ++++++++--
+ activerecord/test/cases/finder_test.rb |   58 +++++++++++++------------------
+ 2 files changed, 39 insertions(+), 38 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index ec49d40..9c0bf41 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -550,7 +550,7 @@ module ActiveRecord #:nodoc:
+       # ==== Parameters
+       #
+       # * <tt>:conditions</tt> - An SQL fragment like "administrator = 1", <tt>[ "user_name = ?", username ]</tt>, or <tt>["user_name = :user_name", { :user_name => user_name }]</tt>. See conditions in the intro.
+-      # * <tt>:order</tt> - An SQL fragment like "created_at DESC, name".
++      # * <tt>:order</tt> - An SQL fragment like "created_at DESC, name", or an array "[{:created_at => :desc}, :name]", or a hash if ordering by just one column in a particular direction "{:created_at => :desc}"
+       # * <tt>:group</tt> - An attribute name by which the result should be grouped. Uses the <tt>GROUP BY</tt> SQL-clause.
+       # * <tt>:having</tt> - Combined with +:group+ this can be used to filter the records that a <tt>GROUP BY</tt> returns. Uses the <tt>HAVING</tt> SQL-clause.
+       # * <tt>:limit</tt> - An integer determining the limit on the number of rows that should be returned.
+@@ -1749,14 +1749,25 @@ module ActiveRecord #:nodoc:
+           scope = scope(:find) if :auto == scope
+           scoped_order = scope[:order] if scope
+           if order
+-            sql << " ORDER BY #{order}"
++            sql << " ORDER BY #{parse_order(order)}"
+             if scoped_order && scoped_order != order
+-              sql << ", #{scoped_order}"
++              sql << ", #{parse_order(scoped_order)}"
+             end
+           else
+-            sql << " ORDER BY #{scoped_order}" if scoped_order
++            sql << " ORDER BY #{parse_order(scoped_order)}" if scoped_order
+           end
+         end
++        
++        def parse_order(order)
++          if order.is_a?(Hash)
++            return "#{order.keys.first} #{order.values.first.to_s.upcase}"
++          elsif order.is_a?(Array)
++            order = order.map do |i|
++              i.is_a?(Hash) ? "#{i.keys.first} #{i.values.first.to_s.upcase}" : i.to_s
++            end.join(", ")
++          end
++          return order
++        end
+ 
+         def add_group!(sql, group, having, scope = :auto)
+           if group
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index 037b67e..e7d3a80 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -177,6 +177,30 @@ class FinderTest < ActiveRecord::TestCase
+     developers = Developer.find(:all, :order => "salary ASC, id DESC", :limit => 3, :offset => 1)
+     assert_equal ["David", "fixture_10", "fixture_9"], developers.collect {|d| d.name}
+   end
++  
++  def test_find_all_with_order_as_a_hash
++    developers = Developer.find(:all, :order => {:id => :asc})
++    assert_equal "David", developers.first.name
++    assert_equal "Jamis", developers.last.name
++  end
++  
++  def test_find_all_with_order_as_an_array
++    developers = Developer.find(:all, :order => [{:salary => :desc}, :id])
++    assert_equal "Jamis", developers.first.name
++    assert_equal "Jamis", developers.last.name
++  end
++  
++  def test_find_all_with_order_as_an_array_with_direction
++    developers = Developer.find(:all, :order => [:id => :desc])
++    assert_equal "Jamis", developers.first.name
++    assert_equal "David", developers.last.name
++  end
++
++  # 
++  # def test_find_all_with_multiple_orderings_as_an_array
++  #   developers = Developer.find(:all, :order => "salary ASC, id DESC", :limit => 3, :offset => 1)
++  #   assert_equal ["David", "fixture_10", "fixture_9"], developers.collect {|d| d.name}
++  # end
+ 
+   def test_find_with_limit_and_condition
+     developers = Developer.find(:all, :order => "id DESC", :conditions => "salary = 100000", :limit => 3, :offset =>7)
+@@ -942,40 +966,6 @@ class FinderTest < ActiveRecord::TestCase
+     assert_raise(ArgumentError) { Topic.find_by_title 'No Title', :join => "It should be `joins'" }
+   end
+ 
+-  def test_find_all_with_limit
+-    first_five_developers = Developer.find :all, :order => 'id ASC', :limit =>  5
+-    assert_equal 5, first_five_developers.length
+-    assert_equal 'David', first_five_developers.first.name
+-    assert_equal 'fixture_5', first_five_developers.last.name
+-
+-    no_developers = Developer.find :all, :order => 'id ASC', :limit => 0
+-    assert_equal 0, no_developers.length
+-  end
+-
+-  def test_find_all_with_limit_and_offset
+-    first_three_developers = Developer.find :all, :order => 'id ASC', :limit => 3, :offset => 0
+-    second_three_developers = Developer.find :all, :order => 'id ASC', :limit => 3, :offset => 3
+-    last_two_developers = Developer.find :all, :order => 'id ASC', :limit => 2, :offset => 8
+-
+-    assert_equal 3, first_three_developers.length
+-    assert_equal 3, second_three_developers.length
+-    assert_equal 2, last_two_developers.length
+-
+-    assert_equal 'David', first_three_developers.first.name
+-    assert_equal 'fixture_4', second_three_developers.first.name
+-    assert_equal 'fixture_9', last_two_developers.first.name
+-  end
+-
+-  def test_find_all_with_limit_and_offset_and_multiple_order_clauses
+-    first_three_posts = Post.find :all, :order => 'author_id, id', :limit => 3, :offset => 0
+-    second_three_posts = Post.find :all, :order => ' author_id,id ', :limit => 3, :offset => 3
+-    last_posts = Post.find :all, :order => ' author_id, id  ', :limit => 3, :offset => 6
+-
+-    assert_equal [[0,3],[1,1],[1,2]], first_three_posts.map { |p| [p.author_id, p.id] }
+-    assert_equal [[1,4],[1,5],[1,6]], second_three_posts.map { |p| [p.author_id, p.id] }
+-    assert_equal [[2,7]], last_posts.map { |p| [p.author_id, p.id] }
+-  end
+-
+   def test_find_all_with_join
+     developers_on_project_one = Developer.find(
+       :all,
+-- 
+1.5.3.1
+

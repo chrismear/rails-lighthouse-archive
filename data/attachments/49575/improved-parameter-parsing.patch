@@ -1,0 +1,217 @@
+diff --git a/actionpack/lib/action_controller/request.rb b/actionpack/lib/action_controller/request.rb
+index 8e6cfb4..ca88684 100755
+--- a/actionpack/lib/action_controller/request.rb
++++ b/actionpack/lib/action_controller/request.rb
+@@ -730,98 +730,66 @@ EOM
+     end
+   end
+ 
+-  class UrlEncodedPairParser < StringScanner #:nodoc:
+-    attr_reader :top, :parent, :result
++  class UrlEncodedPairParser #:nodoc:
++    attr_reader :result
+ 
+-    def initialize(pairs = [])
+-      super('')
++    #
++    # Initialize a new parameter parser.
++    #
++
++    def initialize(params=[])
+       @result = {}
+-      pairs.each { |key, value| parse(key, value) }
++      params.each { |key, value| parse(key, value) }
+     end
+ 
+-    KEY_REGEXP = %r{([^\[\]=&]+)}
+-    BRACKETED_KEY_REGEXP = %r{\[([^\[\]=&]+)\]}
++    ROOT_REGEX = /[^\[]+/
++    ARRAY_REGEX = /\[([0-9]*)\]/
++    HASH_REGEX = /\[([^\]]+)\]/
+ 
+-    # Parse the query string
++    #
++    # Parse a single key/value pair into the internal parameter hash.
++    #
+     def parse(key, value)
+-      self.string = key
+-      @top, @parent = result, nil
+-
+-      # First scan the bare key
+-      key = scan(KEY_REGEXP) or return
+-      key = post_key_check(key)
+-
+-      # Then scan as many nestings as present
+-      until eos?
+-        r = scan(BRACKETED_KEY_REGEXP) or return
+-        key = self[1]
+-        key = post_key_check(key)
+-      end
+-
+-      bind(key, value)
+-    end
+-
+-    private
+-      # After we see a key, we must look ahead to determine our next action. Cases:
+-      #
+-      #   [] follows the key. Then the value must be an array.
+-      #   = follows the key. (A value comes next)
+-      #   & or the end of string follows the key. Then the key is a flag.
+-      #   otherwise, a hash follows the key.
+-      def post_key_check(key)
+-        if scan(/\[\]/) # a[b][] indicates that b is an array
+-          container(key, Array)
+-          nil
+-        elsif check(/\[[^\]]/) # a[b] indicates that a is a hash
+-          container(key, Hash)
+-          nil
+-        else # End of key? We do nothing.
+-          key
+-        end
+-      end
+-
+-      # Add a container to the stack.
+-      def container(key, klass)
+-        type_conflict! klass, top[key] if top.is_a?(Hash) && top.key?(key) && ! top[key].is_a?(klass)
+-        value = bind(key, klass.new)
+-        type_conflict! klass, value unless value.is_a?(klass)
+-        push(value)
+-      end
+-
+-      # Push a value onto the 'stack', which is actually only the top 2 items.
+-      def push(value)
+-        @parent, @top = @top, value
+-      end
+-
+-      # Bind a key (which may be nil for items in an array) to the provided value.
+-      def bind(key, value)
+-        if top.is_a? Array
+-          if key
+-            if top[-1].is_a?(Hash) && ! top[-1].key?(key)
+-              top[-1][key] = value
+-            else
+-              top << {key => value}.with_indifferent_access
+-              push top.last
+-              value = top[key]
+-            end
++      lex = StringScanner.new(key)
++      current = lex.scan(ROOT_REGEX) or return
++      ref = result
++
++      until lex.eos?
++        if lex.scan(ARRAY_REGEX)
++          ref[current] ||= []
++          check_type(Array, ref, current)
++          if lex[1].empty?
++            key = ref[current].length
+           else
+-            top << value
++            key = lex[1].to_i
+           end
+-        elsif top.is_a? Hash
+-          key = CGI.unescape(key)
+-          parent << (@top = {}) if top.key?(key) && parent.is_a?(Array)
+-          top[key] ||= value
+-          return top[key]
++        elsif lex.scan(HASH_REGEX)
++          ref[current] ||= {}.with_indifferent_access
++          check_type(Hash, ref, current)
++          key = lex[1]
+         else
+-          raise ArgumentError, "Don't know what to do: top is #{top.inspect}"
++          break
+         end
+-
+-        return value
++        ref = ref[current]
++        current = key
+       end
+ 
+-      def type_conflict!(klass, value)
+-        raise TypeError, "Conflicting types for parameter containers. Expected an instance of #{klass} but found an instance of #{value.class}. This can be caused by colliding Array and Hash parameters like qs[]=value&qs[key]=value. (The parameters received were #{value.inspect}.)"
++      ref[current] = value
++      result
++    end
++
++    #
++    # If we receive parameters indicating a key being treated as both an
++    # Array and a Hash, we complain about it.
++    #
++    def check_type(expected, actual, key)
++      if !actual[key].kind_of?(expected)
++        raise TypeError,
++          "Ambiguous type encountered while parsing parameters: expected " +
++          "#{expected} but got #{actual[key].class} for key #{key} in " +
++          "#{actual.inspect}"
+       end
++    end
+   end
+ 
+   module UploadedFile
+diff --git a/actionpack/test/controller/request_test.rb b/actionpack/test/controller/request_test.rb
+index e79a0ea..f397176 100644
+--- a/actionpack/test/controller/request_test.rb
++++ b/actionpack/test/controller/request_test.rb
+@@ -434,7 +434,7 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_deep_query_string_with_array_of_hash
+     assert_equal({'x' => {'y' => [{'z' => '10'}]}}, ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10'))
+-    assert_equal({'x' => {'y' => [{'z' => '10', 'w' => '10'}]}}, ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10&x[y][][w]=10'))
++    assert_equal({'x' => {'y' => [{'z' => '10'}, {'w' => '10'}]}}, ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10&x[y][][w]=10'))
+   end
+ 
+   def test_deep_query_string_with_array_of_hashes_with_one_pair
+@@ -445,7 +445,7 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_deep_query_string_with_array_of_hashes_with_multiple_pairs
+     assert_equal(
+-      {'x' => {'y' => [{'z' => '10', 'w' => 'a'}, {'z' => '20', 'w' => 'b'}]}},
++      {'x' => {'y' => [{'z' => '10'}, {'w' => 'a'}, {'z' => '20'}, {'w' => 'b'}]}},
+       ActionController::AbstractRequest.parse_query_parameters('x[y][][z]=10&x[y][][w]=a&x[y][][z]=20&x[y][][w]=b')
+     )
+   end
+@@ -513,10 +513,11 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_request_hash_parsing
+     query = {
+-      "note[viewers][viewer][][type]" => ["User", "Group"],
+-      "note[viewers][viewer][][id]"   => ["1", "2"]
++      "note[viewers][viewer][0][type]" => ["User"],
++      "note[viewers][viewer][0][id]"   => ["1"],
++      "note[viewers][viewer][1][type]" => ["Group"],
++      "note[viewers][viewer][1][id]"   => ["2"],
+     }
+-
+     expected = { "note" => { "viewers"=>{"viewer"=>[{ "id"=>"1", "type"=>"User"}, {"type"=>"Group", "id"=>"2"} ]} } }
+ 
+     assert_equal(expected, ActionController::AbstractRequest.parse_request_parameters(query))
+@@ -663,25 +664,25 @@ class UrlEncodedRequestParameterParsingTest < Test::Unit::TestCase
+ 
+   def test_parse_params_with_single_brackets_in_middle
+     input     = { "a/b[c]d" =>  %w(e) }
+-    expected  = { "a/b" => {} }
++    expected  = { "a/b" => { "c" => "e" } }
+     assert_equal expected, ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 
+   def test_parse_params_with_separated_brackets
+     input     = { "a/b@[c]d[e]" =>  %w(f) }
+-    expected  = { "a/b@" => { }}
++    expected  = { "a/b@" => { "c" => "f" }}
+     assert_equal expected, ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 
+   def test_parse_params_with_separated_brackets_and_array
+     input     = { "a/b@[c]d[e][]" =>  %w(f) }
+-    expected  = { "a/b@" => { }}
++    expected  = { "a/b@" => { "c" => "f" }}
+     assert_equal expected , ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 
+   def test_parse_params_with_unmatched_brackets_and_array
+     input     = { "a/b@[c][d[e][]" =>  %w(f) }
+-    expected  = { "a/b@" => { "c" => { }}}
++    expected  = { "a/b@" => { "c" => { "d[e" => ["f"] }}}
+     assert_equal expected, ActionController::AbstractRequest.parse_request_parameters(input)
+   end
+ 

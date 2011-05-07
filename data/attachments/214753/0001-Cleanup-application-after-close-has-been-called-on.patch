@@ -1,0 +1,174 @@
+From 9eedc48bd2cf0bed25db2e5b7dcf1c8ba839ed12 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Mon, 6 Jul 2009 14:11:28 +0200
+Subject: [PATCH] Cleanup application after #close has been called on the Rack response body, not when AC::Reload#call is done.
+
+The Rack body might lazily evaluate its output, which is for example the case
+if one calls 'render :text => lambda { ... }'. The code which lazily evaluates
+the output might use other application classes. So we will want to defer
+cleanup until the Rack request is completely finished.
+---
+ actionpack/lib/action_controller/reloader.rb |   37 +++++++++-
+ actionpack/test/controller/reloader_test.rb  |   97 ++++++++++++++++++++++++++
+ 2 files changed, 131 insertions(+), 3 deletions(-)
+ create mode 100644 actionpack/test/controller/reloader_test.rb
+
+diff --git a/actionpack/lib/action_controller/reloader.rb b/actionpack/lib/action_controller/reloader.rb
+index 4678930..7ce354f 100644
+--- a/actionpack/lib/action_controller/reloader.rb
++++ b/actionpack/lib/action_controller/reloader.rb
+@@ -1,14 +1,45 @@
+ module ActionController
+   class Reloader
++    class BodyWrapper
++      def initialize(body)
++        @body = body
++      end
++      
++      def close
++        @body.close if @body.respond_to?(:close)
++      ensure
++        Dispatcher.cleanup_application
++      end
++      
++      def method_missing(*args, &block)
++        @body.send(*args, &block)
++      end
++      
++      def respond_to?(symbol, include_private = false)
++        symbol == :close || @body.respond_to?(symbol, include_private)
++      end
++    end
++    
+     def initialize(app)
+       @app = app
+     end
+ 
+     def call(env)
+       Dispatcher.reload_application
+-      @app.call(env)
+-    ensure
+-      Dispatcher.cleanup_application
++      status, headers, body = @app.call(env)
++      # We do not want to call 'cleanup_application' in an ensure block
++      # because the returned Rack response body may lazily generate its data. This
++      # is for example the case if one calls
++      # 
++      #   render :text => lambda { ... code here which refers to application models ... }
++      #
++      # in an ActionController.
++      #
++      # Instead, we will want to cleanup the application code after the request is
++      # completely finished. So we wrap the body in a BodyWrapper class so that
++      # when the Rack handler calls #close during the end of the request, we get to
++      # run our cleanup code.
++      [status, headers, BodyWrapper.new(body)]
+     end
+   end
+ end
+diff --git a/actionpack/test/controller/reloader_test.rb b/actionpack/test/controller/reloader_test.rb
+new file mode 100644
+index 0000000..0db671e
+--- /dev/null
++++ b/actionpack/test/controller/reloader_test.rb
+@@ -0,0 +1,97 @@
++require 'abstract_unit'
++
++class ReloaderTests < ActiveSupport::TestCase
++  Reloader   = ActionController::Reloader
++  Dispatcher = ActionController::Dispatcher
++  
++  class MyBody < Array
++    def initialize(&block)
++      @on_close = block
++    end
++    
++    def foo
++      "foo"
++    end
++    
++    def bar
++      "bar"
++    end
++    
++    def close
++      @on_close.call if @on_close
++    end
++  end
++  
++  def setup_and_return_body(app = lambda { })
++    Dispatcher.expects(:reload_application)
++    reloader = Reloader.new(app)
++    headers, status, body = reloader.call({ })
++    body
++  end
++  
++  def test_it_reloads_the_application_before_the_request
++    Dispatcher.expects(:reload_application)
++    reloader = Reloader.new(lambda {
++      [200, { "Content-Type" => "text/html" }, [""]]
++    })
++    reloader.call({ })
++  end
++  
++  def test_returned_body_object_always_responds_to_close
++    body = setup_and_return_body(lambda {
++      [200, { "Content-Type" => "text/html" }, [""]]
++    })
++    assert body.respond_to?(:close)
++  end
++  
++  def test_returned_body_object_behaves_like_underlying_object
++    body = setup_and_return_body(lambda {
++      b = MyBody.new
++      b << "hello"
++      b << "world"
++      [200, { "Content-Type" => "text/html" }, b]
++    })
++    assert_equal 2, body.size
++    assert_equal "hello", body[0]
++    assert_equal "world", body[1]
++    assert_equal "foo", body.foo
++    assert_equal "bar", body.bar
++  end
++  
++  def test_it_calls_close_on_underlying_object_when_close_is_called_on_body
++    close_called = false
++    body = setup_and_return_body(lambda {
++      b = MyBody.new do
++        close_called = true
++      end
++      [200, { "Content-Type" => "text/html" }, b]
++    })
++    body.close
++    assert close_called
++  end
++  
++  def test_returned_body_object_responds_to_all_methods_supported_by_underlying_object
++    body = setup_and_return_body(lambda {
++      [200, { "Content-Type" => "text/html" }, MyBody.new]
++    })
++    assert body.respond_to?(:size)
++    assert body.respond_to?(:each)
++    assert body.respond_to?(:foo)
++    assert body.respond_to?(:bar)
++  end
++  
++  def test_it_doesnt_clean_up_the_application_after_call
++    Dispatcher.expects(:cleanup_application).never
++    body = setup_and_return_body(lambda {
++      [200, { "Content-Type" => "text/html" }, MyBody.new]
++    })
++  end
++  
++  def test_it_cleans_up_the_application_when_close_is_called_on_body
++    Dispatcher.expects(:cleanup_application)
++    body = setup_and_return_body(lambda {
++      [200, { "Content-Type" => "text/html" }, MyBody.new]
++    })
++    body.close
++  end
++end
+-- 
+1.6.0.5
+

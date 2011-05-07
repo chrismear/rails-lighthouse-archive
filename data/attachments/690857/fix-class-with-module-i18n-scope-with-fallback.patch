@@ -1,0 +1,113 @@
+From 91877acb3637d997e9721425e8a36dcc1a85bf92 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sven=20G.=20Br=C3=B6nstrup?= <broenstrup@spom.net>
+Date: Sat, 25 Sep 2010 13:37:10 +0200
+Subject: [PATCH] Fallback for attributes and errors in translations for models in modules [#5572 state:resolved]
+
+---
+ activemodel/lib/active_model/errors.rb             |   13 ++++++++++---
+ activemodel/lib/active_model/translation.rb        |    9 +++++++--
+ activemodel/test/cases/translation_test.rb         |   15 +++++++++++++++
+ .../test/cases/validations/i18n_validation_test.rb |    6 +++++-
+ 4 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/activemodel/lib/active_model/errors.rb b/activemodel/lib/active_model/errors.rb
+index 99f47f2..185489e 100644
+--- a/activemodel/lib/active_model/errors.rb
++++ b/activemodel/lib/active_model/errors.rb
+@@ -265,10 +265,17 @@ module ActiveModel
+     def generate_message(attribute, type = :invalid, options = {})
+       type = options.delete(:message) if options[:message].is_a?(Symbol)
+ 
+-      defaults = @base.class.lookup_ancestors.map do |klass|
+-        [ :"#{@base.class.i18n_scope}.errors.models.#{klass.model_name.i18n_key}.attributes.#{attribute}.#{type}",
+-          :"#{@base.class.i18n_scope}.errors.models.#{klass.model_name.i18n_key}.#{type}" ]
++      default_attribute_types = []
++      default_types = []
++      @base.class.lookup_ancestors.each do |klass|
++        key_parts = klass.model_name.i18n_key.to_s.split('.')
++        while key_parts.size > 0
++          default_attribute_types << :"#{@base.class.i18n_scope}.errors.models.#{key_parts * '.'}.attributes.#{attribute}.#{type}"
++          default_types << :"#{@base.class.i18n_scope}.errors.models.#{key_parts * '.'}.#{type}"
++          key_parts.pop
++        end
+       end
++      defaults = default_attribute_types + default_types
+ 
+       defaults << options.delete(:message)
+       defaults << :"#{@base.class.i18n_scope}.errors.messages.#{type}"
+diff --git a/activemodel/lib/active_model/translation.rb b/activemodel/lib/active_model/translation.rb
+index 920a133..acf0ded 100644
+--- a/activemodel/lib/active_model/translation.rb
++++ b/activemodel/lib/active_model/translation.rb
+@@ -43,8 +43,13 @@ module ActiveModel
+     #
+     # Specify +options+ with additional translating options.
+     def human_attribute_name(attribute, options = {})
+-      defaults = lookup_ancestors.map do |klass|
+-        :"#{self.i18n_scope}.attributes.#{klass.model_name.i18n_key}.#{attribute}"
++      defaults = []
++      lookup_ancestors.each do |klass|
++        key_parts = klass.model_name.i18n_key.to_s.split('.')
++        while key_parts.size > 0
++          defaults << :"#{self.i18n_scope}.attributes.#{key_parts * '.'}.#{attribute}"
++          key_parts.pop
++        end
+       end
+ 
+       defaults << :"attributes.#{attribute}"
+diff --git a/activemodel/test/cases/translation_test.rb b/activemodel/test/cases/translation_test.rb
+index ac2e563..e564689 100644
+--- a/activemodel/test/cases/translation_test.rb
++++ b/activemodel/test/cases/translation_test.rb
+@@ -31,6 +31,16 @@ class ActiveModelI18nTests < ActiveModel::TestCase
+     I18n.backend.store_translations 'en', :activemodel => {:attributes => {:person => {:name => 'person name attribute'} } }
+     assert_equal 'person name attribute', Child.human_attribute_name('name')
+   end
++  
++  def test_transalted_model_attributes_with_module_fallback
++    I18n.backend.store_translations 'en', :activemodel => {:attributes => {:person_module => {:title => 'title attribute for module'} } }
++    assert_equal 'title attribute for module', PersonModule::Person.human_attribute_name('title')
++  end
++
++  def test_transalted_model_attributes_with_module
++    I18n.backend.store_translations 'en', :activemodel => {:attributes => {:person_module => { :person => {:title => 'title attribute for person'} } } }
++    assert_equal 'title attribute for person', PersonModule::Person.human_attribute_name('title')
++  end
+ 
+   def test_translated_model_names
+     I18n.backend.store_translations 'en', :activemodel => {:models => {:person => 'person model'} }
+@@ -46,6 +56,11 @@ class ActiveModelI18nTests < ActiveModel::TestCase
+     I18n.backend.store_translations 'en', :activemodel => {:models => {:person => 'person model'} }
+     assert_equal 'person model', Child.model_name.human
+   end
++  
++  def test_translated_model_names_with_module
++    I18n.backend.store_translations 'en', :activemodel => {:models => {:person_module => {:person => 'person model in module'} } }
++    assert_equal 'person model in module', PersonModule::Person.model_name.human
++  end
+ 
+   def test_human_does_not_modify_options
+     options = {:default => 'person model'}
+diff --git a/activemodel/test/cases/validations/i18n_validation_test.rb b/activemodel/test/cases/validations/i18n_validation_test.rb
+index 5cb7bff..6deb91e 100644
+--- a/activemodel/test/cases/validations/i18n_validation_test.rb
++++ b/activemodel/test/cases/validations/i18n_validation_test.rb
+@@ -372,10 +372,14 @@ class I18nValidationTest < ActiveModel::TestCase
+   end
+ 
+   def test_model_with_module_i18n_scope
+-      I18n.backend.store_translations 'en', :activemodel => {:errors => {:models => {:person_module => {:person => {:blank => 'generic blank'}}}}}
++      I18n.backend.store_translations 'en', :activemodel => {:errors => {:models => {:person_module => {:blank => 'generic blank from module'}}}}
+       PersonModule::Person.validates_presence_of :title
+       person = PersonModule::Person.new
+       person.valid?
++      assert_equal ['generic blank from module'], person.errors[:title]
++      
++      I18n.backend.store_translations 'en', :activemodel => {:errors => {:models => {:person_module => {:person => {:blank => 'generic blank'}}}}}
++      person.valid?
+       assert_equal ['generic blank'], person.errors[:title]
+ 
+       I18n.backend.store_translations 'en', :activemodel => {:errors => {:models => {:person_module => {:person => {:attributes => {:title => {:blank => 'title cannot be blank'}}}}}}}
+-- 
+1.6.4.4
+

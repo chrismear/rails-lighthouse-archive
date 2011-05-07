@@ -1,0 +1,110 @@
+From 0b5a91673ee74ca6e1acbbfd53362a05de0b5907 Mon Sep 17 00:00:00 2001
+From: Ryan Aipperspach <ryan@goodguide.com>
+Date: Thu, 7 Apr 2011 13:39:12 -0700
+Subject: [PATCH] Put conditions for polymorphic joins in the ON instead of WHERE clause, in order to support OUTER JOINs
+
+---
+ .../associations/association_scope.rb              |    4 +++-
+ .../join_dependency/join_association.rb            |    1 +
+ .../lib/active_record/associations/join_helper.rb  |   15 +++++++++++++++
+ activerecord/lib/active_record/reflection.rb       |    4 ----
+ .../test/cases/associations/join_model_test.rb     |   15 +++++++++++++++
+ 5 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_scope.rb b/activerecord/lib/active_record/associations/association_scope.rb
+index ab102b2..8fdb92b 100644
+--- a/activerecord/lib/active_record/associations/association_scope.rb
++++ b/activerecord/lib/active_record/associations/association_scope.rb
+@@ -87,7 +87,9 @@ module ActiveRecord
+             end
+           else
+             constraint = table[key].eq(foreign_table[foreign_key])
+-            join       = join(foreign_table, constraint)
++            constraint = append_source_type_condition(constraint, table, foreign_table, reflection)
++            
++            join = join(foreign_table, constraint)
+ 
+             scope = scope.joins(join)
+ 
+diff --git a/activerecord/lib/active_record/associations/join_dependency/join_association.rb b/activerecord/lib/active_record/associations/join_dependency/join_association.rb
+index 4121a5b..f44efb2 100644
+--- a/activerecord/lib/active_record/associations/join_dependency/join_association.rb
++++ b/activerecord/lib/active_record/associations/join_dependency/join_association.rb
+@@ -90,6 +90,7 @@ module ActiveRecord
+             end
+ 
+             constraint = table[key].eq(foreign_table[foreign_key])
++            constraint = append_source_type_condition(constraint, table, foreign_table, reflection)
+ 
+             if reflection.klass.finder_needs_type_condition?
+               constraint = table.create_and([
+diff --git a/activerecord/lib/active_record/associations/join_helper.rb b/activerecord/lib/active_record/associations/join_helper.rb
+index eae546e..9f56b5a 100644
+--- a/activerecord/lib/active_record/associations/join_helper.rb
++++ b/activerecord/lib/active_record/associations/join_helper.rb
+@@ -26,6 +26,21 @@ module ActiveRecord
+         end
+         tables
+       end
++      
++      def append_source_type_condition(constraint, table, foreign_table, reflection)
++        source_type = reflection.options[:source_type] ||
++          (reflection.source_reflection && 
++           reflection.source_reflection.options[:source_type])
++        
++        if (source_type)
++          table.create_and([
++            constraint,
++            foreign_table[reflection.foreign_type].eq(source_type)
++          ])
++        else
++          constraint
++        end
++      end
+ 
+       def table_name_for(reflection)
+         reflection.table_name
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index e801bc4..339ceae 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -450,10 +450,6 @@ module ActiveRecord
+ 
+           through_conditions = through_reflection.conditions
+ 
+-          if options[:source_type]
+-            through_conditions.first << { foreign_type => options[:source_type] }
+-          end
+-
+           # Recursively fill out the rest of the array from the through reflection
+           conditions += through_conditions
+ 
+diff --git a/activerecord/test/cases/associations/join_model_test.rb b/activerecord/test/cases/associations/join_model_test.rb
+index 5a7b139..d01544d 100644
+--- a/activerecord/test/cases/associations/join_model_test.rb
++++ b/activerecord/test/cases/associations/join_model_test.rb
+@@ -362,6 +362,21 @@ class AssociationsJoinModelTest < ActiveRecord::TestCase
+     end
+     assert_equal 5, tag_with_include.taggings.length
+   end
++  
++  def test_has_many_polymporphic_with_source_type_and_some_empty_children
++    tags(:misc).taggings.destroy_all
++    tags(:blue).taggings.destroy_all
++
++    assert tags(:general).taggings.present?
++    assert tags(:misc).taggings.empty?
++    assert tags(:blue).taggings.empty?
++    
++    tags_without_taggings = Tag.includes(:tagged_posts).where(:taggings => {:id => nil}).limit(100).all
++    
++    desired = tags(:misc, :blue)
++    
++    assert_equal desired.sort_by(&:id), tags_without_taggings.sort_by(&:id)
++  end
+ 
+   def test_has_many_through_has_many_find_all
+     assert_equal comments(:greetings), authors(:david).comments.find(:all, :order => 'comments.id').first
+-- 
+1.6.5.1
+

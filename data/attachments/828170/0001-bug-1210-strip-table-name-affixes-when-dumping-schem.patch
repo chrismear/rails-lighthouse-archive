@@ -1,0 +1,99 @@
+From cf3d61ca563c81adfca8ecf02a8d71f27e133e11 Mon Sep 17 00:00:00 2001
+From: Dwayne Litzenberger <dlitz@patientway.com>
+Date: Thu, 16 Dec 2010 17:35:30 -0500
+Subject: [PATCH] bug 1210: strip table name affixes when dumping schema
+
+This prevents double affixes when invoking db:test:prepare with
+table_name_prefix or table_name_suffix.
+---
+ activerecord/lib/active_record/schema_dumper.rb |   21 ++++++++++++++++-----
+ activerecord/test/cases/schema_dumper_test.rb   |   19 +++++++++++++++++++
+ 2 files changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index 1a21f86..533de40 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -61,10 +61,11 @@ HEADER
+ 
+       def tables(stream)
+         @connection.tables.sort.each do |tbl|
++          next unless strip_table_name_affixes(tbl)   # If using table_name_prefix/table_name_suffix, only dump the matching tables
+           next if ['schema_migrations', ignore_tables].flatten.any? do |ignored|
+             case ignored
+-            when String; tbl == ignored
+-            when Regexp; tbl =~ ignored
++            when String; strip_table_name_affixes(tbl) == ignored
++            when Regexp; strip_table_name_affixes(tbl) =~ ignored
+             else
+               raise StandardError, 'ActiveRecord::SchemaDumper.ignore_tables accepts an array of String and / or Regexp values.'
+             end
+@@ -85,7 +86,7 @@ HEADER
+             pk = @connection.primary_key(table)
+           end
+           
+-          tbl.print "  create_table #{table.inspect}"
++          tbl.print "  create_table #{strip_table_name_affixes(table).inspect}"
+           if columns.detect { |c| c.name == pk }
+             if pk != 'id'
+               tbl.print %Q(, :primary_key => "#{pk}")
+@@ -166,9 +167,9 @@ HEADER
+       def indexes(table, stream)
+         if (indexes = @connection.indexes(table)).any?
+           add_index_statements = indexes.map do |index|
+-            statment_parts = [ ('add_index ' + index.table.inspect) ]
++            statment_parts = [ ('add_index ' + strip_table_name_affixes(index.table).inspect) ]
+             statment_parts << index.columns.inspect
+-            statment_parts << (':name => ' + index.name.inspect)
++            statment_parts << (':name => ' + strip_table_name_affixes(index.name).inspect)
+             statment_parts << ':unique => true' if index.unique
+ 
+             index_lengths = index.lengths.compact if index.lengths.is_a?(Array)
+@@ -181,5 +182,15 @@ HEADER
+           stream.puts
+         end
+       end
++
++      # Remove the ActiveRecord::Base.table_name_prefix and
++      # ActiveRecord::Base.table_name_suffix from a table name.
++      #
++      # Returns nil if the affixes are missing from the argument.
++      def strip_table_name_affixes(table_name)
++        regexp = /\A#{Regexp.quote(Base.table_name_prefix || "")}(.*)#{Regexp.quote(Base.table_name_suffix || "")}\Z/m
++        return nil unless table_name =~ regexp
++        $1
++      end
+   end
+ end
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index ba714a9..cf29459 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -207,5 +207,24 @@ class SchemaDumperTest < ActiveRecord::TestCase
+     assert_match %r(:id => false), match[1], "no table id not preserved"
+     assert_match %r{t.string[[:space:]]+"id",[[:space:]]+:null => false$}, match[2], "non-primary key id column not preserved"
+   end
++
++  def test_schema_dump_with_table_name_affixes
++    # will match "comments", "companies", "computers"
++    ActiveRecord::Base.table_name_prefix = "com"
++    ActiveRecord::Base.table_name_suffix = "s"
++
++    output = standard_dump
++
++    match = output.match(%r{create_table "ment"(.*)do.*\n(.*)\n})
++    assert_not_nil(match, "(com)ment(s) table not found")
++
++    match = output.match(%r{create_table "panie"(.*)do.*\n(.*)\n})
++    assert_not_nil(match, "(com)panie(s) table not found")
++
++    match = output.match(%r{create_table "puter"(.*)do.*\n(.*)\n})
++    assert_not_nil(match, "(com)puter(s) table not found")
++  ensure
++    ActiveRecord::Base.table_name_prefix = ActiveRecord::Base.table_name_suffix = ""
++  end
+ end
+ 
+-- 
+1.7.1
+

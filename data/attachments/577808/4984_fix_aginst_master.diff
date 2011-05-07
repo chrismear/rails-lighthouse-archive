@@ -1,0 +1,173 @@
+From c1a182c5da940b3a30c2e831fcd64302d8ad219e Mon Sep 17 00:00:00 2001
+From: Neeraj Singh <neerajdotname@gmail.com>
+Date: Sun, 27 Jun 2010 11:17:44 -0400
+Subject: [PATCH] reset_counter should work with non-traditional belongs_to and
+ polymorphic belongs_to
+
+[#4984 state:resolved]
+---
+ activerecord/lib/active_record/counter_cache.rb |   12 +++++++++---
+ activerecord/test/cases/counter_cache_test.rb   |   19 ++++++++++++++++---
+ activerecord/test/fixtures/cars.yml             |    4 ++++
+ activerecord/test/models/car.rb                 |    4 ++++
+ activerecord/test/models/engine.rb              |    3 +++
+ activerecord/test/models/wheel.rb               |    3 +++
+ activerecord/test/schema/schema.rb              |   13 +++++++++++++
+ 7 files changed, 52 insertions(+), 6 deletions(-)
+ create mode 100644 activerecord/test/fixtures/cars.yml
+ create mode 100644 activerecord/test/models/car.rb
+ create mode 100644 activerecord/test/models/engine.rb
+ create mode 100644 activerecord/test/models/wheel.rb
+
+diff --git a/activerecord/lib/active_record/counter_cache.rb b/activerecord/lib/active_record/counter_cache.rb
+index 9993221..808e70d 100644
+--- a/activerecord/lib/active_record/counter_cache.rb
++++ b/activerecord/lib/active_record/counter_cache.rb
+@@ -17,8 +17,14 @@ module ActiveRecord
+     def reset_counters(id, *counters)
+       object = find(id)
+       counters.each do |association|
+-        child_class = reflect_on_association(association.to_sym).klass
+-        belongs_name = self.name.demodulize.underscore.to_sym
++        has_many_association = reflect_on_association(association.to_sym)
++        polymorphic_class = has_many_association.options[:as]
++        child_class = has_many_association.klass
++        belongs_to = child_class.reflect_on_all_associations(:belongs_to)
++        belongs_to_association = belongs_to.detect do |e| 
++          polymorphic_class.nil? ?  (e.class_name == self.name) : (e.class_name.to_s.downcase == polymorphic_class.to_s.downcase)
++        end
++        belongs_name = belongs_to_association.name
+         counter_name = child_class.reflect_on_association(belongs_name).counter_cache_column
+ 
+         self.unscoped.where(arel_table[self.primary_key].eq(object.id)).arel.update({
+@@ -103,4 +109,4 @@ module ActiveRecord
+       update_counters(id, counter_name => -1)
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/cases/counter_cache_test.rb b/activerecord/test/cases/counter_cache_test.rb
+index 377de16..1372362 100644
+--- a/activerecord/test/cases/counter_cache_test.rb
++++ b/activerecord/test/cases/counter_cache_test.rb
+@@ -1,17 +1,20 @@
+ require 'cases/helper'
+ require 'models/topic'
++require 'models/car'
++require 'models/wheel'
++require 'models/engine'
+ require 'models/reply'
+ require 'models/category'
+ require 'models/categorization'
+ 
+ class CounterCacheTest < ActiveRecord::TestCase
+-  fixtures :topics, :categories, :categorizations
++  fixtures :topics, :categories, :categorizations, :cars
+ 
+-  class SpecialTopic < ::Topic
++  class ::SpecialTopic < ::Topic
+     has_many :special_replies, :foreign_key => 'parent_id'
+   end
+ 
+-  class SpecialReply < ::Reply
++  class ::SpecialReply < ::Reply
+     belongs_to :special_topic, :foreign_key => 'parent_id', :counter_cache => 'replies_count'
+   end
+ 
+@@ -58,6 +61,16 @@ class CounterCacheTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  test "reset counter should with belongs_to which has class_name" do
++    car = cars(:honda)
++    assert_nothing_raised do
++      Car.reset_counters(car.id, :engines)
++    end
++    assert_nothing_raised do
++      Car.reset_counters(car.id, :wheels)
++    end
++  end
++
+   test "update counter with initial null value" do
+     category = categories(:general)
+     assert_equal 2, category.categorizations.count
+diff --git a/activerecord/test/fixtures/cars.yml b/activerecord/test/fixtures/cars.yml
+new file mode 100644
+index 0000000..23c98e8
+--- /dev/null
++++ b/activerecord/test/fixtures/cars.yml
+@@ -0,0 +1,4 @@
++honda:
++  id: 1
++  name: honda
++  engines_count: 0
+diff --git a/activerecord/test/models/car.rb b/activerecord/test/models/car.rb
+new file mode 100644
+index 0000000..1101180
+--- /dev/null
++++ b/activerecord/test/models/car.rb
+@@ -0,0 +1,4 @@
++class Car < ActiveRecord::Base
++  has_many :engines
++  has_many :wheels, :as => :wheelable
++end
+diff --git a/activerecord/test/models/engine.rb b/activerecord/test/models/engine.rb
+new file mode 100644
+index 0000000..751c3f0
+--- /dev/null
++++ b/activerecord/test/models/engine.rb
+@@ -0,0 +1,3 @@
++class Engine < ActiveRecord::Base
++  belongs_to :my_car, :class_name => 'Car', :foreign_key => 'car_id',  :counter_cache => :engines_count
++end
+diff --git a/activerecord/test/models/wheel.rb b/activerecord/test/models/wheel.rb
+new file mode 100644
+index 0000000..26868bc
+--- /dev/null
++++ b/activerecord/test/models/wheel.rb
+@@ -0,0 +1,3 @@
++class Wheel < ActiveRecord::Base
++  belongs_to :wheelable, :polymorphic => true, :counter_cache => true
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index b212e7c..bea351b 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -82,6 +82,12 @@ ActiveRecord::Schema.define do
+     t.string :name
+   end
+ 
++  create_table :cars, :force => true do |t|
++    t.string  :name
++    t.integer :engines_count
++    t.integer :wheels_count
++  end
++
+   create_table :categories, :force => true do |t|
+     t.string :name, :null => false
+     t.string :type
+@@ -179,6 +185,9 @@ ActiveRecord::Schema.define do
+   end
+   add_index :edges, [:source_id, :sink_id], :unique => true, :name => 'unique_edge_index'
+ 
++  create_table :engines, :force => true do |t|
++    t.integer :car_id
++  end
+ 
+   create_table :entrants, :force => true do |t|
+     t.string  :name, :null => false
+@@ -566,6 +575,10 @@ ActiveRecord::Schema.define do
+     t.integer :zine_id
+   end
+ 
++  create_table :wheels, :force => true do |t|
++    t.references :wheelable, :polymorphic => true
++  end
++
+   create_table :zines, :force => true do |t|
+     t.string :title
+   end
+-- 
+1.6.5.2
+

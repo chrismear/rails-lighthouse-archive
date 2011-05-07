@@ -1,0 +1,156 @@
+From 9d5573bbd81640db83e28c4bc33b11b9aa46f4b7 Mon Sep 17 00:00:00 2001
+From: Christoph Petschnig <info@purevirtual.de>
+Date: Wed, 3 Jun 2009 14:22:48 +0200
+Subject: [PATCH] SchemaDumper handles table_prefix/suffix better
+
+---
+ activerecord/lib/active_record/schema_dumper.rb    |   18 ++++-
+ .../test/cases/schema_dumper_prefix_suffix_test.rb |  100 ++++++++++++++++++++
+ 2 files changed, 117 insertions(+), 1 deletions(-)
+ create mode 100644 activerecord/test/cases/schema_dumper_prefix_suffix_test.rb
+
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index 2d90ef3..b9b415c 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -15,6 +15,20 @@ module ActiveRecord
+     cattr_accessor :ignore_tables 
+     @@ignore_tables = []
+ 
++    ##
++    # :singleton-method:
++    # If set to true, dump only those tables, where table name begins like
++    # ActiveRecord::Base.table_name_prefix. Default is true.
++    cattr_accessor :dump_only_with_prefix
++    @@dump_only_with_prefix = true
++
++    ##
++    # :singleton-method:
++    # Works like +dump_only_with_prefix+, but checks the end of the table names.
++    # Default is true
++    cattr_accessor :dump_only_with_suffix
++    @@dump_only_with_suffix = true
++
+     def self.dump(connection=ActiveRecord::Base.connection, stream=STDOUT)
+       new(connection).dump(stream)
+       stream
+@@ -61,7 +75,9 @@ HEADER
+ 
+       def tables(stream)
+         @connection.tables.sort.each do |tbl|
+-          next if ['schema_migrations', ignore_tables].flatten.any? do |ignored|
++          next if (dump_only_with_prefix && tbl !~ Regexp.new("^#{ActiveRecord::Base.table_name_prefix}")) ||
++              (dump_only_with_suffix && tbl !~ Regexp.new("#{ActiveRecord::Base.table_name_suffix}$"))
++          next if [ActiveRecord::Migrator.schema_migrations_table_name, ignore_tables].flatten.any? do |ignored|
+             case ignored
+             when String; tbl == ignored
+             when Regexp; tbl =~ ignored
+diff --git a/activerecord/test/cases/schema_dumper_prefix_suffix_test.rb b/activerecord/test/cases/schema_dumper_prefix_suffix_test.rb
+new file mode 100644
+index 0000000..2567720
+--- /dev/null
++++ b/activerecord/test/cases/schema_dumper_prefix_suffix_test.rb
+@@ -0,0 +1,100 @@
++require "cases/helper"
++require 'stringio'
++
++class TableWithPrefixAndSuffix < ActiveRecord::Base; end
++
++class SchemaDumperPrefixSuffixTest < ActiveRecord::TestCase
++
++  OTHER_TABLES = %w(prefix_attached_on_table_name table_with_suffix unmatched_table_name)
++
++  def setup
++    # other tests should not be affected
++    @last_prefix = ActiveRecord::Base.table_name_prefix
++    @last_suffix = ActiveRecord::Base.table_name_suffix
++
++    ActiveRecord::Base.table_name_prefix = 'prefix_'
++    ActiveRecord::Base.table_name_suffix = '_suffix'
++
++    # calling table name will pin down the name of the class' db table
++    TableWithPrefixAndSuffix.table_name
++
++    # create other tables that do not match prefix, suffix or both of them
++    OTHER_TABLES.each do |table_name|
++      ActiveRecord::Base.connection.create_table(table_name) do |t|
++        t.column :foo, :int
++      end
++    end
++
++    # create the pre- and suffixed table
++    ActiveRecord::Base.connection.create_table(TableWithPrefixAndSuffix.table_name) do |t|
++      t.column :foo, :int
++    end
++    
++  end
++
++  def teardown
++    ActiveRecord::Base.connection.drop_table(TableWithPrefixAndSuffix.table_name)
++
++    OTHER_TABLES.each do |table_name|
++      ActiveRecord::Base.connection.drop_table(table_name)
++    end
++
++    # restore previous settings
++    ActiveRecord::Base.table_name_prefix = @last_prefix
++    ActiveRecord::Base.table_name_suffix = @last_suffix
++  end
++  
++  def standard_dump(ignore_tables = [])
++    stream = StringIO.new
++    ActiveRecord::SchemaDumper.ignore_tables = ignore_tables
++    ActiveRecord::SchemaDumper.dump(ActiveRecord::Base.connection, stream)
++    stream.string
++  end
++
++  def test_dump_only_pre_and_suffixed
++    ActiveRecord::SchemaDumper.dump_only_with_prefix = true
++    ActiveRecord::SchemaDumper.dump_only_with_suffix = true
++
++    output = standard_dump
++    assert_match %r{create_table "prefix_table_with_prefix_and_suffixes_suffix"}, output
++    assert output.scan(/create_table/).count == 1
++  end
++
++  def test_dump_only_prefixed
++    ActiveRecord::SchemaDumper.dump_only_with_prefix = true
++    ActiveRecord::SchemaDumper.dump_only_with_suffix = false
++
++    output = standard_dump
++    assert_match %r{create_table "prefix_table_with_prefix_and_suffixes_suffix"}, output
++    # at least two tables must get dumped
++    assert output.scan(/create_table/).count >= 2
++  end
++
++  def test_dump_only_suffixed
++    ActiveRecord::SchemaDumper.dump_only_with_prefix = false
++    ActiveRecord::SchemaDumper.dump_only_with_suffix = true
++
++    output = standard_dump
++    assert_match %r{create_table "prefix_table_with_prefix_and_suffixes_suffix"}, output
++    # at least two tables must get dumped
++    assert output.scan(/create_table/).count >= 2
++  end
++
++  # assert that turning off both flags will dump everything except
++  # ignore_tables and schema_migrations
++  def test_dump_all_with_ignore_tables
++    ActiveRecord::SchemaDumper.dump_only_with_prefix = false
++    ActiveRecord::SchemaDumper.dump_only_with_suffix = false
++
++    output = standard_dump
++    assert_match %r{create_table "prefix_table_with_prefix_and_suffixes_suffix"}, output
++    # at least four tables must get dumped
++    assert output.scan(/create_table/).count >= 4
++
++    # check, if ignore_tables is still working
++    output = standard_dump([/attached_on/])
++    assert_no_match %r{create_table "prefix_attached_on_table_name"}, output
++
++    ActiveRecord::SchemaDumper.ignore_tables = []
++  end
++end
+-- 
+1.5.6.3
+

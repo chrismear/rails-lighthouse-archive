@@ -1,0 +1,348 @@
+From 612049aca6ba2f73dfc1b3cafa46b073a5c292f6 Mon Sep 17 00:00:00 2001
+From: Jakub Suder <jakub.suder@gmail.com>
+Date: Sun, 29 Aug 2010 16:10:31 +0200
+Subject: [PATCH 2/3] fixed some issues with JSON encoding
+
+- as_json in ActiveModel should return a hash
+  and handle :only/:except/:methods options
+- Array and Hash should call as_json on their elements
+- json methods should not modify options argument
+---
+ activemodel/lib/active_model/serialization.rb      |   18 +++---
+ activemodel/lib/active_model/serializers/json.rb   |   14 ++---
+ .../serializeration/json_serialization_test.rb     |   27 ++++++++
+ activerecord/lib/active_record/relation.rb         |    4 +-
+ activerecord/lib/active_record/serialization.rb    |    2 +-
+ activerecord/test/cases/json_serialization_test.rb |    7 ++
+ activesupport/lib/active_support/json/encoding.rb  |   50 +++++++++++++--
+ activesupport/test/json/encoding_test.rb           |   65 +++++++++++++++++++-
+ 8 files changed, 162 insertions(+), 25 deletions(-)
+
+diff --git a/activemodel/lib/active_model/serialization.rb b/activemodel/lib/active_model/serialization.rb
+index 542cff3..8f90ef6 100644
+--- a/activemodel/lib/active_model/serialization.rb
++++ b/activemodel/lib/active_model/serialization.rb
+@@ -54,12 +54,14 @@ module ActiveModel
+   #
+   #   person = Person.new
+   #   person.serializable_hash   # => {"name"=>nil}
+-  #   person.as_json             # => "{\"name\":null}"
++  #   person.as_json             # => {"name"=>nil}
++  #   person.to_json             # => "{\"name\":null}"
+   #   person.to_xml              # => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<serial-person...
+   #
+   #   person.name = "Bob"
+   #   person.serializable_hash   # => {"name"=>"Bob"}
+-  #   person.as_json             # => "{\"name\":\"Bob\"}"
++  #   person.as_json             # => {"name"=>"Bob"}
++  #   person.to_json             # => "{\"name\":\"Bob\"}"
+   #   person.to_xml              # => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<serial-person...
+   #
+   # Valid options are <tt>:only</tt>, <tt>:except</tt> and <tt>:methods</tt> .
+@@ -67,14 +69,14 @@ module ActiveModel
+     def serializable_hash(options = nil)
+       options ||= {}
+ 
+-      options[:only]   = Array.wrap(options[:only]).map { |n| n.to_s }
+-      options[:except] = Array.wrap(options[:except]).map { |n| n.to_s }
++      only   = Array.wrap(options[:only]).map(&:to_s)
++      except = Array.wrap(options[:except]).map(&:to_s)
+ 
+       attribute_names = attributes.keys.sort
+-      if options[:only].any?
+-        attribute_names &= options[:only]
+-      elsif options[:except].any?
+-        attribute_names -= options[:except]
++      if only.any?
++        attribute_names &= only
++      elsif except.any?
++        attribute_names -= except
+       end
+ 
+       method_names = Array.wrap(options[:methods]).inject([]) do |methods, name|
+diff --git a/activemodel/lib/active_model/serializers/json.rb b/activemodel/lib/active_model/serializers/json.rb
+index c9271ed..0bfbf2a 100644
+--- a/activemodel/lib/active_model/serializers/json.rb
++++ b/activemodel/lib/active_model/serializers/json.rb
+@@ -79,18 +79,16 @@ module ActiveModel
+       #                    "title": "Welcome to the weblog"},
+       #                   {"comments": [{"body": "Don't think too hard"}],
+       #                    "title": "So I was thinking"}]}
+-      def encode_json(encoder)
+-        hash = serializable_hash(encoder.options)
++
++      def as_json(options = nil)
++        hash = serializable_hash(options)
++
+         if include_root_in_json
+-          custom_root = encoder.options && encoder.options[:root]
++          custom_root = options && options[:root]
+           hash = { custom_root || self.class.model_name.element => hash }
+         end
+ 
+-        ActiveSupport::JSON.encode(hash)
+-      end
+-
+-      def as_json(options = nil)
+-        self
++        hash
+       end
+ 
+       def from_json(json)
+diff --git a/activemodel/test/cases/serializeration/json_serialization_test.rb b/activemodel/test/cases/serializeration/json_serialization_test.rb
+index 3bc39bb..20d123e 100644
+--- a/activemodel/test/cases/serializeration/json_serialization_test.rb
++++ b/activemodel/test/cases/serializeration/json_serialization_test.rb
+@@ -116,5 +116,32 @@ class JsonSerializationTest < ActiveModel::TestCase
+     assert_equal hash.to_json, car.errors.to_json
+   end
+ 
++  test "serializable_hash should not modify options passed in argument" do
++    options = { :except => :name }
++    @contact.serializable_hash(options)
++
++    assert_nil options[:only]
++    assert_equal :name, options[:except]
++  end
++
++  test "as_json should return a hash" do
++    json = @contact.as_json
++
++    assert_kind_of Hash, json
++    assert_kind_of Hash, json['contact']
++    %w(name age created_at awesome preferences).each do |field|
++      assert_equal @contact.send(field), json['contact'][field]
++    end
++  end
++
++  test "custom as_json should be honored when generating json" do
++    def @contact.as_json(options); { :name => name, :created_at => created_at }; end
++    json = @contact.to_json
++
++    assert_match %r{"name":"Konata Izumi"}, json
++    assert_match %r{"created_at":#{ActiveSupport::JSON.encode(Time.utc(2006, 8, 1))}}, json
++    assert_no_match %r{"awesome":}, json
++    assert_no_match %r{"preferences":}, json
++  end
+ 
+ end
+diff --git a/activerecord/lib/active_record/relation.rb b/activerecord/lib/active_record/relation.rb
+index b7ed81c..c75e645 100644
+--- a/activerecord/lib/active_record/relation.rb
++++ b/activerecord/lib/active_record/relation.rb
+@@ -76,7 +76,9 @@ module ActiveRecord
+       @records
+     end
+ 
+-    def as_json(options = nil) to_a end #:nodoc:
++    def as_json(options = nil) #:nodoc:
++      to_a.as_json(options)
++    end
+ 
+     # Returns size of the records.
+     def size
+diff --git a/activerecord/lib/active_record/serialization.rb b/activerecord/lib/active_record/serialization.rb
+index 6ec4063..ad3f7af 100644
+--- a/activerecord/lib/active_record/serialization.rb
++++ b/activerecord/lib/active_record/serialization.rb
+@@ -5,7 +5,7 @@ module ActiveRecord #:nodoc:
+     include ActiveModel::Serializers::JSON
+ 
+     def serializable_hash(options = nil)
+-      options ||= {}
++      options = options.try(:clone) || {}
+ 
+       options[:except] = Array.wrap(options[:except]).map { |n| n.to_s }
+       options[:except] |= Array.wrap(self.class.inheritance_column)
+diff --git a/activerecord/test/cases/json_serialization_test.rb b/activerecord/test/cases/json_serialization_test.rb
+index a5736b2..5da7f9e 100644
+--- a/activerecord/test/cases/json_serialization_test.rb
++++ b/activerecord/test/cases/json_serialization_test.rb
+@@ -82,6 +82,13 @@ class JsonSerializationTest < ActiveRecord::TestCase
+     assert_match %r{"label":"Has cheezburger"}, methods_json
+     assert_match %r{"favorite_quote":"Constraints are liberating"}, methods_json
+   end
++
++  def test_serializable_hash_should_not_modify_options_in_argument
++    options = { :only => :name }
++    @contact.serializable_hash(options)
++
++    assert_nil options[:except]
++  end
+ end
+ 
+ class DatabaseConnectedJsonEncodingTest < ActiveRecord::TestCase
+diff --git a/activesupport/lib/active_support/json/encoding.rb b/activesupport/lib/active_support/json/encoding.rb
+index 2f9588e..e5fb4b9 100644
+--- a/activesupport/lib/active_support/json/encoding.rb
++++ b/activesupport/lib/active_support/json/encoding.rb
+@@ -41,9 +41,26 @@ module ActiveSupport
+           @seen = []
+         end
+ 
+-        def encode(value)
++        def encode(value, use_options = true)
+           check_for_circular_references(value) do
+-            value.as_json(options).encode_json(self)
++            jsonified = use_options ? value.as_json(options_for(value)) : value.as_json
++            jsonified.encode_json(self)
++          end
++        end
++
++        # like encode, but only calls as_json, without encoding to string
++        def jsonify(value)
++          check_for_circular_references(value) do
++            value.as_json(options_for(value))
++          end
++        end
++
++        def options_for(value)
++          if value.is_a?(Array) || value.is_a?(Hash)
++            # hashes and arrays need to get encoder in the options, so that they can detect circular references
++            (options || {}).merge(:encoder => self)
++          else
++            options
+           end
+         end
+ 
+@@ -186,13 +203,22 @@ module Enumerable
+ end
+ 
+ class Array
+-  def as_json(options = nil) self end #:nodoc:
+-  def encode_json(encoder) "[#{map { |v| encoder.encode(v) } * ','}]" end #:nodoc:
++  def as_json(options = nil) #:nodoc:
++    # use encoder as a proxy to call as_json on all elements, to protect from circular references
++    encoder = options && options[:encoder] || ActiveSupport::JSON::Encoding::Encoder.new(options)
++    map { |v| encoder.jsonify(v) }
++  end
++
++  def encode_json(encoder) #:nodoc:
++    # we assume here that the encoder has already run as_json on self and the elements, so we run encode_json directly
++    "[#{map { |v| v.encode_json(encoder) } * ','}]"
++  end
+ end
+ 
+ class Hash
+   def as_json(options = nil) #:nodoc:
+-    if options
++    # create a subset of the hash by applying :only or :except
++    subset = if options
+       if attrs = options[:only]
+         slice(*Array.wrap(attrs))
+       elsif attrs = options[:except]
+@@ -203,10 +229,22 @@ class Hash
+     else
+       self
+     end
++
++    # use encoder as a proxy to call as_json on all values in the subset, to protect from circular references
++    encoder = options && options[:encoder] || ActiveSupport::JSON::Encoding::Encoder.new(options)
++    pairs = subset.map { |k, v| [k.to_s, encoder.jsonify(v)] }
++    result = self.is_a?(ActiveSupport::OrderedHash) ? ActiveSupport::OrderedHash.new : Hash.new
++    pairs.inject(result) { |hash, pair| hash[pair.first] = pair.last; hash }
+   end
+ 
+   def encode_json(encoder)
+-    "{#{map { |k,v| "#{encoder.encode(k.to_s)}:#{encoder.encode(v)}" } * ','}}"
++    # values are encoded with use_options = false, because we don't want hash representations from ActiveModel to be
++    # processed once again with as_json with options, as this could cause unexpected results (i.e. missing fields);
++
++    # on the other hand, we need to run as_json on the elements, because the model representation may contain fields
++    # like Time/Date in their original (not jsonified) form, etc.
++
++    "{#{map { |k,v| "#{encoder.encode(k.to_s)}:#{encoder.encode(v, false)}" } * ','}}"
+   end
+ end
+ 
+diff --git a/activesupport/test/json/encoding_test.rb b/activesupport/test/json/encoding_test.rb
+index 1527d02..e0494de 100644
+--- a/activesupport/test/json/encoding_test.rb
++++ b/activesupport/test/json/encoding_test.rb
+@@ -108,12 +108,24 @@ class TestJSONEncoding < Test::Unit::TestCase
+     end
+   end
+ 
+-  def test_exception_raised_when_encoding_circular_reference
++  def test_exception_raised_when_encoding_circular_reference_in_array
+     a = [1]
+     a << a
+     assert_raise(ActiveSupport::JSON::Encoding::CircularReferenceError) { ActiveSupport::JSON.encode(a) }
+   end
+ 
++  def test_exception_raised_when_encoding_circular_reference_in_hash
++    a = { :name => 'foo' }
++    a[:next] = a
++    assert_raise(ActiveSupport::JSON::Encoding::CircularReferenceError) { ActiveSupport::JSON.encode(a) }
++  end
++
++  def test_exception_raised_when_encoding_circular_reference_in_hash_inside_array
++    a = { :name => 'foo', :sub => [] }
++    a[:sub] << a
++    assert_raise(ActiveSupport::JSON::Encoding::CircularReferenceError) { ActiveSupport::JSON.encode(a) }
++  end
++
+   def test_hash_key_identifiers_are_always_quoted
+     values = {0 => 0, 1 => 1, :_ => :_, "$" => "$", "a" => "a", :A => :A, :A0 => :A0, "A0B" => "A0B"}
+     assert_equal %w( "$" "A" "A0" "A0B" "_" "a" "0" "1" ).sort, object_keys(ActiveSupport::JSON.encode(values))
+@@ -152,6 +164,57 @@ class TestJSONEncoding < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_hash_should_pass_encoding_options_to_children_in_as_json
++    person = {
++      :name => 'John',
++      :address => {
++        :city => 'London',
++        :country => 'UK'
++      }
++    }
++    json = person.as_json :only => [:address, :city]
++
++    assert_equal({ 'address' => { 'city' => 'London' }}, json)
++  end
++
++  def test_hash_should_pass_encoding_options_to_children_in_to_json
++    person = {
++      :name => 'John',
++      :address => {
++        :city => 'London',
++        :country => 'UK'
++      }
++    }
++    json = person.to_json :only => [:address, :city]
++
++    assert_equal(%({"address":{"city":"London"}}), json)
++  end
++
++  def test_array_should_pass_encoding_options_to_children_in_as_json
++    people = [
++      { :name => 'John', :address => { :city => 'London', :country => 'UK' }},
++      { :name => 'Jean', :address => { :city => 'Paris' , :country => 'France' }}
++    ]
++    json = people.as_json :only => [:address, :city]
++    expected = [
++      { 'address' => { 'city' => 'London' }},
++      { 'address' => { 'city' => 'Paris' }}
++    ]
++
++    assert_equal(expected, json)
++  end
++
++  def test_array_should_pass_encoding_options_to_children_in_to_json
++    people = [
++      { :name => 'John', :address => { :city => 'London', :country => 'UK' }},
++      { :name => 'Jean', :address => { :city => 'Paris' , :country => 'France' }}
++    ]
++    json = people.to_json :only => [:address, :city]
++
++    assert_equal(%([{"address":{"city":"London"}},{"address":{"city":"Paris"}}]), json)
++  end
++
++
+   protected
+ 
+     def object_keys(json_object)
+-- 
+1.6.4.4
+

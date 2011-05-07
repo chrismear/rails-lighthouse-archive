@@ -1,0 +1,229 @@
+From c874aee3b5d31e2d57570491f968a2d8eef4fc40 Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Wed, 31 Mar 2010 03:12:10 +0100
+Subject: [PATCH] Refactor compute_type to handle situations where the correct class is already loaded
+
+---
+ activerecord/lib/active_record/base.rb     |   35 +++++++++++++++------------
+ activerecord/test/cases/base_test.rb       |    5 ----
+ activerecord/test/cases/modules_test.rb    |   33 +++++++++++++++++++++++++-
+ activerecord/test/fixtures/collections.yml |    3 ++
+ activerecord/test/fixtures/products.yml    |    4 +++
+ activerecord/test/fixtures/variants.yml    |    4 +++
+ activerecord/test/models/shop.rb           |   12 +++++++++
+ activerecord/test/schema/schema.rb         |   14 +++++++++++
+ 8 files changed, 88 insertions(+), 22 deletions(-)
+ create mode 100644 activerecord/test/fixtures/collections.yml
+ create mode 100644 activerecord/test/fixtures/products.yml
+ create mode 100644 activerecord/test/fixtures/variants.yml
+ create mode 100644 activerecord/test/models/shop.rb
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 3aab5c0..af6fd56 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1690,16 +1690,6 @@ module ActiveRecord #:nodoc:
+           object
+         end
+ 
+-        # Nest the type name in the same module as this class.
+-        # Bar is "MyApp::Business::Bar" relative to MyApp::Business::Foo
+-        def type_name_with_module(type_name)
+-          if store_full_sti_class
+-            type_name
+-          else
+-            (/^::/ =~ type_name) ? type_name : "#{parent.name}::#{type_name}"
+-          end
+-        end
+-
+         def default_select(qualified)
+           if qualified
+             quoted_table_name + '.*'
+@@ -2221,13 +2211,26 @@ module ActiveRecord #:nodoc:
+         # Returns the class type of the record using the current module as a prefix. So descendants of
+         # MyApp::Business::Account would appear as MyApp::Business::AccountSubclass.
+         def compute_type(type_name)
+-          modularized_name = type_name_with_module(type_name)
+-          silence_warnings do
+-            begin
+-              class_eval(modularized_name, __FILE__, __LINE__)
+-            rescue NameError
+-              class_eval(type_name, __FILE__, __LINE__)
++          if type_name.match(/^::/)
++            # If the type is prefixed with a scope operator then we assume that
++            # the type_name is an absolute reference.
++            type_name.constantize
++          else
++            # Build a list of candidates to search for
++            candidates = []
++            name.scan(/::|$/) { candidates.unshift "#{$`}::#{type_name}" }
++            candidates << type_name
++
++            candidates.each do |candidate|
++              begin
++                constant = candidate.constantize
++                return constant if candidate == constant.to_s
++              rescue NameError
++              rescue ArgumentError
++              end
+             end
++
++            raise NameError, "uninitialized constant #{candidates.first}"
+           end
+         end
+ 
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 2bf7939..d71befb 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -2073,11 +2073,6 @@ class BasicsTest < ActiveRecord::TestCase
+     assert xml.include?(%(<arbitrary-element>#{value}</arbitrary-element>))
+   end
+ 
+-  def test_type_name_with_module_should_handle_beginning
+-    assert_equal 'ActiveRecord::Person', ActiveRecord::Base.send(:type_name_with_module, 'Person')
+-    assert_equal '::Person', ActiveRecord::Base.send(:type_name_with_module, '::Person')
+-  end
+-
+   def test_to_param_should_return_string
+     assert_kind_of String, Client.find(:first).to_param
+   end
+diff --git a/activerecord/test/cases/modules_test.rb b/activerecord/test/cases/modules_test.rb
+index 62d5401..f2eecd8 100644
+--- a/activerecord/test/cases/modules_test.rb
++++ b/activerecord/test/cases/modules_test.rb
+@@ -1,8 +1,9 @@
+ require "cases/helper"
+ require 'models/company_in_module'
++require 'models/shop'
+ 
+ class ModulesTest < ActiveRecord::TestCase
+-  fixtures :accounts, :companies, :projects, :developers
++  fixtures :accounts, :companies, :projects, :developers, :collections, :products, :variants
+ 
+   def setup
+     # need to make sure Object::Firm and Object::Client are not defined,
+@@ -106,4 +107,34 @@ class ModulesTest < ActiveRecord::TestCase
+     ActiveRecord::Base.table_name_prefix = ''
+     classes.each(&:reset_table_name)
+   end
++
++  def test_compute_type_can_infer_class_name_of_sibling_inside_module
++    old = ActiveRecord::Base.store_full_sti_class
++    ActiveRecord::Base.store_full_sti_class = true
++    assert_equal MyApplication::Business::Firm, MyApplication::Business::Client.send(:compute_type, "Firm")
++  ensure
++    ActiveRecord::Base.store_full_sti_class = old
++  end
++
++  def test_nested_models_should_not_raise_exception_when_using_delete_all_dependency_on_association
++    old = ActiveRecord::Base.store_full_sti_class
++    ActiveRecord::Base.store_full_sti_class = true
++
++    collection = Shop::Collection.find(:first)
++    assert !collection.products.empty?, "Collection should have products"
++    assert_nothing_raised { collection.destroy }
++  ensure
++    ActiveRecord::Base.store_full_sti_class = old
++  end
++
++  def test_nested_models_should_not_raise_exception_when_using_nullify_dependency_on_association
++    old = ActiveRecord::Base.store_full_sti_class
++    ActiveRecord::Base.store_full_sti_class = true
++
++    product = Shop::Product.find(:first)
++    assert !product.variants.empty?, "Product should have variants"
++    assert_nothing_raised { product.destroy }
++  ensure
++    ActiveRecord::Base.store_full_sti_class = old
++  end
+ end
+diff --git a/activerecord/test/fixtures/collections.yml b/activerecord/test/fixtures/collections.yml
+new file mode 100644
+index 0000000..ad0fd26
+--- /dev/null
++++ b/activerecord/test/fixtures/collections.yml
+@@ -0,0 +1,3 @@
++collection_1:
++  id: 1
++  name: Collection
+diff --git a/activerecord/test/fixtures/products.yml b/activerecord/test/fixtures/products.yml
+new file mode 100644
+index 0000000..8a197fb
+--- /dev/null
++++ b/activerecord/test/fixtures/products.yml
+@@ -0,0 +1,4 @@
++product_1:
++  id: 1
++  collection_id: 1
++  name: Product
+diff --git a/activerecord/test/fixtures/variants.yml b/activerecord/test/fixtures/variants.yml
+new file mode 100644
+index 0000000..06be307
+--- /dev/null
++++ b/activerecord/test/fixtures/variants.yml
+@@ -0,0 +1,4 @@
++variant_1:
++  id: 1
++  product_id: 1
++  name: Variant
+diff --git a/activerecord/test/models/shop.rb b/activerecord/test/models/shop.rb
+new file mode 100644
+index 0000000..b232185
+--- /dev/null
++++ b/activerecord/test/models/shop.rb
+@@ -0,0 +1,12 @@
++module Shop
++  class Collection < ActiveRecord::Base
++    has_many :products, :dependent => :nullify
++  end
++
++  class Product < ActiveRecord::Base
++    has_many :variants, :dependent => :delete_all
++  end
++  
++  class Variant < ActiveRecord::Base
++  end
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index c8e652a..00594d0 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -100,6 +100,10 @@ ActiveRecord::Schema.define do
+     t.string :name
+   end
+ 
++  create_table :collections, :force => true do |t|
++    t.string :name
++  end
++
+   create_table :colnametests, :force => true do |t|
+     t.integer :references, :null => false
+   end
+@@ -382,6 +386,11 @@ ActiveRecord::Schema.define do
+     t.integer :price
+   end
+ 
++  create_table :products, :force => true do |t|
++    t.references :collection
++    t.string     :name
++  end
++
+   create_table :projects, :force => true do |t|
+     t.string :name
+     t.string :type
+@@ -473,6 +482,11 @@ ActiveRecord::Schema.define do
+     t.column :looter_type, :string
+   end
+ 
++  create_table :variants, :force => true do |t|
++    t.references :product
++    t.string     :name
++  end
++
+   create_table :vertices, :force => true do |t|
+     t.column :label, :string
+   end
+-- 
+1.6.4.4
+

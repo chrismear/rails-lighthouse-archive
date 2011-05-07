@@ -1,0 +1,193 @@
+From 8ea185c2918d44c8332c9198ff0d9708446566c7 Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Mon, 9 Feb 2009 14:09:32 +0000
+Subject: [PATCH] Fix layouts to work with per request view paths
+
+---
+ actionpack/lib/action_controller/layout.rb         |   32 ++++----
+ actionpack/test/controller/layout_test.rb          |   75 ++++++++++++++++++++
+ .../per_request/layouts/layout_test.html.erb       |    1 +
+ .../per_request/layouts/per_request.html.erb       |    1 +
+ .../layout_tests/per_request/views/hello.html.erb  |    1 +
+ 5 files changed, 94 insertions(+), 16 deletions(-)
+ create mode 100644 actionpack/test/fixtures/layout_tests/per_request/layouts/layout_test.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/per_request/layouts/per_request.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/per_request/views/hello.html.erb
+
+diff --git a/actionpack/lib/action_controller/layout.rb b/actionpack/lib/action_controller/layout.rb
+index d6bcf7a..a029108 100644
+--- a/actionpack/lib/action_controller/layout.rb
++++ b/actionpack/lib/action_controller/layout.rb
+@@ -172,23 +172,10 @@ module ActionController #:nodoc:
+         @layout_conditions ||= read_inheritable_attribute(:layout_conditions)
+       end
+ 
+-      def default_layout(format) #:nodoc:
+-        layout = read_inheritable_attribute(:layout) unless format == :js
+-        return layout unless read_inheritable_attribute(:auto_layout)
+-        find_layout(layout, format)
+-      end
+-
+       def layout_list #:nodoc:
+         Array(view_paths).sum([]) { |path| Dir["#{path.to_str}/layouts/**/*"] }
+       end
+ 
+-      def find_layout(layout, *formats) #:nodoc:
+-        return layout if layout.respond_to?(:render)
+-        view_paths.find_template(layout.to_s =~ /layouts\// ? layout : "layouts/#{layout}", *formats)
+-      rescue ActionView::MissingTemplate
+-        nil
+-      end
+-
+       private
+         def inherited_with_layout(child)
+           inherited_without_layout(child)
+@@ -212,7 +199,7 @@ module ActionController #:nodoc:
+     # object). If the layout was defined without a directory, layouts is assumed. So <tt>layout "weblog/standard"</tt> will return
+     # weblog/standard, but <tt>layout "standard"</tt> will return layouts/standard.
+     def active_layout(passed_layout = nil)
+-      layout = passed_layout || self.class.default_layout(default_template_format)
++      layout = passed_layout || default_layout(default_template_format)
+ 
+       active_layout = case layout
+         when Symbol then __send__(layout)
+@@ -221,14 +208,27 @@ module ActionController #:nodoc:
+       end
+ 
+       if active_layout
+-        if layout = self.class.find_layout(active_layout, @template.template_format)
++        if layout = find_layout(active_layout, @template.template_format)
+           layout
+         else
+-          raise ActionView::MissingTemplate.new(self.class.view_paths, active_layout)
++          raise ActionView::MissingTemplate.new(view_paths, active_layout)
+         end
+       end
+     end
+ 
++    def default_layout(format) #:nodoc:
++      layout = self.class.read_inheritable_attribute(:layout) unless format == :js
++      return layout unless self.class.read_inheritable_attribute(:auto_layout)
++      find_layout(layout, format)
++    end
++
++    def find_layout(layout, *formats) #:nodoc:
++      return layout if layout.respond_to?(:render)
++      view_paths.find_template(layout.to_s =~ /layouts\// ? layout : "layouts/#{layout}", *formats)
++    rescue ActionView::MissingTemplate
++      nil
++    end
++
+     private
+       def candidate_for_layout?(options)
+         template = options[:template] || default_template(options[:action])
+diff --git a/actionpack/test/controller/layout_test.rb b/actionpack/test/controller/layout_test.rb
+index 2f5e830..ea9e811 100644
+--- a/actionpack/test/controller/layout_test.rb
++++ b/actionpack/test/controller/layout_test.rb
+@@ -178,3 +178,78 @@ unless RUBY_PLATFORM =~ /(:?mswin|mingw|bccwin)/
+     end
+   end
+ end
++
++class PerRequest < LayoutTest
++  before_filter :set_view_path
++
++  private
++    def set_view_path
++      self.view_paths = [ File.dirname(__FILE__) + '/../fixtures/layout_tests/per_request/' ]
++    end
++end
++
++class PerRequestSetInController < PerRequest
++  layout 'per_request'
++end
++
++class PerRequestSetInRender < PerRequest
++  def hello
++    render :action => 'hello', :layout => 'per_request'
++  end
++end
++
++class PerRequestNoLayout < PerRequest
++  def hello
++    render :action => 'hello', :layout => false
++  end
++end
++
++class PerRequestLayoutTest < ActionController::TestCase
++  def test_layout_set_when_using_default_layout
++    @controller = PerRequest.new
++    get :hello
++    assert_equal 'layouts/layout_test', @response.layout
++  end
++
++  def test_layout_rendered_when_using_default_layout
++    @controller = PerRequest.new
++    get :hello
++    assert_equal 'layout_test.html.erb hello.html.erb', @response.body
++  end
++
++  def test_layout_set_when_set_in_controller
++    @controller = PerRequestSetInController.new
++    get :hello
++    assert_equal 'layouts/per_request', @response.layout
++  end
++
++  def test_layout_rendered_when_set_in_controller
++    @controller = PerRequestSetInController.new
++    get :hello
++    assert_equal 'per_request.html.erb hello.html.erb', @response.body
++  end
++
++  def test_layout_set_when_using_render
++    @controller = PerRequestSetInRender.new
++    get :hello
++    assert_equal 'layouts/per_request', @response.layout
++  end
++
++  def test_layout_rendered_when_using_render
++    @controller = PerRequestSetInRender.new
++    get :hello
++    assert_equal 'per_request.html.erb hello.html.erb', @response.body
++  end
++
++  def test_layout_is_not_set_when_none_rendered
++    @controller = PerRequestNoLayout.new
++    get :hello
++    assert_nil @response.layout
++  end
++
++  def test_layout_not_rendered
++    @controller = PerRequestNoLayout.new
++    get :hello
++    assert_equal 'hello.html.erb', @response.body
++  end
++end
+diff --git a/actionpack/test/fixtures/layout_tests/per_request/layouts/layout_test.html.erb b/actionpack/test/fixtures/layout_tests/per_request/layouts/layout_test.html.erb
+new file mode 100644
+index 0000000..c91b29b
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/per_request/layouts/layout_test.html.erb
+@@ -0,0 +1 @@
++layout_test.html.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/per_request/layouts/per_request.html.erb b/actionpack/test/fixtures/layout_tests/per_request/layouts/per_request.html.erb
+new file mode 100644
+index 0000000..9fe4175
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/per_request/layouts/per_request.html.erb
+@@ -0,0 +1 @@
++per_request.html.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/per_request/views/hello.html.erb b/actionpack/test/fixtures/layout_tests/per_request/views/hello.html.erb
+new file mode 100644
+index 0000000..2184550
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/per_request/views/hello.html.erb
+@@ -0,0 +1 @@
++hello.html.erb
+\ No newline at end of file
+-- 
+1.5.4.5
+

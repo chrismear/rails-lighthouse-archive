@@ -1,0 +1,663 @@
+From b1915abb49b70abe5023b08c5e8ef3d8d77b3238 Mon Sep 17 00:00:00 2001
+From: Murray Steele <muz@h-lame.com>
+Date: Sun, 26 Oct 2008 15:16:24 +0000
+Subject: [PATCH] Adding a repair_helper that knows how to repair changes to the validations of models and reworking validations_test to make use of it.
+
+Many of the tests in validations_test would add a new validation to
+models.  However, only Topic was being reset with a fairly aggressive
+clearing of all validations.  None of the other models being used however
+were recieving the same treatment.  Now we use repair_validations(Topic)
+for the whole test case because most test cases use Topic and then the
+block form of repair_validations(<other_models>) inside any tests that use
+other models.
+
+Because we're no longer zero-ing Topic's validations before each test we
+had to change the validates_size_of_association_XXX tests to use a
+different model as the default Topic validations meant these tests would
+never work.
+
+The new repair helper provides code to allow you to safely change the
+definition of a model and have that state change be reverted later.  For
+example, if you want to test a validation you don't want to create a new
+model just for that change, but you don't want a new validation on an
+existing model to hang around after your test as it might affect other
+tests that come after yours.
+
+ActiveRecord::Testing::RepairHelper currently provides a single repair
+functions: repair_validations
+
+This can be used either inside a test with a block:
+
+def test_something
+  repair_validations(MyModel) do
+    MyModel.validate_uniqueness_of :my_face
+    ...
+  end
+end
+
+or inside a TestCase to ensure that each test has the repair magic done:
+
+class MyTest < Test::Unit::TestCase
+  repair_validations(MyModel)
+
+  def test_soemthing
+    MyModel.validate_uniqueness_of :my_face
+    ...
+  end
+
+  def test_something_else
+    MyModel.validate_uniqueness_of :my_face, :scope => :my_head
+    ...
+  end
+end
+
+ActiveRecord::TestCase includes this functionality by default.
+---
+ activerecord/lib/active_record/test_case.rb |    3 +
+ activerecord/test/cases/repair_helper.rb    |   50 ++++
+ activerecord/test/cases/validations_test.rb |  351 +++++++++++++++------------
+ 3 files changed, 244 insertions(+), 160 deletions(-)
+ create mode 100644 activerecord/test/cases/repair_helper.rb
+
+diff --git a/activerecord/lib/active_record/test_case.rb b/activerecord/lib/active_record/test_case.rb
+index eabf06f..6b3264c 100644
+--- a/activerecord/lib/active_record/test_case.rb
++++ b/activerecord/lib/active_record/test_case.rb
+@@ -1,4 +1,5 @@
+ require "active_support/test_case"
++require "cases/repair_helper"
+ 
+ module ActiveRecord 
+   class TestCase < ActiveSupport::TestCase #:nodoc:
+@@ -6,6 +7,8 @@ module ActiveRecord
+     self.use_instantiated_fixtures  = false
+     self.use_transactional_fixtures = true
+ 
++    include ActiveRecord::Testing::RepairHelper
++
+     def create_fixtures(*table_names, &block)
+       Fixtures.create_fixtures(FIXTURES_ROOT, table_names, {}, &block)
+     end
+diff --git a/activerecord/test/cases/repair_helper.rb b/activerecord/test/cases/repair_helper.rb
+new file mode 100644
+index 0000000..ff3e843
+--- /dev/null
++++ b/activerecord/test/cases/repair_helper.rb
+@@ -0,0 +1,50 @@
++module ActiveRecord
++  module Testing
++    module RepairHelper
++      def self.included(base)
++        base.class_eval do
++          extend ClassMethods
++        end
++      end
++      
++      module Toolbox
++        def self.record_validations(*model_classes)
++          model_classes.inject({}) do |repair, klass|
++                                     repair[klass] ||= {}
++                                     [:validate, :validate_on_create, :validate_on_update].each do |callback|
++                                       the_callback = klass.instance_variable_get("@#{callback.to_s}_callbacks")
++                                       repair[klass][callback] = (the_callback.nil? ? nil : the_callback.dup)
++                                     end
++                                     repair
++                                   end
++        end
++        
++        def self.reset_validations(recorded)
++          recorded.each do |klass, repairs|
++            [:validate, :validate_on_create, :validate_on_update].each do |callback|
++              klass.instance_variable_set("@#{callback.to_s}_callbacks", repairs[callback])
++            end
++          end
++        end
++      end
++      
++      module ClassMethods
++        def repair_validations(*model_classes)
++          setup do 
++            @validation_repairs = ActiveRecord::Testing::RepairHelper::Toolbox.record_validations(*model_classes)
++          end
++          teardown do
++            ActiveRecord::Testing::RepairHelper::Toolbox.reset_validations(@validation_repairs)
++          end
++        end
++      end
++      
++      def repair_validations(*model_classes, &block)
++        validation_repairs = ActiveRecord::Testing::RepairHelper::Toolbox.record_validations(*model_classes)
++        return block.call
++      ensure
++        ActiveRecord::Testing::RepairHelper::Toolbox.reset_validations(validation_repairs)
++      end
++    end
++  end
++end
+diff --git a/activerecord/test/cases/validations_test.rb b/activerecord/test/cases/validations_test.rb
+index c049659..0282d69 100644
+--- a/activerecord/test/cases/validations_test.rb
++++ b/activerecord/test/cases/validations_test.rb
+@@ -6,6 +6,8 @@ require 'models/person'
+ require 'models/developer'
+ require 'models/warehouse_thing'
+ require 'models/guid'
++require 'models/owner'
++require 'models/pet'
+ 
+ # The following methods in Topic are used in test_conditional_validation_*
+ class Topic
+@@ -31,10 +33,6 @@ class UniqueReply < Reply
+   validates_uniqueness_of :content, :scope => 'parent_id'
+ end
+ 
+-class PlagiarizedReply < Reply
+-  validates_acceptance_of :author_name
+-end
+-
+ class SillyUniqueReply < UniqueReply
+ end
+ 
+@@ -58,11 +56,9 @@ end
+ class ValidationsTest < ActiveRecord::TestCase
+   fixtures :topics, :developers, 'warehouse-things'
+ 
+-  def setup
+-    Topic.instance_variable_set("@validate_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-    Topic.instance_variable_set("@validate_on_create_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-    Topic.instance_variable_set("@validate_on_update_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-  end
++  # Most of the tests mess with the validations of Topic, so lets repair it all the time.
++  # Other classes we mess with will be dealt with in the specific tests
++  repair_validations(Topic)
+ 
+   def test_single_field_validation
+     r = Reply.new
+@@ -229,21 +225,16 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validates_each
+-    perform = true
+     hits = 0
+     Topic.validates_each(:title, :content, [:title, :content]) do |record, attr|
+-      if perform
+-        record.errors.add attr, 'gotcha'
+-        hits += 1
+-      end
++      record.errors.add attr, 'gotcha'
++      hits += 1
+     end
+     t = Topic.new("title" => "valid", "content" => "whatever")
+     assert !t.save
+     assert_equal 4, hits
+     assert_equal %w(gotcha gotcha), t.errors.on(:title)
+     assert_equal %w(gotcha gotcha), t.errors.on(:content)
+-  ensure
+-    perform = false
+   end
+ 
+   def test_no_title_confirmation
+@@ -315,8 +306,12 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validates_acceptance_of_as_database_column
+-    reply = PlagiarizedReply.create("author_name" => "Dan Brown")
+-    assert_equal "Dan Brown", reply["author_name"]
++    repair_validations(Reply) do
++      Reply.validates_acceptance_of(:author_name)
++      
++      reply = Reply.create("author_name" => "Dan Brown")
++      assert_equal "Dan Brown", reply["author_name"]
++    end
+   end
+ 
+   def test_validates_acceptance_of_with_non_existant_table
+@@ -372,22 +367,24 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validate_uniqueness_with_scope
+-    Reply.validates_uniqueness_of(:content, :scope => "parent_id")
++    repair_validations(Reply) do
++      Reply.validates_uniqueness_of(:content, :scope => "parent_id")
+ 
+-    t = Topic.create("title" => "I'm unique!")
++      t = Topic.create("title" => "I'm unique!")
+ 
+-    r1 = t.replies.create "title" => "r1", "content" => "hello world"
+-    assert r1.valid?, "Saving r1"
++      r1 = t.replies.create "title" => "r1", "content" => "hello world"
++      assert r1.valid?, "Saving r1"
+ 
+-    r2 = t.replies.create "title" => "r2", "content" => "hello world"
+-    assert !r2.valid?, "Saving r2 first time"
++      r2 = t.replies.create "title" => "r2", "content" => "hello world"
++      assert !r2.valid?, "Saving r2 first time"
+ 
+-    r2.content = "something else"
+-    assert r2.save, "Saving r2 second time"
++      r2.content = "something else"
++      assert r2.save, "Saving r2 second time"
+ 
+-    t2 = Topic.create("title" => "I'm unique too!")
+-    r3 = t2.replies.create "title" => "r3", "content" => "hello world"
+-    assert r3.valid?, "Saving r3"
++      t2 = Topic.create("title" => "I'm unique too!")
++      r3 = t2.replies.create "title" => "r3", "content" => "hello world"
++      assert r3.valid?, "Saving r3"
++    end
+   end
+ 
+   def test_validate_uniqueness_scoped_to_defining_class
+@@ -406,27 +403,29 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validate_uniqueness_with_scope_array
+-    Reply.validates_uniqueness_of(:author_name, :scope => [:author_email_address, :parent_id])
++    repair_validations(Reply) do
++      Reply.validates_uniqueness_of(:author_name, :scope => [:author_email_address, :parent_id])
+ 
+-    t = Topic.create("title" => "The earth is actually flat!")
++      t = Topic.create("title" => "The earth is actually flat!")
+ 
+-    r1 = t.replies.create "author_name" => "jeremy", "author_email_address" => "jeremy@rubyonrails.com", "title" => "You're crazy!", "content" => "Crazy reply"
+-    assert r1.valid?, "Saving r1"
++      r1 = t.replies.create "author_name" => "jeremy", "author_email_address" => "jeremy@rubyonrails.com", "title" => "You're crazy!", "content" => "Crazy reply"
++      assert r1.valid?, "Saving r1"
+ 
+-    r2 = t.replies.create "author_name" => "jeremy", "author_email_address" => "jeremy@rubyonrails.com", "title" => "You're crazy!", "content" => "Crazy reply again..."
+-    assert !r2.valid?, "Saving r2. Double reply by same author."
++      r2 = t.replies.create "author_name" => "jeremy", "author_email_address" => "jeremy@rubyonrails.com", "title" => "You're crazy!", "content" => "Crazy reply again..."
++      assert !r2.valid?, "Saving r2. Double reply by same author."
+ 
+-    r2.author_email_address = "jeremy_alt_email@rubyonrails.com"
+-    assert r2.save, "Saving r2 the second time."
++      r2.author_email_address = "jeremy_alt_email@rubyonrails.com"
++      assert r2.save, "Saving r2 the second time."
+ 
+-    r3 = t.replies.create "author_name" => "jeremy", "author_email_address" => "jeremy_alt_email@rubyonrails.com", "title" => "You're wrong", "content" => "It's cubic"
+-    assert !r3.valid?, "Saving r3"
++      r3 = t.replies.create "author_name" => "jeremy", "author_email_address" => "jeremy_alt_email@rubyonrails.com", "title" => "You're wrong", "content" => "It's cubic"
++      assert !r3.valid?, "Saving r3"
+ 
+-    r3.author_name = "jj"
+-    assert r3.save, "Saving r3 the second time."
++      r3.author_name = "jj"
++      assert r3.save, "Saving r3 the second time."
+ 
+-    r3.author_name = "jeremy"
+-    assert !r3.save, "Saving r3 the third time."
++      r3.author_name = "jeremy"
++      assert !r3.save, "Saving r3 the third time."
++    end
+   end
+ 
+   def test_validate_case_insensitive_uniqueness
+@@ -523,10 +522,12 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validate_uniqueness_with_columns_which_are_sql_keywords
+-    Guid.validates_uniqueness_of :key
+-    g = Guid.new
+-    g.key = "foo"
+-    assert_nothing_raised { !g.valid? }
++    repair_validations(Guid) do
++      Guid.validates_uniqueness_of :key
++      g = Guid.new
++      g.key = "foo"
++      assert_nothing_raised { !g.valid? }
++    end
+   end
+ 
+   def test_validate_straight_inheritance_uniqueness
+@@ -648,10 +649,12 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_numericality_with_getter_method
+-    Developer.validates_numericality_of( :salary )
+-    developer = Developer.new("name" => "michael", "salary" => nil)
+-    developer.instance_eval("def salary; read_attribute('salary') ? read_attribute('salary') : 100000; end")
+-    assert developer.valid?
++    repair_validations(Developer) do
++      Developer.validates_numericality_of( :salary )
++      developer = Developer.new("name" => "michael", "salary" => nil)
++      developer.instance_eval("def salary; read_attribute('salary') ? read_attribute('salary') : 100000; end")
++      assert developer.valid?
++    end
+   end
+ 
+   def test_validates_length_of_with_allow_nil
+@@ -684,10 +687,12 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_numericality_with_allow_nil_and_getter_method
+-    Developer.validates_numericality_of( :salary, :allow_nil => true)
+-    developer = Developer.new("name" => "michael", "salary" => nil)
+-    developer.instance_eval("def salary; read_attribute('salary') ? read_attribute('salary') : 100000; end")
+-    assert developer.valid?
++    repair_validations(Developer) do
++      Developer.validates_numericality_of( :salary, :allow_nil => true)
++      developer = Developer.new("name" => "michael", "salary" => nil)
++      developer.instance_eval("def salary; read_attribute('salary') ? read_attribute('salary') : 100000; end")
++      assert developer.valid?
++    end
+   end
+ 
+   def test_validates_exclusion_of
+@@ -892,26 +897,30 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validates_size_of_association
+-    assert_nothing_raised { Topic.validates_size_of :replies, :minimum => 1 }
+-    t = Topic.new('title' => 'noreplies', 'content' => 'whatever')
+-    assert !t.save
+-    assert t.errors.on(:replies)
+-    reply = t.replies.build('title' => 'areply', 'content' => 'whateveragain')
+-    assert t.valid?
++    repair_validations(Owner) do
++      assert_nothing_raised { Owner.validates_size_of :pets, :minimum => 1 }
++      o = Owner.new('name' => 'nopets')
++      assert !o.save
++      assert o.errors.on(:pets)
++      pet = o.pets.build('name' => 'apet')
++      assert o.valid?
++    end
+   end
+ 
+   def test_validates_size_of_association_using_within
+-    assert_nothing_raised { Topic.validates_size_of :replies, :within => 1..2 }
+-    t = Topic.new('title' => 'noreplies', 'content' => 'whatever')
+-    assert !t.save
+-    assert t.errors.on(:replies)
+-
+-    reply = t.replies.build('title' => 'areply', 'content' => 'whateveragain')
+-    assert t.valid?
+-
+-    2.times { t.replies.build('title' => 'areply', 'content' => 'whateveragain') }
+-    assert !t.save
+-    assert t.errors.on(:replies)
++    repair_validations(Owner) do
++      assert_nothing_raised { Owner.validates_size_of :pets, :within => 1..2 }
++      o = Owner.new('name' => 'nopets')
++      assert !o.save
++      assert o.errors.on(:pets)
++
++      pet = o.pets.build('name' => 'apet')
++      assert o.valid?
++
++      2.times { o.pets.build('name' => 'apet') }
++      assert !o.save
++      assert o.errors.on(:pets)
++    end
+   end
+ 
+   def test_validates_length_of_nasty_params
+@@ -1102,13 +1111,15 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validates_size_of_association_utf8
+-    with_kcode('UTF8') do
+-      assert_nothing_raised { Topic.validates_size_of :replies, :minimum => 1 }
+-      t = Topic.new('title' => 'あいうえお', 'content' => 'かきくけこ')
+-      assert !t.save
+-      assert t.errors.on(:replies)
+-      t.replies.build('title' => 'あいうえお', 'content' => 'かきくけこ')
+-      assert t.valid?
++    repair_validations(Owner) do
++      with_kcode('UTF8') do
++        assert_nothing_raised { Owner.validates_size_of :pets, :minimum => 1 }
++        o = Owner.new('name' => 'あいうえおかきくけこ')
++        assert !o.save
++        assert o.errors.on(:pets)
++        o.pets.build('name' => 'あいうえおかきくけこ')
++        assert o.valid?
++      end
+     end
+   end
+ 
+@@ -1127,14 +1138,16 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validates_associated_one
+-    Reply.validates_associated( :topic )
+-    Topic.validates_presence_of( :content )
+-    r = Reply.new("title" => "A reply", "content" => "with content!")
+-    r.topic = Topic.create("title" => "uhohuhoh")
+-    assert !r.valid?
+-    assert r.errors.on(:topic)
+-    r.topic.content = "non-empty"
+-    assert r.valid?
++    repair_validations(Reply) do
++      Reply.validates_associated( :topic )
++      Topic.validates_presence_of( :content )
++      r = Reply.new("title" => "A reply", "content" => "with content!")
++      r.topic = Topic.create("title" => "uhohuhoh")
++      assert !r.valid?
++      assert r.errors.on(:topic)
++      r.topic.content = "non-empty"
++      assert r.valid?
++    end
+   end
+ 
+   def test_validate_block
+@@ -1158,85 +1171,105 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validates_acceptance_of_with_custom_error_using_quotes
+-    Developer.validates_acceptance_of :salary, :message=> "This string contains 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.salary = "0"
+-    assert !d.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:salary).last
++    repair_validations(Developer) do
++      Developer.validates_acceptance_of :salary, :message=> "This string contains 'single' and \"double\" quotes"
++      d = Developer.new
++      d.salary = "0"
++      assert !d.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:salary).last
++    end
+   end
+ 
+   def test_validates_confirmation_of_with_custom_error_using_quotes
+-    Developer.validates_confirmation_of :name, :message=> "confirm 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.name = "John"
+-    d.name_confirmation = "Johnny"
+-    assert !d.valid?
+-    assert_equal "confirm 'single' and \"double\" quotes", d.errors.on(:name)
++    repair_validations(Developer) do
++      Developer.validates_confirmation_of :name, :message=> "confirm 'single' and \"double\" quotes"
++      d = Developer.new
++      d.name = "John"
++      d.name_confirmation = "Johnny"
++      assert !d.valid?
++      assert_equal "confirm 'single' and \"double\" quotes", d.errors.on(:name)
++    end
+   end
+ 
+   def test_validates_format_of_with_custom_error_using_quotes
+-    Developer.validates_format_of :name, :with => /^(A-Z*)$/, :message=> "format 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.name = d.name_confirmation = "John 32"
+-    assert !d.valid?
+-    assert_equal "format 'single' and \"double\" quotes", d.errors.on(:name)
++    repair_validations(Developer) do
++      Developer.validates_format_of :name, :with => /^(A-Z*)$/, :message=> "format 'single' and \"double\" quotes"
++      d = Developer.new
++      d.name = d.name_confirmation = "John 32"
++      assert !d.valid?
++      assert_equal "format 'single' and \"double\" quotes", d.errors.on(:name)
++    end
+   end
+ 
+   def test_validates_inclusion_of_with_custom_error_using_quotes
+-    Developer.validates_inclusion_of :salary, :in => 1000..80000, :message=> "This string contains 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.salary = "90,000"
+-    assert !d.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:salary).last
++    repair_validations(Developer) do 
++      Developer.validates_inclusion_of :salary, :in => 1000..80000, :message=> "This string contains 'single' and \"double\" quotes"
++      d = Developer.new
++      d.salary = "90,000"
++      assert !d.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:salary).last
++    end
+   end
+ 
+   def test_validates_length_of_with_custom_too_long_using_quotes
+-    Developer.validates_length_of :name, :maximum => 4, :too_long=> "This string contains 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.name = "Jeffrey"
+-    assert !d.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name).last
++    repair_validations(Developer) do
++      Developer.validates_length_of :name, :maximum => 4, :too_long=> "This string contains 'single' and \"double\" quotes"
++      d = Developer.new
++      d.name = "Jeffrey"
++      assert !d.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name)
++    end
+   end
+ 
+   def test_validates_length_of_with_custom_too_short_using_quotes
+-    Developer.validates_length_of :name, :minimum => 4, :too_short=> "This string contains 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.name = "Joe"
+-    assert !d.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name).last
++    repair_validations(Developer) do
++      Developer.validates_length_of :name, :minimum => 4, :too_short=> "This string contains 'single' and \"double\" quotes"
++      d = Developer.new
++      d.name = "Joe"
++      assert !d.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name)
++    end
+   end
+ 
+   def test_validates_length_of_with_custom_message_using_quotes
+-    Developer.validates_length_of :name, :minimum => 4, :message=> "This string contains 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.name = "Joe"
+-    assert !d.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name).last
++    repair_validations(Developer) do
++      Developer.validates_length_of :name, :minimum => 4, :message=> "This string contains 'single' and \"double\" quotes"
++      d = Developer.new
++      d.name = "Joe"
++      assert !d.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name)
++    end
+   end
+ 
+   def test_validates_presence_of_with_custom_message_using_quotes
+-    Developer.validates_presence_of :non_existent, :message=> "This string contains 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.name = "Joe"
+-    assert !d.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:non_existent)
++    repair_validations(Developer) do
++      Developer.validates_presence_of :non_existent, :message=> "This string contains 'single' and \"double\" quotes"
++      d = Developer.new
++      d.name = "Joe"
++      assert !d.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:non_existent)
++    end
+   end
+ 
+   def test_validates_uniqueness_of_with_custom_message_using_quotes
+-    Developer.validates_uniqueness_of :name, :message=> "This string contains 'single' and \"double\" quotes"
+-    d = Developer.new
+-    d.name = "David"
+-    assert !d.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name).last
++    repair_validations(Developer) do
++      Developer.validates_uniqueness_of :name, :message=> "This string contains 'single' and \"double\" quotes"
++      d = Developer.new
++      d.name = "David"
++      assert !d.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", d.errors.on(:name)
++    end
+   end
+ 
+   def test_validates_associated_with_custom_message_using_quotes
+-    Reply.validates_associated :topic, :message=> "This string contains 'single' and \"double\" quotes"
+-    Topic.validates_presence_of :content
+-    r = Reply.create("title" => "A reply", "content" => "with content!")
+-    r.topic = Topic.create("title" => "uhohuhoh")
+-    assert !r.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", r.errors.on(:topic).last
++    repair_validations(Reply) do
++      Reply.validates_associated :topic, :message=> "This string contains 'single' and \"double\" quotes"
++      Topic.validates_presence_of :content
++      r = Reply.create("title" => "A reply", "content" => "with content!")
++      r.topic = Topic.create("title" => "uhohuhoh")
++      assert !r.valid?
++      assert_equal "This string contains 'single' and \"double\" quotes", r.errors.on(:topic)
++    end
+   end
+ 
+   def test_if_validation_using_method_true
+@@ -1346,13 +1379,15 @@ class ValidationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_validates_associated_missing
+-    Reply.validates_presence_of(:topic)
+-    r = Reply.create("title" => "A reply", "content" => "with content!")
+-    assert !r.valid?
+-    assert r.errors.on(:topic)
+-
+-    r.topic = Topic.find :first
+-    assert r.valid?
++    repair_validations(Reply) do
++      Reply.validates_presence_of(:topic)
++      r = Reply.create("title" => "A reply", "content" => "with content!")
++      assert !r.valid?
++      assert r.errors.on(:topic)
++
++      r.topic = Topic.find :first
++      assert r.valid?
++    end
+   end
+ 
+   def test_errors_to_xml
+@@ -1364,14 +1399,14 @@ class ValidationsTest < ActiveRecord::TestCase
+     assert xml.include?("<error>Content Empty</error>")
+   end
+ 
+- def test_validation_order
+-    Topic.validates_presence_of :title
+-    Topic.validates_length_of :title, :minimum => 2
+-
+-    t = Topic.new("title" => "")
+-    assert !t.valid?
+-    assert_equal "can't be blank", t.errors.on("title").first
+- end
++  def test_validation_order
++     Topic.validates_presence_of :title
++     Topic.validates_length_of :title, :minimum => 2
++  
++     t = Topic.new("title" => "")
++     assert !t.valid?
++     assert_equal "can't be blank", t.errors.on("title").first
++  end
+ 
+   # previous implementation of validates_presence_of eval'd the
+   # string with the wrong binding, this regression test is to
+@@ -1423,12 +1458,8 @@ class ValidatesNumericalityTest < ActiveRecord::TestCase
+   JUNK = ["not a number", "42 not a number", "0xdeadbeef", "00-1", "--3", "+-3", "+3-1", "-+019.0", "12.12.13.12", "123\nnot a number"]
+   INFINITY = [1.0/0.0]
+ 
+-  def setup
+-    Topic.instance_variable_set("@validate_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-    Topic.instance_variable_set("@validate_on_create_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-    Topic.instance_variable_set("@validate_on_update_callbacks", ActiveSupport::Callbacks::CallbackChain.new)
+-  end
+-
++  repair_validations(Topic)
++  
+   def test_default_validates_numericality_of
+     Topic.validates_numericality_of :approved
+ 
+-- 
+1.6.0.2
+

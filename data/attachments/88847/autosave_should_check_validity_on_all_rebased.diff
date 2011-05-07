@@ -1,0 +1,260 @@
+From 4f82c675df8065bd56c2a77ee4a8971cf5180a53 Mon Sep 17 00:00:00 2001
+From: Gaspard Bucher <gaspard@teti.ch>
+Date: Tue, 10 Feb 2009 17:43:51 +0100
+Subject: [PATCH] Autosave should always check the validity of the associated records (even if the master record is not valid) so that the end user sees the errors on all invalid records (master and all slaves). There should not be a double validity check for new slave records.
+
+---
+ activerecord/lib/active_record/associations.rb     |   15 ++--
+ .../lib/active_record/autosave_association.rb      |   81 ++++++++++++++------
+ .../lib/active_record/nested_attributes.rb         |    2 +-
+ .../test/cases/autosave_association_test.rb        |   30 +++++++-
+ 4 files changed, 94 insertions(+), 34 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 05ce8ff..919a3b7 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -790,7 +790,7 @@ module ActiveRecord
+ 
+         configure_dependency_for_has_many(reflection)
+ 
+-        add_multiple_associated_validation_callbacks(reflection.name) unless options[:validate] == false
++        add_multiple_associated_validation_callbacks(reflection) unless options[:validate] == false
+         add_multiple_associated_save_callbacks(reflection.name)
+         add_association_callbacks(reflection.name, reflection.options)
+ 
+@@ -913,7 +913,7 @@ module ActiveRecord
+           end
+           after_save method_name
+ 
+-          add_single_associated_validation_callbacks(reflection.name) if options[:validate] == true
++          add_single_associated_validation_callbacks(reflection) if options[:validate] == true || options[:autosave] == true
+           association_accessor_methods(reflection, HasOneAssociation)
+           association_constructor_method(:build,  reflection, HasOneAssociation)
+           association_constructor_method(:create, reflection, HasOneAssociation)
+@@ -1074,7 +1074,7 @@ module ActiveRecord
+           )
+         end
+ 
+-        add_single_associated_validation_callbacks(reflection.name) if options[:validate] == true
++        add_single_associated_validation_callbacks(reflection) if options[:validate] == true || options[:autosave] == true
+ 
+         configure_dependency_for_belongs_to(reflection)
+       end
+@@ -1242,7 +1242,7 @@ module ActiveRecord
+       def has_and_belongs_to_many(association_id, options = {}, &extension)
+         reflection = create_has_and_belongs_to_many_reflection(association_id, options, &extension)
+ 
+-        add_multiple_associated_validation_callbacks(reflection.name) unless options[:validate] == false
++        add_multiple_associated_validation_callbacks(reflection) unless options[:validate] == false
+         add_multiple_associated_save_callbacks(reflection.name)
+         collection_accessor_methods(reflection, HasAndBelongsToManyAssociation)
+ 
+@@ -1365,7 +1365,8 @@ module ActiveRecord
+           end
+         end
+ 
+-        def add_single_associated_validation_callbacks(association_name)
++        def add_single_associated_validation_callbacks(reflection)
++          association_name = reflection.name
+           method_name = "validate_associated_records_for_#{association_name}".to_sym
+           define_method(method_name) do
+             if association = association_instance_get(association_name)
+@@ -1376,11 +1377,11 @@ module ActiveRecord
+           validate method_name
+         end
+ 
+-        def add_multiple_associated_validation_callbacks(association_name)
++        def add_multiple_associated_validation_callbacks(reflection)
++          association_name = reflection.name
+           method_name = "validate_associated_records_for_#{association_name}".to_sym
+           define_method(method_name) do
+             association = association_instance_get(association_name)
+-
+             if association
+               if new_record?
+                 association
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 680b415..4dacd2d 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -130,14 +130,66 @@ module ActiveRecord
+         alias_method_chain :reload, :autosave_associations
+         alias_method_chain :save,   :autosave_associations
+         alias_method_chain :save!,  :autosave_associations
+-        alias_method_chain :valid?, :autosave_associations
+ 
+         %w{ has_one belongs_to has_many has_and_belongs_to_many }.each do |type|
+           base.send("valid_keys_for_#{type}_association") << :autosave
+         end
++        base.extend(ClassMethods)
+       end
+     end
++    
++    module ClassMethods
++      def add_single_associated_validation_callbacks(reflection)
++        association_name = reflection.name
++        method_name = "validate_associated_records_for_#{association_name}".to_sym
++        define_method(method_name) do
++          if (association = association_instance_get(association_name)) && !association.target.nil?
++            returning(association.valid?) do |valid|
++              if reflection.options[:autosave]
++                association.errors.each do |attribute, message|
++                  errors.add "#{reflection.name}_#{attribute}", message
++                end
++              else
++                errors.add association_name
++              end unless valid
++            end
++          end
++        end
+ 
++        validate method_name
++      end
++      
++      def add_multiple_associated_validation_callbacks(reflection)
++        association_name = reflection.name
++        method_name = "validate_associated_records_for_#{association_name}".to_sym
++        define_method(method_name) do
++          autosave = reflection.options[:autosave]
++          association = association_instance_get(association_name)
++          if association
++            if new_record?
++              association
++            elsif association.loaded?
++              autosave ? association : association.select { |record| record.new_record? }
++            else
++              autosave ? (association.target || []) : association.target.select { |record| record.new_record? }
++            end.each do |record|
++              returning(record.valid?) do |valid|
++                if autosave
++                  record.errors.each do |attribute, message|
++                    error_name = "#{reflection.name}_#{attribute}"
++                    errors.add error_name, message unless errors.on(error_name)
++                  end
++                else
++                  errors.add association_name
++                end unless valid
++              end
++            end
++          end
++        end
++        
++        validate method_name
++      end
++    end
+     # Saves the parent, <tt>self</tt>, and any loaded autosave associations.
+     # In addition, it destroys all children that were marked for destruction
+     # with mark_for_destruction.
+@@ -151,10 +203,10 @@ module ActiveRecord
+             if (association = association_instance_get(reflection.name)) && association.loaded?
+               if association.is_a?(Array)
+                 association.proxy_target.each do |child|
+-                  child.marked_for_destruction? ? child.destroy : child.save(perform_validation)
++                  child.marked_for_destruction? ? child.destroy : child.save(false)
+                 end
+               else
+-                association.marked_for_destruction? ? association.destroy : association.save(perform_validation)
++                association.marked_for_destruction? ? association.destroy : association.save(false)
+               end
+             end
+           end
+@@ -166,32 +218,13 @@ module ActiveRecord
+     # will raise a RecordInvalid exception instead of returning false if the
+     # record is not valid.
+     def save_with_autosave_associations!
+-      if valid_with_autosave_associations?
++      if valid?
+         save_with_autosave_associations(false) || raise(RecordNotSaved)
+       else
+         raise RecordInvalid.new(self)
+       end
+     end
+-
+-    # Returns whether or not the parent, <tt>self</tt>, and any loaded autosave associations are valid.
+-    def valid_with_autosave_associations?
+-      if valid_without_autosave_associations?
+-        self.class.reflect_on_all_autosave_associations.all? do |reflection|
+-          if (association = association_instance_get(reflection.name)) && association.loaded?
+-            if association.is_a?(Array)
+-              association.proxy_target.all? { |child| autosave_association_valid?(reflection, child) }
+-            else
+-              autosave_association_valid?(reflection, association)
+-            end
+-          else
+-            true # association not loaded yet, so it should be valid
+-          end
+-        end
+-      else
+-        false # self was not valid
+-      end
+-    end
+-
++    
+     # Returns whether or not the association is valid and applies any errors to the parent, <tt>self</tt>, if it wasn't.
+     def autosave_association_valid?(reflection, association)
+       returning(association.valid?) do |valid|
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index e3122d1..1154b89 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -200,7 +200,7 @@ module ActiveRecord
+               :collection
+             end
+ 
+-            reflection.options[:autosave] = true
++            send(reflection.macro, reflection.name, reflection.options.merge(:autosave => true))
+             self.reject_new_nested_attributes_procs[association_name.to_sym] = options[:reject_if]
+ 
+             # def pirate_attributes=(attributes)
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 381249c..c2054fe 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -180,7 +180,15 @@ class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
+     assert !@pirate.valid?
+     assert !@pirate.errors.on(:ship_name).blank?
+   end
+-
++  
++  def test_should_merge_errors_in_the_associated_model_even_if_master_is_not_valid
++    @pirate.ship.name   = nil
++    @pirate.catchphrase = nil
++    assert !@pirate.valid?
++    assert !@pirate.errors.on(:ship_name).blank?
++    assert !@pirate.errors.on(:catchphrase).blank?
++  end
++  
+   def test_should_still_allow_to_bypass_validations_on_the_associated_model
+     @pirate.catchphrase = ''
+     @pirate.ship.name = ''
+@@ -325,7 +333,25 @@ module AutosaveAssociationOnACollectionAssociationTests
+     assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
+     assert @pirate.errors.on(@association_name).blank?
+   end
+-
++  
++  def test_should_not_use_default_invalid_error_on_associated_models
++    # default association validations only run on new associated records
++    @pirate.send(@association_name).build(:name => '')
++    
++    assert !@pirate.valid?
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert @pirate.errors.on(@association_name).blank?
++  end
++  
++  def test_should_merge_errors_in_the_associated_model_even_if_master_is_not_valid
++    @pirate.send(@association_name).each { |child| child.name = '' }
++    @pirate.catchphrase = nil
++    
++    assert !@pirate.valid?
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert !@pirate.errors.on(:catchphrase).blank?
++  end
++  
+   def test_should_still_allow_to_bypass_validations_on_the_associated_models
+     @pirate.catchphrase = ''
+     @pirate.send(@association_name).each { |child| child.name = '' }
+-- 
+1.6.0
+

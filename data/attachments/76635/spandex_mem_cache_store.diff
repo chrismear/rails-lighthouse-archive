@@ -1,0 +1,588 @@
+From f669f17fba33facfc9865b970d9e4b79fad6f231 Mon Sep 17 00:00:00 2001
+From: Nahum Wild <nahum.wild@gmail.com>
+Date: Sat, 27 Dec 2008 18:54:51 +1300
+Subject: [PATCH] Added in a local per request cache from my SpandexMemCacheStore plugin.  It acts as a buffer to stop unneccessary requests being sent through to memcache.
+
+---
+ .../lib/active_support/cache/mem_cache_store.rb    |   64 +++++++++++++--
+ activesupport/test/caching_test.rb                 |   91 +++++++++++++++++++-
+ 2 files changed, 148 insertions(+), 7 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index f9a7fb1..aba19ab 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -1,4 +1,5 @@
+ require 'memcache'
++require 'dispatcher'
+ 
+ module ActiveSupport
+   module Cache
+@@ -21,8 +22,15 @@ module ActiveSupport
+         NOT_FOUND   = "NOT_FOUND\r\n"
+         DELETED     = "DELETED\r\n"
+       end
+-
+-      attr_reader :addresses
++      
++      module LocalCache
++        # this allows caching of the fact that there is nothing in the remote cache
++        NULL = 'spandex:cached_null'
++      end
++      
++      attr_accessor :data 
++      attr_accessor :local_cache
++      attr_reader   :addresses
+ 
+       # Creates a new MemCacheStore object, with the given memcached server
+       # addresses. Each address is either a host name, or a host-with-port string
+@@ -33,16 +41,36 @@ module ActiveSupport
+       # If no addresses are specified, then MemCacheStore will connect to
+       # localhost port 11211 (the default memcached port).
+       def initialize(*addresses)
++
+         addresses = addresses.flatten
+         options = addresses.extract_options!
+         addresses = ["localhost"] if addresses.empty?
++
+         @addresses = addresses
+         @data = MemCache.new(addresses, options)
++        @local_cache = Hash.new
++        
++        # clear the local cache before each new request is processed
++        ActionController::Dispatcher.before_dispatch proc { clear_local_cache }
++        
+       end
+ 
+       def read(key, options = nil) # :nodoc:
+         super
+-        @data.get(key, raw?(options))
++
++        value = @local_cache[key]
++        if value == LocalCache::NULL
++          value = nil
++        elsif value.nil?
++          value = @data.get(key, raw?(options))
++          @local_cache[key] = value || LocalCache::NULL
++        else
++          # forcing the value to be immutable
++          value = value.dup
++        end
++  
++        value
++        
+       rescue MemCache::MemCacheError => e
+         logger.error("MemCacheError (#{e}): #{e.message}")
+         nil
+@@ -58,9 +86,11 @@ module ActiveSupport
+       def write(key, value, options = nil)
+         super
+         method = options && options[:unless_exist] ? :add : :set
++
+         # memcache-client will break the connection if you send it an integer
+         # in raw mode, so we convert it to a string to be sure it continues working.
+         value = value.to_s if raw?(options)
++        @local_cache[key] = value || LocalCache::NULL
+         response = @data.send(method, key, value, expires_in(options), raw?(options))
+         response == Response::STORED
+       rescue MemCache::MemCacheError => e
+@@ -70,6 +100,7 @@ module ActiveSupport
+ 
+       def delete(key, options = nil) # :nodoc:
+         super
++        @local_cache[key] = LocalCache::NULL
+         response = @data.delete(key, expires_in(options))
+         response == Response::DELETED
+       rescue MemCache::MemCacheError => e
+@@ -80,14 +111,21 @@ module ActiveSupport
+       def exist?(key, options = nil) # :nodoc:
+         # Doesn't call super, cause exist? in memcache is in fact a read
+         # But who cares? Reading is very fast anyway
+-        !read(key, options).nil?
++        # Local cache is checked first too
++        @local_cache.has_key?(key) || !read(key, options).nil?
+       end
+ 
+       def increment(key, amount = 1) # :nodoc:
+         log("incrementing", key, amount)
+ 
+         response = @data.incr(key, amount)
+-        response == Response::NOT_FOUND ? nil : response
++        unless response == Response::NOT_FOUND
++          @local_cache[key] = response.to_s
++          response
++        else
++          nil
++        end
++
+       rescue MemCache::MemCacheError
+         nil
+       end
+@@ -96,17 +134,31 @@ module ActiveSupport
+         log("decrement", key, amount)
+ 
+         response = @data.decr(key, amount)
+-        response == Response::NOT_FOUND ? nil : response
++        unless response == Response::NOT_FOUND
++          @local_cache[key] = response.to_s
++          response
++        else
++          nil
++        end
++        
+       rescue MemCache::MemCacheError
+         nil
+       end
+ 
+       def delete_matched(matcher, options = nil) # :nodoc:
++        # don't do any local caching at present, just pass 
++        # through and let the error happen
+         super
+         raise "Not supported by Memcache"
+       end
++  
++      def clear_local_cache
++        # calling @hash.clear is something like 20x slower than just invoking a new hash
++        @local_cache = Hash.new
++      end        
+ 
+       def clear
++        clear_local_cache
+         @data.flush_all
+       end
+ 
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index d8506de..44d35af 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -1,4 +1,6 @@
+ require 'abstract_unit'
++require 'dispatcher'
++require 'active_support/testing/assertions'
+ 
+ class CacheKeyTest < Test::Unit::TestCase
+   def test_expand_cache_key
+@@ -116,6 +118,12 @@ module CacheStoreBehavior
+     assert_equal 1, @cache.decrement('foo')
+     assert_equal 1, @cache.read('foo', :raw => true).to_i
+   end
++  
++  def test_exist
++    @cache.write('foo', 'bar')
++    assert @cache.exist?('foo')
++    assert !@cache.exist?('bar')
++  end
+ end
+ 
+ class FileStoreTest < Test::Unit::TestCase
+@@ -146,13 +154,15 @@ end
+ 
+ uses_memcached 'memcached backed store' do
+   class MemCacheStoreTest < Test::Unit::TestCase
++    include ActiveSupport::Testing::Assertions
++
+     def setup
+       @cache = ActiveSupport::Cache.lookup_store(:mem_cache_store)
+       @cache.clear
+     end
+ 
+     include CacheStoreBehavior
+-
++    
+     def test_store_objects_should_be_immutable
+       @cache.write('foo', 'bar')
+       @cache.read('foo').gsub!(/.*/, 'baz')
+@@ -164,6 +174,85 @@ uses_memcached 'memcached backed store' do
+       assert_equal 'bar', @cache.read('foo') # make sure 'foo' was written
+       assert result
+     end
++    
++    # In the below local_cache tests, it's proven the local_cache is talked to and memcache isn't
++    # by nilling out the reference to the MemCacheClient object and testing that no errors are 
++    # raised while the expected caching behaviour still occurs.
++
++    def test_clear_local_cache
++      @cache.write('foo', 'bar')
++    
++      @cache.data = nil
++      @cache.clear_local_cache
++      
++      assert_raise(NoMethodError) { @cache.read('foo') }
++    end
++    
++    def test_clearing_local_cache_only_doesnt_clear_remote_cache
++      @cache.write('foo', 'bar')
++      @cache.clear_local_cache
++      assert_equal 'bar', @cache.read('foo')
++    end    
++    
++    def test_clear_also_clears_local_cache
++      @cache.write('foo', 'bar')
++      @cache.clear
++      assert_nil @cache.read('foo')
++    end
++         
++    def test_local_cache_of_read_and_write
++      @cache.write('foo', 'bar')
++      @cache.data = nil      
++      assert_nothing_raised { assert_equal 'bar', @cache.read('foo') }
++    end
++
++    def test_local_cache_of_delete
++      @cache.write('foo', 'bar')
++      @cache.delete('foo')
++      @cache.data = nil
++      assert_nothing_raised { assert_nil @cache.read('foo') }
++    end
++    
++    def test_local_cache_of_exist
++      @cache.write('foo', 'bar')
++      @cache.data = nil      
++      assert_nothing_raised { assert @cache.exist?('foo') }
++    end
++    
++    def test_local_cache_of_increment
++      @cache.write('foo', 1, :raw => true)
++      @cache.increment('foo')
++      @cache.data = nil      
++      assert_nothing_raised { assert_equal 2, @cache.read('foo', :raw => true).to_i }
++    end
++    
++    def test_local_cache_of_decrement
++      @cache.write('foo', 1, :raw => true)
++      @cache.decrement('foo')
++      @cache.data = nil      
++      assert_nothing_raised { assert_equal 0, @cache.read('foo', :raw => true).to_i }
++    end
++    
++    # when MemCacheStore is initialized it adds clear_local_cache to ActionController::Dispatcher.before_dispatch
++    # so that it's local cache is cleared between requests
++    def test_dispatcher_before_dispatch_is_hocked_into_correctly
++      assert_difference 'ActionController::Dispatcher.before_dispatch.size' do
++        ActiveSupport::Cache.lookup_store(:mem_cache_store)
++      end
++      assert_match /active_support\/cache\/mem_cache_store.rb/, ActionController::Dispatcher.before_dispatch.last.method.to_s
++    end
++    
++    def test_local_cache_cleared_between_requests
++      dispatcher = ActionController::Dispatcher.new
++     
++      @cache.write('foo', 'bar')
++      
++      dispatcher.run_callbacks :before_dispatch  
++      @cache.data = nil
++      
++      assert_raise(NoMethodError) { @cache.read('foo') }  
++    end
++    
+   end
+ 
+   class CompressedMemCacheStore < Test::Unit::TestCase
+-- 
+1.6.0.4
+
+
+From 4059b20d0164c06cbce3ffad2959f8d757ea0f41 Mon Sep 17 00:00:00 2001
+From: Nahum Wild <nahum.wild@gmail.com>
+Date: Sun, 28 Dec 2008 17:39:54 +1300
+Subject: [PATCH] Added to class description explaining new change.
+
+---
+ .../lib/active_support/cache/mem_cache_store.rb    |    2 ++
+ 1 files changed, 2 insertions(+), 0 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index aba19ab..a76e0aa 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -14,6 +14,8 @@ module ActiveSupport
+     #   server goes down, then MemCacheStore will ignore it until it goes back
+     #   online.
+     # - Time-based expiry support. See #write and the +:expires_in+ option.
++    # - Per-request in memory cache for all comunication with the MemCache server(s).
++    
+     class MemCacheStore < Store
+       module Response # :nodoc:
+         STORED      = "STORED\r\n"
+-- 
+1.6.0.4
+
+
+From 7d771f9c206c5f6787559b03ed51e7096c5ec101 Mon Sep 17 00:00:00 2001
+From: Nahum Wild <nahum.wild@gmail.com>
+Date: Fri, 9 Jan 2009 09:53:55 +1300
+Subject: [PATCH] Added thead saftey to MemCacheStore in active support and fixed a problem with the exist method not checking the local cache correctly for nulls.
+
+---
+ .../lib/active_support/cache/mem_cache_store.rb    |  135 ++++++++++++--------
+ activesupport/test/caching_test.rb                 |    6 +
+ 2 files changed, 86 insertions(+), 55 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index a76e0aa..fb1aad1 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -33,7 +33,7 @@ module ActiveSupport
+       attr_accessor :data 
+       attr_accessor :local_cache
+       attr_reader   :addresses
+-
++  
+       # Creates a new MemCacheStore object, with the given memcached server
+       # addresses. Each address is either a host name, or a host-with-port string
+       # in the form of "host_name:port". For example:
+@@ -43,14 +43,16 @@ module ActiveSupport
+       # If no addresses are specified, then MemCacheStore will connect to
+       # localhost port 11211 (the default memcached port).
+       def initialize(*addresses)
+-
++        @lock = Mutex.new
++        
+         addresses = addresses.flatten
+         options = addresses.extract_options!
++        
+         addresses = ["localhost"] if addresses.empty?
+ 
+         @addresses = addresses
+         @data = MemCache.new(addresses, options)
+-        @local_cache = Hash.new
++        @lock.synchronize { setup_local_cache }
+         
+         # clear the local cache before each new request is processed
+         ActionController::Dispatcher.before_dispatch proc { clear_local_cache }
+@@ -58,20 +60,22 @@ module ActiveSupport
+       end
+ 
+       def read(key, options = nil) # :nodoc:
+-        super
+-
+-        value = @local_cache[key]
+-        if value == LocalCache::NULL
+-          value = nil
+-        elsif value.nil?
+-          value = @data.get(key, raw?(options))
+-          @local_cache[key] = value || LocalCache::NULL
+-        else
+-          # forcing the value to be immutable
+-          value = value.dup
+-        end
++        @lock.synchronize do
++          super
++
++          value = @local_cache[key]
++          if value == LocalCache::NULL
++            value = nil
++          elsif value.nil?
++            value = @data.get(key, raw?(options))
++            @local_cache[key] = value || LocalCache::NULL
++          else
++            # forcing the value to be immutable
++            value = value.dup
++          end
+   
+-        value
++          value
++        end
+         
+       rescue MemCache::MemCacheError => e
+         logger.error("MemCacheError (#{e}): #{e.message}")
+@@ -86,63 +90,78 @@ module ActiveSupport
+       # - +:expires_in+ - the number of seconds that this value may stay in
+       #   the cache. See ActiveSupport::Cache::Store#write for an example.
+       def write(key, value, options = nil)
+-        super
+-        method = options && options[:unless_exist] ? :add : :set
+-
+-        # memcache-client will break the connection if you send it an integer
+-        # in raw mode, so we convert it to a string to be sure it continues working.
+-        value = value.to_s if raw?(options)
+-        @local_cache[key] = value || LocalCache::NULL
+-        response = @data.send(method, key, value, expires_in(options), raw?(options))
+-        response == Response::STORED
++        @lock.synchronize do
++          super
++          method = options && options[:unless_exist] ? :add : :set
++
++          # memcache-client will break the connection if you send it an integer
++          # in raw mode, so we convert it to a string to be sure it continues working.
++          value = value.to_s if raw?(options)
++          @local_cache[key] = value || LocalCache::NULL
++          response = @data.send(method, key, value, expires_in(options), raw?(options))
++          response == Response::STORED
++        end
+       rescue MemCache::MemCacheError => e
+         logger.error("MemCacheError (#{e}): #{e.message}")
+         false
+       end
+ 
+       def delete(key, options = nil) # :nodoc:
+-        super
+-        @local_cache[key] = LocalCache::NULL
+-        response = @data.delete(key, expires_in(options))
+-        response == Response::DELETED
++        @lock.synchronize do
++          super
++          @local_cache[key] = LocalCache::NULL
++          response = @data.delete(key, expires_in(options))
++          response == Response::DELETED
++        end
+       rescue MemCache::MemCacheError => e
+         logger.error("MemCacheError (#{e}): #{e.message}")
+         false
+       end
+ 
+       def exist?(key, options = nil) # :nodoc:
+-        # Doesn't call super, cause exist? in memcache is in fact a read
+-        # But who cares? Reading is very fast anyway
+-        # Local cache is checked first too
+-        @local_cache.has_key?(key) || !read(key, options).nil?
++        @lock.synchronize do
++          # Doesn't call super, cause exist? in memcache is in fact a read
++          # But who cares? Reading is very fast anyway
++          # Local cache is checked first, if it doesn't know then memcache itself is read from
++          value = @local_cache[key]
++          if value == LocalCache::NULL
++            false
++          elsif value
++            true
++          elsif @data.get(key, raw?(options))
++            false
++          end
++        end
+       end
+ 
+       def increment(key, amount = 1) # :nodoc:
+-        log("incrementing", key, amount)
+-
+-        response = @data.incr(key, amount)
+-        unless response == Response::NOT_FOUND
+-          @local_cache[key] = response.to_s
+-          response
+-        else
+-          nil
++        @lock.synchronize do
++          log("incrementing", key, amount)
++
++          response = @data.incr(key, amount)
++          unless response == Response::NOT_FOUND
++            @local_cache[key] = response.to_s
++            response
++          else
++            nil
++          end
+         end
+-
+       rescue MemCache::MemCacheError
+         nil
+       end
+ 
+       def decrement(key, amount = 1) # :nodoc:
+-        log("decrement", key, amount)
+-
+-        response = @data.decr(key, amount)
+-        unless response == Response::NOT_FOUND
+-          @local_cache[key] = response.to_s
+-          response
+-        else
+-          nil
++        @lock.synchronize do
++          log("decrement", key, amount)
++
++          response = @data.decr(key, amount)
++          unless response == Response::NOT_FOUND
++            @local_cache[key] = response.to_s
++            response
++          else
++            nil
++          end
+         end
+-        
+       rescue MemCache::MemCacheError
+         nil
+       end
+@@ -155,13 +174,14 @@ module ActiveSupport
+       end
+   
+       def clear_local_cache
+-        # calling @hash.clear is something like 20x slower than just invoking a new hash
+-        @local_cache = Hash.new
++        @lock.synchronize { setup_local_cache }
+       end        
+ 
+       def clear
+-        clear_local_cache
+-        @data.flush_all
++        @lock.synchronize do
++          setup_local_cache
++          @data.flush_all
++        end
+       end
+ 
+       def stats
+@@ -176,6 +196,11 @@ module ActiveSupport
+         def raw?(options)
+           options && options[:raw]
+         end
++        
++        def setup_local_cache
++          # calling @hash.clear is something like 20x slower than just invoking a new hash
++          @local_cache = Hash.new
++        end
+     end
+   end
+ end
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index 44d35af..01b0986 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -253,6 +253,12 @@ uses_memcached 'memcached backed store' do
+       assert_raise(NoMethodError) { @cache.read('foo') }  
+     end
+     
++    def test_exist_with_nulls_cached_locally
++      @cache.write('foo', 'bar')
++      @cache.delete('foo')
++      assert !@cache.exist?('foo')
++    end
++    
+   end
+ 
+   class CompressedMemCacheStore < Test::Unit::TestCase
+-- 
+1.6.0.4
+
+
+From 7b1cd44d595976eff6201c72c0cded0179a766b6 Mon Sep 17 00:00:00 2001
+From: Nahum Wild <nahum.wild@gmail.com>
+Date: Fri, 9 Jan 2009 09:59:04 +1300
+Subject: [PATCH] Sorted out some comments in MemCacheStore.
+
+---
+ .../lib/active_support/cache/mem_cache_store.rb    |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index fb1aad1..f49a1b8 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -14,7 +14,7 @@ module ActiveSupport
+     #   server goes down, then MemCacheStore will ignore it until it goes back
+     #   online.
+     # - Time-based expiry support. See #write and the +:expires_in+ option.
+-    # - Per-request in memory cache for all comunication with the MemCache server(s).
++    # - Per-request in memory cache for all communication with the MemCache server(s).
+     
+     class MemCacheStore < Store
+       module Response # :nodoc:
+@@ -198,7 +198,7 @@ module ActiveSupport
+         end
+         
+         def setup_local_cache
+-          # calling @hash.clear is something like 20x slower than just invoking a new hash
++          # calling @hash.clear is something like 20x slower than just invoking a new hash apparently
+           @local_cache = Hash.new
+         end
+     end
+-- 
+1.6.0.4
+

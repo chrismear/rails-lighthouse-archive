@@ -1,0 +1,1825 @@
+From 962571407b3e58c107087b7de4bc8e3adc1ec84b Mon Sep 17 00:00:00 2001
+From: Nick Muerdter <spam@nickm.org>
+Date: Sun, 27 Sep 2009 18:30:40 -0600
+Subject: [PATCH] Refactoring to_xml to be more flexible.
+
+---
+ activemodel/lib/active_model/serializers/xml.rb    |  118 +++----
+ .../serializeration/xml_serialization_test.rb      |    4 +-
+ .../active_record/serializers/xml_serializer.rb    |   73 ++---
+ activerecord/test/cases/xml_serialization_test.rb  |   28 ++
+ activerecord/test/models/contact.rb                |   20 ++-
+ .../lib/active_resource/formats/xml_format.rb      |    1 +
+ .../active_support/core_ext/array/conversions.rb   |  107 -------
+ .../active_support/core_ext/hash/conversions.rb    |   83 -----
+ activesupport/lib/active_support/time_with_zone.rb |    6 +
+ activesupport/lib/active_support/xml.rb            |    1 +
+ .../lib/active_support/xml/encoders/date.rb        |    6 +
+ .../lib/active_support/xml/encoders/date_time.rb   |    6 +
+ .../lib/active_support/xml/encoders/enumerable.rb  |  111 +++++++
+ .../lib/active_support/xml/encoders/false_class.rb |    6 +
+ .../lib/active_support/xml/encoders/hash.rb        |   20 ++
+ .../lib/active_support/xml/encoders/nil_class.rb   |    6 +
+ .../lib/active_support/xml/encoders/numeric.rb     |   28 ++
+ .../lib/active_support/xml/encoders/object.rb      |   49 +++
+ .../lib/active_support/xml/encoders/string.rb      |    5 +
+ .../lib/active_support/xml/encoders/symbol.rb      |    6 +
+ .../lib/active_support/xml/encoders/time.rb        |    6 +
+ .../lib/active_support/xml/encoders/true_class.rb  |    6 +
+ activesupport/lib/active_support/xml/encoding.rb   |  149 +++++++++
+ activesupport/test/core_ext/array_ext_test.rb      |   90 ------
+ activesupport/test/core_ext/hash_ext_test.rb       |  159 +---------
+ activesupport/test/xml/encoding_test.rb            |  333 ++++++++++++++++++++
+ 26 files changed, 874 insertions(+), 553 deletions(-)
+ create mode 100644 activesupport/lib/active_support/xml.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/date.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/date_time.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/enumerable.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/false_class.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/hash.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/nil_class.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/numeric.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/object.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/string.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/symbol.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/time.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoders/true_class.rb
+ create mode 100644 activesupport/lib/active_support/xml/encoding.rb
+ create mode 100644 activesupport/test/xml/encoding_test.rb
+
+diff --git a/activemodel/lib/active_model/serializers/xml.rb b/activemodel/lib/active_model/serializers/xml.rb
+index 86149f1..d029c56 100644
+--- a/activemodel/lib/active_model/serializers/xml.rb
++++ b/activemodel/lib/active_model/serializers/xml.rb
+@@ -1,5 +1,6 @@
+ require 'active_support/core_ext/class/attribute_accessors'
+ require 'active_support/core_ext/hash/conversions'
++require 'active_support/xml'
+ 
+ module ActiveModel
+   module Serializers
+@@ -13,8 +14,17 @@ module ActiveModel
+ 
+           def initialize(name, serializable)
+             @name, @serializable = name, serializable
+-            @type  = compute_type
+             @value = compute_value
++            @type  = compute_type
++
++            if !@value.nil?
++              case(@type)
++              when :binary
++                @value = ActiveSupport::Base64.encode64(@value)
++              when :yaml
++                @value = @value.to_yaml
++              end
++            end
+           end
+ 
+           # There is a significant speed improvement if the value
+@@ -30,14 +40,14 @@ module ActiveModel
+             ![ :binary, :date, :datetime, :boolean, :float, :integer ].include?(type)
+           end
+ 
+-          def decorations(include_types = true)
++          def decorations
+             decorations = {}
+ 
+             if type == :binary
+               decorations[:encoding] = 'base64'
+             end
+ 
+-            if include_types && type != :string
++            if !type.nil? && type != :string
+               decorations[:type] = type
+             end
+ 
+@@ -48,31 +58,28 @@ module ActiveModel
+             decorations
+           end
+ 
++          def as_xml(options = {})
++            options[:tag_attributes].merge!(self.decorations)
++
++            # Defer as_xml to the value object.
++            self.value.as_xml(options)
++          end
++
+           protected
+             def compute_type
+-              value = @serializable.send(name)
+-              type = Hash::XML_TYPE_NAMES[value.class.name]
+-              type ||= :string if value.respond_to?(:to_str)
+-              type ||= :yaml
+-              type
++              # By default, let the the value object's as_xml method determine
++              # its own type.
++              nil
+             end
+ 
+             def compute_value
+-              value = @serializable.send(name)
+-
+-              if formatter = Hash::XML_FORMATTING[type.to_s]
+-                value ? formatter.call(value) : nil
+-              else
+-                value
+-              end
++              @serializable.send(name)
+             end
+         end
+ 
+         class MethodAttribute < Attribute #:nodoc:
+-          protected
+-            def compute_type
+-              Hash::XML_TYPE_NAMES[@serializable.send(name).class.name] || :string
+-            end
++          def compute_type
++          end
+         end
+ 
+         attr_reader :options
+@@ -114,71 +121,46 @@ module ActiveModel
+           end
+         end
+ 
+-        def serialize
+-          args = [root]
+-
+-          if options[:namespace]
+-            args << {:xmlns => options[:namespace]}
+-          end
++        # Serialize the model record into a hash, so we can take advantaged of
++        # Hash's to_xml behavior.
++        def serializable_record
++          @serializable_record = {}
+ 
+-          if options[:type]
+-            args << {:type => options[:type]}
+-          end
++          add_attributes
+ 
+-          builder.tag!(*args) do
+-            add_attributes
+-            procs = options.delete(:procs)
+-            options[:procs] = procs
+-            add_procs
+-            yield builder if block_given?
+-          end
++          @serializable_record
+         end
+ 
+-        private
+-          def builder
+-            @builder ||= begin
+-              require 'builder' unless defined? ::Builder
+-              options[:indent] ||= 2
+-              builder = options[:builder] ||= ::Builder::XmlMarkup.new(:indent => options[:indent])
+-
+-              unless options[:skip_instruct]
+-                builder.instruct!
+-                options[:skip_instruct] = true
+-              end
++        def as_xml(opts = {})
++          opts.reverse_merge!(options)
+ 
+-              builder
+-            end
+-          end
++          opts[:root] ||= @serializable.class.model_name.singular
+ 
+-          def root
+-            root = (options[:root] || @serializable.class.model_name.singular).to_s
+-            reformat_name(root)
++          if opts[:namespace]
++            opts[:tag_attributes][:xmlns] = opts.delete(:namespace)
+           end
+ 
+-          def dasherize?
+-            !options.has_key?(:dasherize) || options[:dasherize]
++          if opts[:type]
++            opts[:tag_attributes][:type] = opts.delete(:type)
+           end
+ 
+-          def camelize?
+-            options.has_key?(:camelize) && options[:camelize]
+-          end
++          self
++        end
+ 
+-          def reformat_name(name)
+-            name = name.camelize if camelize?
+-            dasherize? ? name.dasherize : name
++        def build_xml(encoder)
++          serializable_record.build_xml(encoder) do
++            call_procs
+           end
++        end
+ 
++        private
+           def add_attributes
+             (serializable_attributes + serializable_method_attributes).each do |attribute|
+-              builder.tag!(
+-                reformat_name(attribute.name),
+-                attribute.value.to_s,
+-                attribute.decorations(!options[:skip_types])
+-              )
++              @serializable_record[attribute.name] = attribute
+             end
+           end
+ 
+-          def add_procs
++          def call_procs
+             if procs = options.delete(:procs)
+               [ *procs ].each do |proc|
+                 if proc.arity > 1
+@@ -191,8 +173,8 @@ module ActiveModel
+           end
+       end
+ 
+-      def to_xml(options = {}, &block)
+-        Serializer.new(self, options).serialize(&block)
++      def as_xml(options = {}) #:nodoc:
++        Serializer.new(self, options).as_xml(options)
+       end
+ 
+       def from_xml(xml)
+diff --git a/activemodel/test/cases/serializeration/xml_serialization_test.rb b/activemodel/test/cases/serializeration/xml_serialization_test.rb
+index 6340aad..90b92bd 100644
+--- a/activemodel/test/cases/serializeration/xml_serialization_test.rb
++++ b/activemodel/test/cases/serializeration/xml_serialization_test.rb
+@@ -93,7 +93,9 @@ class XmlSerializationTest < ActiveModel::TestCase
+   end
+ 
+   test "should serialize yaml" do
+-    assert_match %r{<preferences type=\"yaml\">--- \n:gem: ruby\n</preferences>}, @contact.to_xml
++    assert_match %r{<preferences>}, @contact.to_xml
++    assert_match %r{<gem>ruby</gem>}, @contact.to_xml
++    assert_match %r{</preferences>}, @contact.to_xml
+   end
+ 
+   test "should call proc on object" do
+diff --git a/activerecord/lib/active_record/serializers/xml_serializer.rb b/activerecord/lib/active_record/serializers/xml_serializer.rb
+index b199207..bcc0a0b 100644
+--- a/activerecord/lib/active_record/serializers/xml_serializer.rb
++++ b/activerecord/lib/active_record/serializers/xml_serializer.rb
+@@ -171,7 +171,11 @@ module ActiveRecord #:nodoc:
+     #     end
+     #   end
+     def to_xml(options = {}, &block)
+-      XmlSerializer.new(self, options).serialize(&block)
++      super
++    end
++
++    def as_xml(options = {}) #:nodoc:
++      XmlSerializer.new(self, options).as_xml(options)
+     end
+   end
+ 
+@@ -184,7 +188,7 @@ module ActiveRecord #:nodoc:
+     def serializable_attributes
+       serializable_attribute_names.collect { |name| Attribute.new(name, @serializable) }
+     end
+-
++ 
+     def serializable_method_attributes
+       Array(options[:methods]).inject([]) do |method_attributes, name|
+         method_attributes << MethodAttribute.new(name.to_s, @serializable) if @serializable.respond_to?(name.to_s)
+@@ -194,59 +198,42 @@ module ActiveRecord #:nodoc:
+ 
+     def add_associations(association, records, opts)
+       if records.is_a?(Enumerable)
+-        tag = reformat_name(association.to_s)
+-        type = options[:skip_types] ? {} : {:type => "array"}
+-
+-        if records.empty?
+-          builder.tag!(tag, type)
+-        else
+-          builder.tag!(tag, type) do
+-            association_name = association.to_s.singularize
+-            records.each do |record|
+-              if options[:skip_types]
+-                record_type = {}
+-              else
+-                record_class = (record.class.to_s.underscore == association_name) ? nil : record.class.name
+-                record_type = {:type => record_class}
+-              end
+-
+-              record.to_xml opts.merge(:root => association_name).merge(record_type)
+-            end
++        @serializable_record[association] = records.collect do |record|
++          if(record.class.to_s.underscore != association.to_s.singularize)
++            opts[:type] = record.class.name
+           end
++
++          self.class.new(record, opts)
+         end
+       else
+-        if record = @serializable.send(association)
+-          record.to_xml(opts.merge(:root => association))
+-        end
++        @serializable_record[association] = self.class.new(records, opts)
+       end
+     end
+ 
+-    def serialize
+-      args = [root]
+-      if options[:namespace]
+-        args << {:xmlns=>options[:namespace]}
+-      end
++    def serializable_record
++      @serializable_record = {}
+ 
+-      if options[:type]
+-        args << {:type=>options[:type]}
+-      end
++      add_attributes
+ 
+-      builder.tag!(*args) do
+-        add_attributes
+-        procs = options.delete(:procs)
+-        @serializable.send(:serializable_add_includes, options) { |association, records, opts|
+-          add_associations(association, records, opts)
+-        }
+-        options[:procs] = procs
+-        add_procs
+-        yield builder if block_given?
++      # Add association data to the hash. Remove the procs from the options
++      # during this so they aren't applied to the associations.
++      procs = options.delete(:procs)
++      @serializable.send(:serializable_add_includes, options) do |association, records, opts|
++        add_associations(association, records, opts)
+       end
++      options[:procs] = procs
++
++      @serializable_record
+     end
+ 
+     class Attribute < ActiveModel::Serializers::Xml::Serializer::Attribute #:nodoc:
+       protected
+         def compute_type
+-          type = @serializable.class.serialized_attributes.has_key?(name) ? :yaml : @serializable.class.columns_hash[name].type
++          type = if(@serializable.class.serialized_attributes.has_key?(name))
++            :yaml
++          elsif(!@serializable.class.columns_hash[name].nil?)
++            @serializable.class.columns_hash[name].type
++          end
+ 
+           case type
+             when :text
+@@ -260,10 +247,6 @@ module ActiveRecord #:nodoc:
+     end
+ 
+     class MethodAttribute < Attribute #:nodoc:
+-      protected
+-        def compute_type
+-          Hash::XML_TYPE_NAMES[@serializable.send(name).class.name] || :string
+-        end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/xml_serialization_test.rb b/activerecord/test/cases/xml_serialization_test.rb
+index e1ad5c1..19bf766 100644
+--- a/activerecord/test/cases/xml_serialization_test.rb
++++ b/activerecord/test/cases/xml_serialization_test.rb
+@@ -83,6 +83,27 @@ class DefaultXmlSerializationTest < ActiveRecord::TestCase
+   end
+ end
+ 
++class NestedStructuresXmlSerializationTest < ActiveRecord::TestCase
++  def setup
++    @xml = Contact.new(:created_at => Time.utc(2006, 8, 1)).to_xml(:methods => [:extra_data, :extra_list], :indent => 1, :camelize => true)
++  end
++
++  def test_should_serialize_hash_method
++    assert_match %r{^ <ExtraData>}, @xml
++    assert_match %r{^  <Field1>value1</Field1>}, @xml
++    assert_match %r{^   <SubField type="datetime">2009-09-01T00:00:00Z</SubField>}, @xml
++    assert_match %r{^   <SubValues type="array">}, @xml
++    assert_match %r{^    <SubValue type="integer">9</SubValue>}, @xml
++    assert_match %r{^    <SubValue type="integer">283</SubValue>}, @xml
++  end
++
++  def test_should_serialize_array_method
++    assert_match %r{^ <ExtraList type="array">}, @xml
++    assert_match %r{^  <ExtraList type="datetime">2009-08-01T00:00:00Z</ExtraList>}, @xml
++    assert_match %r{^  <ExtraList nil="true"></ExtraList>}, @xml
++  end
++end
++
+ class NilXmlSerializationTest < ActiveRecord::TestCase
+   def setup
+     @xml = Contact.new.to_xml(:root => 'xml_contact')
+@@ -223,4 +244,11 @@ class DatabaseConnectedXmlSerializationTest < ActiveRecord::TestCase
+     assert types.include?('StiPost')
+   end
+ 
++  def test_should_include_has_many_array_of_ids
++    xml = authors(:david).to_xml :methods => :post_ids, :indent => 2
++
++    assert_match %r{^  <post-ids type="array">}, xml
++    assert_match %r{^    <post-id type="integer">1</post-id>}, xml
++    assert_match %r{^    <post-id type="integer">2</post-id>}, xml
++  end
+ end
+diff --git a/activerecord/test/models/contact.rb b/activerecord/test/models/contact.rb
+index dbfa57b..5960f1e 100644
+--- a/activerecord/test/models/contact.rb
++++ b/activerecord/test/models/contact.rb
+@@ -13,4 +13,22 @@ class Contact < ActiveRecord::Base
+   column :preferences, :string
+ 
+   serialize :preferences
+-end
+\ No newline at end of file
++
++  def extra_data
++    {
++      :field1 => "value1",
++      :field2 => {
++        :sub_field => Time.utc(2009, 9, 1),
++        :sub_values => [3, 9, 283],
++      }
++    }
++  end
++
++  def extra_list
++    ["list_value", Time.utc(2009, 8, 1), nil]
++  end
++
++  def extra_nil
++    nil
++  end
++end
+diff --git a/activeresource/lib/active_resource/formats/xml_format.rb b/activeresource/lib/active_resource/formats/xml_format.rb
+index 3b2575c..0f2b059 100644
+--- a/activeresource/lib/active_resource/formats/xml_format.rb
++++ b/activeresource/lib/active_resource/formats/xml_format.rb
+@@ -1,4 +1,5 @@
+ require 'active_support/core_ext/hash/conversions'
++require 'active_support/xml'
+ 
+ module ActiveResource
+   module Formats
+diff --git a/activesupport/lib/active_support/core_ext/array/conversions.rb b/activesupport/lib/active_support/core_ext/array/conversions.rb
+index c53cf3f..9fcfb6a 100644
+--- a/activesupport/lib/active_support/core_ext/array/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/array/conversions.rb
+@@ -79,111 +79,4 @@ class Array
+   end
+   alias_method :to_default_s, :to_s
+   alias_method :to_s, :to_formatted_s
+-
+-  # Returns a string that represents this array in XML by sending +to_xml+
+-  # to each element. Active Record collections delegate their representation
+-  # in XML to this method.
+-  #
+-  # All elements are expected to respond to +to_xml+, if any of them does
+-  # not an exception is raised.
+-  #
+-  # The root node reflects the class name of the first element in plural
+-  # if all elements belong to the same type and that's not Hash:
+-  #
+-  #   customer.projects.to_xml
+-  #
+-  #   <?xml version="1.0" encoding="UTF-8"?>
+-  #   <projects type="array">
+-  #     <project>
+-  #       <amount type="decimal">20000.0</amount>
+-  #       <customer-id type="integer">1567</customer-id>
+-  #       <deal-date type="date">2008-04-09</deal-date>
+-  #       ...
+-  #     </project>
+-  #     <project>
+-  #       <amount type="decimal">57230.0</amount>
+-  #       <customer-id type="integer">1567</customer-id>
+-  #       <deal-date type="date">2008-04-15</deal-date>
+-  #       ...
+-  #     </project>
+-  #   </projects>
+-  #
+-  # Otherwise the root element is "records":
+-  #
+-  #   [{:foo => 1, :bar => 2}, {:baz => 3}].to_xml
+-  #
+-  #   <?xml version="1.0" encoding="UTF-8"?>
+-  #   <records type="array">
+-  #     <record>
+-  #       <bar type="integer">2</bar>
+-  #       <foo type="integer">1</foo>
+-  #     </record>
+-  #     <record>
+-  #       <baz type="integer">3</baz>
+-  #     </record>
+-  #   </records>
+-  #
+-  # If the collection is empty the root element is "nil-classes" by default:
+-  #
+-  #   [].to_xml
+-  #
+-  #   <?xml version="1.0" encoding="UTF-8"?>
+-  #   <nil-classes type="array"/>
+-  #
+-  # To ensure a meaningful root element use the <tt>:root</tt> option:
+-  #
+-  #   customer_with_no_projects.projects.to_xml(:root => "projects")
+-  #
+-  #   <?xml version="1.0" encoding="UTF-8"?>
+-  #   <projects type="array"/>
+-  #
+-  # By default root children have as node name the one of the root
+-  # singularized. You can change it with the <tt>:children</tt> option.
+-  #
+-  # The +options+ hash is passed downwards:
+-  #
+-  #   Message.all.to_xml(:skip_types => true)
+-  #
+-  #   <?xml version="1.0" encoding="UTF-8"?>
+-  #   <messages>
+-  #     <message>
+-  #       <created-at>2008-03-07T09:58:18+01:00</created-at>
+-  #       <id>1</id>
+-  #       <name>1</name>
+-  #       <updated-at>2008-03-07T09:58:18+01:00</updated-at>
+-  #       <user-id>1</user-id>
+-  #     </message>
+-  #   </messages>
+-  #
+-  def to_xml(options = {})
+-    raise "Not all elements respond to to_xml" unless all? { |e| e.respond_to? :to_xml }
+-    require 'builder' unless defined?(Builder)
+-
+-    options = options.dup
+-    options[:root]     ||= all? { |e| e.is_a?(first.class) && first.class.to_s != "Hash" } ? ActiveSupport::Inflector.pluralize(ActiveSupport::Inflector.underscore(first.class.name)) : "records"
+-    options[:children] ||= options[:root].singularize
+-    options[:indent]   ||= 2
+-    options[:builder]  ||= Builder::XmlMarkup.new(:indent => options[:indent])
+-
+-    root     = options.delete(:root).to_s
+-    children = options.delete(:children)
+-
+-    if !options.has_key?(:dasherize) || options[:dasherize]
+-      root = root.dasherize
+-    end
+-
+-    options[:builder].instruct! unless options.delete(:skip_instruct)
+-
+-    opts = options.merge({ :root => children })
+-
+-    xml = options[:builder]
+-    if empty?
+-      xml.tag!(root, options[:skip_types] ? {} : {:type => "array"})
+-    else
+-      xml.tag!(root, options[:skip_types] ? {} : {:type => "array"}) {
+-        yield xml if block_given?
+-        each { |e| e.to_xml(opts.merge({ :skip_instruct => true })) }
+-      }
+-    end
+-  end
+ end
+diff --git a/activesupport/lib/active_support/core_ext/hash/conversions.rb b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+index bd9419e..9e4805a 100644
+--- a/activesupport/lib/active_support/core_ext/hash/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+@@ -18,27 +18,6 @@ class Hash
+     end
+   end
+ 
+-  XML_TYPE_NAMES = {
+-    "Symbol"     => "symbol",
+-    "Fixnum"     => "integer",
+-    "Bignum"     => "integer",
+-    "BigDecimal" => "decimal",
+-    "Float"      => "float",
+-    "TrueClass"  => "boolean",
+-    "FalseClass" => "boolean",
+-    "Date"       => "date",
+-    "DateTime"   => "datetime",
+-    "Time"       => "datetime"
+-  } unless defined?(XML_TYPE_NAMES)
+-
+-  XML_FORMATTING = {
+-    "symbol"   => Proc.new { |symbol| symbol.to_s },
+-    "date"     => Proc.new { |date| date.to_s(:db) },
+-    "datetime" => Proc.new { |time| time.xmlschema },
+-    "binary"   => Proc.new { |binary| ActiveSupport::Base64.encode64(binary) },
+-    "yaml"     => Proc.new { |yaml| yaml.to_yaml }
+-  } unless defined?(XML_FORMATTING)
+-
+   # TODO: use Time.xmlschema instead of Time.parse;
+   #       use regexp instead of Date.parse
+   unless defined?(XML_PARSING)
+@@ -83,68 +62,6 @@ class Hash
+   
+   alias_method :to_param, :to_query
+ 
+-  def to_xml(options = {})
+-    require 'builder' unless defined?(Builder)
+-
+-    options = options.dup
+-    options[:indent] ||= 2
+-    options.reverse_merge!({ :builder => Builder::XmlMarkup.new(:indent => options[:indent]),
+-                             :root => "hash" })
+-    options[:builder].instruct! unless options.delete(:skip_instruct)
+-    root = rename_key(options[:root].to_s, options)
+-
+-    options[:builder].__send__(:method_missing, root) do
+-      each do |key, value|
+-        case value
+-          when ::Hash
+-            value.to_xml(options.merge({ :root => key, :skip_instruct => true }))
+-          when ::Array
+-            value.to_xml(options.merge({ :root => key, :children => key.to_s.singularize, :skip_instruct => true}))
+-          when ::Method, ::Proc
+-            # If the Method or Proc takes two arguments, then
+-            # pass the suggested child element name.  This is
+-            # used if the Method or Proc will be operating over
+-            # multiple records and needs to create an containing
+-            # element that will contain the objects being
+-            # serialized.
+-            if 1 == value.arity
+-              value.call(options.merge({ :root => key, :skip_instruct => true }))
+-            else
+-              value.call(options.merge({ :root => key, :skip_instruct => true }), key.to_s.singularize)
+-            end
+-          else
+-            if value.respond_to?(:to_xml)
+-              value.to_xml(options.merge({ :root => key, :skip_instruct => true }))
+-            else
+-              type_name = XML_TYPE_NAMES[value.class.name]
+-
+-              key = rename_key(key.to_s, options)
+-
+-              attributes = options[:skip_types] || value.nil? || type_name.nil? ? { } : { :type => type_name }
+-              if value.nil?
+-                attributes[:nil] = true
+-              end
+-
+-              options[:builder].tag!(key,
+-                XML_FORMATTING[type_name] ? XML_FORMATTING[type_name].call(value) : value,
+-                attributes
+-              )
+-            end
+-        end
+-      end
+-      
+-      yield options[:builder] if block_given?
+-    end
+-
+-  end
+-
+-  def rename_key(key, options = {})
+-    camelize = options.has_key?(:camelize) && options[:camelize]
+-    dasherize = !options.has_key?(:dasherize) || options[:dasherize]
+-    key = key.camelize if camelize
+-    dasherize ? key.dasherize : key
+-  end
+-
+   class << self
+     def from_xml(xml)
+       typecast_xml_value(unrename_keys(ActiveSupport::XmlMini.parse(xml)))
+diff --git a/activesupport/lib/active_support/time_with_zone.rb b/activesupport/lib/active_support/time_with_zone.rb
+index 4907fae..b7951dc 100644
+--- a/activesupport/lib/active_support/time_with_zone.rb
++++ b/activesupport/lib/active_support/time_with_zone.rb
+@@ -118,6 +118,12 @@ module ActiveSupport
+     end
+     alias_method :iso8601, :xmlschema
+ 
++    def as_xml(options = {}) #:nodoc:
++      options[:tag_attributes][:type] ||= "datetime"
++
++      xmlschema
++    end
++
+     # Coerces the date to a string for JSON encoding.
+     #
+     # ISO 8601 format is used if ActiveSupport::JSON::Encoding.use_standard_json_time_format is set.
+diff --git a/activesupport/lib/active_support/xml.rb b/activesupport/lib/active_support/xml.rb
+new file mode 100644
+index 0000000..11ae318
+--- /dev/null
++++ b/activesupport/lib/active_support/xml.rb
+@@ -0,0 +1 @@
++require "active_support/xml/encoding"
+diff --git a/activesupport/lib/active_support/xml/encoders/date.rb b/activesupport/lib/active_support/xml/encoders/date.rb
+new file mode 100644
+index 0000000..d3130ed
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/date.rb
+@@ -0,0 +1,6 @@
++class Date
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "date"
++    to_s(:db)
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/date_time.rb b/activesupport/lib/active_support/xml/encoders/date_time.rb
+new file mode 100644
+index 0000000..ac02699
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/date_time.rb
+@@ -0,0 +1,6 @@
++class DateTime
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "datetime"
++    xmlschema
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/enumerable.rb b/activesupport/lib/active_support/xml/encoders/enumerable.rb
+new file mode 100644
+index 0000000..8eb636d
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/enumerable.rb
+@@ -0,0 +1,111 @@
++module Enumerable
++  def as_xml(options = {}) #:nodoc:
++    to_a
++  end
++end
++
++class Array
++  # Returns a string that represents this array in XML by sending +to_xml+
++  # to each element. Active Record collections delegate their representation
++  # in XML to this method.
++  #
++  # All elements are expected to respond to +to_xml+, if any of them does
++  # not an exception is raised.
++  #
++  # The root node reflects the class name of the first element in plural
++  # if all elements belong to the same type and that's not Hash:
++  #
++  #   customer.projects.to_xml
++  #
++  #   <?xml version="1.0" encoding="UTF-8"?>
++  #   <projects type="array">
++  #     <project>
++  #       <amount type="decimal">20000.0</amount>
++  #       <customer-id type="integer">1567</customer-id>
++  #       <deal-date type="date">2008-04-09</deal-date>
++  #       ...
++  #     </project>
++  #     <project>
++  #       <amount type="decimal">57230.0</amount>
++  #       <customer-id type="integer">1567</customer-id>
++  #       <deal-date type="date">2008-04-15</deal-date>
++  #       ...
++  #     </project>
++  #   </projects>
++  #
++  # Otherwise the root element is "records":
++  #
++  #   [{:foo => 1, :bar => 2}, {:baz => 3}].to_xml
++  #
++  #   <?xml version="1.0" encoding="UTF-8"?>
++  #   <records type="array">
++  #     <record>
++  #       <bar type="integer">2</bar>
++  #       <foo type="integer">1</foo>
++  #     </record>
++  #     <record>
++  #       <baz type="integer">3</baz>
++  #     </record>
++  #   </records>
++  #
++  # If the collection is empty the root element is "nil-classes" by default:
++  #
++  #   [].to_xml
++  #
++  #   <?xml version="1.0" encoding="UTF-8"?>
++  #   <nil-classes type="array"/>
++  #
++  # To ensure a meaningful root element use the <tt>:root</tt> option:
++  #
++  #   customer_with_no_projects.projects.to_xml(:root => "projects")
++  #
++  #   <?xml version="1.0" encoding="UTF-8"?>
++  #   <projects type="array"/>
++  #
++  # By default root children have as node name the one of the root
++  # singularized. You can change it with the <tt>:children</tt> option.
++  #
++  # The +options+ hash is passed downwards:
++  #
++  #   Message.all.to_xml(:skip_types => true)
++  #
++  #   <?xml version="1.0" encoding="UTF-8"?>
++  #   <messages>
++  #     <message>
++  #       <created-at>2008-03-07T09:58:18+01:00</created-at>
++  #       <id>1</id>
++  #       <name>1</name>
++  #       <updated-at>2008-03-07T09:58:18+01:00</updated-at>
++  #       <user-id>1</user-id>
++  #     </message>
++  #   </messages>
++  #
++  def to_xml(options = {}, encoder = nil, &block)
++    super
++  end
++
++  def as_xml(options = {}) #:nodoc:
++    options[:root]     ||= all? { |e| e.is_a?(first.class) && first.class.to_s != "Hash" } ? first.class.to_s.underscore.pluralize : "records"
++    options[:children] ||= options[:root].to_s.singularize
++
++    options[:tag_attributes][:type] ||= "array"
++
++    self
++  end
++
++  def build_xml(encoder, &block) #:nodoc:
++    if(empty? && !block_given?)
++      encoder.build_current_tag
++    else
++      encoder.build_current_tag do
++        children = encoder.options.delete(:children)
++        each do |value|
++          encoder.options[:root] = children
++          encoder.encode(value)
++        end
++
++        yield(encoder) if(block_given?)
++      end
++    end
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/false_class.rb b/activesupport/lib/active_support/xml/encoders/false_class.rb
+new file mode 100644
+index 0000000..1d9c877
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/false_class.rb
+@@ -0,0 +1,6 @@
++class FalseClass
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "boolean"
++    to_s
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/hash.rb b/activesupport/lib/active_support/xml/encoders/hash.rb
+new file mode 100644
+index 0000000..ec4fba9
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/hash.rb
+@@ -0,0 +1,20 @@
++class Hash
++  def as_xml(options = {}) #:nodoc:
++    self
++  end
++
++  def build_xml(encoder, &block) #:nodoc:
++    if(empty? && !block_given?)
++      encoder.build_current_tag
++    else
++      encoder.build_current_tag do
++        each do |key, value|
++          encoder.options[:root] = key
++          encoder.encode(value)
++        end
++
++        yield(encoder) if(block_given?)
++      end
++    end
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/nil_class.rb b/activesupport/lib/active_support/xml/encoders/nil_class.rb
+new file mode 100644
+index 0000000..d353a72
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/nil_class.rb
+@@ -0,0 +1,6 @@
++class NilClass
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:nil] ||= true
++    self
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/numeric.rb b/activesupport/lib/active_support/xml/encoders/numeric.rb
+new file mode 100644
+index 0000000..d342cc6
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/numeric.rb
+@@ -0,0 +1,28 @@
++require 'active_support/core_ext/big_decimal'
++
++class Numeric
++  def as_xml(options = {}) #:nodoc:
++    self
++  end
++end
++
++class Float
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "float"
++    self
++  end
++end
++
++class Integer
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "integer"
++    super
++  end
++end
++
++class BigDecimal
++  def as_xml(options = {}) #:nodoc:#
++    options[:tag_attributes][:type] ||= "decimal"
++    super
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/object.rb b/activesupport/lib/active_support/xml/encoders/object.rb
+new file mode 100644
+index 0000000..e428bec
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/object.rb
+@@ -0,0 +1,49 @@
++class Object
++  # Converts the object to an XML string representation.
++  #
++  # ==== Options
++  # The +options+ parameter controls the formatting of the XML output.
++  #
++  # * <tt>:indent</tt> - Set the indent level for the XML output (default is +2+).
++  # * <tt>:dasherize</tt> - Boolean option to determine whether or not element
++  #   names should replace underscores with dashes (default is <tt>true</tt>).
++  # * <tt>:camelize</tt> - Boolean option to determine whether or not element
++  #   names should be camelized (default is <tt>false</tt>).
++  # * <tt>:skip_instruct</tt> - Toggle skipping the +instruct!+ call on the XML
++  #   builder that generates the XML declaration (default is <tt>false</tt>).
++  #
++  # System-wide defaults for the +dasherize+ and +camelize+ options can be set
++  # using +ActiveSupport.dasherize_xml+ and ActiveSupport.camelize_xml+.
++  #
++  # ==== Examples
++  #   my_group = SubsidiaryGroup.find(:first)
++  #   my_group.to_xml
++  #   # => <?xml version="1.0" encoding="UTF-8"?>
++  #   #    <subsidiary_group> [...] </subsidiary_group>
++  #
++  #   my_group.to_xml(:dasherize => true)
++  #   # => <?xml version="1.0" encoding="UTF-8"?>
++  #   #    <subsidiary-group> [...] </subsidiary-group>
++  #
++  #   my_group.to_xml(:skip_instruct => true)
++  #   # => <subsidiary_group> [...] </subsidiary_group>
++  def to_xml(options = {}, encoder = nil, &block)
++    # To maintain backwards compatibility, we call build_xml from here if we're
++    # in the middle of an existing encoding process. See
++    # ActiveSupport::XML::Encoding::Encoder.encode for more details.
++    if(options[:encoder])
++      self.build_xml(options[:encoder])
++    else
++      # The default to_xml call will just pass everything off for encoding. 
++      ActiveSupport::XML.encode(self, options, &block)
++    end
++  end
++
++  def build_xml(encoder) #:nodoc:
++    encoder.build_current_leaf_tag(self)
++  end
++
++  def as_xml(options = {}) #:nodoc:
++    self
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/string.rb b/activesupport/lib/active_support/xml/encoders/string.rb
+new file mode 100644
+index 0000000..e300d61
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/string.rb
+@@ -0,0 +1,5 @@
++class String
++  def as_xml(options = {}) #:nodoc:
++    self
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/symbol.rb b/activesupport/lib/active_support/xml/encoders/symbol.rb
+new file mode 100644
+index 0000000..768ae00
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/symbol.rb
+@@ -0,0 +1,6 @@
++class Symbol
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "symbol"
++    to_s
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/time.rb b/activesupport/lib/active_support/xml/encoders/time.rb
+new file mode 100644
+index 0000000..32e9811
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/time.rb
+@@ -0,0 +1,6 @@
++class Time
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "datetime"
++    xmlschema
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoders/true_class.rb b/activesupport/lib/active_support/xml/encoders/true_class.rb
+new file mode 100644
+index 0000000..6b5af81
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoders/true_class.rb
+@@ -0,0 +1,6 @@
++class TrueClass
++  def as_xml(options = {}) #:nodoc:
++    options[:tag_attributes][:type] ||= "boolean"
++    to_s
++  end
++end
+diff --git a/activesupport/lib/active_support/xml/encoding.rb b/activesupport/lib/active_support/xml/encoding.rb
+new file mode 100644
+index 0000000..46b0143
+--- /dev/null
++++ b/activesupport/lib/active_support/xml/encoding.rb
+@@ -0,0 +1,149 @@
++require 'active_support/core_ext/module/delegation'
++
++module ActiveSupport
++  class << self
++    delegate :camelize_xml, :camelize_xml=,
++      :dasherize_xml, :dasherize_xml=,
++      :to => :'ActiveSupport::XML::Encoding'
++  end
++
++  module XML
++    # Convert and encode an object into XML format.
++    def self.encode(object, options = {}, &block)
++      Encoding::Encoder.new(options, &block).encode(object)
++    end
++
++    module Encoding #:nodoc:
++      # These accessors are here because people using ActiveResource and REST
++      # to integrate with other systems have to be able to control the default
++      # behavior of rename_key. dasherize_xml is set to true to emulate
++      # existing behavior. In a future version it should be set to false by
++      # default.
++      mattr_accessor :camelize_xml
++      mattr_accessor :dasherize_xml
++      self.dasherize_xml = true
++      self.camelize_xml = false
++
++      class CircularReferenceError < StandardError; end
++
++      class Encoder
++        attr_reader :options, :block
++
++        def initialize(options = {}, &block)
++          @options = options.dup
++          @block = block
++          @seen = []
++        end
++
++        # Encode the given object into XML. First coerce the object using
++        # as_xml to get the value to represent the object in XML format. Then
++        # build the xml on the internal Builder.
++        def encode(object)
++          require "builder" unless defined?(Builder)
++
++          check_for_circular_references(object) do
++            # Only create the builder once per encoding.
++            unless options[:builder]
++              options[:indent] ||= 2
++              options[:builder] = Builder::XmlMarkup.new(:indent => options.delete(:indent))
++
++              options[:builder].instruct! unless options[:skip_instruct]
++              options[:skip_instruct] = true
++            end
++
++            options[:tag_attributes] ||= {}
++
++            # Get the value we want to use to represent this object in XML.
++            value = object.as_xml(options)
++
++            # Apply default option values.
++            options[:root] ||= object.class.name.underscore
++            options[:root] = reformat_tag(options[:root])
++
++            # At this point, we want to call build_xml on the value object
++            # returned by as_xml. However, to maintain backwards compatibility
++            # for when to_xml was overwritten by subclasses to provide custom
++            # functionaity, we'll call that instead. We'll call build_xml
++            # inside Object's default to_xml.
++            options[:encoder] = self
++            value.to_xml(options)
++          end
++        end
++
++        # Build a node tag from the options currently set.
++        def build_current_tag
++          options[:tag_attributes].delete(:type) if(options[:skip_types])
++
++          if(block_given? || block)
++            options[:builder].tag!(options[:root], options.delete(:tag_attributes)) do
++              yield if(block_given?)
++
++              if(block)
++                block.call(options[:builder])
++                block = nil
++              end
++            end
++          else
++            options[:builder].tag!(options[:root], options.delete(:tag_attributes))
++          end
++        end
++
++        # Build a leaf node tag with a value from the options currently set.
++        def build_current_leaf_tag(value)
++          options[:tag_attributes].delete(:type) if(options[:skip_types])
++
++          options[:builder].tag!(options[:root], value, options.delete(:tag_attributes))
++        end
++
++        private
++          # Apply the current format settings to rename an XML tag, either
++          # dasherizing or camelizing it.
++          def reformat_tag(tag)
++            tag = tag.to_s
++            tag = tag.camelize if(camelize?)
++            tag = tag.dasherize if(dasherize?)
++            tag
++          end
++
++          def camelize?
++            if(options.has_key?(:dasherize) || options.has_key?(:camelize))
++              options[:camelize]
++            else
++              ActiveSupport.camelize_xml
++            end
++          end
++
++          def dasherize?
++            if(options.has_key?(:dasherize) || options.has_key?(:camelize))
++              options[:dasherize]
++            else
++              ActiveSupport.dasherize_xml
++            end
++          end
++
++          def check_for_circular_references(value)
++            if @seen.any? { |object| object.equal?(value) }
++              raise CircularReferenceError, 'object references itself'
++            end
++            @seen.unshift value
++            yield
++          ensure
++            @seen.shift
++          end
++      end
++    end
++  end
++end
++
++require "active_support/xml/encoders/date"
++require "active_support/xml/encoders/date_time"
++require "active_support/xml/encoders/enumerable"
++require "active_support/xml/encoders/false_class"
++require "active_support/xml/encoders/hash"
++require "active_support/xml/encoders/nil_class"
++require "active_support/xml/encoders/numeric"
++require "active_support/xml/encoders/object"
++require "active_support/xml/encoders/string"
++require "active_support/xml/encoders/symbol"
++require "active_support/xml/encoders/time"
++require "active_support/xml/encoders/true_class"
+diff --git a/activesupport/test/core_ext/array_ext_test.rb b/activesupport/test/core_ext/array_ext_test.rb
+index 8198b9b..23efec9 100644
+--- a/activesupport/test/core_ext/array_ext_test.rb
++++ b/activesupport/test/core_ext/array_ext_test.rb
+@@ -221,96 +221,6 @@ class ArraySplitTests < Test::Unit::TestCase
+   end
+ end
+ 
+-class ArrayToXmlTests < Test::Unit::TestCase
+-  def test_to_xml
+-    xml = [
+-      { :name => "David", :age => 26, :age_in_millis => 820497600000 },
+-      { :name => "Jason", :age => 31, :age_in_millis => BigDecimal.new('1.0') }
+-    ].to_xml(:skip_instruct => true, :indent => 0)
+-
+-    assert_equal '<records type="array"><record>', xml.first(30)
+-    assert xml.include?(%(<age type="integer">26</age>)), xml
+-    assert xml.include?(%(<age-in-millis type="integer">820497600000</age-in-millis>)), xml
+-    assert xml.include?(%(<name>David</name>)), xml
+-    assert xml.include?(%(<age type="integer">31</age>)), xml
+-    assert xml.include?(%(<age-in-millis type="decimal">1.0</age-in-millis>)), xml
+-    assert xml.include?(%(<name>Jason</name>)), xml
+-  end
+-
+-  def test_to_xml_with_dedicated_name
+-    xml = [
+-      { :name => "David", :age => 26, :age_in_millis => 820497600000 }, { :name => "Jason", :age => 31 }
+-    ].to_xml(:skip_instruct => true, :indent => 0, :root => "people")
+-
+-    assert_equal '<people type="array"><person>', xml.first(29)
+-  end
+-
+-  def test_to_xml_with_options
+-    xml = [
+-      { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
+-    ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0)
+-
+-    assert_equal "<records><record>", xml.first(17)
+-    assert xml.include?(%(<street-address>Paulina</street-address>))
+-    assert xml.include?(%(<name>David</name>))
+-    assert xml.include?(%(<street-address>Evergreen</street-address>))
+-    assert xml.include?(%(<name>Jason</name>))
+-  end
+-
+-  def test_to_xml_with_dasherize_false
+-    xml = [
+-      { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
+-    ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0, :dasherize => false)
+-
+-    assert_equal "<records><record>", xml.first(17)
+-    assert xml.include?(%(<street_address>Paulina</street_address>))
+-    assert xml.include?(%(<street_address>Evergreen</street_address>))
+-  end
+-
+-  def test_to_xml_with_dasherize_true
+-    xml = [
+-      { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
+-    ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0, :dasherize => true)
+-
+-    assert_equal "<records><record>", xml.first(17)
+-    assert xml.include?(%(<street-address>Paulina</street-address>))
+-    assert xml.include?(%(<street-address>Evergreen</street-address>))
+-  end
+-
+-  def test_to_with_instruct
+-    xml = [
+-      { :name => "David", :age => 26, :age_in_millis => 820497600000 },
+-      { :name => "Jason", :age => 31, :age_in_millis => BigDecimal.new('1.0') }
+-    ].to_xml(:skip_instruct => false, :indent => 0)
+-
+-    assert_match(/^<\?xml [^>]*/, xml)
+-    assert_equal 0, xml.rindex(/<\?xml /)
+-  end
+-
+-  def test_to_xml_with_block
+-    xml = [
+-      { :name => "David", :age => 26, :age_in_millis => 820497600000 },
+-      { :name => "Jason", :age => 31, :age_in_millis => BigDecimal.new('1.0') }
+-    ].to_xml(:skip_instruct => true, :indent => 0) do |builder|
+-      builder.count 2
+-    end
+-
+-    assert xml.include?(%(<count>2</count>)), xml
+-  end
+-
+-  def test_to_xml_with_empty
+-    xml = [].to_xml
+-    assert_match(/type="array"\/>/, xml)
+-  end
+-
+-  def test_to_xml_dups_options
+-    options = {:skip_instruct => true}
+-    [].to_xml(options)
+-    # :builder, etc, shouldn't be added to options
+-    assert_equal({:skip_instruct => true}, options)
+-  end
+-end
+-
+ class ArrayExtractOptionsTests < Test::Unit::TestCase
+   def test_extract_options
+     assert_equal({}, [].extract_options!)
+diff --git a/activesupport/test/core_ext/hash_ext_test.rb b/activesupport/test/core_ext/hash_ext_test.rb
+index eb4c37a..65a31a3 100644
+--- a/activesupport/test/core_ext/hash_ext_test.rb
++++ b/activesupport/test/core_ext/hash_ext_test.rb
+@@ -401,125 +401,11 @@ class HashExtTest < Test::Unit::TestCase
+   end
+ end
+ 
+-class IWriteMyOwnXML
+-  def to_xml(options = {})
+-    options[:indent] ||= 2
+-    xml = options[:builder] ||= Builder::XmlMarkup.new(:indent => options[:indent])
+-    xml.instruct! unless options[:skip_instruct]
+-    xml.level_one do
+-      xml.tag!(:second_level, 'content')
+-    end
+-  end
+-end
+-
+-class HashToXmlTest < Test::Unit::TestCase
++class HashFromXmlTest < Test::Unit::TestCase
+   def setup
+     @xml_options = { :root => :person, :skip_instruct => true, :indent => 0 }
+   end
+ 
+-  def test_one_level
+-    xml = { :name => "David", :street => "Paulina" }.to_xml(@xml_options)
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<street>Paulina</street>))
+-    assert xml.include?(%(<name>David</name>))
+-  end
+-
+-  def test_one_level_dasherize_false
+-    xml = { :name => "David", :street_name => "Paulina" }.to_xml(@xml_options.merge(:dasherize => false))
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<street_name>Paulina</street_name>))
+-    assert xml.include?(%(<name>David</name>))
+-  end
+-
+-  def test_one_level_dasherize_true
+-    xml = { :name => "David", :street_name => "Paulina" }.to_xml(@xml_options.merge(:dasherize => true))
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<street-name>Paulina</street-name>))
+-    assert xml.include?(%(<name>David</name>))
+-  end
+-
+-  def test_one_level_camelize_true
+-    xml = { :name => "David", :street_name => "Paulina" }.to_xml(@xml_options.merge(:camelize => true))
+-    assert_equal "<Person>", xml.first(8)
+-    assert xml.include?(%(<StreetName>Paulina</StreetName>))
+-    assert xml.include?(%(<Name>David</Name>))
+-  end
+-
+-  def test_one_level_with_types
+-    xml = { :name => "David", :street => "Paulina", :age => 26, :age_in_millis => 820497600000, :moved_on => Date.new(2005, 11, 15), :resident => :yes }.to_xml(@xml_options)
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<street>Paulina</street>))
+-    assert xml.include?(%(<name>David</name>))
+-    assert xml.include?(%(<age type="integer">26</age>))
+-    assert xml.include?(%(<age-in-millis type="integer">820497600000</age-in-millis>))
+-    assert xml.include?(%(<moved-on type="date">2005-11-15</moved-on>))
+-    assert xml.include?(%(<resident type="symbol">yes</resident>))
+-  end
+-
+-  def test_one_level_with_nils
+-    xml = { :name => "David", :street => "Paulina", :age => nil }.to_xml(@xml_options)
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<street>Paulina</street>))
+-    assert xml.include?(%(<name>David</name>))
+-    assert xml.include?(%(<age nil="true"></age>))
+-  end
+-
+-  def test_one_level_with_skipping_types
+-    xml = { :name => "David", :street => "Paulina", :age => nil }.to_xml(@xml_options.merge(:skip_types => true))
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<street>Paulina</street>))
+-    assert xml.include?(%(<name>David</name>))
+-    assert xml.include?(%(<age nil="true"></age>))
+-  end
+-
+-  def test_one_level_with_yielding
+-    xml = { :name => "David", :street => "Paulina" }.to_xml(@xml_options) do |x|
+-      x.creator("Rails")
+-    end
+-
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<street>Paulina</street>))
+-    assert xml.include?(%(<name>David</name>))
+-    assert xml.include?(%(<creator>Rails</creator>))
+-  end
+-
+-  def test_two_levels
+-    xml = { :name => "David", :address => { :street => "Paulina" } }.to_xml(@xml_options)
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<address><street>Paulina</street></address>))
+-    assert xml.include?(%(<name>David</name>))
+-  end
+-
+-  def test_two_levels_with_second_level_overriding_to_xml
+-    xml = { :name => "David", :address => { :street => "Paulina" }, :child => IWriteMyOwnXML.new }.to_xml(@xml_options)
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<address><street>Paulina</street></address>))
+-    assert xml.include?(%(<level_one><second_level>content</second_level></level_one>))
+-  end
+-
+-  def test_two_levels_with_array
+-    xml = { :name => "David", :addresses => [{ :street => "Paulina" }, { :street => "Evergreen" }] }.to_xml(@xml_options)
+-    assert_equal "<person>", xml.first(8)
+-    assert xml.include?(%(<addresses type="array"><address>))
+-    assert xml.include?(%(<address><street>Paulina</street></address>))
+-    assert xml.include?(%(<address><street>Evergreen</street></address>))
+-    assert xml.include?(%(<name>David</name>))
+-  end
+-
+-  def test_three_levels_with_array
+-    xml = { :name => "David", :addresses => [{ :streets => [ { :name => "Paulina" }, { :name => "Paulina" } ] } ] }.to_xml(@xml_options)
+-    assert xml.include?(%(<addresses type="array"><address><streets type="array"><street><name>))
+-  end
+-
+-  def test_timezoned_attributes
+-    xml = {
+-      :created_at => Time.utc(1999,2,2),
+-      :local_created_at => Time.utc(1999,2,2).in_time_zone('Eastern Time (US & Canada)')
+-    }.to_xml(@xml_options)
+-    assert_match %r{<created-at type=\"datetime\">1999-02-02T00:00:00Z</created-at>}, xml
+-    assert_match %r{<local-created-at type=\"datetime\">1999-02-01T19:00:00-05:00</local-created-at>}, xml
+-  end
+-
+   def test_single_record_from_xml
+     topic_xml = <<-EOT
+       <topic>
+@@ -810,33 +696,6 @@ class HashToXmlTest < Test::Unit::TestCase
+     assert_equal 3, hash_wia.default
+   end
+ 
+-  # The XML builder seems to fail miserably when trying to tag something
+-  # with the same name as a Kernel method (throw, test, loop, select ...)
+-  def test_kernel_method_names_to_xml
+-    hash     = { :throw => { :ball => 'red' } }
+-    expected = '<person><throw><ball>red</ball></throw></person>'
+-
+-    assert_nothing_raised do
+-      assert_equal expected, hash.to_xml(@xml_options)
+-    end
+-  end
+-  
+-  def test_empty_string_works_for_typecast_xml_value    
+-    assert_nothing_raised do
+-      Hash.__send__(:typecast_xml_value, "")
+-    end
+-  end
+-  
+-  def test_escaping_to_xml
+-    hash = { 
+-      :bare_string        => 'First & Last Name', 
+-      :pre_escaped_string => 'First &amp; Last Name'
+-    }.stringify_keys
+-    
+-    expected_xml = '<person><bare-string>First &amp; Last Name</bare-string><pre-escaped-string>First &amp;amp; Last Name</pre-escaped-string></person>'
+-    assert_equal expected_xml, hash.to_xml(@xml_options)
+-  end
+-  
+   def test_unescaping_from_xml
+     xml_string = '<person><bare-string>First &amp; Last Name</bare-string><pre-escaped-string>First &amp;amp; Last Name</pre-escaped-string></person>'
+     expected_hash = { 
+@@ -845,16 +704,7 @@ class HashToXmlTest < Test::Unit::TestCase
+     }.stringify_keys
+     assert_equal expected_hash, Hash.from_xml(xml_string)['person']
+   end
+-  
+-  def test_roundtrip_to_xml_from_xml
+-    hash = { 
+-      :bare_string        => 'First & Last Name', 
+-      :pre_escaped_string => 'First &amp; Last Name'
+-    }.stringify_keys
+ 
+-    assert_equal hash, Hash.from_xml(hash.to_xml(@xml_options))['person']
+-  end
+-  
+   def test_datetime_xml_type_with_utc_time
+     alert_xml = <<-XML
+       <alert>
+@@ -892,13 +742,6 @@ class HashToXmlTest < Test::Unit::TestCase
+     assert_equal 30,    alert_at.min
+     assert_equal 45,    alert_at.sec
+   end
+-
+-  def test_to_xml_dups_options
+-    options = {:skip_instruct => true}
+-    {}.to_xml(options)
+-    # :builder, etc, shouldn't be added to options
+-    assert_equal({:skip_instruct => true}, options)
+-  end
+ end
+ 
+ class QueryTest < Test::Unit::TestCase
+diff --git a/activesupport/test/xml/encoding_test.rb b/activesupport/test/xml/encoding_test.rb
+new file mode 100644
+index 0000000..be5d646
+--- /dev/null
++++ b/activesupport/test/xml/encoding_test.rb
+@@ -0,0 +1,333 @@
++require 'abstract_unit'
++require 'active_support/core_ext/hash'
++require 'active_support/xml'
++
++class IWriteMyOwnXML
++  def to_xml(options = {})
++    options[:indent] ||= 2
++    xml = options[:builder] ||= Builder::XmlMarkup.new(:indent => options[:indent])
++    xml.instruct! unless options[:skip_instruct]
++    xml.level_one do
++      xml.tag!(:second_level, 'content')
++    end
++  end
++end
++
++class HashToXmlTest < Test::Unit::TestCase
++  def setup
++    @xml_options = { :root => :person, :skip_instruct => true, :indent => 0 }
++  end
++
++  def test_one_level
++    xml = { :name => "David", :street => "Paulina" }.to_xml(@xml_options)
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<street>Paulina</street>))
++    assert xml.include?(%(<name>David</name>))
++  end
++
++  def test_one_level_dasherize_false
++    xml = { :name => "David", :street_name => "Paulina" }.to_xml(@xml_options.merge(:dasherize => false))
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<street_name>Paulina</street_name>))
++    assert xml.include?(%(<name>David</name>))
++  end
++
++  def test_one_level_dasherize_true
++    xml = { :name => "David", :street_name => "Paulina" }.to_xml(@xml_options.merge(:dasherize => true))
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<street-name>Paulina</street-name>))
++    assert xml.include?(%(<name>David</name>))
++  end
++
++  def test_one_level_camelize_true
++    xml = { :name => "David", :street_name => "Paulina" }.to_xml(@xml_options.merge(:camelize => true))
++    assert_equal "<Person>", xml.first(8)
++    assert xml.include?(%(<StreetName>Paulina</StreetName>))
++    assert xml.include?(%(<Name>David</Name>))
++  end
++
++  def test_one_level_with_types
++    xml = { :name => "David", :street => "Paulina", :age => 26, :age_in_millis => 820497600000, :moved_on => Date.new(2005, 11, 15), :resident => :yes }.to_xml(@xml_options)
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<street>Paulina</street>))
++    assert xml.include?(%(<name>David</name>))
++    assert xml.include?(%(<age type="integer">26</age>))
++    assert xml.include?(%(<age-in-millis type="integer">820497600000</age-in-millis>))
++    assert xml.include?(%(<moved-on type="date">2005-11-15</moved-on>))
++    assert xml.include?(%(<resident type="symbol">yes</resident>))
++  end
++
++  def test_one_level_with_nils
++    xml = { :name => "David", :street => "Paulina", :age => nil }.to_xml(@xml_options)
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<street>Paulina</street>))
++    assert xml.include?(%(<name>David</name>))
++    assert xml.include?(%(<age nil="true"></age>))
++  end
++
++  def test_one_level_with_skipping_types
++    xml = { :name => "David", :street => "Paulina", :age => nil }.to_xml(@xml_options.merge(:skip_types => true))
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<street>Paulina</street>))
++    assert xml.include?(%(<name>David</name>))
++    assert xml.include?(%(<age nil="true"></age>))
++  end
++
++  def test_one_level_with_yielding
++    xml = { :name => "David", :street => "Paulina" }.to_xml(@xml_options) do |x|
++      x.creator("Rails")
++    end
++
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<street>Paulina</street>))
++    assert xml.include?(%(<name>David</name>))
++    assert xml.include?(%(<creator>Rails</creator>))
++  end
++
++  def test_two_levels
++    xml = { :name => "David", :address => { :street => "Paulina" } }.to_xml(@xml_options)
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<address><street>Paulina</street></address>))
++    assert xml.include?(%(<name>David</name>))
++  end
++
++  def test_two_levels_with_second_level_overriding_to_xml
++    xml = { :name => "David", :address => { :street => "Paulina" }, :child => IWriteMyOwnXML.new }.to_xml(@xml_options)
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<address><street>Paulina</street></address>))
++    assert xml.include?(%(<level_one><second_level>content</second_level></level_one>))
++  end
++
++  def test_two_levels_with_array
++    xml = { :name => "David", :addresses => [{ :street => "Paulina" }, { :street => "Evergreen" }] }.to_xml(@xml_options)
++    assert_equal "<person>", xml.first(8)
++    assert xml.include?(%(<addresses type="array"><address>))
++    assert xml.include?(%(<address><street>Paulina</street></address>))
++    assert xml.include?(%(<address><street>Evergreen</street></address>))
++    assert xml.include?(%(<name>David</name>))
++  end
++
++  def test_three_levels_with_array
++    xml = { :name => "David", :addresses => [{ :streets => [ { :name => "Paulina" }, { :name => "Paulina" } ] } ] }.to_xml(@xml_options)
++    assert xml.include?(%(<addresses type="array"><address><streets type="array"><street><name>))
++  end
++
++  def test_timezoned_attributes
++    xml = {
++      :created_at => Time.utc(1999,2,2),
++      :local_created_at => Time.utc(1999,2,2).in_time_zone('Eastern Time (US & Canada)')
++    }.to_xml(@xml_options)
++    assert_match %r{<created-at type=\"datetime\">1999-02-02T00:00:00Z</created-at>}, xml
++    assert_match %r{<local-created-at type=\"datetime\">1999-02-01T19:00:00-05:00</local-created-at>}, xml
++  end
++
++  # The XML builder seems to fail miserably when trying to tag something
++  # with the same name as a Kernel method (throw, test, loop, select ...)
++  def test_kernel_method_names_to_xml
++    hash     = { :throw => { :ball => 'red' } }
++    expected = '<person><throw><ball>red</ball></throw></person>'
++
++    assert_nothing_raised do
++      assert_equal expected, hash.to_xml(@xml_options)
++    end
++  end
++  
++  def test_empty_string_works_for_typecast_xml_value    
++    assert_nothing_raised do
++      Hash.__send__(:typecast_xml_value, "")
++    end
++  end
++  
++  def test_escaping_to_xml
++    hash = { 
++      :bare_string        => 'First & Last Name', 
++      :pre_escaped_string => 'First &amp; Last Name'
++    }.stringify_keys
++    
++    expected_xml = '<person><bare-string>First &amp; Last Name</bare-string><pre-escaped-string>First &amp;amp; Last Name</pre-escaped-string></person>'
++    assert_equal expected_xml, hash.to_xml(@xml_options)
++  end
++  
++  def test_roundtrip_to_xml_from_xml
++    hash = { 
++      :bare_string        => 'First & Last Name', 
++      :pre_escaped_string => 'First &amp; Last Name'
++    }.stringify_keys
++
++    assert_equal hash, Hash.from_xml(hash.to_xml(@xml_options))['person']
++  end
++
++  def test_to_xml_dups_options
++    options = {:skip_instruct => true}
++    {}.to_xml(options)
++    # :builder, etc, shouldn't be added to options
++    assert_equal({:skip_instruct => true}, options)
++  end
++end
++
++class ArrayToXmlTests < Test::Unit::TestCase
++  def test_to_xml
++    xml = [
++      { :name => "David", :age => 26, :age_in_millis => 820497600000 },
++      { :name => "Jason", :age => 31, :age_in_millis => BigDecimal.new('1.0') }
++    ].to_xml(:skip_instruct => true, :indent => 0)
++
++    assert_equal '<records type="array"><record>', xml.first(30)
++    assert xml.include?(%(<age type="integer">26</age>)), xml
++    assert xml.include?(%(<age-in-millis type="integer">820497600000</age-in-millis>)), xml
++    assert xml.include?(%(<name>David</name>)), xml
++    assert xml.include?(%(<age type="integer">31</age>)), xml
++    assert xml.include?(%(<age-in-millis type="decimal">1.0</age-in-millis>)), xml
++    assert xml.include?(%(<name>Jason</name>)), xml
++  end
++
++  def test_to_xml_with_dedicated_name
++    xml = [
++      { :name => "David", :age => 26, :age_in_millis => 820497600000 }, { :name => "Jason", :age => 31 }
++    ].to_xml(:skip_instruct => true, :indent => 0, :root => "people")
++
++    assert_equal '<people type="array"><person>', xml.first(29)
++  end
++
++  def test_to_xml_with_options
++    xml = [
++      { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
++    ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0)
++
++    assert_equal "<records><record>", xml.first(17)
++    assert xml.include?(%(<street-address>Paulina</street-address>))
++    assert xml.include?(%(<name>David</name>))
++    assert xml.include?(%(<street-address>Evergreen</street-address>))
++    assert xml.include?(%(<name>Jason</name>))
++  end
++
++  def test_to_xml_with_dasherize_false
++    xml = [
++      { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
++    ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0, :dasherize => false)
++
++    assert_equal "<records><record>", xml.first(17)
++    assert xml.include?(%(<street_address>Paulina</street_address>))
++    assert xml.include?(%(<street_address>Evergreen</street_address>))
++  end
++
++  def test_to_xml_with_dasherize_true
++    xml = [
++      { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
++    ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0, :dasherize => true)
++
++    assert_equal "<records><record>", xml.first(17)
++    assert xml.include?(%(<street-address>Paulina</street-address>))
++    assert xml.include?(%(<street-address>Evergreen</street-address>))
++  end
++
++  def test_to_with_instruct
++    xml = [
++      { :name => "David", :age => 26, :age_in_millis => 820497600000 },
++      { :name => "Jason", :age => 31, :age_in_millis => BigDecimal.new('1.0') }
++    ].to_xml(:skip_instruct => false, :indent => 0)
++
++    assert_match(/^<\?xml [^>]*/, xml)
++    assert_equal 0, xml.rindex(/<\?xml /)
++  end
++
++  def test_to_xml_with_block
++    xml = [
++      { :name => "David", :age => 26, :age_in_millis => 820497600000 },
++      { :name => "Jason", :age => 31, :age_in_millis => BigDecimal.new('1.0') }
++    ].to_xml(:skip_instruct => true, :indent => 0) do |builder|
++      builder.count 2
++    end
++
++    assert xml.include?(%(<count>2</count>)), xml
++  end
++
++  def test_to_xml_with_empty
++    xml = [].to_xml
++    assert_match(/type="array"\/>/, xml)
++  end
++
++  def test_to_xml_dups_options
++    options = {:skip_instruct => true}
++    [].to_xml(options)
++    # :builder, etc, shouldn't be added to options
++    assert_equal({:skip_instruct => true}, options)
++  end
++
++  def test_array_of_integers
++    xml = [23, 91, 22].to_xml(:indent => 1)
++    assert_match %r{^<fixnums type="array">}, xml
++    assert_match %r{^ <fixnum type="integer">23</fixnum>}, xml
++    assert_match %r{^ <fixnum type="integer">91</fixnum>}, xml
++    assert_match %r{^ <fixnum type="integer">22</fixnum>}, xml
++  end
++
++  def test_array_of_strings
++    xml = ["hello", "world"].to_xml(:indent => 2)
++    assert_match %r{^<strings type="array">}, xml
++    assert_match %r{^  <string>hello</string>}, xml
++    assert_match %r{^  <string>world</string>}, xml
++  end
++
++  def test_array_of_objects
++    xml = ["hello", 2.3, :very_symbolic, false, Date.new(2009, 1, 2)].to_xml(:indent => 2)
++    assert_match %r{^<records type="array">}, xml
++    assert_match %r{^  <record>hello</record>}, xml
++    assert_match %r{^  <record type="float">2.3</record>}, xml
++    assert_match %r{^  <record type="symbol">very_symbolic</record>}, xml
++    assert_match %r{^  <record type="boolean">false</record>}, xml
++    assert_match %r{^  <record type="date">2009-01-02</record>}, xml
++  end
++end
++
++class ShallowObjectsToXmlTest < Test::Unit::TestCase
++  def test_string_to_xml
++    xml = "Hello, world.".to_xml
++    assert_match %r{^<string>Hello, world.</string>}, xml
++  end
++
++  def test_symbol_to_xml
++    xml = :hello_world.to_xml
++    assert_match %r{^<symbol type="symbol">hello_world</symbol>}, xml
++  end
++
++  def test_true_to_xml
++    xml = true.to_xml
++    assert_match %r{^<true-class type="boolean">true</true-class>}, xml
++  end
++
++  def test_false_to_xml
++    xml = false.to_xml(:camelize => true)
++    assert_match %r{^<FalseClass type="boolean">false</FalseClass>}, xml
++  end
++
++  def test_nil_to_xml
++    xml = nil.to_xml
++    assert_match %r{^<nil-class nil="true"></nil-class>}, xml
++  end
++
++  def test_integer_to_xml
++    xml = 29.to_xml
++    assert_match %r{^<fixnum type="integer">29</fixnum>}, xml
++  end
++
++  def test_float_to_xml
++    xml = 2.11.to_xml
++    assert_match %r{^<float type="float">2.11</float>}, xml
++  end
++
++  def test_date_to_xml
++    xml = Date.new(2009, 1, 2).to_xml
++    assert_match %r{^<date type="date">2009-01-02</date>}, xml
++  end
++
++  def test_time_to_xml
++    xml = Time.utc(2009, 1, 2).to_xml
++    assert_match %r{^<time type="datetime">2009-01-02T00:00:00Z</time>}, xml
++  end
++
++  def test_date_time_to_xml
++    xml = Time.utc(2009, 1, 2, 20, 27, 0).to_datetime.to_xml
++    assert_match %r{^<date-time type="datetime">2009-01-02T20:27:00\+00:00</date-time>}, xml
++  end
++end
+-- 
+1.6.4.4
+

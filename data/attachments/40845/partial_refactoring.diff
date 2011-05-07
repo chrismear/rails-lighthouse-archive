@@ -1,0 +1,177 @@
+From 6bb2b5b7db9cdf0c66507e79c1a57285f3dc4d9f Mon Sep 17 00:00:00 2001
+From: Ryan Bates <ryan@railscasts.com>
+Date: Thu, 21 Aug 2008 16:42:57 -0700
+Subject: [PATCH] refactoring ActionView::Partials
+
+---
+ actionpack/lib/action_controller/base.rb |   15 +-----
+ actionpack/lib/action_view/base.rb       |    4 +-
+ actionpack/lib/action_view/partials.rb   |   68 +++++++++++++++++-------------
+ actionpack/lib/action_view/renderable.rb |    8 +++-
+ actionpack/test/template/render_test.rb  |    2 +-
+ 5 files changed, 51 insertions(+), 46 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index 09414e7..c811e88 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -917,18 +917,9 @@ module ActionController #:nodoc:
+           elsif partial = options[:partial]
+             partial = default_template_name if partial == true
+             add_variables_to_assigns
+-
+-            if collection = options[:collection]
+-              render_for_text(
+-                @template.send!(:render_partial_collection, partial, collection,
+-                options[:spacer_template], options[:locals], options[:as]), options[:status]
+-              )
+-            else
+-              render_for_text(
+-                @template.send!(:render_partial, partial,
+-                options[:object], options[:locals]), options[:status]
+-              )
+-            end
++            render_for_text(
++              @template.send!(:render_partial, options.merge(:partial => partial)), options[:status]
++            )
+ 
+           elsif options[:update]
+             add_variables_to_assigns
+diff --git a/actionpack/lib/action_view/base.rb b/actionpack/lib/action_view/base.rb
+index 46bacbc..9cd58eb 100644
+--- a/actionpack/lib/action_view/base.rb
++++ b/actionpack/lib/action_view/base.rb
+@@ -263,10 +263,8 @@ module ActionView #:nodoc:
+           end
+         elsif options[:file]
+           render_file(options[:file], nil, options[:locals])
+-        elsif options[:partial] && options.has_key?(:collection)
+-          render_partial_collection(options[:partial], options[:collection], options[:spacer_template], options[:locals], options[:as])
+         elsif options[:partial]
+-          render_partial(options[:partial], options[:object], options[:locals])
++          render_partial(options)
+         elsif options[:inline]
+           render_inline(options[:inline], options[:locals], options[:type])
+         end
+diff --git a/actionpack/lib/action_view/partials.rb b/actionpack/lib/action_view/partials.rb
+index 074ba5a..a804141 100644
+--- a/actionpack/lib/action_view/partials.rb
++++ b/actionpack/lib/action_view/partials.rb
+@@ -139,43 +139,53 @@ module ActionView
+     extend ActiveSupport::Memoizable
+ 
+     private
+-      def render_partial(partial_path, object_assigns = nil, local_assigns = {}) #:nodoc:
+-        local_assigns ||= {}
+-
+-        case partial_path
+-        when String, Symbol, NilClass
+-          pick_template(find_partial_path(partial_path)).render_partial(self, object_assigns, local_assigns)
+-        when ActionView::Helpers::FormBuilder
+-          builder_partial_path = partial_path.class.to_s.demodulize.underscore.sub(/_builder$/, '')
+-          render_partial(builder_partial_path, object_assigns, (local_assigns || {}).merge(builder_partial_path.to_sym => partial_path))
+-        when Array, ActiveRecord::Associations::AssociationCollection, ActiveRecord::NamedScope::Scope
+-          if partial_path.any?
+-            collection = partial_path
+-            render_partial_collection(nil, collection, nil, local_assigns)
++      def render_partial(options = {}) #:nodoc:
++        options ||= {}
++        if options.has_key? :collection
++          render_partial_collection(options.delete(:collection), options)
++        else
++          case options[:partial]
++          when String, Symbol, NilClass
++            render_partial_template(options[:partial], options[:object], options[:locals])
++          when ActionView::Helpers::FormBuilder
++            render_partial_for_form_builder(options[:partial], options[:object], options[:locals])
++          when Array, ActiveRecord::Associations::AssociationCollection, ActiveRecord::NamedScope::Scope
++            render_partial_collection(options.delete(:partial), options)
+           else
+-            ""
++            render_partial_for_object(options[:partial], nil, options[:locals])
+           end
+-        else
+-          render_partial(ActionController::RecordIdentifier.partial_path(partial_path, controller.class.controller_path), partial_path, local_assigns)
+         end
+       end
+ 
+-      def render_partial_collection(partial_path, collection, partial_spacer_template = nil, local_assigns = {}, as = nil) #:nodoc:
+-        return nil if collection.blank?
++      def render_partial_collection(objects, options = {}) #:nodoc:
++        unless objects.blank?
++          spacer = options[:spacer_template] ? render(:partial => options[:spacer_template]) : ''
++          render_partials_for_objects(objects, options[:partial], options[:locals], options[:as]).join(spacer)
++        end
++      end
+ 
++      # returns an array with the rendered partial content for each object
++      def render_partials_for_objects(objects, partial_path = nil, local_assigns = {}, as = nil)
+         local_assigns = local_assigns ? local_assigns.clone : {}
+-        spacer = partial_spacer_template ? render(:partial => partial_spacer_template) : ''
++        objects.enum_with_index.map do |object, index|
++          local_assigns[:collection_counter] = index
++          render_partial_for_object(object, partial_path, local_assigns, as)
++        end
++      end
++
++      def render_partial_for_object(object, partial_path = nil, local_assigns = {}, as = nil)
++        partial_path ||= ActionController::RecordIdentifier.partial_path(object, controller.class.controller_path)
++        render_partial_template(partial_path, object, local_assigns, as)
++      end
++
++      def render_partial_for_form_builder(form_builder, object, local_assigns = {})
++        builder_partial_path = form_builder.class.to_s.demodulize.underscore.sub(/_builder$/, '')
++        render_partial_template(builder_partial_path, object, (local_assigns || {}).merge(builder_partial_path.to_sym => form_builder))
++      end
+ 
+-        index = 0
+-        collection.map do |object|
+-          _partial_path ||= partial_path || ActionController::RecordIdentifier.partial_path(object, controller.class.controller_path)
+-          path = find_partial_path(_partial_path)
+-          template = pick_template(path)
+-          local_assigns[template.counter_name] = index
+-          result = template.render_partial(self, object, local_assigns, as)
+-          index += 1
+-          result
+-        end.join(spacer)
++      def render_partial_template(partial_path, object, local_assigns = {}, as = nil)
++        template = pick_template(find_partial_path(partial_path))
++        template.render_partial(self, object, (local_assigns || {}), as)
+       end
+ 
+       def find_partial_path(partial_path)
+diff --git a/actionpack/lib/action_view/renderable.rb b/actionpack/lib/action_view/renderable.rb
+index c011f21..ec90edf 100644
+--- a/actionpack/lib/action_view/renderable.rb
++++ b/actionpack/lib/action_view/renderable.rb
+@@ -61,7 +61,13 @@ module ActionView
+       end
+ 
+       def compile!(render_symbol, local_assigns)
+-        locals_code = local_assigns.keys.map { |key| "#{key} = local_assigns[:#{key}];" }.join
++        locals_code = local_assigns.keys.map do |key|
++          if key == :collection_counter
++            "#{counter_name} = local_assigns[:collection_counter];"
++          else
++            "#{key} = local_assigns[:#{key}];"
++          end
++        end.join
+ 
+         source = <<-end_src
+           def #{render_symbol}(local_assigns)
+diff --git a/actionpack/test/template/render_test.rb b/actionpack/test/template/render_test.rb
+index 25bbc26..f7a1ce4 100644
+--- a/actionpack/test/template/render_test.rb
++++ b/actionpack/test/template/render_test.rb
+@@ -83,7 +83,7 @@ class ViewRenderTest < Test::Unit::TestCase
+   end
+ 
+   def test_render_partial_collection_without_as
+-    assert_equal "local_inspector,local_inspector_counter,object",
++    assert_equal "collection_counter,local_inspector,object",
+       @view.render(:partial => "test/local_inspector", :collection => [ Customer.new("mary") ])
+   end
+ 
+-- 
+1.5.6.4
+

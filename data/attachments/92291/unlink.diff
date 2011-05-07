@@ -1,0 +1,259 @@
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0fefec1..57aa801 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -110,13 +110,13 @@ module ActiveRecord
+       # Since << flattens its argument list and inserts each record, +push+ and +concat+ behave identically.
+       def <<(*records)
+         result = true
+-        load_target if @owner.new_record?
++        load_target if @owner.new_record? || @reflection.options[:autosave]
+ 
+         transaction do
+           flatten_deeper(records).each do |record|
+             raise_on_type_mismatch(record)
+             add_record_to_target_with_callbacks(record) do |r|
+-              result &&= insert_record(record) unless @owner.new_record?
++              result &&= insert_record(record) unless @owner.new_record? || @reflection.options[:autosave]
+             end
+           end
+         end
+@@ -195,17 +195,21 @@ module ActiveRecord
+       # are actually removed from the database, that depends precisely on
+       # +delete_records+. They are in any case removed from the collection.
+       def delete(*records)
++        load_target if @reflection.options[:autosave]
++
+         records = flatten_deeper(records)
+         records.each { |record| raise_on_type_mismatch(record) }
+-        
++
+         transaction do
+           records.each { |record| callback(:before_remove, record) }
+-          
+-          old_records = records.reject {|r| r.new_record? }
+-          delete_records(old_records) if old_records.any?
+-          
++
++          unless @reflection.options[:autosave]
++            old_records = records.reject {|r| r.new_record? }
++            delete_records(old_records) if old_records.any?
++          end
++
+           records.each do |record|
+-            @target.delete(record)
++            delete_from_target(record)
+             callback(:after_remove, record)
+           end
+         end
+@@ -333,6 +337,16 @@ module ActiveRecord
+       def proxy_respond_to?(method, include_private = false)
+         super || @reflection.klass.respond_to?(method, include_private)
+       end
++      
++      # @private
++      def records_to_insert
++        @records_to_insert ||= []
++      end
++
++      # @private
++      def records_to_delete
++        @records_to_delete ||= []
++      end
+ 
+       protected
+         def construct_find_options!(options)
+@@ -384,6 +398,7 @@ module ActiveRecord
+ 
+         def reset_target!
+           @target = Array.new
++          @records_to_insert = @records_to_delete = nil
+         end
+ 
+         def find_target
+@@ -425,12 +440,23 @@ module ActiveRecord
+         def add_record_to_target_with_callbacks(record)
+           callback(:before_add, record)
+           yield(record) if block_given?
+-          @target ||= [] unless loaded?
++          @target ||= []
+           @target << record unless @reflection.options[:uniq] && @target.include?(record)
++          if loaded? && @reflection.options[:autosave]
++            records_to_delete.delete(record)
++            records_to_insert.push(record)
++          end 
+           callback(:after_add, record)
+           record
+         end
+ 
++        def delete_from_target(record)
++          @target.delete(record)
++          if loaded? && @reflection.options[:autosave]
++            records_to_delete.push(record) unless records_to_insert.delete(record)
++          end
++        end
++
+         def callback(method, record)
+           callbacks_for(method).each do |callback|
+             ActiveSupport::Callbacks::Callback.new(method, callback, record).call(@owner, record)
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 6e09b13..a9faeae 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -277,6 +277,10 @@ module ActiveRecord
+       if association = association_instance_get(reflection.name)
+         autosave = reflection.options[:autosave]
+ 
++        unless association.records_to_delete.empty?
++          association.send(:delete_records, association.records_to_delete)
++        end
++
+         if records = associated_records_to_validate_or_save(association, @new_record_before_save, autosave)
+           records.each do |record|
+             if autosave && record.marked_for_destruction?
+@@ -288,7 +292,11 @@ module ActiveRecord
+                 association.send(:insert_record, record)
+               end
+             elsif autosave
+-              record.save(false)
++              if association.records_to_insert.include?(record)
++                association.send(:insert_record, record)
++              else
++                record.save(false)
++              end
+             end
+           end
+         end
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index e3122d1..fc26fde 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -227,11 +227,18 @@ module ActiveRecord
+       marked_for_destruction?
+     end
+ 
++    # See ActionView::Helpers::FormHelper::fields_for for more info.
++    def _unlink
++      # TODO: should return true when validation of a form fails and
++      # a record has been marked for unlinking.
++      false
++    end
++
+     private
+ 
+     # Attribute hash keys that should not be assigned as normal attributes.
+     # These hash keys are nested attributes implementation details.
+-    UNASSIGNABLE_KEYS = %w{ id _delete }
++    UNASSIGNABLE_KEYS = %w{ id _delete _unlink }
+ 
+     # Assigns the given attributes to the association.
+     #
+@@ -297,8 +304,18 @@ module ActiveRecord
+           unless reject_new_record?(association_name, attributes)
+             send(association_name).build(attributes.except(*UNASSIGNABLE_KEYS))
+           end
+-        elsif existing_record = send(association_name).detect { |record| record.id.to_s == attributes['id'].to_s }
+-          assign_to_or_mark_for_destruction(existing_record, attributes, allow_destroy)
++        else
++          existing_record = send(association_name).detect { |record| record.id.to_s == attributes['id'].to_s }
++          if attributes.has_key?("_unlink")
++            if has_unlink_flag?(attributes)
++              send(association_name).delete(existing_record)
++            elsif existing_record.nil?
++              existing_record = self.class.reflections[association_name].klass.find(attributes['id'].to_s.to_i)
++              send(association_name).push(existing_record) if existing_record
++            end
++          elsif existing_record
++            assign_to_or_mark_for_destruction(existing_record, attributes, allow_destroy)
++          end
+         end
+       end
+     end
+@@ -318,11 +335,17 @@ module ActiveRecord
+       ConnectionAdapters::Column.value_to_boolean hash['_delete']
+     end
+ 
++    # Determines if a hash contains a truthy _unlink key.
++    def has_unlink_flag?(hash)
++      ConnectionAdapters::Column.value_to_boolean hash['_unlink']
++    end
++
+     # Determines if a new record should be build by checking for
+-    # has_delete_flag? or if a <tt>:reject_if</tt> proc exists for this
+-    # association and evaluates to +true+.
++    # has_delete_flag? or has_unlink_flag? or if a <tt>:reject_if</tt> proc
++    # exists for this association and evaluates to +true+.
+     def reject_new_record?(association_name, attributes)
+       has_delete_flag?(attributes) ||
++      has_unlink_flag?(attributes) ||
+         self.class.reject_new_nested_attributes_procs[association_name].try(:call, attributes)
+     end
+   end
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 6ced84e..7d5eb4c 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -810,6 +810,33 @@ module AutosaveAssociationOnACollectionAssociationTests
+       @pirate.save!
+     end
+   end
++  
++  def test_should_link_associated_model
++    @pirate.send(@association_name).push(@child)
++    assert_equal 3, @pirate.send(@association_name).size
++    assert_equal 2, @pirate.send(@association_name).count
++    @pirate.save!
++    assert_equal 3, @pirate.send(@association_name).count
++  end
++  
++  def test_should_unlink_associated_model
++    @pirate.send(@association_name).delete(@child_1)
++    assert_equal 1, @pirate.send(@association_name).size
++    assert_equal 2, @pirate.send(@association_name).count
++    @pirate.save!
++    assert_equal 1, @pirate.send(@association_name).count
++  end
++  
++  def test_should_link_and_unlink_associated_models
++    @pirate.send(@association_name).push(@child)
++    @pirate.send(@association_name).delete(@child_1)
++    assert_equal 2, @pirate.send(@association_name).size
++    @pirate.save!
++    @pirate.reload
++    assert_equal 2, @pirate.send(@association_name).count
++    assert @pirate.send(@association_name).include?(@child)
++    assert @pirate.send(@association_name).include?(@child_2)
++  end
+ end
+ 
+ class TestAutosaveAssociationOnAHasManyAssociation < ActiveRecord::TestCase
+@@ -817,10 +844,11 @@ class TestAutosaveAssociationOnAHasManyAssociation < ActiveRecord::TestCase
+ 
+   def setup
+     @association_name = :birds
++    @child = Bird.first
+ 
+     @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
+-    @child_1 = @pirate.birds.create(:name => 'Posideons Killer')
+-    @child_2 = @pirate.birds.create(:name => 'Killer bandita Dionne')
++    @child_1 = @pirate.birds.create(:name => 'Posideons Killer2')
++    @child_2 = @pirate.birds.create(:name => 'Killer bandita Dionne2')
+   end
+ 
+   include AutosaveAssociationOnACollectionAssociationTests
+@@ -831,11 +859,12 @@ class TestAutosaveAssociationOnAHasAndBelongsToManyAssociation < ActiveRecord::T
+ 
+   def setup
+     @association_name = :parrots
++    @child = Parrot.first
+     @habtm = true
+ 
+     @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
+-    @child_1 = @pirate.parrots.create(:name => 'Posideons Killer')
+-    @child_2 = @pirate.parrots.create(:name => 'Killer bandita Dionne')
++    @child_1 = @pirate.parrots.create(:name => 'Posideons Killer3')
++    @child_2 = @pirate.parrots.create(:name => 'Killer bandita Dionne3')
+   end
+ 
+   include AutosaveAssociationOnACollectionAssociationTests
+ 

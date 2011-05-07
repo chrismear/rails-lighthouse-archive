@@ -1,0 +1,298 @@
+From a603376d11537ff4bd33514afd2b9855dd23a5a3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Mislav=20Marohni=C4=87?= <mislav.marohnic@gmail.com>
+Date: Fri, 16 Apr 2010 16:20:31 +0200
+Subject: [PATCH 1/3] merge callbacks_observers_test.rb into lifecycle_test.rb where other observers test reside
+
+Benefits: test able to run independently, subclassing instead of changing the original Comment model
+---
+ .../test/cases/callbacks_observers_test.rb         |   37 --------------------
+ activerecord/test/cases/lifecycle_test.rb          |   34 ++++++++++++++++++
+ 2 files changed, 34 insertions(+), 37 deletions(-)
+ delete mode 100644 activerecord/test/cases/callbacks_observers_test.rb
+
+diff --git a/activerecord/test/cases/callbacks_observers_test.rb b/activerecord/test/cases/callbacks_observers_test.rb
+deleted file mode 100644
+index 52ce384..0000000
+--- a/activerecord/test/cases/callbacks_observers_test.rb
++++ /dev/null
+@@ -1,37 +0,0 @@
+-require "cases/helper"
+-
+-class Comment < ActiveRecord::Base
+-  attr_accessor :callers
+-
+-  before_validation :record_callers
+-
+-  after_validation do
+-    record_callers
+-  end
+-
+-  def record_callers
+-    callers << self.class if callers
+-  end
+-end
+-
+-class CommentObserver < ActiveRecord::Observer
+-  attr_accessor :callers
+-
+-  def after_validation(model)
+-    callers << self.class if callers
+-  end
+-end
+-
+-class CallbacksObserversTest < ActiveRecord::TestCase
+-  def test_model_callbacks_fire_before_observers_are_notified
+-    callers = []
+-
+-    comment = Comment.new
+-    comment.callers = callers
+-
+-    CommentObserver.instance.callers = callers
+-
+-    comment.valid?
+-    assert_equal [Comment, Comment, CommentObserver], callers, "model callbacks did not fire before observers were notified"
+-  end
+-end
+diff --git a/activerecord/test/cases/lifecycle_test.rb b/activerecord/test/cases/lifecycle_test.rb
+index fcad3e9..13d7bfc 100644
+--- a/activerecord/test/cases/lifecycle_test.rb
++++ b/activerecord/test/cases/lifecycle_test.rb
+@@ -3,6 +3,7 @@ require 'models/topic'
+ require 'models/developer'
+ require 'models/reply'
+ require 'models/minimalistic'
++require 'models/comment'
+ 
+ class SpecialDeveloper < Developer; end
+ 
+@@ -57,6 +58,28 @@ class MultiObserver < ActiveRecord::Observer
+   end
+ end
+ 
++class ValidatedComment < Comment
++  attr_accessor :callers
++
++  before_validation :record_callers
++
++  after_validation do
++    record_callers
++  end
++
++  def record_callers
++    callers << self.class if callers
++  end
++end
++
++class ValidatedCommentObserver < ActiveRecord::Observer
++  attr_accessor :callers
++
++  def after_validation(model)
++    callers << self.class if callers
++  end
++end
++
+ class LifecycleTest < ActiveRecord::TestCase
+   fixtures :topics, :developers, :minimalistics
+ 
+@@ -125,4 +148,15 @@ class LifecycleTest < ActiveRecord::TestCase
+   def test_invalid_observer
+     assert_raise(ArgumentError) { Topic.observers = Object.new; Topic.instantiate_observers }
+   end
++  
++  test "model callbacks fire before observers are notified" do
++    callers = []
++
++    comment = ValidatedComment.new
++    comment.callers = ValidatedCommentObserver.instance.callers = callers
++
++    comment.valid?
++    assert_equal [ValidatedComment, ValidatedComment, ValidatedCommentObserver], callers,
++      "model callbacks did not fire before observers were notified"
++  end
+ end
+-- 
+1.7.0.4
+
+
+From 6445727bc98d305b774e302a1beba20297c1a08b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Mislav=20Marohni=C4=87?= <mislav.marohnic@gmail.com>
+Date: Fri, 16 Apr 2010 19:30:40 +0200
+Subject: [PATCH 2/3] ActiveModel::Observing: stop using Observable Ruby module, re-implement `notify_observers`
+
+`Observable#notify_observers` from Ruby always returns false (which halts ActiveRecord
+callback chains) and has extra features (like `changed`) that were never used.
+---
+ activemodel/lib/active_model/observing.rb |   23 ++++++++++++++++-------
+ activerecord/test/cases/lifecycle_test.rb |   20 ++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/activemodel/lib/active_model/observing.rb b/activemodel/lib/active_model/observing.rb
+index ed6fb47..f9ee142 100644
+--- a/activemodel/lib/active_model/observing.rb
++++ b/activemodel/lib/active_model/observing.rb
+@@ -1,4 +1,3 @@
+-require 'observer'
+ require 'singleton'
+ require 'active_support/core_ext/array/wrap'
+ require 'active_support/core_ext/module/aliasing'
+@@ -8,10 +7,6 @@ module ActiveModel
+   module Observing
+     extend ActiveSupport::Concern
+ 
+-    included do
+-      extend Observable
+-    end
+-
+     module ClassMethods
+       # Activates the observers assigned. Examples:
+       #
+@@ -41,6 +36,22 @@ module ActiveModel
+         observers.each { |o| instantiate_observer(o) }
+       end
+ 
++      def add_observer(observer)
++        unless observer.respond_to? :update
++          raise ArgumentError, "observer needs to respond to `update'"
++        end
++        @observer_instances ||= []
++        @observer_instances << observer
++      end
++
++      def notify_observers(*arg)
++        if defined? @observer_instances
++          for observer in @observer_instances
++            observer.update(*arg)
++          end
++        end
++      end
++
+       protected
+         def instantiate_observer(observer) #:nodoc:
+           # string/symbol
+@@ -56,7 +67,6 @@ module ActiveModel
+         # Notify observers when the observed class is subclassed.
+         def inherited(subclass)
+           super
+-          changed
+           notify_observers :observed_class_inherited, subclass
+         end
+     end
+@@ -70,7 +80,6 @@ module ActiveModel
+       #   notify_observers(:after_save)
+       # end
+       def notify_observers(method)
+-        self.class.changed
+         self.class.notify_observers(method, self)
+       end
+   end
+diff --git a/activerecord/test/cases/lifecycle_test.rb b/activerecord/test/cases/lifecycle_test.rb
+index 13d7bfc..64c0e06 100644
+--- a/activerecord/test/cases/lifecycle_test.rb
++++ b/activerecord/test/cases/lifecycle_test.rb
+@@ -7,6 +7,14 @@ require 'models/comment'
+ 
+ class SpecialDeveloper < Developer; end
+ 
++class SalaryChecker < ActiveRecord::Observer
++  observe :special_developer
++
++  def before_save(developer)
++    return developer.salary > 80000
++  end
++end
++
+ class TopicaAuditor < ActiveRecord::Observer
+   observe :topic
+ 
+@@ -159,4 +167,16 @@ class LifecycleTest < ActiveRecord::TestCase
+     assert_equal [ValidatedComment, ValidatedComment, ValidatedCommentObserver], callers,
+       "model callbacks did not fire before observers were notified"
+   end
++
++  test "able to save developer" do
++    SalaryChecker.instance # activate
++    developer = SpecialDeveloper.new :name => 'Roger', :salary => 100000
++    assert developer.save, "developer with normal salary failed to save"
++  end
++
++  test "unable to save developer with low salary" do
++    SalaryChecker.instance # activate
++    developer = SpecialDeveloper.new :name => 'Rookie', :salary => 50000
++    assert !developer.save, "allowed to save a developer with too low salary"
++  end
+ end
+-- 
+1.7.0.4
+
+
+From 46af2c02a320497d1d35879a3aa858a31d1da2ad Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Mislav=20Marohni=C4=87?= <mislav.marohnic@gmail.com>
+Date: Fri, 16 Apr 2010 19:37:12 +0200
+Subject: [PATCH 3/3] improve how ActiveRecord::Observer defines callbacks on observed models
+
+Instead of using a single `notify_observers` call for every callback type,
+each observer now registers a unique callback for itself. Example:
+
+  before_save :_notify_user_observer_for_before_save
+
+  def _notify_user_observer_for_before_save
+    observer.update(:before_save, self)
+  end
+
+Benefit: "before" callbacks halt when `observer.update` returns false.
+This way, ActiveRecord observers can prevent records from saving.
+---
+ activerecord/lib/active_record/observer.rb |   26 +++++++++++++++++++-------
+ 1 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/lib/active_record/observer.rb b/activerecord/lib/active_record/observer.rb
+index 0fbb1f0..ed0f039 100644
+--- a/activerecord/lib/active_record/observer.rb
++++ b/activerecord/lib/active_record/observer.rb
+@@ -96,7 +96,8 @@ module ActiveRecord
+     end
+ 
+     def self.method_added(method)
+-      self.observed_methods += [method] if ActiveRecord::Callbacks::CALLBACKS.include?(method.to_sym)
++      method = method.to_sym
++      observed_methods << method if ActiveRecord::Callbacks::CALLBACKS.include?(method)
+     end
+ 
+     protected
+@@ -104,16 +105,27 @@ module ActiveRecord
+         observed_classes.sum([]) { |klass| klass.send(:subclasses) }
+       end
+ 
++      def observe_callbacks?
++        self.class.observed_methods.any?
++      end
++
+       def add_observer!(klass)
+         super
++        define_callbacks klass if observe_callbacks?
++      end
++
++      def define_callbacks(klass)
++        existing_methods = klass.instance_methods.map(&:to_sym)
++        observer = self
++        observer_name = observer.class.name.underscore.gsub('/', '__')
+ 
+-        # Check if a notifier callback was already added to the given class. If
+-        # it was not, add it.
+         self.class.observed_methods.each do |method|
+-          callback = :"_notify_observers_for_#{method}"
+-          if (klass.instance_methods & [callback, callback.to_s]).empty?
+-            klass.class_eval "def #{callback}; notify_observers(:#{method}); end"
+-            klass.send(method, callback)
++          callback = :"_notify_#{observer_name}_for_#{method}"
++          unless existing_methods.include? callback
++            klass.send(:define_method, callback) do  # def _notify_user_observer_for_before_save
++              observer.update(method, self)          #   observer.update(:before_save, self)
++            end                                      # end
++            klass.send(method, callback)             # before_save :_notify_user_observer_for_before_save
+           end
+         end
+       end
+-- 
+1.7.0.4
+

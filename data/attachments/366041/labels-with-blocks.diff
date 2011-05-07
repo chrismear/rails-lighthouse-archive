@@ -1,0 +1,213 @@
+From 553fbe140b8ef9866a1f754f127f236ca31aeb45 Mon Sep 17 00:00:00 2001
+From: Stephen Celis <stephen@stephencelis.com>
+Date: Sun, 3 Jan 2010 11:22:21 -0600
+Subject: [PATCH] Let label helpers accept blocks.
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb  |   50 +++++++++++++-------
+ .../lib/action_view/helpers/form_tag_helper.rb     |   19 ++++++--
+ actionpack/test/template/form_helper_test.rb       |    8 ++-
+ actionpack/test/template/form_tag_helper_test.rb   |    9 ++++
+ 4 files changed, 63 insertions(+), 23 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 81c9c88..a852d7d 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -505,7 +505,7 @@ module ActionView
+ 
+       # Returns a label tag tailored for labelling an input field for a specified attribute (identified by +method+) on an object
+       # assigned to the template (identified by +object+). The text of label will default to the attribute name unless a translation
+-      # is found in the current I18n locale (through views.labels.<modelname>.<attribute>) or you specify it explicitly. 
++      # is found in the current I18n locale (through views.labels.<modelname>.<attribute>) or you specify it explicitly.
+       # Additional options on the label tag can be passed as a hash with +options+. These options will be tagged
+       # onto the HTML as an HTML element attribute as in the example shown, except for the <tt>:value</tt> option, which is designed to
+       # target labels for radio_button tags (where the value is used in the ID of the input tag).
+@@ -546,8 +546,20 @@ module ActionView
+       #   label(:post, :privacy, "Public Post", :value => "public")
+       #   # => <label for="post_privacy_public">Public Post</label>
+       #
+-      def label(object_name, method, text = nil, options = {})
+-        InstanceTag.new(object_name, method, self, options.delete(:object)).to_label_tag(text, options)
++      #   label(:post, :terms) do
++      #     "Accept <a href="/terms">Terms</a>."
++      #   end
++      #   # => <label for="post_terms">Accept <a href="/terms">Terms</a>.</label>
++      def label(object_name, method, content_or_options_with_block = nil, options = nil, &block)
++        if block_given?
++          options = content_or_options_with_block if content_or_options_with_block.is_a?(Hash)
++          text = nil
++        else
++          text = content_or_options_with_block
++        end
++
++        options ||= {}
++        InstanceTag.new(object_name, method, self, options.delete(:object)).to_label_tag(text, options, &block)
+       end
+ 
+       # Returns an input tag of the "text" type tailored for accessing a specified attribute (identified by +method+) on an object
+@@ -746,7 +758,7 @@ module ActionView
+ 
+     module InstanceTagMethods #:nodoc:
+       extend ActiveSupport::Concern
+-      include Helpers::TagHelper, Helpers::FormTagHelper
++      include Helpers::CaptureHelper, Context, Helpers::TagHelper, Helpers::FormTagHelper
+ 
+       attr_reader :method_name, :object_name
+ 
+@@ -767,7 +779,7 @@ module ActionView
+         end
+       end
+ 
+-      def to_label_tag(text = nil, options = {})
++      def to_label_tag(text = nil, options = {}, &block)
+         options = options.stringify_keys
+         tag_value = options.delete("value")
+         name_and_id = options.dup
+@@ -776,19 +788,23 @@ module ActionView
+         options.delete("index")
+         options["for"] ||= name_and_id["id"]
+ 
+-        content = if text.blank?
+-          I18n.t("views.labels.#{object_name}.#{method_name}", :default => "").presence
++        if block_given?
++          label_tag(name_and_id["id"], options, &block)
+         else
+-          text.to_s
+-        end
++          content = if text.blank?
++            I18n.t("views.labels.#{object_name}.#{method_name}", :default => "").presence
++          else
++            text.to_s
++          end
+ 
+-        content ||= if object && object.class.respond_to?(:human_attribute_name)
+-          object.class.human_attribute_name(method_name)
+-        end
++          content ||= if object && object.class.respond_to?(:human_attribute_name)
++            object.class.human_attribute_name(method_name)
++          end
+ 
+-        content ||= method_name.humanize
++          content ||= method_name.humanize
+ 
+-        label_tag(name_and_id["id"], content, options)
++          label_tag(name_and_id["id"], content, options)
++        end
+       end
+ 
+       def to_input_field_tag(field_type, options = {})
+@@ -1047,8 +1063,8 @@ module ActionView
+         @template.fields_for(name, *args, &block)
+       end
+ 
+-      def label(method, text = nil, options = {})
+-        @template.label(@object_name, method, text, objectify_options(options))
++      def label(method, text = nil, options = {}, &block)
++        @template.label(@object_name, method, text, objectify_options(options), &block)
+       end
+ 
+       def check_box(method, options = {}, checked_value = "1", unchecked_value = "0")
+@@ -1058,7 +1074,7 @@ module ActionView
+       def radio_button(method, tag_value, options = {})
+         @template.radio_button(@object_name, method, tag_value, objectify_options(options))
+       end
+-      
++
+       def hidden_field(method, options = {})
+         @emitted_hidden_id = true if method == :id
+         @template.hidden_field(@object_name, method, objectify_options(options))
+diff --git a/actionpack/lib/action_view/helpers/form_tag_helper.rb b/actionpack/lib/action_view/helpers/form_tag_helper.rb
+index 7688e78..136cfec 100644
+--- a/actionpack/lib/action_view/helpers/form_tag_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_tag_helper.rb
+@@ -123,9 +123,9 @@ module ActionView
+         tag :input, { "type" => "text", "name" => name, "id" => sanitize_to_id(name), "value" => value }.update(options.stringify_keys)
+       end
+ 
+-      # Creates a label field
++      # Creates a label element. Accepts a block.
+       #
+-      # ==== Options  
++      # ==== Options
+       # * Creates standard HTML attributes for the tag.
+       #
+       # ==== Examples
+@@ -137,8 +137,19 @@ module ActionView
+       #
+       #   label_tag 'name', nil, :class => 'small_label'
+       #   # => <label for="name" class="small_label">Name</label>
+-      def label_tag(name, text = nil, options = {})
+-        content_tag :label, text || name.to_s.humanize, { "for" => sanitize_to_id(name) }.update(options.stringify_keys)
++      #
++      #   label_tag do
++      #     '<input type="checkbox" /> Accept <a href="/terms">terms</a>'
++      #   end
++      #   # => <label><input type="checkbox" /> Accept <a>terms</a></label>
++      def label_tag(name = nil, content_or_options_with_block = nil, options = nil, &block)
++        if block_given?
++          options = content_or_options_with_block if content_or_options_with_block.is_a?(Hash)
++        end
++        options ||= {}
++        options.stringify_keys!
++        options["for"] = sanitize_to_id(name) unless name.blank? || options.has_key?("for")
++        content_tag("label", content_or_options_with_block || name.to_s.humanize, options, &block)
+       end
+ 
+       # Creates a hidden form input field used to transmit data that would be lost due to HTTP's statelessness or
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index b1e9fe9..6d64ecb 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -120,6 +120,10 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal('<label for="post_title_great_title">The title goes here</label>', label("post", "title", "The title goes here", :value => "great title"))
+   end
+ 
++  def test_label_with_block
++    assert_dom_equal('<label for="post_title">The title, please:</label>', label(:post, :title) { "The title, please:" })
++  end
++
+   def test_text_field
+     assert_dom_equal(
+       '<input id="post_title" name="post[title]" size="30" type="text" value="Hello World" />', text_field("post", "title")
+@@ -380,7 +384,7 @@ class FormHelperTest < ActionView::TestCase
+ 
+   def test_form_for
+     form_for(:post, @post, :html => { :id => 'create-post' }) do |f|
+-      concat f.label(:title)
++      concat f.label(:title) { "The Title" }
+       concat f.text_field(:title)
+       concat f.text_area(:body)
+       concat f.check_box(:secret)
+@@ -389,7 +393,7 @@ class FormHelperTest < ActionView::TestCase
+ 
+     expected =
+       "<form action='http://www.example.com' id='create-post' method='post'>" +
+-      "<label for='post_title'>Title</label>" +
++      "<label for='post_title'>The Title</label>" +
+       "<input name='post[title]' size='30' type='text' id='post_title' value='Hello World' />" +
+       "<textarea name='post[body]' id='post_body' rows='20' cols='40'>Back to the hill and over it again!</textarea>" +
+       "<input name='post[secret]' type='hidden' value='0' />" +
+diff --git a/actionpack/test/template/form_tag_helper_test.rb b/actionpack/test/template/form_tag_helper_test.rb
+index 47462b1..965f6c5 100644
+--- a/actionpack/test/template/form_tag_helper_test.rb
++++ b/actionpack/test/template/form_tag_helper_test.rb
+@@ -268,6 +268,15 @@ class FormTagHelperTest < ActionView::TestCase
+     assert_match VALID_HTML_ID, label_elem['for']
+   end
+ 
++  def test_label_tag_with_block
++    assert_dom_equal('<label>Blocked</label>', label_tag { "Blocked" })
++  end
++
++  def test_label_tag_with_block_and_argument
++    output = label_tag("clock") { "Grandfather" }
++    assert_dom_equal('<label for="clock">Grandfather</label>', output)
++  end
++
+   def test_boolean_options
+     assert_dom_equal %(<input checked="checked" disabled="disabled" id="admin" name="admin" readonly="readonly" type="checkbox" value="1" />), check_box_tag("admin", 1, true, 'disabled' => true, :readonly => "yes")
+     assert_dom_equal %(<input checked="checked" id="admin" name="admin" type="checkbox" value="1" />), check_box_tag("admin", 1, true, :disabled => false, :readonly => nil)
+-- 
+1.6.6
+

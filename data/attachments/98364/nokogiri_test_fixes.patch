@@ -1,0 +1,155 @@
+From d2fb62369159011f0c1a9bcdf440e44f763f74be Mon Sep 17 00:00:00 2001
+From: Aaron Patterson <aaron.patterson@gmail.com>
+Date: Tue, 10 Mar 2009 20:45:14 -0700
+Subject: [PATCH] adding more nokogiri tests and making the main rails tests pass with nokogiri
+
+---
+ .../lib/active_support/xml_mini/nokogiri.rb        |   21 ++++++---
+ activesupport/test/core_ext/hash_ext_test.rb       |    7 +++-
+ .../test/xml_mini/nokogiri_engine_test.rb          |   47 ++++++++++++++++++++
+ 3 files changed, 67 insertions(+), 8 deletions(-)
+
+diff --git a/activesupport/lib/active_support/xml_mini/nokogiri.rb b/activesupport/lib/active_support/xml_mini/nokogiri.rb
+index 5c8a6bf..1028158 100644
+--- a/activesupport/lib/active_support/xml_mini/nokogiri.rb
++++ b/activesupport/lib/active_support/xml_mini/nokogiri.rb
+@@ -1,3 +1,5 @@
++require 'nokogiri'
++
+ # = XmlMini Nokogiri implementation
+ module ActiveSupport
+   module XmlMini_Nokogiri #:nodoc:
+@@ -10,7 +12,9 @@ module ActiveSupport
+       if string.blank?
+         {}
+       else
+-        Nokogiri::XML(string).to_hash
++        doc = Nokogiri::XML(string)
++        raise doc.errors.first if doc.errors.length > 0
++        doc.to_hash
+       end
+     end
+ 
+@@ -31,8 +35,8 @@ module ActiveSupport
+         def to_hash(hash = {})
+           hash[name] ||= attributes_as_hash
+ 
+-          walker = lambda { |child, memo, callback|
+-            next if child.blank?
++          walker = lambda { |memo, parent, child, callback|
++            next if child.blank? && 'file' != parent['type']
+ 
+             if child.text?
+               (memo[CONTENT_ROOT] ||= '') << child.content
+@@ -41,18 +45,21 @@ module ActiveSupport
+ 
+             name = child.name
+ 
++            child_hash = child.attributes_as_hash
+             if memo[name]
+               memo[name] = [memo[name]].flatten
+-              memo[name] << child.attributes_as_hash
++              memo[name] << child_hash
+             else
+-              memo[name] = child.attributes_as_hash
++              memo[name] = child_hash
+             end
+ 
+             # Recusively walk children
+-            child.children.each { |c| callback.call(c, memo[name], callback) }
++            child.children.each { |c|
++              callback.call(child_hash, child, c, callback)
++            }
+           }
+ 
+-          children.each { |c| walker.call(c, hash[name], walker) }
++          children.each { |c| walker.call(hash[name], self, c, walker) }
+           hash
+         end
+ 
+diff --git a/activesupport/test/core_ext/hash_ext_test.rb b/activesupport/test/core_ext/hash_ext_test.rb
+index 2285d5a..80582cd 100644
+--- a/activesupport/test/core_ext/hash_ext_test.rb
++++ b/activesupport/test/core_ext/hash_ext_test.rb
+@@ -884,7 +884,12 @@ class QueryTest < Test::Unit::TestCase
+   end
+ 
+   def test_expansion_count_is_limited
+-    expected = defined?(LibXML) ? LibXML::XML::Error : RuntimeError
++    expected = {
++      'ActiveSupport::XmlMini_REXML'    => 'RuntimeError',
++      'ActiveSupport::XmlMini_Nokogiri' => 'Nokogiri::XML::SyntaxError',
++      'ActiveSupport::XmlMini_LibXML'   => 'LibXML::XML::Error',
++    }[ActiveSupport::XmlMini.backend.name].constantize
++
+     assert_raise expected do
+       attack_xml = <<-EOT
+       <?xml version="1.0" encoding="UTF-8"?>
+diff --git a/activesupport/test/xml_mini/nokogiri_engine_test.rb b/activesupport/test/xml_mini/nokogiri_engine_test.rb
+index 1ab3678..d11bae2 100644
+--- a/activesupport/test/xml_mini/nokogiri_engine_test.rb
++++ b/activesupport/test/xml_mini/nokogiri_engine_test.rb
+@@ -20,6 +20,42 @@ class NokogiriEngineTest < Test::Unit::TestCase
+   def teardown
+     XmlMini.backend = @default_backend
+   end
++  
++  def test_file_from_xml
++    hash = Hash.from_xml(<<-eoxml)
++      <blog>
++        <logo type="file" name="logo.png" content_type="image/png">
++        </logo>
++      </blog>
++    eoxml
++    assert hash.has_key?('blog')
++    assert hash['blog'].has_key?('logo')
++
++    file = hash['blog']['logo']
++    assert_equal 'logo.png', file.original_filename
++    assert_equal 'image/png', file.content_type
++  end
++
++  def test_exception_thrown_on_expansion_attack
++    assert_raise Nokogiri::XML::SyntaxError do
++      attack_xml = <<-EOT
++      <?xml version="1.0" encoding="UTF-8"?>
++      <!DOCTYPE member [
++        <!ENTITY a "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
++        <!ENTITY b "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
++        <!ENTITY c "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">
++        <!ENTITY d "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;">
++        <!ENTITY e "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">
++        <!ENTITY f "&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;">
++        <!ENTITY g "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
++      ]>
++      <member>
++      &a;
++      </member>
++      EOT
++      Hash.from_xml(attack_xml)
++    end
++  end
+ 
+   def test_setting_nokogiri_as_backend
+     XmlMini.backend = 'Nokogiri'
+@@ -31,6 +67,17 @@ class NokogiriEngineTest < Test::Unit::TestCase
+     assert_equal({}, XmlMini.parse(''))
+   end
+ 
++  def test_array_type_makes_an_array
++    assert_equal_rexml(<<-eoxml)
++      <blog>
++        <posts type="array">
++          <post>a post</post>
++          <post>another post</post>
++        </posts>
++      </blog>
++    eoxml
++  end
++
+   def test_one_node_document_as_hash
+     assert_equal_rexml(<<-eoxml)
+     <products/>
+-- 
+1.6.1.3
+

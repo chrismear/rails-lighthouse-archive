@@ -1,0 +1,130 @@
+From f21640d9dc52db974f7851f73d8c47775dd8f283 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Fri, 31 Jul 2009 15:35:53 +0200
+Subject: [PATCH] Make the new code reloading behavior work with multi-threaded environments such as Mongrel. Fixes issues #2948 and #8994.
+
+---
+ actionpack/lib/action_controller/reloader.rb |   14 ++++++--
+ actionpack/test/controller/reloader_test.rb  |   44 ++++++++++++++++++++++++-
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/reloader.rb b/actionpack/lib/action_controller/reloader.rb
+index 459dece..9a9786b 100644
+--- a/actionpack/lib/action_controller/reloader.rb
++++ b/actionpack/lib/action_controller/reloader.rb
+@@ -1,14 +1,20 @@
++require 'thread'
++
+ module ActionController
+   class Reloader
++    @@lock = Mutex.new
++    
+     class BodyWrapper
+-      def initialize(body)
++      def initialize(body, lock)
+         @body = body
++        @lock = lock
+       end
+ 
+       def close
+         @body.close if @body.respond_to?(:close)
+       ensure
+         Dispatcher.cleanup_application
++        @lock.unlock
+       end
+ 
+       def method_missing(*args, &block)
+@@ -20,11 +26,13 @@ module ActionController
+       end
+     end
+ 
+-    def initialize(app)
++    def initialize(app, lock = @@lock)
+       @app = app
++      @lock = lock
+     end
+ 
+     def call(env)
++      @lock.lock
+       Dispatcher.reload_application
+       status, headers, body = @app.call(env)
+       # We do not want to call 'cleanup_application' in an ensure block
+@@ -39,7 +47,7 @@ module ActionController
+       # completely finished. So we wrap the body in a BodyWrapper class so that
+       # when the Rack handler calls #close during the end of the request, we get to
+       # run our cleanup code.
+-      [status, headers, BodyWrapper.new(body)]
++      [status, headers, BodyWrapper.new(body, @lock)]
+     end
+   end
+ end
+diff --git a/actionpack/test/controller/reloader_test.rb b/actionpack/test/controller/reloader_test.rb
+index 6f1f3c8..4631cce 100644
+--- a/actionpack/test/controller/reloader_test.rb
++++ b/actionpack/test/controller/reloader_test.rb
+@@ -21,10 +21,28 @@ class ReloaderTests < ActiveSupport::TestCase
+       @on_close.call if @on_close
+     end
+   end
++  
++  class MyLock
++    def lock
++      @locked = true
++    end
++    
++    def unlock
++      @locked = false
++    end
++    
++    def locked?
++      @locked
++    end
++  end
++  
++  def setup
++    @lock = Mutex.new
++  end
+ 
+   def setup_and_return_body(app = lambda { })
+     Dispatcher.expects(:reload_application)
+-    reloader = Reloader.new(app)
++    reloader = Reloader.new(app, @lock)
+     headers, status, body = reloader.call({ })
+     body
+   end
+@@ -33,9 +51,31 @@ class ReloaderTests < ActiveSupport::TestCase
+     Dispatcher.expects(:reload_application)
+     reloader = Reloader.new(lambda {
+       [200, { "Content-Type" => "text/html" }, [""]]
+-    })
++    }, @lock)
+     reloader.call({ })
+   end
++  
++  def test_it_locks_before_calling_app
++    lock = MyLock.new
++    Dispatcher.expects(:reload_application)
++    reloader = Reloader.new(lambda {
++      [200, { "Content-Type" => "text/html" }, [""]]
++    }, lock)
++    assert !lock.locked?
++    reloader.call({ })
++    assert lock.locked?
++  end
++  
++  def it_unlocks_upon_calling_close_on_body
++    lock = MyLock.new
++    Dispatcher.expects(:reload_application)
++    reloader = Reloader.new(lambda {
++      [200, { "Content-Type" => "text/html" }, [""]]
++    }, lock)
++    headers, status, body = reloader.call({ })
++    body.close
++    assert !lock.locked?
++  end
+ 
+   def test_returned_body_object_always_responds_to_close
+     body = setup_and_return_body(lambda {
+-- 
+1.6.0.5
+

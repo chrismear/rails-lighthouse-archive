@@ -1,0 +1,292 @@
+From 264c71a82d444b57130c7f3786cafcb8be58cfc1 Mon Sep 17 00:00:00 2001
+From: Joseph Anthony Pasquale Holsten <joseph@josephholsten.com>
+Date: Tue, 11 Jan 2011 09:41:03 -0600
+Subject: [PATCH] seperate rendering from calculation in code statistics
+
+---
+ railties/lib/rails/code_statistics.rb    |  185 +++++++++++++++++------------
+ railties/lib/rails/tasks/statistics.rake |    2 +-
+ railties/test/code_statistics_test.rb    |   42 +++++++
+ 3 files changed, 151 insertions(+), 78 deletions(-)
+ create mode 100644 railties/test/code_statistics_test.rb
+
+diff --git a/railties/lib/rails/code_statistics.rb b/railties/lib/rails/code_statistics.rb
+index 40416dd..7c59ddd 100644
+--- a/railties/lib/rails/code_statistics.rb
++++ b/railties/lib/rails/code_statistics.rb
+@@ -3,105 +3,136 @@ class CodeStatistics #:nodoc:
+   TEST_TYPES = %w(Units Functionals Unit\ tests Functional\ tests Integration\ tests)
+ 
+   def initialize(*pairs)
+-    @pairs      = pairs
+-    @statistics = calculate_statistics
+-    @total      = calculate_total if pairs.length > 1
++    @pairs = pairs
+   end
+ 
+   def to_s
+-    print_header
+-    @pairs.each { |pair| print_line(pair.first, @statistics[pair.first]) }
+-    print_splitter
+-
+-    if @total
+-      print_line("Total", @total)
+-      print_splitter
+-    end
+-
+-    print_code_test_stats
++    CodeStatisticsView.new(self).to_s
+   end
+ 
+-  private
+-    def calculate_statistics
+-      Hash[@pairs.map{|pair| [pair.first, calculate_directory_statistics(pair.last)]}]
+-    end
++  def multiple_pairs?
++    @pairs.length > 1
++  end
+ 
+-    def calculate_directory_statistics(directory, pattern = /.*\.rb$/)
+-      stats = { "lines" => 0, "codelines" => 0, "classes" => 0, "methods" => 0 }
++  def statistics
++    @statistics ||= Hash[@pairs.map{|pair| [pair.first, calculate_directory_statistics(pair.last)]}]
++  end
+ 
+-      Dir.foreach(directory) do |file_name|
+-        if File.stat(directory + "/" + file_name).directory? and (/^\./ !~ file_name)
+-          newstats = calculate_directory_statistics(directory + "/" + file_name, pattern)
+-          stats.each { |k, v| stats[k] += newstats[k] }
+-        end
++  def calculate_total
++    total = { "lines" => 0, "codelines" => 0, "classes" => 0, "methods" => 0 }
++    statistics.each_value { |pair| pair.each { |k, v| total[k] += v } }
++    total
++  end
+ 
+-        next unless file_name =~ pattern
++  def code_loc
++    code_loc = 0
++    statistics.each { |k, v| code_loc += v['codelines'] unless TEST_TYPES.include? k }
++    code_loc
++  end
+ 
+-        f = File.open(directory + "/" + file_name)
++  def tests_loc
++    test_loc = 0
++    statistics.each { |k, v| test_loc += v['codelines'] if TEST_TYPES.include? k }
++    test_loc
++  end
+ 
+-        while line = f.gets
+-          stats["lines"]     += 1
+-          stats["classes"]   += 1 if line =~ /class [A-Z]/
+-          stats["methods"]   += 1 if line =~ /def [a-z]/
+-          stats["codelines"] += 1 unless line =~ /^\s*$/ || line =~ /^\s*#/
+-        end
+-      end
++  def code_to_test_ratio
++    tests_loc.to_f/code_loc
++  end
+ 
+-      stats
++  def lines
++    @pairs.collect do |pair|
++      line(pair.first, statistics[pair.first])
+     end
++  end
+ 
+-    def calculate_total
+-      total = { "lines" => 0, "codelines" => 0, "classes" => 0, "methods" => 0 }
+-      @statistics.each_value { |pair| pair.each { |k, v| total[k] += v } }
+-      total
+-    end
++  def total
++    line("Total", calculate_total)
++  end
+ 
+-    def calculate_code
+-      code_loc = 0
+-      @statistics.each { |k, v| code_loc += v['codelines'] unless TEST_TYPES.include? k }
+-      code_loc
+-    end
++  def line(name, statistics)
++    m_over_c   = (statistics["methods"] / statistics["classes"])   rescue m_over_c = 0
++    loc_over_m = (statistics["codelines"] / statistics["methods"]) - 2 rescue loc_over_m = 0
++
++    {
++      :name => name,
++      :lines => statistics["lines"],
++      :codelines => statistics["codelines"],
++      :classes => statistics["classes"],
++      :methods => statistics["methods"],
++      :m_over_c => m_over_c,
++      :loc_over_m => loc_over_m
++    }
++  end
+ 
+-    def calculate_tests
+-      test_loc = 0
+-      @statistics.each { |k, v| test_loc += v['codelines'] if TEST_TYPES.include? k }
+-      test_loc
+-    end
++  private
++  def calculate_directory_statistics(directory, pattern = /.*\.rb$/)
++    stats = { "lines" => 0, "codelines" => 0, "classes" => 0, "methods" => 0 }
+ 
+-    def print_header
+-      print_splitter
+-      puts "| Name                 | Lines |   LOC | Classes | Methods | M/C | LOC/M |"
+-      print_splitter
+-    end
++    Dir.foreach(directory) do |file_name|
++      if File.stat(directory + "/" + file_name).directory? and (/^\./ !~ file_name)
++        newstats = calculate_directory_statistics(directory + "/" + file_name, pattern)
++        stats.each { |k, v| stats[k] += newstats[k] }
++      end
+ 
+-    def print_splitter
+-      puts "+----------------------+-------+-------+---------+---------+-----+-------+"
+-    end
++      next unless file_name =~ pattern
+ 
+-    def print_line(name, statistics)
+-      m_over_c   = (statistics["methods"] / statistics["classes"])   rescue m_over_c = 0
+-      loc_over_m = (statistics["codelines"] / statistics["methods"]) - 2 rescue loc_over_m = 0
++      f = File.open(directory + "/" + file_name)
+ 
+-      start = if TEST_TYPES.include? name
+-        "| #{name.ljust(20)} "
+-      else
+-        "| #{name.ljust(20)} "
++      while line = f.gets
++        stats["lines"]     += 1
++        stats["classes"]   += 1 if line =~ /class [A-Z]/
++        stats["methods"]   += 1 if line =~ /def [a-z]/
++        stats["codelines"] += 1 unless line =~ /^\s*$/ || line =~ /^\s*#/
+       end
+-
+-      puts start +
+-           "| #{statistics["lines"].to_s.rjust(5)} " +
+-           "| #{statistics["codelines"].to_s.rjust(5)} " +
+-           "| #{statistics["classes"].to_s.rjust(7)} " +
+-           "| #{statistics["methods"].to_s.rjust(7)} " +
+-           "| #{m_over_c.to_s.rjust(3)} " +
+-           "| #{loc_over_m.to_s.rjust(5)} |"
+     end
+ 
+-    def print_code_test_stats
+-      code  = calculate_code
+-      tests = calculate_tests
++    stats
++  end
++end
+ 
+-      puts "  Code LOC: #{code}     Test LOC: #{tests}     Code to Test Ratio: 1:#{sprintf("%.1f", tests.to_f/code)}"
+-      puts ""
++class CodeStatisticsView
++  def initialize(stats)
++    @stats = stats
++  end
++  def to_s
++    lines = []
++    lines << hr
++    lines << header
++    lines << hr
++    lines << @stats.lines.map {|l| line(l) }
++    lines << hr
++    if @stats.multiple_pairs?
++      lines << line(@stats.total)
++      lines << hr
+     end
++    lines << code_test_stats
++    lines << br
++    lines << br
++    lines.join("\n")
++  end
++  private
++  def header
++    "| Name                 | Lines |   LOC | Classes | Methods | M/C | LOC/M |"
++  end
++  def line(data)
++    "| #{data[:name].ljust(20)} " +
++      "| #{data[:lines].to_s.rjust(5)} " +
++      "| #{data[:codelines].to_s.rjust(5)} " +
++      "| #{data[:classes].to_s.rjust(7)} " +
++      "| #{data[:methods].to_s.rjust(7)} " +
++      "| #{data[:m_over_c].to_s.rjust(3)} " +
++      "| #{data[:loc_over_m].to_s.rjust(5)} |"
++  end
++  def code_test_stats
++    "  Code LOC: #{@stats.code_loc}     "+
++      "Test LOC: #{@stats.tests_loc}     "+
++      "Code to Test Ratio: 1:#{sprintf("%.1f", @stats.code_to_test_ratio)}"
++  end
++  def hr
++    "+----------------------+-------+-------+---------+---------+-----+-------+"
++  end
++  def br
++    ''
+   end
++end
+diff --git a/railties/lib/rails/tasks/statistics.rake b/railties/lib/rails/tasks/statistics.rake
+index 40f8c10..b72caed 100644
+--- a/railties/lib/rails/tasks/statistics.rake
++++ b/railties/lib/rails/tasks/statistics.rake
+@@ -12,5 +12,5 @@ STATS_DIRECTORIES = [
+ desc "Report code statistics (KLOCs, etc) from the application"
+ task :stats do
+   require 'rails/code_statistics'
+-  CodeStatistics.new(*STATS_DIRECTORIES).to_s
++  STDOUT << CodeStatistics.new(*STATS_DIRECTORIES).to_s
+ end
+diff --git a/railties/test/code_statistics_test.rb b/railties/test/code_statistics_test.rb
+new file mode 100644
+index 0000000..ac789b9
+--- /dev/null
++++ b/railties/test/code_statistics_test.rb
+@@ -0,0 +1,42 @@
++require "isolation/abstract_unit"
++require 'rails/code_statistics.rb'
++
++class CodeStatisticsTest < Test::Unit::TestCase
++  include ActiveSupport::Testing::Isolation
++
++  def setup
++    build_app
++    boot_rails
++  end
++
++  test "to_s" do
++    stats_directories = [
++      %w(Controllers        app/controllers),
++      %w(Helpers            app/helpers),
++      %w(Models             app/models),
++      %w(Libraries          lib/),
++      %w(Integration\ tests test/integration),
++      %w(Functional\ tests  test/functional),
++      %w(Unit\ tests        test/unit)
++    ].map {|name, dir| [ name, "#{app_path}/#{dir}" ]}
++
++    expected =<<-END
+++----------------------+-------+-------+---------+---------+-----+-------+
++| Name                 | Lines |   LOC | Classes | Methods | M/C | LOC/M |
+++----------------------+-------+-------+---------+---------+-----+-------+
++| Controllers          |     3 |     3 |       1 |       0 |   0 |     0 |
++| Helpers              |     2 |     2 |       0 |       0 |   0 |     0 |
++| Models               |     0 |     0 |       0 |       0 |   0 |     0 |
++| Libraries            |     0 |     0 |       0 |       0 |   0 |     0 |
++| Integration tests    |     0 |     0 |       0 |       0 |   0 |     0 |
++| Functional tests     |     0 |     0 |       0 |       0 |   0 |     0 |
++| Unit tests           |     0 |     0 |       0 |       0 |   0 |     0 |
+++----------------------+-------+-------+---------+---------+-----+-------+
++| Total                |     5 |     5 |       1 |       0 |   0 |     0 |
+++----------------------+-------+-------+---------+---------+-----+-------+
++  Code LOC: 5     Test LOC: 0     Code to Test Ratio: 1:0.0
++
++    END
++    assert_equal expected, CodeStatistics.new(*stats_directories).to_s
++  end
++end
+-- 
+1.7.2.3
+

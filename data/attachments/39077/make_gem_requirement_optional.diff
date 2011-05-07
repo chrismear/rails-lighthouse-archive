@@ -1,0 +1,173 @@
+From 40aa16afe3ffad3c843900e9080c047fa22a339d Mon Sep 17 00:00:00 2001
+From: Ben Sandofsky <sandofsky@gmail.com>
+Date: Wed, 13 Aug 2008 15:51:37 -0700
+Subject: [PATCH] Add optional parameter to gem dependencies.
+
+---
+ railties/lib/initializer.rb          |   41 +++++++++++++++++++++++++--------
+ railties/lib/rails/gem_dependency.rb |    5 ++++
+ railties/test/gem_dependency_test.rb |    6 +++++
+ railties/test/initializer_test.rb    |   37 ++++++++++++++++++++++++++++++
+ 4 files changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 6576cd3..3dae28f 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -270,20 +270,34 @@ module Rails
+     end
+ 
+     def check_gem_dependencies
+-      unloaded_gems = @configuration.gems.reject { |g| g.loaded? }
+-      if unloaded_gems.size > 0
+-        @gems_dependencies_loaded = false
+-        # don't print if the gems rake tasks are being run
+-        unless $rails_gem_installer
+-          abort <<-end_error
+-Missing these required gems:
+-  #{unloaded_gems.map { |gem| "#{gem.name}  #{gem.requirement}" } * "\n  "}
+-
++      unloaded_gems = @configuration.gems.reject(&:loaded?)
++      required_unloaded_gems = unloaded_gems.reject(&:optional?)
++      optional_unloaded_gems = unloaded_gems.select(&:optional?)
++      gemlist = Proc.new {|g| "  #{g.name}  #{g.requirement}\n"}
++      instructions = <<-END_INSTRUCTIONS
++      
+ You're running:
+   ruby #{Gem.ruby_version} at #{Gem.ruby}
+   rubygems #{Gem::RubyGemsVersion} at #{Gem.path * ', '}
+ 
+ Run `rake gems:install` to install the missing gems.
++END_INSTRUCTIONS
++      if optional_unloaded_gems.size > 0
++puts <<-end_warning
++Missing these optional gems:
++#{optional_unloaded_gems.map(&gemlist)}
++#{instructions unless required_unloaded_gems.size > 0}
++end_warning
++
++      end
++      if required_unloaded_gems.size > 0
++        @gems_dependencies_loaded = false
++        # don't print if the gems rake tasks are being run
++        unless $rails_gem_installer
++          abort <<-end_error
++Missing these required gems:
++#{required_unloaded_gems.map(&gemlist)}
++#{instructions}
+           end_error
+         end
+       else
+@@ -685,7 +699,7 @@ Run `rake gems:install` to install the missing gems.
+     attr_accessor :dependency_loading
+ 
+     # An array of gems that this rails application depends on.  Rails will automatically load
+-    # these gems during installation, and allow you to install any missing gems with:
++    # these gems during installation and allow you to install any missing gems with:
+     #
+     #   rake gems:install
+     #
+@@ -703,6 +717,13 @@ Run `rake gems:install` to install the missing gems.
+     # To require a library be installed, but not attempt to load it, pass :lib => false
+     #
+     #   config.gem 'qrp', :version => '0.4.1', :lib => false
++    #
++    # If a gem isn't available, the application will abort on start and list
++    # the gems that are missing. If you'd rather print a warning and attempt
++    # to start anyway, pass :optional => true
++    #
++    #   config.gem 'qrp', :version => '0.4.1', :lib => false, :optional => true
++    #
+     def gem(name, options = {})
+       @gems << Rails::GemDependency.new(name, options)
+     end
+diff --git a/railties/lib/rails/gem_dependency.rb b/railties/lib/rails/gem_dependency.rb
+index 471e03f..6054f40 100644
+--- a/railties/lib/rails/gem_dependency.rb
++++ b/railties/lib/rails/gem_dependency.rb
+@@ -18,6 +18,7 @@ module Rails
+       @version  = @requirement.instance_variable_get("@requirements").first.last if @requirement
+       @name     = name.to_s
+       @lib      = options[:lib]
++      @optional = options[:optional]
+       @source   = options[:source]
+       @loaded   = @frozen = @load_paths_added = false
+       @unpack_directory = nil
+@@ -77,6 +78,10 @@ module Rails
+       @load_paths_added
+     end
+ 
++    def optional?
++      @optional
++    end
++
+     def install
+       cmd = "#{gem_command} #{install_command.join(' ')}"
+       puts cmd
+diff --git a/railties/test/gem_dependency_test.rb b/railties/test/gem_dependency_test.rb
+index 964ca50..8e4de76 100644
+--- a/railties/test/gem_dependency_test.rb
++++ b/railties/test/gem_dependency_test.rb
+@@ -71,5 +71,11 @@ uses_mocha "Plugin Tests" do
+       @gem_without_load.load
+     end
+ 
++    def test_should_have_optional_parameter
++      assert Rails::GemDependency.new("hpricot", :optional => true).optional?
++      assert !Rails::GemDependency.new("hpricot", :optional => false).optional?
++      assert !Rails::GemDependency.new("hpricot").optional?
++    end
++
+   end
+ end
+diff --git a/railties/test/initializer_test.rb b/railties/test/initializer_test.rb
+index 07303a5..26b9b8e 100644
+--- a/railties/test/initializer_test.rb
++++ b/railties/test/initializer_test.rb
+@@ -30,6 +30,43 @@ class Initializer_load_environment_Test < Test::Unit::TestCase
+ 
+ end
+ 
++class GemDependencyLoadingTest < Test::Unit::TestCase
++  
++  def setup
++    @initializer = Rails::Initializer.new(Rails::Configuration.new)
++    @dependency = mock('GemDependency', :load => true)
++    @dependency.stubs(:name).returns('hpricot')
++    @dependency.stubs(:requirement).returns('0.5')
++    Rails::GemDependency.expects(:new).with('hpricot', {}).returns(@dependency)
++    @initializer.configuration.gem 'hpricot'
++  end
++  
++  def test_should_load_gem_dependencies
++    @dependency.expects(:loaded?).returns(true)
++    @initializer.load_gems
++    @initializer.check_gem_dependencies
++    assert @initializer.gems_dependencies_loaded
++  end
++  
++  def test_should_abort_if_gems_fail_to_load
++    @dependency.stubs(:optional?).returns(false)
++    @dependency.expects(:loaded?).returns(false)
++    @initializer.load_gems
++    @initializer.expects(:abort).returns(true)
++    @initializer.check_gem_dependencies
++  end
++  
++  def test_should_continue_if_gem_fails_to_load_but_is_optional
++    @dependency.expects(:optional?).at_least_once.returns(true)
++    @dependency.expects(:loaded?).returns(false)
++    @initializer.load_gems
++    @initializer.expects(:abort).never
++    @initializer.expects(:puts)
++    @initializer.check_gem_dependencies    
++  end
++  
++end
++
+ uses_mocha 'Initializer after_initialize' do
+   class Initializer_after_initialize_with_blocks_environment_Test < Test::Unit::TestCase
+     def setup
+-- 
+1.5.5.1
+

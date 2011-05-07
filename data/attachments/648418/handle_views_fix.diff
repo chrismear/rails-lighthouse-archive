@@ -1,0 +1,139 @@
+From 22af22cc405cf79a63478c611a515b1ceede5131 Mon Sep 17 00:00:00 2001
+From: Brian Durand <brian@embellishedvisions.com>
+Date: Fri, 27 Aug 2010 09:47:22 -0500
+Subject: [PATCH] Restore support for using views instead of tables in postgresql and sqlite3 adapters.
+
+---
+ .../connection_adapters/postgresql_adapter.rb      |   17 +++++-
+ .../connection_adapters/sqlite_adapter.rb          |    2 +-
+ activerecord/test/cases/database_view_test.rb      |   64 ++++++++++++++++++++
+ 3 files changed, 81 insertions(+), 2 deletions(-)
+ create mode 100644 activerecord/test/cases/database_view_test.rb
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 0a2bacd..150cf07 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -597,6 +597,10 @@ module ActiveRecord
+           SELECT tablename
+           FROM pg_tables
+           WHERE schemaname = ANY (current_schemas(false))
++          UNION
++          SELECT viewname as tablename
++          FROM pg_views
++          WHERE schemaname = ANY (current_schemas(false))
+         SQL
+       end
+ 
+@@ -614,12 +618,23 @@ module ActiveRecord
+           schema = nil
+         end
+ 
+-        query(<<-SQL).first[0].to_i > 0
++        exists = query(<<-SQL).first[0].to_i > 0
+             SELECT COUNT(*)
+             FROM pg_tables
+             WHERE tablename = '#{table.gsub(/(^"|"$)/,'')}'
+             #{schema ? "AND schemaname = '#{schema}'" : ''}
+         SQL
++
++        unless exists
++          exists = query(<<-SQL).first[0].to_i > 0
++              SELECT COUNT(*)
++              FROM pg_views
++              WHERE viewname = '#{table.gsub(/(^"|"$)/,'')}'
++              #{schema ? "AND schemaname = '#{schema}'" : ''}
++          SQL
++        end
++
++        exists
+       end
+ 
+       # Returns the list of all indexes for a table.
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 0571e0c..2c376fc 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -174,7 +174,7 @@ module ActiveRecord
+         sql = <<-SQL
+           SELECT name
+           FROM sqlite_master
+-          WHERE type = 'table' AND NOT name = 'sqlite_sequence'
++          WHERE type IN ('table', 'view') AND NOT name = 'sqlite_sequence'
+         SQL
+ 
+         execute(sql, name).map do |row|
+diff --git a/activerecord/test/cases/database_view_test.rb b/activerecord/test/cases/database_view_test.rb
+new file mode 100644
+index 0000000..a993fc3
+--- /dev/null
++++ b/activerecord/test/cases/database_view_test.rb
+@@ -0,0 +1,64 @@
++require 'cases/helper'
++require 'models/book'
++
++# Tests for ActiveRecord models backed by database views. Only run if the database
++# Only run if the database adapter supports creating views.
++class ViewBook < ActiveRecord::Base
++  class << self
++    def create_view
++      connection.execute "CREATE VIEW view_books AS SELECT id, name as title FROM books"
++      @view_created = true
++    rescue
++      @view_created = false
++    end
++    
++    def drop_view
++      connection.execute "DROP VIEW view_books" rescue nil
++    end
++    
++    def view_created?
++      @view_created
++    end
++  end
++end
++
++# Test that ActiveRecord models can be mapped to database views.
++class DatabaseViewTest < ActiveRecord::TestCase
++  fixtures :books
++  
++  def setup
++    ViewBook.create_view
++  end
++  
++  def teardown
++    ViewBook.drop_view
++  end
++
++  def test_table_exists?
++    if ViewBook.view_created?
++      assert ViewBook.table_exists?
++    end
++  end
++
++  def test_tables_includes_views
++    if ViewBook.view_created?
++      assert ActiveRecord::Base.connection.tables.collect{|t| t.downcase}.include?("view_books")
++    end
++  end
++
++  def test_find
++    if ViewBook.view_created?
++      book = ViewBook.find(1)
++      assert_equal 1, book.id
++    end
++  end
++
++  def test_columns
++    if ViewBook.view_created?
++      view_columns = ViewBook.columns_hash
++      assert_equal 2, view_columns.size
++      assert_equal :integer, view_columns["id"].type
++      assert_equal :string, view_columns["title"].type
++    end
++  end
++end
+\ No newline at end of file
+-- 
+1.6.4.1
+

@@ -1,0 +1,752 @@
+From b52baca38ea0e9e69725bb93c302b152e1c8415d Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Jos=C3=A9=20Valim?= <jose.valim@gmail.com>
+Date: Wed, 2 Sep 2009 23:03:07 +0200
+Subject: [PATCH] Refactor new callbacks and AR implementation.
+
+---
+ activemodel/lib/active_model/validations.rb        |    2 +-
+ activerecord/lib/active_record/callbacks.rb        |   74 +++----------
+ .../test/cases/callbacks_observers_test.rb         |    3 +-
+ activerecord/test/cases/callbacks_test.rb          |    5 +-
+ activerecord/test/cases/lifecycle_test.rb          |   18 ---
+ activerecord/test/cases/transactions_test.rb       |   12 +-
+ activerecord/test/models/author.rb                 |    3 +-
+ activerecord/test/models/project.rb                |    3 +-
+ activerecord/test/models/topic.rb                  |   17 +++-
+ activesupport/lib/active_support/new_callbacks.rb  |  114 ++++++++++----------
+ activesupport/test/new_callbacks_test.rb           |   56 ++++++++--
+ 11 files changed, 150 insertions(+), 157 deletions(-)
+
+diff --git a/activemodel/lib/active_model/validations.rb b/activemodel/lib/active_model/validations.rb
+index 7289872..c4c0615 100644
+--- a/activemodel/lib/active_model/validations.rb
++++ b/activemodel/lib/active_model/validations.rb
+@@ -9,7 +9,7 @@ module ActiveModel
+     include ActiveSupport::NewCallbacks
+ 
+     included do
+-      define_callbacks :validate
++      define_callbacks :validate, :scope => :name
+     end
+ 
+     module ClassMethods
+diff --git a/activerecord/lib/active_record/callbacks.rb b/activerecord/lib/active_record/callbacks.rb
+index 9aaa075..0666c00 100644
+--- a/activerecord/lib/active_record/callbacks.rb
++++ b/activerecord/lib/active_record/callbacks.rb
+@@ -222,7 +222,8 @@ module ActiveRecord
+         alias_method_chain method, :callbacks
+       end
+ 
+-      define_callbacks :initialize, :find, :save, :create, :update, :destroy, :validation, "result == false"
++      define_callbacks :initialize, :find, :save, :create, :update, :destroy,
++                       :validation, :terminator => "result == false", :scope => [:kind, :name]
+     end
+ 
+     module ClassMethods
+@@ -238,64 +239,23 @@ module ActiveRecord
+         set_callback(:find, :after, *(args << options), &block)
+       end
+ 
+-      def before_save(*args, &block)
+-        set_callback(:save, :before, *args, &block)
+-      end
+-
+-      def around_save(*args, &block)
+-        set_callback(:save, :around, *args, &block)
+-      end
+-
+-      def after_save(*args, &block)
+-        options = args.extract_options!
+-        options[:prepend] = true
+-        options[:if] = Array(options[:if]) << "!halted && value != false"
+-        set_callback(:save, :after, *(args << options), &block)
+-      end
+-
+-      def before_create(*args, &block)
+-        set_callback(:create, :before, *args, &block)
+-      end
+-
+-      def around_create(*args, &block)
+-        set_callback(:create, :around, *args, &block)
+-      end
+-
+-      def after_create(*args, &block)
+-        options = args.extract_options!
+-        options[:prepend] = true
+-        options[:if] = Array(options[:if]) << "!halted && value != false"
+-        set_callback(:create, :after, *(args << options), &block)
+-      end
+-
+-      def before_update(*args, &block)
+-        set_callback(:update, :before, *args, &block)
+-      end
+-
+-      def around_update(*args, &block)
+-        set_callback(:update, :around, *args, &block)
+-      end
+-
+-      def after_update(*args, &block)
+-        options = args.extract_options!
+-        options[:prepend] = true
+-        options[:if] = Array(options[:if]) << "!halted && value != false"
+-        set_callback(:update, :after, *(args << options), &block)
+-      end
++      [:save, :create, :update, :destroy].each do |callback|
++        module_eval <<-CALLBACKS, __FILE__, __LINE__
++          def before_#{callback}(*args, &block)
++            set_callback(:#{callback}, :before, *args, &block)
++          end
+ 
+-      def before_destroy(*args, &block)
+-        set_callback(:destroy, :before, *args, &block)
+-      end
++          def around_#{callback}(*args, &block)
++            set_callback(:#{callback}, :around, *args, &block)
++          end
+ 
+-      def around_destroy(*args, &block)
+-        set_callback(:destroy, :around, *args, &block)
+-      end
+-
+-      def after_destroy(*args, &block)
+-        options = args.extract_options!
+-        options[:prepend] = true
+-        options[:if] = Array(options[:if]) << "!halted && value != false"
+-        set_callback(:destroy, :after, *(args << options), &block)
++          def after_#{callback}(*args, &block)
++            options = args.extract_options!
++            options[:prepend] = true
++            options[:if] = Array(options[:if]) << "!halted && value != false"
++            set_callback(:#{callback}, :after, *(args << options), &block)
++          end
++        CALLBACKS
+       end
+ 
+       def before_validation(*args, &block)
+diff --git a/activerecord/test/cases/callbacks_observers_test.rb b/activerecord/test/cases/callbacks_observers_test.rb
+index 87de524..52ce384 100644
+--- a/activerecord/test/cases/callbacks_observers_test.rb
++++ b/activerecord/test/cases/callbacks_observers_test.rb
+@@ -5,7 +5,7 @@ class Comment < ActiveRecord::Base
+ 
+   before_validation :record_callers
+ 
+-  def after_validation
++  after_validation do
+     record_callers
+   end
+ 
+@@ -32,7 +32,6 @@ class CallbacksObserversTest < ActiveRecord::TestCase
+     CommentObserver.instance.callers = callers
+ 
+     comment.valid?
+-
+     assert_equal [Comment, Comment, CommentObserver], callers, "model callbacks did not fire before observers were notified"
+   end
+ end
+diff --git a/activerecord/test/cases/callbacks_test.rb b/activerecord/test/cases/callbacks_test.rb
+index 092522b..3553343 100644
+--- a/activerecord/test/cases/callbacks_test.rb
++++ b/activerecord/test/cases/callbacks_test.rb
+@@ -18,11 +18,10 @@ class CallbackDeveloper < ActiveRecord::Base
+       end
+     end
+ 
+-    def callback_object(callback_symbol)
++    def callback_object(callback_method)
+       klass = Class.new
+-      callback_method = callback_symbol.to_s.split('_').first.to_sym
+       klass.send(:define_method, callback_method) do |model|
+-        model.history << [callback_symbol, :object]
++        model.history << [callback_method, :object]
+       end
+       klass.new
+     end
+diff --git a/activerecord/test/cases/lifecycle_test.rb b/activerecord/test/cases/lifecycle_test.rb
+index ebf2e87..aa7ce2e 100644
+--- a/activerecord/test/cases/lifecycle_test.rb
++++ b/activerecord/test/cases/lifecycle_test.rb
+@@ -4,8 +4,6 @@ require 'models/developer'
+ require 'models/reply'
+ require 'models/minimalistic'
+ 
+-class Topic; def after_find() end end
+-class Developer; def after_find() end end
+ class SpecialDeveloper < Developer; end
+ 
+ class TopicManualObserver
+@@ -164,22 +162,6 @@ class LifecycleTest < ActiveRecord::TestCase
+     assert_equal topic, observer.topic
+   end
+ 
+-  def test_after_find_is_not_clobbered_if_it_already_exists
+-    # use a fresh observer class so we can instantiate it (Observer is
+-    # a Singleton)
+-    model_class = Class.new(ActiveRecord::Base) do
+-      def after_find; end
+-    end
+-    original_method = model_class.instance_method(:after_find)
+-    observer_class = Class.new(ActiveRecord::Observer) do
+-      def after_find; end
+-    end
+-    observer_class.observe(model_class)
+-
+-    observer = observer_class.instance
+-    assert_equal original_method, model_class.instance_method(:after_find)
+-  end
+-
+   def test_invalid_observer
+     assert_raise(ArgumentError) { Topic.observers = Object.new; Topic.instantiate_observers }
+   end
+diff --git a/activerecord/test/cases/transactions_test.rb b/activerecord/test/cases/transactions_test.rb
+index 66baf10..aca70b4 100644
+--- a/activerecord/test/cases/transactions_test.rb
++++ b/activerecord/test/cases/transactions_test.rb
+@@ -382,28 +382,28 @@ class TransactionTest < ActiveRecord::TestCase
+ 
+   private
+     def add_exception_raising_after_save_callback_to_topic
+-        Topic.class_eval "def after_save; raise 'Make the transaction rollback' end"
++      Topic.class_eval "def after_save_for_transaction; raise 'Make the transaction rollback' end"
+     end
+ 
+     def remove_exception_raising_after_save_callback_to_topic
+-      Topic.class_eval "def after_save; end"
++      Topic.class_eval "def after_save_for_transaction; end"
+     end
+ 
+     def add_exception_raising_after_create_callback_to_topic
+-        Topic.class_eval "def after_create; raise 'Make the transaction rollback' end"
++      Topic.class_eval "def after_create_for_transaction; raise 'Make the transaction rollback' end"
+     end
+ 
+     def remove_exception_raising_after_create_callback_to_topic
+-      Topic.class_eval "def after_create; end"
++      Topic.class_eval "def after_create_for_transaction; end"
+     end
+ 
+     %w(validation save destroy).each do |filter|
+       define_method("add_cancelling_before_#{filter}_with_db_side_effect_to_topic") do
+-        Topic.class_eval "def before_#{filter}() Book.create; false end"
++        Topic.class_eval "def before_#{filter}_for_transaction() Book.create; false end"
+       end
+ 
+       define_method("remove_cancelling_before_#{filter}_with_db_side_effect_to_topic") do
+-        Topic.class_eval "def before_#{filter}; end"
++        Topic.class_eval "def before_#{filter}_for_transaction; end"
+       end
+     end
+ end
+diff --git a/activerecord/test/models/author.rb b/activerecord/test/models/author.rb
+index f264f98..7cbc6e8 100644
+--- a/activerecord/test/models/author.rb
++++ b/activerecord/test/models/author.rb
+@@ -94,8 +94,9 @@ class Author < ActiveRecord::Base
+   belongs_to :author_address_extra, :dependent => :delete, :class_name => "AuthorAddress"
+ 
+   attr_accessor :post_log
++  after_initialize :set_post_log
+ 
+-  def after_initialize
++  def set_post_log
+     @post_log = []
+   end
+ 
+diff --git a/activerecord/test/models/project.rb b/activerecord/test/models/project.rb
+index 422b12d..416032c 100644
+--- a/activerecord/test/models/project.rb
++++ b/activerecord/test/models/project.rb
+@@ -22,8 +22,9 @@ class Project < ActiveRecord::Base
+   has_and_belongs_to_many :well_payed_salary_groups, :class_name => "Developer", :group => "developers.salary", :having => "SUM(salary) > 10000", :select => "SUM(salary) as salary"
+ 
+   attr_accessor :developers_log
++  after_initialize :set_developers_log
+ 
+-  def after_initialize
++  def set_developers_log
+     @developers_log = []
+   end
+ 
+diff --git a/activerecord/test/models/topic.rb b/activerecord/test/models/topic.rb
+index c16a6f2..baca497 100644
+--- a/activerecord/test/models/topic.rb
++++ b/activerecord/test/models/topic.rb
+@@ -52,6 +52,15 @@ class Topic < ActiveRecord::Base
+     id
+   end
+ 
++  before_validation :before_validation_for_transaction
++  before_save :before_save_for_transaction
++  before_destroy :before_destroy_for_transaction
++
++  after_save :after_save_for_transaction
++  after_create :after_create_for_transaction
++
++  after_initialize :set_email_address
++
+   protected
+     def approved=(val)
+       @custom_approved = val
+@@ -66,11 +75,17 @@ class Topic < ActiveRecord::Base
+       self.class.delete_all "parent_id = #{id}"
+     end
+ 
+-    def after_initialize
++    def set_email_address
+       if self.new_record?
+         self.author_email_address = 'test@test.com'
+       end
+     end
++
++    def before_validation_for_transaction; end
++    def before_save_for_transaction; end
++    def before_destroy_for_transaction; end
++    def after_save_for_transaction; end
++    def after_create_for_transaction; end
+ end
+ 
+ module Web
+diff --git a/activesupport/lib/active_support/new_callbacks.rb b/activesupport/lib/active_support/new_callbacks.rb
+index 61651ca..7623e3e 100644
+--- a/activesupport/lib/active_support/new_callbacks.rb
++++ b/activesupport/lib/active_support/new_callbacks.rb
+@@ -83,18 +83,18 @@ module ActiveSupport
+     def self.included(klass)
+       klass.extend ClassMethods
+     end
+-        
++
+     def run_callbacks(kind, options = {}, &blk)
+       send("_run_#{kind}_callbacks", &blk)
+     end
+-    
++
+     class Callback
+       @@_callback_sequence = 0
+-      
+-      attr_accessor :filter, :kind, :name, :options, :per_key, :klass
+-      def initialize(filter, kind, options, klass)
+-        @kind, @klass = kind, klass
+-        
++
++      attr_accessor :name, :filter, :kind, :options, :per_key, :klass
++
++      def initialize(name, filter, kind, options, klass)
++        @name, @kind, @klass = name, kind, klass
+         normalize_options!(options)
+ 
+         @per_key              = options.delete(:per_key)
+@@ -105,9 +105,10 @@ module ActiveSupport
+ 
+         _compile_per_key_options
+       end
+-      
++
+       def clone(klass)
+         obj                  = super()
++        obj.name             = name
+         obj.klass            = klass
+         obj.per_key          = @per_key.dup
+         obj.options          = @options.dup
+@@ -115,36 +116,39 @@ module ActiveSupport
+         obj.per_key[:unless] = @per_key[:unless].dup
+         obj.options[:if]     = @options[:if].dup
+         obj.options[:unless] = @options[:unless].dup
++        obj.options[:scope]  = @options[:scope].dup
+         obj
+       end
+-      
++
+       def normalize_options!(options)
+         options[:if] = Array.wrap(options[:if])
+         options[:unless] = Array.wrap(options[:unless])
+ 
++        options[:scope] ||= [:kind]
++        options[:scope] = Array.wrap(options[:scope])
++
+         options[:per_key] ||= {}
+         options[:per_key][:if] = Array.wrap(options[:per_key][:if])
+         options[:per_key][:unless] = Array.wrap(options[:per_key][:unless])
+       end
+-      
++
+       def next_id
+         @@_callback_sequence += 1
+       end
+-      
++
+       def matches?(_kind, _filter)
+-        @kind   == _kind &&
+-        @filter == _filter
++        @kind == _kind && @filter == _filter
+       end
+ 
+       def _update_filter(filter_options, new_options)
+         filter_options[:if].push(new_options[:unless]) if new_options.key?(:unless)
+         filter_options[:unless].push(new_options[:if]) if new_options.key?(:if)
+       end
+-            
++
+       def recompile!(_options, _per_key)
+         _update_filter(self.options, _options)
+         _update_filter(self.per_key, _per_key)
+-        
++
+         @callback_id      = next_id
+         @filter           = _compile_filter(@raw_filter)
+         @compiled_options = _compile_options(@options)
+@@ -165,14 +169,13 @@ module ActiveSupport
+       # contents for after filters (for the forward pass).
+       def start(key = nil, options = {})
+         object, terminator = (options || {}).values_at(:object, :terminator)
+-        
+         return if key && !object.send("_one_time_conditions_valid_#{@callback_id}?")
+-        
++
+         terminator ||= false
+-        
++
+         # options[0] is the compiled form of supplied conditions
+         # options[1] is the "end" for the conditional
+-                
++
+         if @kind == :before || @kind == :around
+           if @kind == :before
+             # if condition    # before_save :filter_name, :if => :condition
+@@ -184,7 +187,7 @@ module ActiveSupport
+                 halted = (#{terminator})
+               end
+             RUBY_EVAL
+-            
++
+             [@compiled_options[0], filter, @compiled_options[1]].compact.join("\n")
+           else
+             # Compile around filters with conditions into proxy methods
+@@ -201,7 +204,7 @@ module ActiveSupport
+             #     yield self
+             #   end
+             # end
+-            
++            #
+             name = "_conditional_callback_#{@kind}_#{next_id}"
+             txt, line = <<-RUBY_EVAL, __LINE__ + 1
+               def #{name}(halted)
+@@ -224,9 +227,8 @@ module ActiveSupport
+       # before filters (for the backward pass).
+       def end(key = nil, options = {})
+         object = (options || {})[:object]
+-        
+         return if key && !object.send("_one_time_conditions_valid_#{@callback_id}?")
+-        
++
+         if @kind == :around || @kind == :after
+           # if condition    # after_save :filter_name, :if => :condition
+           #   filter_name
+@@ -238,27 +240,28 @@ module ActiveSupport
+           end
+         end
+       end
+-      
++
+       private
++
+       # Options support the same options as filters themselves (and support
+       # symbols, string, procs, and objects), so compile a conditional
+       # expression based on the options
+       def _compile_options(options)
+         return [] if options[:if].empty? && options[:unless].empty?
+-        
++
+         conditions = []
+-        
++
+         unless options[:if].empty?
+           conditions << Array.wrap(_compile_filter(options[:if]))
+         end
+-        
++
+         unless options[:unless].empty?
+           conditions << Array.wrap(_compile_filter(options[:unless])).map {|f| "!#{f}"}
+         end
+-        
++
+         ["if #{conditions.flatten.join(" && ")}", "end"]
+       end
+-      
++
+       # Filters support:
+       #
+       #   Arrays::  Used in conditions. This is used to specify
+@@ -298,10 +301,11 @@ module ActiveSupport
+           @klass.send(:define_method, "#{method_name}_object") { filter }
+ 
+           _normalize_legacy_filter(kind, filter)
++          method_to_call = @options[:scope].map{ |s| send(s) }.join("_")
+ 
+           @klass.class_eval <<-RUBY_EVAL, __FILE__, __LINE__ + 1
+             def #{method_name}(&blk)
+-              #{method_name}_object.send(:#{kind}, self, &blk)
++              #{method_name}_object.send(:#{method_to_call}, self, &blk)
+             end
+           RUBY_EVAL
+ 
+@@ -322,34 +326,40 @@ module ActiveSupport
+           end
+         end
+       end
+-
+     end
+ 
+     # An Array with a compile method
+     class CallbackChain < Array
+-      def initialize(symbol)
++      attr_reader :symbol, :config
++
++      def initialize(symbol, config)
+         @symbol = symbol
++        @config = config
+       end
+-      
+-      def compile(key = nil, options = {})
++
++      def compile(key=nil, options={})
++        options = config.merge(options)
++
+         method = []
+         method << "value = nil"
+         method << "halted = false"
++
+         each do |callback|
+           method << callback.start(key, options)
+         end
++
+         method << "value = yield if block_given? && !halted"
+-        # TODO Make each and reverse each part of the callbacks definition.
+-        # TODO Make halted on after part of the callbacks definition.
++
+         reverse_each do |callback|
+           method << callback.end(key, options)
+         end
++
+         method << "halted ? false : (block_given? ? value : true)"
+         method.compact.join("\n")
+       end
+-      
++
+       def clone(klass)
+-        chain = CallbackChain.new(@symbol)
++        chain = CallbackChain.new(@symbol, @config.dup)
+         chain.push(*map {|c| c.clone(klass)})
+       end
+     end
+@@ -359,7 +369,7 @@ module ActiveSupport
+       # a block that it'll yield to. It'll call the before and around filters
+       # in order, yield the block, and then run the after filters.
+       # 
+-      # _run_set_callback :save,s do
++      # _run_set_callback :save do
+       #   save
+       # end
+       #
+@@ -368,14 +378,13 @@ module ActiveSupport
+       # key. See #define_callbacks for more information.
+       #
+       def __define_runner(symbol) #:nodoc:
+-        body = send("_#{symbol}_callbacks").
+-          compile(nil, :terminator => send("_#{symbol}_terminator"))
++        body = send("_#{symbol}_callbacks").compile(nil)
+ 
+         body, line = <<-RUBY_EVAL, __LINE__
+           def _run_#{symbol}_callbacks(key = nil, &blk)
+             if key
+               name = "_run__\#{self.class.name.hash.abs}__#{symbol}__\#{key.hash.abs}__callbacks"
+-              
++
+               unless respond_to?(name)
+                 self.class.__create_keyed_callback(name, :#{symbol}, self, &blk)
+               end
+@@ -386,7 +395,7 @@ module ActiveSupport
+             end
+           end
+         RUBY_EVAL
+-  
++
+         undef_method "_run_#{symbol}_callbacks" if method_defined?("_run_#{symbol}_callbacks")
+         class_eval body, __FILE__, line
+       end
+@@ -398,16 +407,13 @@ module ActiveSupport
+       def __create_keyed_callback(name, kind, obj, &blk) #:nodoc:
+         @_keyed_callbacks ||= {}
+         @_keyed_callbacks[name] ||= begin
+-          str = send("_#{kind}_callbacks").
+-            compile(name, :object => obj, :terminator => send("_#{kind}_terminator"))
+-
++          str = send("_#{kind}_callbacks").compile(name, :object => obj)
+           class_eval "def #{name}() #{str} end", __FILE__, __LINE__
+-
+           true
+         end
+       end
+ 
+-      def __update_callbacks(name, filters = CallbackChain.new(name), block = nil)
++      def __update_callbacks(name, filters = CallbackChain.new(name, {}), block = nil)
+         type = [:before, :after, :around].include?(filters.first) ? filters.shift : :before
+         options = filters.last.is_a?(Hash) ? filters.pop : {}
+         filters.unshift(block) if block
+@@ -446,11 +452,10 @@ module ActiveSupport
+       # is a speed improvement for ActionPack.
+       #
+       def set_callback(name, *filters, &block)
+-        __update_callbacks(name, filters, block) do |callbacks, type, filters, options|        
++        __update_callbacks(name, filters, block) do |callbacks, type, filters, options|
+           filters.map! do |filter|
+-            # overrides parent class
+             callbacks.delete_if {|c| c.matches?(type, filter) }
+-            Callback.new(filter, type, options.dup, self)
++            Callback.new(name, filter, type, options.merge(callbacks.config), self)
+           end
+ 
+           options[:prepend] ? callbacks.unshift(*filters) : callbacks.push(*filters)
+@@ -461,7 +466,6 @@ module ActiveSupport
+         __update_callbacks(name, filters, block) do |callbacks, type, filters, options|
+           filters.each do |filter|
+             callbacks = send("_#{name}_callbacks=", callbacks.clone(self))
+-
+             filter = callbacks.find {|c| c.matches?(type, filter) }
+ 
+             if filter && options.any?
+@@ -479,12 +483,10 @@ module ActiveSupport
+       end
+ 
+       def define_callbacks(*symbols)
+-        terminator = symbols.pop if symbols.last.is_a?(String)
++        config = symbols.last.is_a?(Hash) ? symbols.pop : {}
+         symbols.each do |symbol|
+-          extlib_inheritable_accessor("_#{symbol}_terminator") { terminator }
+-
+           extlib_inheritable_accessor("_#{symbol}_callbacks") do
+-            CallbackChain.new(symbol)
++            CallbackChain.new(symbol, config)
+           end
+ 
+           __define_runner(symbol)
+diff --git a/activesupport/test/new_callbacks_test.rb b/activesupport/test/new_callbacks_test.rb
+index 54b278c..04db376 100644
+--- a/activesupport/test/new_callbacks_test.rb
++++ b/activesupport/test/new_callbacks_test.rb
+@@ -364,7 +364,7 @@ module NewCallbacksTest
+   class CallbackTerminator
+     include ActiveSupport::NewCallbacks
+   
+-    define_callbacks :save, "result == :halt"
++    define_callbacks :save, :terminator => "result == :halt"
+   
+     set_callback :save, :before, :first
+     set_callback :save, :before, :second
+@@ -412,7 +412,11 @@ module NewCallbacksTest
+     def before(caller)
+       caller.record << "before"
+     end
+-    
++
++    def before_save(caller)
++      caller.record << "before save"
++    end
++
+     def around(caller)
+       caller.record << "around before"
+       yield
+@@ -422,15 +426,15 @@ module NewCallbacksTest
+ 
+   class UsingObjectBefore
+     include ActiveSupport::NewCallbacks
+-    
++
+     define_callbacks :save
+     set_callback :save, :before, CallbackObject.new
+-    
++
+     attr_accessor :record
+     def initialize
+       @record = []
+     end
+-    
++
+     def save
+       _run_save_callbacks do
+         @record << "yielded"
+@@ -455,19 +459,49 @@ module NewCallbacksTest
+       end
+     end 
+   end
+-  
++
++  class CustomScopeObject
++    include ActiveSupport::NewCallbacks
++
++    define_callbacks :save, :scope => [:kind, :name]
++    set_callback :save, :before, CallbackObject.new
++
++    attr_accessor :record
++    def initialize
++      @record = []
++    end
++
++    def save
++      _run_save_callbacks do
++        @record << "yielded"
++        "CallbackResult"
++      end
++    end 
++  end
++
+   class UsingObjectTest < Test::Unit::TestCase
+     def test_before_object
+       u = UsingObjectBefore.new
+       u.save
+       assert_equal ["before", "yielded"], u.record
+     end
+-    
++
+     def test_around_object
+       u = UsingObjectAround.new
+       u.save
+       assert_equal ["around before", "yielded", "around after"], u.record
+-    end    
++    end
++
++    def test_customized_object
++      u = CustomScopeObject.new
++      u.save
++      assert_equal ["before save", "yielded"], u.record
++    end
++
++    def test_block_result_is_returned
++      u = CustomScopeObject.new
++      assert_equal "CallbackResult", u.save
++    end
+   end
+ 
+   class CallbackTerminatorTest < Test::Unit::TestCase
+@@ -481,7 +515,7 @@ module NewCallbacksTest
+       obj = CallbackTerminator.new
+       obj.save
+       assert !obj.saved
+-    end    
++    end
+   end
+   
+   class HyphenatedKeyTest < Test::Unit::TestCase
+@@ -489,6 +523,6 @@ module NewCallbacksTest
+       obj = HyphenatedCallbacks.new
+       obj.save
+       assert_equal obj.stuff, "OMG"
+-    end    
+-  end  
++    end
++  end
+ end
+-- 
+1.5.4.3
+

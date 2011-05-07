@@ -1,0 +1,191 @@
+From 4497d5798f0ac4a8afe81811297e2d01eeb506b8 Mon Sep 17 00:00:00 2001
+From: Johannes Barre <igel@igels.net>
+Date: Wed, 21 Oct 2009 22:42:39 +0200
+Subject: [PATCH] Fix polymorphic_url with path_prefix with variable
+
+polymorphic_url used to raise an error, if the given resource has a path_prefix,
+which contains a variable. For example, if this resource is defined:
+
+map.resource :articles, :path_prefix => "/:locale"
+
+The problem was, that polymorphic_url gave an Array to the route:
+
+link_to @article.name, @article
+becomes
+articles_url([1]) # /:locale/articles/:id
+
+This would fill in the 1 into the locale, leaving the article id unsatisfied.
+This patch changes the behavior to giving a Hash to the route:
+
+link_to @article.name, @article
+becomes
+articles_url({:id => 1}) # /:locale/articles/:id
+
+If the user provided the locale to polymorphic_route or defined it in
+default_url_options, that route will be generated.
+---
+ .../lib/action_controller/polymorphic_routes.rb    |   11 ++++++++++-
+ .../test/activerecord/polymorphic_routes_test.rb   |   13 +++++++++++++
+ actionpack/test/template/form_helper_test.rb       |   15 +++++++++++++--
+ actionpack/test/template/prototype_helper_test.rb  |    8 +++++++-
+ actionpack/test/template/test_test.rb              |    2 +-
+ 5 files changed, 44 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/polymorphic_routes.rb b/actionpack/lib/action_controller/polymorphic_routes.rb
+index 2adf357..2a4ce8c 100644
+--- a/actionpack/lib/action_controller/polymorphic_routes.rb
++++ b/actionpack/lib/action_controller/polymorphic_routes.rb
+@@ -113,7 +113,16 @@ module ActionController
+         args.last.kind_of?(Hash) ? args.last.merge!(url_options) : args << url_options
+       end
+ 
+-      __send__(named_route, *args)
++      hsh = args.last.is_a?(Hash) ? args.pop : {}
++      args.each do |itm|
++        if itm == record
++          hsh[:id] = itm
++        else
++          hsh[(itm.class.to_s.underscore.pluralize.singularize + "_id").gsub("/", "_").to_sym] = itm
++        end
++      end
++
++      hsh.empty? ? __send__(named_route) : __send__(named_route, hsh)
+     end
+ 
+     # Returns the path component of a URL for the given record. It uses
+diff --git a/actionpack/test/activerecord/polymorphic_routes_test.rb b/actionpack/test/activerecord/polymorphic_routes_test.rb
+index 37f1f6d..ceeec33 100644
+--- a/actionpack/test/activerecord/polymorphic_routes_test.rb
++++ b/actionpack/test/activerecord/polymorphic_routes_test.rb
+@@ -25,6 +25,10 @@ class Series < ActiveRecord::Base
+   set_table_name 'projects'
+ end
+ 
++class Article < ActiveRecord::Base
++  set_table_name 'projects'
++end
++
+ class PolymorphicRoutesTest < ActionController::TestCase
+   include ActionController::UrlWriter
+   self.default_url_options[:host] = 'example.com'
+@@ -37,6 +41,7 @@ class PolymorphicRoutesTest < ActionController::TestCase
+     @tax = Tax.new
+     @fax = Fax.new
+     @series = Series.new
++    @article = Article.new
+   end
+ 
+   def test_with_record
+@@ -386,6 +391,13 @@ class PolymorphicRoutesTest < ActionController::TestCase
+     end
+   end
+ 
++  def test_with_path_prefix
++    with_test_routes do
++      @article.save
++      assert_equal "http://example.com/en/articles/#{@article.id}", polymorphic_url(@article, :locale => "en")
++    end
++  end
++
+   def with_test_routes(options = {})
+     with_routing do |set|
+       set.draw do |map|
+@@ -400,6 +412,7 @@ class PolymorphicRoutesTest < ActionController::TestCase
+           taxes.resource :bid
+         end
+         map.resources :series
++        map.resources :articles, :path_prefix => ":locale"
+       end
+ 
+       ActionController::Routing::Routes.install_helpers(self.class)
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 04c635e..3c15114 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -1230,21 +1230,31 @@ class FormHelperTest < ActionView::TestCase
+ 
+   protected
+     def comments_path(post)
++      post = post[:post_id] if post.is_a?(Hash)
+       "/posts/#{post.id}/comments"
+     end
+     alias_method :post_comments_path, :comments_path
+ 
+-    def comment_path(post, comment)
++    def comment_path(post, comment = nil)
++      if post.is_a?(Hash)
++        comment = post[:id]
++        post = post[:post_id]
++      end
+       "/posts/#{post.id}/comments/#{comment.id}"
+     end
+     alias_method :post_comment_path, :comment_path
+ 
+     def admin_comments_path(post)
++      post = post[:post_id] if post.is_a?(Hash)
+       "/admin/posts/#{post.id}/comments"
+     end
+     alias_method :admin_post_comments_path, :admin_comments_path
+ 
+-    def admin_comment_path(post, comment)
++    def admin_comment_path(post, comment = nil)
++      if post.is_a?(Hash)
++        comment = post[:id]
++        post = post[:post_id]
++      end
+       "/admin/posts/#{post.id}/comments/#{comment.id}"
+     end
+     alias_method :admin_post_comment_path, :admin_comment_path
+@@ -1254,6 +1264,7 @@ class FormHelperTest < ActionView::TestCase
+     end
+ 
+     def post_path(post)
++      post = post[:id] if post.is_a?(Hash)
+       "/posts/#{post.id}"
+     end
+ 
+diff --git a/actionpack/test/template/prototype_helper_test.rb b/actionpack/test/template/prototype_helper_test.rb
+index 313a769..83c75eb 100644
+--- a/actionpack/test/template/prototype_helper_test.rb
++++ b/actionpack/test/template/prototype_helper_test.rb
+@@ -297,6 +297,7 @@ class PrototypeHelperTest < PrototypeHelperBaseTest
+ 
+   protected
+     def author_path(record)
++      record = record[:id] if record.is_a?(Hash)
+       "/authors/#{record.id}"
+     end
+ 
+@@ -305,10 +306,15 @@ class PrototypeHelperTest < PrototypeHelperBaseTest
+     end
+ 
+     def author_articles_path(author)
++      author = author[:author_id] if author.is_a?(Hash)
+       "/authors/#{author.id}/articles"
+     end
+ 
+-    def author_article_path(author, article)
++    def author_article_path(author, article = nil)
++      if author.is_a?(Hash)
++        article = author[:id]
++        author = author[:author_id]
++      end
+       "/authors/#{author.id}/articles/#{article.id}"
+     end
+ end
+diff --git a/actionpack/test/template/test_test.rb b/actionpack/test/template/test_test.rb
+index 68e790c..3aa8e83 100644
+--- a/actionpack/test/template/test_test.rb
++++ b/actionpack/test/template/test_test.rb
+@@ -39,7 +39,7 @@ class PeopleHelperTest < ActionView::TestCase
+     with_test_route_set do
+       person = mock(:name => "David")
+       person.class.extend ActiveModel::Naming
+-      expects(:mocha_mock_path).with(person).returns("/people/1")
++      expects(:mocha_mock_path).with(:id => person).returns("/people/1")
+       assert_equal '<a href="/people/1">David</a>', link_to_person(person)
+     end
+   end
+-- 
+1.6.3.3
+

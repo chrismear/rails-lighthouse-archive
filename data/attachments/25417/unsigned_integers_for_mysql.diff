@@ -1,0 +1,630 @@
+From 900577da032928c4b37e976ada299d6bd24f4855 Mon Sep 17 00:00:00 2001
+From: Rob Anderton <rob.anderton@thewebfellas.com>
+Date: Mon, 2 Jun 2008 14:35:17 +0100
+Subject: [PATCH] Added unsigned integer support for MySQL
+
+---
+ .../abstract/schema_definitions.rb                 |   28 +++++-
+ .../abstract/schema_statements.rb                  |    4 +-
+ .../connection_adapters/mysql_adapter.rb           |   59 +++++++++-
+ activerecord/lib/active_record/schema_dumper.rb    |   19 ++--
+ activerecord/test/cases/migration_test.rb          |  113 ++++++++++++++++---
+ activerecord/test/cases/schema_dumper_test.rb      |    6 +
+ activerecord/test/schema/schema.rb                 |    2 +-
+ 7 files changed, 193 insertions(+), 38 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index f968b9b..9ac1764 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -11,7 +11,7 @@ module ActiveRecord
+         ISO_DATETIME = /\A(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?\z/
+       end
+ 
+-      attr_reader :name, :default, :type, :limit, :null, :sql_type, :precision, :scale
++      attr_reader :name, :default, :type, :limit, :null, :sql_type, :precision, :scale, :unsigned
+       attr_accessor :primary
+ 
+       # Instantiates a new column in the table.
+@@ -25,6 +25,7 @@ module ActiveRecord
+         @limit, @precision, @scale = extract_limit(sql_type), extract_precision(sql_type), extract_scale(sql_type)
+         @type = simplified_type(sql_type)
+         @default = extract_default(default)
++        @unsigned = extract_unsigned(sql_type)
+ 
+         @primary = nil
+       end
+@@ -101,6 +102,10 @@ module ActiveRecord
+         type_cast(default)
+       end
+ 
++      def extract_unsigned(sql_type)
++        false
++      end
++
+       class << self
+         # Used to convert from Strings to BLOBs
+         def string_to_binary(value)
+@@ -249,10 +254,10 @@ module ActiveRecord
+     class IndexDefinition < Struct.new(:table, :name, :unique, :columns) #:nodoc:
+     end
+ 
+-    class ColumnDefinition < Struct.new(:base, :name, :type, :limit, :precision, :scale, :default, :null) #:nodoc:
++    class ColumnDefinition < Struct.new(:base, :name, :type, :limit, :precision, :scale, :default, :null, :unsigned) #:nodoc:
+ 
+       def sql_type
+-        base.type_to_sql(type.to_sym, limit, precision, scale) rescue type
++        base.type_to_sql(type.to_sym, limit, precision, scale, unsigned) rescue type
+       end
+ 
+       def to_sql
+@@ -315,6 +320,10 @@ module ActiveRecord
+       #   Specifies the precision for a <tt>:decimal</tt> column.
+       # * <tt>:scale</tt> -
+       #   Specifies the scale for a <tt>:decimal</tt> column.
++      # * <tt>:unsigned</tt> -
++      #   Specifies the unsigned flag for an <tt>:integer</tt> column. Currently
++      #   only supported by MySQL but can safely be used while still remaining
++      #   database agnostic as it is simply ignored by other database adapters.
+       #
+       # Please be aware of different RDBMS implementations behavior with
+       # <tt>:decimal</tt> columns:
+@@ -382,6 +391,7 @@ module ActiveRecord
+       #     t.column "creator_id", :integer
+       #     t.column "name",       :string,   :default => "Untitled"
+       #     t.column "value",      :string,   :default => "Untitled"
++      #     t.column "stock",      :integer,  :unsigned => true
+       #     t.column "created_at", :datetime
+       #     t.column "updated_at", :datetime
+       #   end
+@@ -391,6 +401,7 @@ module ActiveRecord
+       #   create_table :products do |t|
+       #     t.integer :shop_id, :creator_id
+       #     t.string  :name, :value, :default => "Untitled"
++      #     t.integer :stock, :unsigned => true
+       #     t.timestamps
+       #   end
+       #
+@@ -414,6 +425,15 @@ module ActiveRecord
+       #     t.references :tagger, :polymorphic => true
+       #     t.references :taggable, :polymorphic => { :default => 'Photo' }
+       #   end
++      #
++      # If you are using MySQL the _id column will default to unsigned. To create a signed _id column
++      # pass the :unsigned => false option to +references+ like this:
++      #
++      # create_table :taggings do |t|
++      #     t.references :tag, :unsigned => false
++      #     t.references :tagger, :polymorphic => true, :unsigned => false
++      #     t.references :taggable, :polymorphic => { :default => 'Photo' }, :unsigned => false
++      #   end
+       def column(name, type, options = {})
+         column = self[name] || ColumnDefinition.new(@base, name, type)
+         if options[:limit]
+@@ -425,6 +445,7 @@ module ActiveRecord
+         column.scale = options[:scale]
+         column.default = options[:default]
+         column.null = options[:null]
++        column.unsigned = options[:unsigned]
+         @columns << column unless @columns.include? column
+         self
+       end
+@@ -645,6 +666,7 @@ module ActiveRecord
+               column.scale = options[:scale]
+               column.default = options[:default]
+               column.null = options[:null]
++              column.unsigned = options[:unsigned]
+               @base.add_column(@table_name, name, column.sql_type, options)
+             end
+           end
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+index 67d70b3..f96a60f 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+@@ -184,7 +184,7 @@ module ActiveRecord
+       # Adds a new column to the named table.
+       # See TableDefinition#column for details of the options you can use.
+       def add_column(table_name, column_name, type, options = {})
+-        add_column_sql = "ALTER TABLE #{quote_table_name(table_name)} ADD #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"
++        add_column_sql = "ALTER TABLE #{quote_table_name(table_name)} ADD #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale], options[:unsigned])}"
+         add_column_options!(add_column_sql, options)
+         execute(add_column_sql)
+       end
+@@ -343,7 +343,7 @@ module ActiveRecord
+         end
+       end
+ 
+-      def type_to_sql(type, limit = nil, precision = nil, scale = nil) #:nodoc:
++      def type_to_sql(type, limit = nil, precision = nil, scale = nil, unsigned = false) #:nodoc:
+         if native = native_database_types[type]
+           column_type_sql = native.is_a?(Hash) ? native[:name] : native
+ 
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 653b450..58c8051 100755
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -90,6 +90,30 @@ module ActiveRecord
+   end
+ 
+   module ConnectionAdapters
++    class MysqlTable < Table
++      def references(*args)
++        options = args.extract_options!
++        polymorphic = options.delete(:polymorphic)
++        args.each do |col|
++          @base.add_column(@table_name, "#{col}_id", :integer, options.reverse_merge(:unsigned => true))
++          @base.add_column(@table_name, "#{col}_type", :string, polymorphic.is_a?(Hash) ? polymorphic : options) unless polymorphic.nil?
++        end
++      end
++      alias :belongs_to :references
++    end
++
++    class MysqlTableDefinition < TableDefinition
++      def references(*args)
++        options = args.extract_options!
++        polymorphic = options.delete(:polymorphic)
++        args.each do |col|
++          column("#{col}_id", :integer, options.reverse_merge(:unsigned => true))
++          column("#{col}_type", :string, polymorphic.is_a?(Hash) ? polymorphic : options) unless polymorphic.nil?
++        end
++      end
++      alias :belongs_to :references
++    end
++
+     class MysqlColumn < Column #:nodoc:
+       def extract_default(default)
+         if type == :binary || type == :text
+@@ -105,6 +129,10 @@ module ActiveRecord
+         end
+       end
+ 
++      def extract_unsigned(sql_type)
++        sql_type =~ /unsigned/ ? true : false
++      end
++
+       private
+         def simplified_type(field_type)
+           return :boolean if MysqlAdapter.emulate_booleans && field_type.downcase.index("tinyint(1)")
+@@ -193,7 +221,7 @@ module ActiveRecord
+ 
+       def native_database_types #:nodoc:
+         {
+-          :primary_key => "int(11) DEFAULT NULL auto_increment PRIMARY KEY",
++          :primary_key => "int(11) UNSIGNED DEFAULT NULL auto_increment PRIMARY KEY",
+           :string      => { :name => "varchar", :limit => 255 },
+           :text        => { :name => "text" },
+           :integer     => { :name => "int"},
+@@ -432,7 +460,25 @@ module ActiveRecord
+       end
+ 
+       def create_table(table_name, options = {}) #:nodoc:
+-        super(table_name, options.reverse_merge(:options => "ENGINE=InnoDB"))
++        options = options.reverse_merge(:options => "ENGINE=InnoDB")
++        table_definition = MysqlTableDefinition.new(self)
++        table_definition.primary_key(options[:primary_key] || Base.get_primary_key(table_name)) unless options[:id] == false
++
++        yield table_definition
++
++        if options[:force] && table_exists?(table_name)
++          drop_table(table_name, options)
++        end
++
++        create_sql = "CREATE#{' TEMPORARY' if options[:temporary]} TABLE "
++        create_sql << "#{quote_table_name(table_name)} ("
++        create_sql << table_definition.to_sql
++        create_sql << ") #{options[:options]}"
++        execute create_sql
++      end
++
++      def change_table(table_name)
++        yield MysqlTable.new(table_name, self)
+       end
+ 
+       def rename_table(table_name, new_name)
+@@ -454,7 +500,7 @@ module ActiveRecord
+           end
+         end
+ 
+-        change_column_sql = "ALTER TABLE #{quote_table_name(table_name)} CHANGE #{quote_column_name(column_name)} #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"
++        change_column_sql = "ALTER TABLE #{quote_table_name(table_name)} CHANGE #{quote_column_name(column_name)} #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale], options[:unsigned])}"
+         add_column_options!(change_column_sql, options)
+         execute(change_column_sql)
+       end
+@@ -465,10 +511,10 @@ module ActiveRecord
+       end
+ 
+       # Maps logical Rails types to MySQL-specific data types.
+-      def type_to_sql(type, limit = nil, precision = nil, scale = nil)
++      def type_to_sql(type, limit = nil, precision = nil, scale = nil, unsigned = false)
+         return super unless type.to_s == 'integer'
+ 
+-        case limit
++        sql = case limit
+         when 0..3
+           "smallint(#{limit})"
+         when 4..8
+@@ -478,6 +524,9 @@ module ActiveRecord
+         else
+           'int(11)'
+         end
++
++        sql << ' UNSIGNED' if unsigned
++        sql
+       end
+ 
+ 
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index b90ed88..a6a8b09 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -6,11 +6,11 @@ module ActiveRecord
+   # output format (i.e., ActiveRecord::Schema).
+   class SchemaDumper #:nodoc:
+     private_class_method :new
+-    
+-    # A list of tables which should not be dumped to the schema. 
++
++    # A list of tables which should not be dumped to the schema.
+     # Acceptable values are strings as well as regexp.
+     # This setting is only used if ActiveRecord::Base.schema_format == :ruby
+-    cattr_accessor :ignore_tables 
++    cattr_accessor :ignore_tables
+     @@ignore_tables = []
+ 
+     def self.dump(connection=ActiveRecord::Base.connection, stream=STDOUT)
+@@ -37,7 +37,7 @@ module ActiveRecord
+         define_params = @version ? ":version => #{@version}" : ""
+ 
+         stream.puts <<HEADER
+-# This file is auto-generated from the current state of the database. Instead of editing this file, 
++# This file is auto-generated from the current state of the database. Instead of editing this file,
+ # please use the migrations feature of Active Record to incrementally modify your database, and
+ # then regenerate this schema definition.
+ #
+@@ -66,7 +66,7 @@ HEADER
+             else
+               raise StandardError, 'ActiveRecord::SchemaDumper.ignore_tables accepts an array of String and / or Regexp values.'
+             end
+-          end 
++          end
+           table(tbl, stream)
+         end
+       end
+@@ -103,12 +103,13 @@ HEADER
+             spec[:scale]     = column.scale.inspect if !column.scale.nil?
+             spec[:null]      = 'false' if !column.null
+             spec[:default]   = default_string(column.default) if !column.default.nil?
++            spec[:unsigned]  = 'true' if column.unsigned == true
+             (spec.keys - [:name, :type]).each{ |k| spec[k].insert(0, "#{k.inspect} => ")}
+             spec
+           end.compact
+ 
+           # find all migration keys used in this table
+-          keys = [:name, :limit, :precision, :scale, :default, :null] & column_specs.map(&:keys).flatten
++          keys = [:name, :limit, :precision, :scale, :default, :null, :unsigned] & column_specs.map(&:keys).flatten
+ 
+           # figure out the lengths for each column based on above keys
+           lengths = keys.map{ |key| column_specs.map{ |spec| spec[key] ? spec[key].length + 2 : 0 }.max }
+@@ -133,7 +134,7 @@ HEADER
+ 
+           tbl.puts "  end"
+           tbl.puts
+-          
++
+           indexes(table, tbl)
+ 
+           tbl.rewind
+@@ -143,7 +144,7 @@ HEADER
+           stream.puts "#   #{e.message}"
+           stream.puts
+         end
+-        
++
+         stream
+       end
+ 
+@@ -157,7 +158,7 @@ HEADER
+           value.inspect
+         end
+       end
+-      
++
+       def indexes(table, stream)
+         indexes = @connection.indexes(table)
+         indexes.each do |index|
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index f36255e..5b75b3b 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -324,7 +324,15 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert_equal 9, wealth_column.precision
+       assert_equal 7, wealth_column.scale
+     end
+-    
++
++    def test_add_column_with_unsigned
++      Person.connection.add_column 'people', 'age', :integer, :unsigned => true
++      Person.reset_column_information
++
++      age_column = Person.columns_hash['age']
++      assert_equal (current_adapter?(:MysqlAdapter) ? true : false), age_column.unsigned
++    end
++
+     def test_native_types
+       Person.delete_all
+       Person.connection.add_column "people", "last_name", :string
+@@ -668,6 +676,22 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert_nil Person.new.first_name
+     end
+ 
++    def test_change_column_unsigned_integer
++      Person.connection.add_column "people", "age", :integer
++      Person.reset_column_information
++      assert !Person.columns_hash["age"].unsigned, "Column 'age' must initially be signed"
++      Person.connection.change_column "people", "age", :integer, :unsigned => true
++      Person.reset_column_information
++      if current_adapter?(:MysqlAdapter)
++        assert Person.columns_hash["age"].unsigned, "Column 'age' must be unsigned at this point"
++      else
++        assert !Person.columns_hash["age"].unsigned, "Column 'age' must still be signed at this point"
++      end
++      Person.connection.change_column "people", "age", :integer, :unsigned => false
++      Person.reset_column_information
++      assert !Person.columns_hash["age"].unsigned, "Column 'age' must be signed again at this point"
++    end
++
+     def test_add_table
+       assert !Reminder.table_exists?
+ 
+@@ -783,9 +807,9 @@ if ActiveRecord::Base.connection.supports_migrations?
+ 
+     def test_migrator_one_down
+       ActiveRecord::Migrator.up(MIGRATIONS_ROOT + "/valid")
+-    
++
+       ActiveRecord::Migrator.down(MIGRATIONS_ROOT + "/valid", 1)
+-    
++
+       Person.reset_column_information
+       assert Person.column_methods_hash.include?(:last_name)
+       assert !Reminder.table_exists?
+@@ -871,24 +895,24 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert Reminder.create("content" => "hello world", "remind_at" => Time.now)
+       assert_equal "hello world", Reminder.find(:first).content
+     end
+-    
++
+     def test_migrator_rollback
+       ActiveRecord::Migrator.migrate(MIGRATIONS_ROOT + "/valid")
+       assert_equal(3, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(2, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(1, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+-      
++
+       ActiveRecord::Migrator.rollback(MIGRATIONS_ROOT + "/valid")
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+     end
+-    
++
+     def test_migrator_run
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+       ActiveRecord::Migrator.run(:up, MIGRATIONS_ROOT + "/valid", 3)
+@@ -1042,20 +1066,29 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+ 
+   end
+-  
++
+   uses_mocha 'Sexy migration tests' do
+     class SexyMigrationsTest < ActiveRecord::TestCase
+       def test_references_column_type_adds_id
+         with_new_table do |t|
+-          t.expects(:column).with('customer_id', :integer, {})
++          t.expects(:column).with('customer_id', :integer, references_options)
+           t.references :customer
+         end
+       end
+ 
++      def test_references_column_type_with_unsigned_adds_id
++        with_new_table do |t|
++          t.expects(:column).with('customer_id', :integer, {:unsigned => false})
++          t.expects(:column).with('taggable_id', :integer, {:unsigned => true})
++          t.references :customer, :unsigned => false
++          t.references :taggable, :unsigned => true
++        end
++      end
++
+       def test_references_column_type_with_polymorphic_adds_type
+         with_new_table do |t|
+           t.expects(:column).with('taggable_type', :string, {})
+-          t.expects(:column).with('taggable_id', :integer, {})
++          t.expects(:column).with('taggable_id', :integer, references_options)
+           t.references :taggable, :polymorphic => true
+         end
+       end
+@@ -1063,14 +1096,14 @@ if ActiveRecord::Base.connection.supports_migrations?
+       def test_references_column_type_with_polymorphic_and_options_null_is_false_adds_table_flag
+         with_new_table do |t|
+           t.expects(:column).with('taggable_type', :string, {:null => false})
+-          t.expects(:column).with('taggable_id', :integer, {:null => false})
++          t.expects(:column).with('taggable_id', :integer, references_options(:null => false))
+           t.references :taggable, :polymorphic => true, :null => false
+         end
+       end
+ 
+       def test_belongs_to_works_like_references
+         with_new_table do |t|
+-          t.expects(:column).with('customer_id', :integer, {})
++          t.expects(:column).with('customer_id', :integer, references_options)
+           t.belongs_to :customer
+         end
+       end
+@@ -1091,6 +1124,15 @@ if ActiveRecord::Base.connection.supports_migrations?
+         end
+       end
+ 
++      def test_integer_creates_unsigned_integer_column
++        with_new_table do |t|
++          t.expects(:column).with(:foo, 'integer', { :unsigned => false })
++          t.expects(:column).with(:bar, 'integer', { :unsigned => true })
++          t.integer :foo, :unsigned => false
++          t.integer :bar, :unsigned => true
++        end
++      end
++
+       def test_string_creates_string_column
+         with_new_table do |t|
+           t.expects(:column).with(:foo, 'string', {})
+@@ -1099,6 +1141,11 @@ if ActiveRecord::Base.connection.supports_migrations?
+         end
+       end
+ 
++      def references_options(options = {})
++        options.reverse_merge!(:unsigned => true) if current_adapter?(:MysqlAdapter)
++        options
++      end
++
+       protected
+       def with_new_table
+         Person.connection.create_table :delete_me, :force => true do |t|
+@@ -1125,11 +1172,20 @@ if ActiveRecord::Base.connection.supports_migrations?
+ 
+       def test_references_column_type_adds_id
+         with_change_table do |t|
+-          @connection.expects(:add_column).with(:delete_me, 'customer_id', :integer, {})
++          @connection.expects(:add_column).with(:delete_me, 'customer_id', :integer, references_options)
+           t.references :customer
+         end
+       end
+ 
++      def test_references_column_type_with_unsigned_adds_id
++        with_change_table do |t|
++          @connection.expects(:add_column).with(:delete_me, 'customer_id', :integer, {:unsigned => false})
++          @connection.expects(:add_column).with(:delete_me, 'taggable_id', :integer, {:unsigned => true})
++          t.references :customer, :unsigned => false
++          t.references :taggable, :unsigned => true
++        end
++      end
++
+       def test_remove_references_column_type_removes_id
+         with_change_table do |t|
+           @connection.expects(:remove_column).with(:delete_me, 'customer_id')
+@@ -1139,7 +1195,7 @@ if ActiveRecord::Base.connection.supports_migrations?
+ 
+       def test_add_belongs_to_works_like_add_references
+         with_change_table do |t|
+-          @connection.expects(:add_column).with(:delete_me, 'customer_id', :integer, {})
++          @connection.expects(:add_column).with(:delete_me, 'customer_id', :integer, references_options)
+           t.belongs_to :customer
+         end
+       end
+@@ -1154,7 +1210,7 @@ if ActiveRecord::Base.connection.supports_migrations?
+       def test_references_column_type_with_polymorphic_adds_type
+         with_change_table do |t|
+           @connection.expects(:add_column).with(:delete_me, 'taggable_type', :string, {})
+-          @connection.expects(:add_column).with(:delete_me, 'taggable_id', :integer, {})
++          @connection.expects(:add_column).with(:delete_me, 'taggable_id', :integer, references_options)
+           t.references :taggable, :polymorphic => true
+         end
+       end
+@@ -1170,7 +1226,7 @@ if ActiveRecord::Base.connection.supports_migrations?
+       def test_references_column_type_with_polymorphic_and_options_null_is_false_adds_table_flag
+         with_change_table do |t|
+           @connection.expects(:add_column).with(:delete_me, 'taggable_type', :string, {:null => false})
+-          @connection.expects(:add_column).with(:delete_me, 'taggable_id', :integer, {:null => false})
++          @connection.expects(:add_column).with(:delete_me, 'taggable_id', :integer, references_options(:null => false))
+           t.references :taggable, :polymorphic => true, :null => false
+         end
+       end
+@@ -1197,6 +1253,11 @@ if ActiveRecord::Base.connection.supports_migrations?
+         end
+       end
+ 
++      def references_options(options = {})
++        options.reverse_merge!(:unsigned => true) if current_adapter?(:MysqlAdapter)
++        options
++      end
++
+       def string_column
+         if current_adapter?(:PostgreSQLAdapter)
+           "character varying(255)"
+@@ -1221,6 +1282,15 @@ if ActiveRecord::Base.connection.supports_migrations?
+         end
+       end
+ 
++      def test_integer_creates_unsigned_integer_column
++        with_change_table do |t|
++          @connection.expects(:add_column).with(:delete_me, :foo, integer_column, { :unsigned => false })
++          @connection.expects(:add_column).with(:delete_me, :bar, (current_adapter?(:MysqlAdapter) ? 'int(11) UNSIGNED' : integer_column), { :unsigned => true })
++          t.integer :foo, :unsigned => false
++          t.integer :bar, :unsigned => true
++        end
++      end
++
+       def test_string_creates_string_column
+         with_change_table do |t|
+           @connection.expects(:add_column).with(:delete_me, :foo, string_column, {})
+@@ -1278,6 +1348,13 @@ if ActiveRecord::Base.connection.supports_migrations?
+         end
+       end
+ 
++      def test_change_unsigned_integer_changes_column
++        with_change_table do |t|
++          @connection.expects(:change_column).with(:delete_me, :bar, :integer, {:unsigned => true})
++          t.change :bar, :integer, :unsigned => true
++        end
++      end
++
+       def test_remove_drops_single_column
+         with_change_table do |t|
+           @connection.expects(:remove_column).with(:delete_me, [:bar])
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index c42b0ef..d4f54ec 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -55,6 +55,7 @@ class SchemaDumperTest < ActiveRecord::TestCase
+       assert_line_up(column_set, /:default => /)
+       assert_line_up(column_set, /:limit => /)
+       assert_line_up(column_set, /:null => /)
++      assert_line_up(column_set, /:unsigned => /)
+     end
+   end
+ 
+@@ -126,6 +127,11 @@ class SchemaDumperTest < ActiveRecord::TestCase
+       assert_match %r{t.text\s+"medium_text",\s+:limit => 16777215$}, output
+       assert_match %r{t.text\s+"long_text",\s+:limit => 2147483647$}, output
+     end
++
++    def test_schema_dump_includes_unsigned_columns
++      output = standard_dump
++      assert_match %r{:unsigned => true}, output
++    end
+   end
+ 
+   def test_schema_dump_includes_decimal_options
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 423929f..80db628 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -410,7 +410,7 @@ ActiveRecord::Schema.define do
+   except 'SQLite' do
+     # fk_test_has_fk should be before fk_test_has_pk
+     create_table :fk_test_has_fk, :force => true do |t|
+-      t.integer :fk_id, :null => false
++      t.integer :fk_id, :null => false, :unsigned => true
+     end
+ 
+     create_table :fk_test_has_pk, :force => true do |t|
+-- 
+1.5.5.1015.g9d258
+

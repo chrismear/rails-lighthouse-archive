@@ -1,0 +1,145 @@
+From e3cb794c3b04b27492fab1c7c8bbd99e77fd3857 Mon Sep 17 00:00:00 2001
+From: Will Bryant <will.bryant@gmail.com>
+Date: Sat, 27 Sep 2008 15:28:21 +1200
+Subject: [PATCH] explicitly including child associations that are also included in the parent association definition should not result in double records in the collection/double loads (#1110)
+
+---
+ .../lib/active_record/association_preload.rb       |    3 +
+ activerecord/lib/active_record/associations.rb     |    5 ++
+ activerecord/test/cases/associations/eager_test.rb |   42 +++++++++++++++++++-
+ activerecord/test/models/author.rb                 |    2 +
+ activerecord/test/models/post.rb                   |    1 +
+ 5 files changed, 52 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index 99e3973..6e194ab 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -193,6 +193,7 @@ module ActiveRecord
+       end
+ 
+       def preload_has_one_association(records, reflection, preload_options={})
++        return if records.first.send("loaded_#{reflection.name}?")
+         id_to_record_map, ids = construct_id_map(records)        
+         options = reflection.options
+         records.each {|record| record.send("set_#{reflection.name}_target", nil)}
+@@ -214,6 +215,7 @@ module ActiveRecord
+       end
+ 
+       def preload_has_many_association(records, reflection, preload_options={})
++        return if records.first.send(reflection.name).loaded?
+         options = reflection.options
+ 
+         primary_key_name = reflection.through_reflection_primary_key_name
+@@ -271,6 +273,7 @@ module ActiveRecord
+       end
+ 
+       def preload_belongs_to_association(records, reflection, preload_options={})
++        return if records.first.send("loaded_#{reflection.name}?")
+         options = reflection.options
+         primary_key_name = reflection.primary_key_name
+ 
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index d1a0b2f..a4f38ca 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1247,6 +1247,11 @@ module ActiveRecord
+ 
+             association.target.nil? ? nil : association
+           end
++        
++          define_method("loaded_#{reflection.name}?") do
++            association = instance_variable_get(ivar) if instance_variable_defined?(ivar)
++            association && association.loaded?
++          end
+ 
+           define_method("#{reflection.name}=") do |new_value|
+             association = instance_variable_get(ivar) if instance_variable_defined?(ivar)
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 7f42577..1d801cb 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -18,7 +18,7 @@ require 'models/developer'
+ require 'models/project'
+ 
+ class EagerAssociationTest < ActiveRecord::TestCase
+-  fixtures :posts, :comments, :authors, :categories, :categories_posts,
++  fixtures :posts, :comments, :authors, :author_addresses, :categories, :categories_posts,
+             :companies, :accounts, :tags, :taggings, :people, :readers,
+             :owners, :pets, :author_favorites, :jobs, :references, :subscribers, :subscriptions, :books,
+             :developers, :projects, :developers_projects
+@@ -110,6 +110,46 @@ class EagerAssociationTest < ActiveRecord::TestCase
+       assert_equal [comment], category.posts[0].comments
+     end
+   end
++  
++  def test_finding_with_includes_on_has_many_association_with_same_include_includes_only_once
++    author_id = authors(:david).id
++    author = assert_queries(3) { Author.find(author_id, :include => {:posts_with_comments => :comments}) } # find the author, then find the posts, then find the comments
++    author.posts_with_comments.each do |post_with_comments|
++      assert_equal post_with_comments.comments.length, post_with_comments.comments.count
++      assert_equal nil, post_with_comments.comments.uniq!
++    end
++  end
++  
++  def test_finding_with_includes_on_has_one_assocation_with_same_include_includes_only_once
++    author = authors(:david)
++    post = author.post_about_thinking_with_last_comment
++    last_comment = post.last_comment
++    author = assert_queries(3) { Author.find(author.id, :include => {:post_about_thinking_with_last_comment => :last_comment})} # find the author, then find the posts, then find the comments
++    assert_no_queries do
++      assert_equal post, author.post_about_thinking_with_last_comment
++      assert_equal last_comment, author.post_about_thinking_with_last_comment.last_comment
++    end
++  end
++  
++  def test_finding_with_includes_on_belongs_to_association_with_same_include_includes_only_once
++    post = posts(:welcome)
++    author = post.author
++    author_address = author.author_address
++    post = assert_queries(3) { Post.find(post.id, :include => {:author_with_address => :author_address}) } # find the post, then find the author, then find the address
++    assert_no_queries do
++      assert_equal author, post.author_with_address
++      assert_equal author_address, post.author_with_address.author_address
++    end
++  end
++
++  def test_finding_with_includes_on_null_belongs_to_association_with_same_include_includes_only_once
++    post = posts(:welcome)
++    post.update_attributes!(:author => nil)
++    post = assert_queries(2) { Post.find(post.id, :include => {:author_with_address => :author_address}) } # find the post, then find the author which is null so no query for the address
++    assert_no_queries do
++      assert_equal nil, post.author_with_address
++    end
++  end
+ 
+   def test_loading_from_an_association
+     posts = authors(:david).posts.find(:all, :include => :comments, :order => "posts.id")
+diff --git a/activerecord/test/models/author.rb b/activerecord/test/models/author.rb
+index 37551c8..e5b19ff 100644
+--- a/activerecord/test/models/author.rb
++++ b/activerecord/test/models/author.rb
+@@ -17,6 +17,8 @@ class Author < ActiveRecord::Base
+       proxy_target
+     end
+   end
++  has_one  :post_about_thinking, :class_name => 'Post', :conditions => "posts.title like '%thinking%'"
++  has_one  :post_about_thinking_with_last_comment, :class_name => 'Post', :conditions => "posts.title like '%thinking%'", :include => :last_comment
+   has_many :comments, :through => :posts
+   has_many :comments_containing_the_letter_e, :through => :posts, :source => :comments
+   has_many :comments_with_order_and_conditions, :through => :posts, :source => :comments, :order => 'comments.body', :conditions => "comments.body like 'Thank%'"
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index 6da37c3..e0d8be6 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -13,6 +13,7 @@ class Post < ActiveRecord::Base
+   end
+ 
+   belongs_to :author_with_posts, :class_name => "Author", :foreign_key => :author_id, :include => :posts
++  belongs_to :author_with_address, :class_name => "Author", :foreign_key => :author_id, :include => :author_address
+ 
+   has_one :last_comment, :class_name => 'Comment', :order => 'id desc'
+ 
+-- 
+1.5.5.1
+

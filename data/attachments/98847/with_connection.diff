@@ -1,0 +1,111 @@
+From 54c45205cce11eaec25e6d5451d5d9b8e81ff3c2 Mon Sep 17 00:00:00 2001
+From: steve <coderrr.contact@gmail.com>
+Date: Thu, 15 Jan 2009 05:00:38 +0700
+Subject: [PATCH] modified with_connection to release connection after block finishes if no previous connection existed
+
+---
+ .../abstract/connection_pool.rb                    |   11 ++--
+ activerecord/test/cases/pooled_connections_test.rb |   58 ++++++++++++++++++++
+ 2 files changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+index aac84cc..e8e736b 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+@@ -107,13 +107,14 @@ module ActiveRecord
+         checkin conn if conn
+       end
+ 
+-      # Reserve a connection, and yield it to a block. Ensure the connection is
+-      # checked back in when finished.
++      # If a connection already exists yield it to the block.  If no connection
++      # exists checkout a connection, yield it to the block, and checkin the 
++      # connection when finished.
+       def with_connection
+-        conn = checkout
+-        yield conn
++        fresh_connection = true unless @reserved_connections[current_connection_id]
++        yield connection
+       ensure
+-        checkin conn
++        release_connection if fresh_connection
+       end
+ 
+       # Returns true if a connection has already been opened.
+diff --git a/activerecord/test/cases/pooled_connections_test.rb b/activerecord/test/cases/pooled_connections_test.rb
+index 2649a93..0cec06c 100644
+--- a/activerecord/test/cases/pooled_connections_test.rb
++++ b/activerecord/test/cases/pooled_connections_test.rb
+@@ -1,4 +1,6 @@
+ require "cases/helper"
++require "models/project"
++require "timeout"
+ 
+ class PooledConnectionsTest < ActiveRecord::TestCase
+   def setup
+@@ -89,6 +91,62 @@ class PooledConnectionsTest < ActiveRecord::TestCase
+   ensure
+     ActiveRecord::Base.connection_handler = old_handler
+   end
++
++  def test_with_connection
++    ActiveRecord::Base.establish_connection(@connection.merge({:pool => 2, :wait_timeout => 10}))
++    threads = []
++    10.times do
++      threads << Thread.new do
++        ActiveRecord::Base.connection_pool.with_connection do
++          ActiveRecord::Base.connection.execute("select 1")
++        end
++      end
++    end
++
++    assert_nothing_raised do
++      Timeout.timeout(2) do
++        threads.each {|t| t.join }
++      end
++    end
++  end
++
++  def test_with_connection_nesting_safety
++    ActiveRecord::Base.establish_connection(@connection.merge({:pool => 1, :wait_timeout => 0.1}))
++
++    before_count = Project.count
++
++    add_record('one')
++
++    transaction do
++      add_record('two')
++      # have another thread try to screw up the transaction
++      Thread.new do
++        ActiveRecord::Base.connection.execute("rollback")
++        ActiveRecord::Base.connection_pool.release_connection
++      end.join rescue nil
++      add_record('three')
++    end
++
++    after_count = Project.count
++    assert_equal 3, after_count - before_count
++  end
++
++  private
++
++  def add_record(name)
++    ActiveRecord::Base.connection_pool.with_connection do
++      ActiveRecord::Base.connection.execute("insert into projects (name) values ('#{name}')")
++    end
++  end
++
++  def transaction
++    ActiveRecord::Base.connection_pool.with_connection do
++      ActiveRecord::Base.connection.execute("start transaction")
++      yield
++      ActiveRecord::Base.connection.execute("commit")
++    end
++  end
++
+ end unless %w(FrontBase).include? ActiveRecord::Base.connection.adapter_name
+ 
+ class AllowConcurrencyDeprecatedTest < ActiveRecord::TestCase
+-- 
+1.6.2.107.ge47ee
+

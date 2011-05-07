@@ -1,0 +1,153 @@
+--- /Library/Ruby/Gems/1.8/gems/activerecord-2.3.2/lib/active_record/base.rb	2009-04-21 01:27:52.000000000 -0500
++++ base.rb	2009-04-21 01:24:35.000000000 -0500
+@@ -1492,11 +1492,12 @@
+ 
+       # Merges conditions so that the result is a valid +condition+
+       def merge_conditions(*conditions)
++        chain_aliases = conditions.extract_options! || Hash.new
+         segments = []
+ 
+         conditions.each do |condition|
+           unless condition.blank?
+-            sql = sanitize_sql(condition)
++            sql = sanitize_sql(condition, chain_aliases)
+             segments << sql unless sql.blank?
+           end
+         end
+@@ -1688,8 +1689,9 @@
+           sql  = "SELECT #{options[:select] || (scope && scope[:select]) || default_select(options[:joins] || (scope && scope[:joins]))} "
+           sql << "FROM #{options[:from]  || (scope && scope[:from]) || quoted_table_name} "
+ 
+-          add_joins!(sql, options[:joins], scope)
+-          add_conditions!(sql, options[:conditions], scope)
++          chain_aliases = Hash.new
++          add_joins!(sql, options[:joins], scope, chain_aliases)
++          add_conditions!(sql, options[:conditions], scope, chain_aliases)
+ 
+           add_group!(sql, options[:group], options[:having], scope)
+           add_order!(sql, options[:order], scope)
+@@ -1783,9 +1785,11 @@
+         end
+ 
+         # The optional scope argument is for the current <tt>:find</tt> scope.
+-        def add_joins!(sql, joins, scope = :auto)
++        def add_joins!(sql, joins, scope = :auto, chain_aliases = Hash.new)
+           scope = scope(:find) if :auto == scope
+           merged_joins = scope && scope[:joins] && joins ? merge_joins(scope[:joins], joins) : (joins || scope && scope[:joins])
++          chain_aliases.clear # blangenfeld
++          chain_aliases[nil] = self.table_name
+           case merged_joins
+           when Symbol, Hash, Array
+             if array_of_strings?(merged_joins)
+@@ -1793,6 +1797,18 @@
+             else
+               join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, merged_joins, nil)
+               sql << " #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} "
++              
++              # blangenfeld
++              join_dependency.join_associations.each_with_index do |join, index|
++                path = []
++                j = join
++                while j.respond_to?( :reflection )
++                  path << j.reflection.name
++                  j = j.parent
++                end
++                chain_aliases[path.reverse] = join.aliased_table_name
++              end
++              
+             end
+           when String
+             sql << " #{merged_joins} "
+@@ -1801,12 +1817,14 @@
+ 
+         # Adds a sanitized version of +conditions+ to the +sql+ string. Note that the passed-in +sql+ string is changed.
+         # The optional scope argument is for the current <tt>:find</tt> scope.
+-        def add_conditions!(sql, conditions, scope = :auto)
++        def add_conditions!(sql, conditions, scope = :auto, chain_aliases = nil)
+           scope = scope(:find) if :auto == scope
+           conditions = [conditions]
+           conditions << scope[:conditions] if scope
+           conditions << type_condition if finder_needs_type_condition?
++          conditions << chain_aliases # blangenfeld
+           merged_conditions = merge_conditions(*conditions)
++          
+           sql << "WHERE #{merged_conditions} " unless merged_conditions.blank?
+         end
+ 
+@@ -2117,9 +2135,9 @@
+                       merge = hash[method][key] && params[key] # merge if both scopes have the same key
+                       if key == :conditions && merge
+                         if params[key].is_a?(Hash) && hash[method][key].is_a?(Hash)
+-                          hash[method][key] = merge_conditions(hash[method][key].deep_merge(params[key]))
++                          hash[method][key] = merge_conditions(hash[method][key].deep_merge(params[key]), nil)
+                         else
+-                          hash[method][key] = merge_conditions(params[key], hash[method][key])
++                          hash[method][key] = merge_conditions(params[key], hash[method][key], nil)
+                         end
+                       elsif key == :include && merge
+                         hash[method][key] = merge_includes(hash[method][key], params[key]).uniq
+@@ -2228,12 +2246,12 @@
+         #   ["name='%s' and group_id='%s'", "foo'bar", 4]  returns  "name='foo''bar' and group_id='4'"
+         #   { :name => "foo'bar", :group_id => 4 }  returns "name='foo''bar' and group_id='4'"
+         #   "name='foo''bar' and group_id='4'" returns "name='foo''bar' and group_id='4'"
+-        def sanitize_sql_for_conditions(condition)
++        def sanitize_sql_for_conditions(condition, chain_aliases = nil)
+           return nil if condition.blank?
+ 
+           case condition
+-            when Array; sanitize_sql_array(condition)
+-            when Hash;  sanitize_sql_hash_for_conditions(condition)
++            when Array; sanitize_sql_array(condition, chain_aliases)
++            when Hash;  sanitize_sql_hash_for_conditions(condition, quoted_table_name, chain_aliases)
+             else        condition
+           end
+         end
+@@ -2299,11 +2317,11 @@
+         # And for value objects on a composed_of relationship:
+         #   { :address => Address.new("123 abc st.", "chicago") }
+         #     # => "address_street='123 abc st.' and address_city='chicago'"
+-        def sanitize_sql_hash_for_conditions(attrs, table_name = quoted_table_name)
++        def sanitize_sql_hash_for_conditions(attrs, table_name = quoted_table_name, chain_aliases = nil, path = nil)
+           attrs = expand_hash_conditions_for_aggregates(attrs)
+ 
+           conditions = attrs.map do |attr, value|
+-            unless value.is_a?(Hash)
++            if !value.is_a?(Hash)
+               attr = attr.to_s
+ 
+               # Extract table name from qualified attribute names.
+@@ -2313,8 +2331,15 @@
+               end
+ 
+               attribute_condition("#{table_name}.#{connection.quote_column_name(attr)}", value)
+-            else
++            elsif chain_aliases.nil?
+               sanitize_sql_hash_for_conditions(value, connection.quote_table_name(attr.to_s))
++            else
++              path_plus_one = [path, attr.to_sym].flatten.compact
++              if table_alias = chain_aliases[path_plus_one]
++                sanitize_sql_hash_for_conditions(value, connection.quote_table_name(table_alias), chain_aliases, path_plus_one)
++              else
++                sanitize_sql_hash_for_conditions(value, connection.quote_table_name(attr.to_s), chain_aliases, path)
++              end
+             end
+           end.join(' AND ')
+ 
+@@ -2334,9 +2359,15 @@
+         # Accepts an array of conditions.  The array has each value
+         # sanitized and interpolated into the SQL statement.
+         #   ["name='%s' and group_id='%s'", "foo'bar", 4]  returns  "name='foo''bar' and group_id='4'"
+-        def sanitize_sql_array(ary)
++        def sanitize_sql_array(ary, chain_aliases = nil)
+           statement, *values = ary
+-          if values.first.is_a?(Hash) and statement =~ /:\w+/
++          if statement.is_a?(Hash)
++            conditions = []
++            ary.each do |condition|
++              conditions << "(#{sanitize_sql_hash_for_conditions(condition, quoted_table_name, chain_aliases)})"
++            end
++            conditions.join(' OR ')
++          elsif values.first.is_a?(Hash) and statement =~ /:\w+/
+             replace_named_bind_variables(statement, values.first)
+           elsif statement.include?('?')
+             replace_bind_variables(statement, values)

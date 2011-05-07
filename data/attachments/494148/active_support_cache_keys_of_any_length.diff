@@ -1,0 +1,140 @@
+From 7788ec0e72ec9077e23039adb1618d4185035eb6 Mon Sep 17 00:00:00 2001
+From: Brian Durand <bdurand@bdurand.local>
+Date: Thu, 22 Apr 2010 20:59:05 -0500
+Subject: [PATCH] Ensure that ActiveSupport::Cache keys can be of any length and not limited by the implementation.
+
+---
+ .../lib/active_support/cache/file_store.rb         |   14 +++++++-
+ .../lib/active_support/cache/mem_cache_store.rb    |   15 ++++-----
+ activesupport/test/caching_test.rb                 |   31 +++++++++++++-------
+ 3 files changed, 39 insertions(+), 21 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache/file_store.rb b/activesupport/lib/active_support/cache/file_store.rb
+index bff80f7..8656d8b 100644
+--- a/activesupport/lib/active_support/cache/file_store.rb
++++ b/activesupport/lib/active_support/cache/file_store.rb
+@@ -117,12 +117,22 @@ module ActiveSupport
+           hash = Zlib.adler32(fname)
+           hash, dir_1 = hash.divmod(0x1000)
+           dir_2 = hash.modulo(0x1000)
+-          File.join(cache_path, DIR_FORMATTER % dir_1, DIR_FORMATTER % dir_2, fname)
++          fname_paths = []
++          # Make sure file name is < 255 characters so it doesn't exceed file system limits.
++          if fname.size <= 255
++            fname_paths << fname
++          else
++            while fname.size <= 255
++              fname_path << fname[0, 255]
++              fname = fname[255, -1]
++            end
++          end
++          File.join(cache_path, DIR_FORMATTER % dir_1, DIR_FORMATTER % dir_2, *fname_paths)
+         end
+ 
+         # Translate a file path into a key.
+         def file_path_key (path)
+-          fname = File.basename(path)
++          fname = path[cache_path.size, path.size].split(File::SEPARATOR, 4).last
+           fname.gsub(UNESCAPE_FILENAME_CHARS){|match| $1.to_s(16)}
+         end
+ 
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index 432ece6..66a9400 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -1,4 +1,5 @@
+ require 'memcache'
++require 'md5'
+ 
+ module ActiveSupport
+   module Cache
+@@ -25,7 +26,6 @@ module ActiveSupport
+       end
+ 
+       ESCAPE_KEY_CHARS = /[\x00-\x20%\x7F-\xFF]/
+-      UNESCAPE_KEY_CHARS = /%[0-9A-F]{2}/
+ 
+       def self.build_mem_cache(*addresses)
+         addresses = addresses.flatten
+@@ -69,11 +69,12 @@ module ActiveSupport
+       def read_multi(*names)
+         options = names.extract_options!
+         options = merged_options(options)
+-        raw_values = @data.get_multi(names.collect{|n| escape_key(namespaced_key(n, options))}, :raw => true)
++        keys_to_names = names.inject({}){|map, name| map[escape_key(namespaced_key(name, options))] = name; map}
++        raw_values = @data.get_multi(keys_to_names.keys, :raw => true)
+         values = {}
+         raw_values.each do |key, value|
+           entry = deserialize_entry(value)
+-          values[unescape_key(key)] = entry.value unless entry.expired?
++          values[keys_to_names[key]] = entry.value unless entry.expired?
+         end
+         values
+       end
+@@ -153,11 +154,9 @@ module ActiveSupport
+ 
+       private
+         def escape_key (key)
+-          key.to_s.gsub(ESCAPE_KEY_CHARS){|match| "%#{match[0].to_s(16).upcase}"}
+-        end
+-
+-        def unescape_key (key)
+-          key.gsub(UNESCAPE_KEY_CHARS){|match| $1.to_s(16)}
++          key = key.to_s.gsub(ESCAPE_KEY_CHARS){|match| "%#{match[0].to_s(16).upcase}"}
++          key = "#{key[0, 213]}:md5:#{MD5.md5(key).to_s}" if key.size > 250
++          key
+         end
+ 
+         def deserialize_entry (raw_value)
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index 88466e9..5ee88d4 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -304,6 +304,26 @@ module CacheStoreBehavior
+     Time.stubs(:now).returns(time + 71)
+     assert_nil @cache.read('foo')
+   end
++  
++  def test_crazy_key_characters
++    crazy_key = "#/:*(<+=> )&$%@?;'\"\'`~-"
++    assert_equal true, @cache.write(crazy_key, "1", :raw => true)
++    assert_equal "1", @cache.read(crazy_key)
++    assert_equal "1", @cache.fetch(crazy_key)
++    assert_equal true, @cache.delete(crazy_key)
++    assert_equal "2", @cache.fetch(crazy_key, :raw => true) { "2" }
++    assert_equal 3, @cache.increment(crazy_key)
++    assert_equal 2, @cache.decrement(crazy_key)
++  end
++  
++  def test_really_long_keys
++    key = ""
++    1000.times{key << "x"}
++    assert_equal true, @cache.write(key, "bar")
++    assert_equal "bar", @cache.read(key)
++    assert_equal({key => "bar"}, @cache.read_multi(key))
++    assert_equal true, @cache.delete(key)
++  end
+ end
+ 
+ module CacheKeysIteratorBehavior
+@@ -403,17 +423,6 @@ module LocalCacheBehavior
+     app = @cache.middleware.new(app)
+     app.call({})
+   end
+-  
+-  def test_crazy_key_characters
+-    crazy_key = "#/:*(<+=> )&$%@?;'\"\'`~-"
+-    assert_equal true, @cache.write(crazy_key, "1", :raw => true)
+-    assert_equal "1", @cache.read(crazy_key)
+-    assert_equal "1", @cache.fetch(crazy_key)
+-    assert_equal true, @cache.delete(crazy_key)
+-    assert_equal "2", @cache.fetch(crazy_key, :raw => true) { "2" }
+-    assert_equal 3, @cache.increment(crazy_key)
+-    assert_equal 2, @cache.decrement(crazy_key)
+-  end
+ end
+ 
+ class FileStoreTest < ActiveSupport::TestCase
+-- 
+1.6.4.1
+

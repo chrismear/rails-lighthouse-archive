@@ -1,0 +1,200 @@
+From ab6437978e4f92b813e095246ef39a6d9ed0fd06 Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Wed, 30 Apr 2008 23:11:25 +0100
+Subject: [PATCH] Association preload should not assume integer keys
+
+---
+ .../lib/active_record/association_preload.rb       |   26 +++++++++++--------
+ activerecord/test/cases/associations/eager_test.rb |   23 ++++++++++++++++-
+ activerecord/test/fixtures/subscriptions.yml       |   15 +++++++++++
+ activerecord/test/models/subscriber.rb             |    2 +
+ activerecord/test/models/subscription.rb           |    4 +++
+ activerecord/test/schema/schema.rb                 |    5 ++++
+ 6 files changed, 63 insertions(+), 12 deletions(-)
+ create mode 100644 activerecord/test/fixtures/subscriptions.yml
+ create mode 100644 activerecord/test/models/subscription.rb
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index 55c0cdd..3e7c787 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -59,14 +59,14 @@ module ActiveRecord
+ 
+       def set_association_collection_records(id_to_record_map, reflection_name, associated_records, key)
+         associated_records.each do |associated_record|
+-          mapped_records = id_to_record_map[associated_record[key].to_i]
++          mapped_records = id_to_record_map[associated_record[key].to_s]
+           add_preloaded_records_to_collection(mapped_records, reflection_name, associated_record)
+         end
+       end
+ 
+       def set_association_single_records(id_to_record_map, reflection_name, associated_records, key)
+         associated_records.each do |associated_record|
+-          mapped_records = id_to_record_map[associated_record[key].to_i]
++          mapped_records = id_to_record_map[associated_record[key].to_s]
+           mapped_records.each do |mapped_record|
+             mapped_record.send("set_#{reflection_name}_target", associated_record)
+           end
+@@ -78,7 +78,7 @@ module ActiveRecord
+         ids = []
+         records.each do |record|
+           ids << record.id
+-          mapped_records = (id_to_record_map[record.id] ||= [])
++          mapped_records = (id_to_record_map[record.id.to_s] ||= [])
+           mapped_records << record
+         end
+         ids.uniq!
+@@ -115,7 +115,7 @@ module ActiveRecord
+             source = reflection.source_reflection.name
+             through_records.first.class.preload_associations(through_records, source)
+             through_records.each do |through_record|
+-              add_preloaded_record_to_collection(id_to_record_map[through_record[through_primary_key].to_i],
++              add_preloaded_record_to_collection(id_to_record_map[through_record[through_primary_key].to_s],
+                                                  reflection.name, through_record.send(source))
+             end
+           end
+@@ -140,7 +140,7 @@ module ActiveRecord
+             source = reflection.source_reflection.name
+             through_records.first.class.preload_associations(through_records, source)
+             through_records.each do |through_record|
+-              add_preloaded_records_to_collection(id_to_record_map[through_record[through_primary_key].to_i],
++              add_preloaded_records_to_collection(id_to_record_map[through_record[through_primary_key].to_s],
+                                                  reflection.name, through_record.send(source))
+             end
+           end
+@@ -195,18 +195,22 @@ module ActiveRecord
+           records.each do |record|
+             if klass = record.send(polymorph_type)
+               klass_id = record.send(primary_key_name)
+-
+-              id_map = klasses_and_ids[klass] ||= {}
+-              id_list_for_klass_id = (id_map[klass_id] ||= [])
+-              id_list_for_klass_id << record
++              if klass_id
++                id_map = klasses_and_ids[klass] ||= {}
++                id_list_for_klass_id = (id_map[klass_id.to_s] ||= [])
++                id_list_for_klass_id << record
++              end
+             end
+           end
+           klasses_and_ids = klasses_and_ids.to_a
+         else
+           id_map = {}
+           records.each do |record|
+-            mapped_records = (id_map[record.send(primary_key_name)] ||= [])
+-            mapped_records << record
++            key = record.send(primary_key_name)
++            if key
++              mapped_records = (id_map[key.to_s] ||= [])
++              mapped_records << record
++            end
+           end
+           klasses_and_ids = [[reflection.klass.name, id_map]]
+         end
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 1a3017a..546ed80 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -11,11 +11,14 @@ require 'models/owner'
+ require 'models/pet'
+ require 'models/reference'
+ require 'models/job'
++require 'models/subscriber'
++require 'models/subscription'
++require 'models/book'
+ 
+ class EagerAssociationTest < ActiveRecord::TestCase
+   fixtures :posts, :comments, :authors, :categories, :categories_posts,
+             :companies, :accounts, :tags, :taggings, :people, :readers,
+-            :owners, :pets, :author_favorites, :jobs, :references
++            :owners, :pets, :author_favorites, :jobs, :references, :subscribers, :subscriptions, :books
+ 
+   def test_loading_with_one_association
+     posts = Post.find(:all, :include => :comments)
+@@ -220,6 +223,24 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_no_queries{ assert_equal jobs(:unicyclist, :magician), michael.jobs.sort_by(&:id) }
+   end
+ 
++  def test_eager_load_has_many_with_string_keys
++    subscriptions = subscriptions(:webster_awdr, :webster_rfr)
++    subscriber =Subscriber.find(subscribers(:second).id, :include => :subscriptions)
++    assert_equal subscriptions, subscriber.subscriptions.sort_by(&:id)
++  end
++  
++  def test_eager_load_has_many_through_with_string_keys
++    books = books(:awdr, :rfr)
++    subscriber = Subscriber.find(subscribers(:second).id, :include => :books)
++    assert_equal books, subscriber.books.sort_by(&:id)
++  end
++  
++  def test_eager_load_belongs_to_with_string_keys
++    subscriber = subscribers(:second)
++    subscription = Subscription.find(subscriptions(:webster_awdr).id, :include => :subscriber)
++    assert_equal subscriber, subscription.subscriber
++  end
++
+   def test_eager_association_loading_with_explicit_join
+     posts = Post.find(:all, :include => :comments, :joins => "INNER JOIN authors ON posts.author_id = authors.id AND authors.name = 'Mary'", :limit => 1, :order => 'author_id')
+     assert_equal 1, posts.length
+diff --git a/activerecord/test/fixtures/subscriptions.yml b/activerecord/test/fixtures/subscriptions.yml
+new file mode 100644
+index 0000000..c372450
+--- /dev/null
++++ b/activerecord/test/fixtures/subscriptions.yml
+@@ -0,0 +1,15 @@
++webster_awdr:
++  id: 1
++  subscriber_id: webster132
++  book_id: 1
++  
++webster_rfr:
++  id: 2
++  subscriber_id: webster132
++  book_id: 2
++  
++  
++alterself_awdr:
++  id: 3
++  subscriber_id: alterself
++  book_id: 3
+diff --git a/activerecord/test/models/subscriber.rb b/activerecord/test/models/subscriber.rb
+index 51335a8..5b78014 100644
+--- a/activerecord/test/models/subscriber.rb
++++ b/activerecord/test/models/subscriber.rb
+@@ -1,5 +1,7 @@
+ class Subscriber < ActiveRecord::Base
+   set_primary_key 'nick'
++  has_many :subscriptions
++  has_many :books, :through => :subscriptions
+ end
+ 
+ class SpecialSubscriber < Subscriber
+diff --git a/activerecord/test/models/subscription.rb b/activerecord/test/models/subscription.rb
+new file mode 100644
+index 0000000..4bdb36e
+--- /dev/null
++++ b/activerecord/test/models/subscription.rb
+@@ -0,0 +1,4 @@
++class Subscription < ActiveRecord::Base
++  belongs_to :subscriber
++  belongs_to :book
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index e22b787..818237f 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -349,6 +349,11 @@ ActiveRecord::Schema.define do
+   end
+   add_index :subscribers, :nick, :unique => true
+ 
++  create_table :subscriptions, :force => true do |t|
++    t.string :subscriber_id
++    t.integer :book_id
++  end
++
+   create_table :tasks, :force => true do |t|
+     t.datetime :starting
+     t.datetime :ending
+-- 
+1.5.4.4
+

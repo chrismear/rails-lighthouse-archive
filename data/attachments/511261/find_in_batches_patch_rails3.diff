@@ -1,0 +1,206 @@
+From 8643701af36000404014bf057f6f6f88c3ac9761 Mon Sep 17 00:00:00 2001
+From: Tanel Suurhans <scient@ubuntu.(none)>
+Date: Wed, 5 May 2010 14:33:47 -0700
+Subject: [PATCH] Enable :order and :limit options for batch finders, rename :start to :offset [#2137:commited]
+
+---
+ activerecord/lib/active_record/relation/batches.rb |   51 +++++--------
+ activerecord/test/cases/batches_test.rb            |   74 +++++++++++---------
+ 2 files changed, 62 insertions(+), 63 deletions(-)
+
+diff --git a/activerecord/lib/active_record/relation/batches.rb b/activerecord/lib/active_record/relation/batches.rb
+index 1c61e7d..ae07562 100644
+--- a/activerecord/lib/active_record/relation/batches.rb
++++ b/activerecord/lib/active_record/relation/batches.rb
+@@ -29,56 +29,45 @@ module ActiveRecord
+     # option; the default is 1000.
+     #
+     # You can control the starting point for the batch processing by
+-    # supplying the <tt>:start</tt> option. This is especially useful if you
++    # supplying the <tt>:offset</tt> option. This is especially useful if you
+     # want multiple workers dealing with the same processing queue. You can
+     # make worker 1 handle all the records between id 0 and 10,000 and
+-    # worker 2 handle from 10,000 and beyond (by setting the <tt>:start</tt>
++    # worker 2 handle from 10,000 and beyond (by setting the <tt>:offset</tt>
+     # option on that worker).
+     #
+-    # It's not possible to set the order. That is automatically set to
+-    # ascending on the primary key ("id ASC") to make the batch ordering
+-    # work. This also mean that this method only works with integer-based
+-    # primary keys. You can't set the limit either, that's used to control
+-    # the the batch sizes.
+-    #
+     # Example:
+     #
+     #   Person.where("age > 21").find_in_batches do |group|
+     #     sleep(50) # Make sure it doesn't get too crowded in there!
+     #     group.each { |person| person.party_all_night! }
+     #   end
++    #
++    #  Person.find_in_batches(:batch_size => 10, :order => "age DESC", :limit => 140)  do |group|
++    #    group.each { |person| person.party_all_night! }
++    #  end
++    #
+     def find_in_batches(options = {})
+       relation = self
++      relation = apply_finder_options(options.except(:batch_size)) if options.present?
++      relation = relation.select("#{@klass.table_name}.#{@klass.primary_key}").all
+ 
+-       if orders.present? || taken.present?
+-         ActiveRecord::Base.logger.warn("Scoped order and limit are ignored, it's forced to be batch order and batch size")
+-       end
+-
+-      if (finder_options = options.except(:start, :batch_size)).present?
+-        raise "You can't specify an order, it's forced to be #{batch_order}" if options[:order].present?
+-        raise "You can't specify a limit, it's forced to be the batch_size"  if options[:limit].present?
+-
+-        relation = apply_finder_options(finder_options)
+-      end
+-
+-      start = options.delete(:start).to_i
+       batch_size = options.delete(:batch_size) || 1000
++      record_ids = relation.map(&:id)
+ 
+-      relation = relation.except(:order).order(batch_order).limit(batch_size)
+-      records = relation.where(primary_key.gteq(start)).all
+-
+-      while records.any?
+-        yield records
+-
+-        break if records.size < batch_size
+-        records = relation.where(primary_key.gt(records.last.id)).all
++      record_ids.in_groups_of(batch_size, false) do |ids|
++        records = self.unscoped.where(primary_key.in(ids)).all
++        sort_batch_rows(records, ids) if options.has_key?(:order)
++        yield records unless records.empty?
+       end
++      self
+     end
+ 
+     private
+ 
+-    def batch_order
+-      "#{@klass.table_name}.#{@klass.primary_key} ASC"
++    def sort_batch_rows(records, ids)
++      sorted = {}
++      ids.each_with_index { |id, index| sorted.store(id, index ) }
++      records.sort! { |a, b| sorted[a.id] <=> sorted[b.id] }
+     end
+   end
+-end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/batches_test.rb b/activerecord/test/cases/batches_test.rb
+index 83deabb..578b859 100644
+--- a/activerecord/test/cases/batches_test.rb
++++ b/activerecord/test/cases/batches_test.rb
+@@ -9,63 +9,73 @@ class EachTest < ActiveRecord::TestCase
+     @total = Post.count
+   end
+ 
+-  def test_each_should_excecute_one_query_per_batch
+-    assert_queries(Post.count + 1) do
+-      Post.find_each(:batch_size => 1) do |post|
++  def test_each_should_execute_one_query_per_batch
++    assert_queries((@total / 2.to_f).ceil + 1) do
++      Post.find_each(:batch_size => 2) do |post|
+         assert_kind_of Post, post
+       end
+     end
+   end
+ 
+-  def test_each_should_raise_if_the_order_is_set
+-    assert_raise(RuntimeError) do
+-      Post.find_each(:order => "title") { |post| post }
++  def test_find_in_batches_should_honor_finder_scopes
++    containing_a = Post.containing_the_letter_a.all
++    posts = []
++    Post.containing_the_letter_a.find_in_batches(:batch_size => 1) do |batch|
++      posts.concat(batch)
+     end
++    assert_equal posts.sort{|a,b| a.id <=> b.id}, containing_a.sort{|a,b| a.id <=> b.id}
+   end
+ 
+-  def test_each_should_raise_if_the_limit_is_set
+-    assert_raise(RuntimeError) do
+-      Post.find_each(:limit => 1) { |post| post }
++  def test_find_in_batches_should_return_batches
++    assert_queries((@total / 2.to_f).ceil + 1) do
++      Post.find_in_batches(:batch_size => 2) do |batch|
++        assert_kind_of Array, batch
++        assert_kind_of Post, batch.first
++      end
+     end
+   end
+ 
+-  def test_warn_if_limit_scope_is_set
+-    ActiveRecord::Base.logger.expects(:warn)
+-    Post.limit(1).find_each { |post| post }
+-  end
+-
+-  def test_warn_if_order_scope_is_set
+-    ActiveRecord::Base.logger.expects(:warn)
+-    Post.order("title").find_each { |post| post }
+-  end
+-
+-  def test_find_in_batches_should_return_batches
+-    assert_queries(Post.count + 1) do
+-      Post.find_in_batches(:batch_size => 1) do |batch|
++  def test_find_in_batches_should_limit_with_the_limit_option
++    assert_queries(4) do
++      Post.find_in_batches(:batch_size => 1, :limit => 3) do |batch|
+         assert_kind_of Array, batch
+         assert_kind_of Post, batch.first
+       end
+     end
+   end
+ 
+-  def test_find_in_batches_should_start_from_the_start_option
+-    assert_queries(Post.count) do
+-      Post.find_in_batches(:batch_size => 1, :start => 2) do |batch|
++  def test_find_in_batches_should_start_from_the_offset_option
++    assert_queries((@total - 3) + 1) do
++      Post.find_in_batches(:batch_size => 1, :offset => 3) do |batch|
+         assert_kind_of Array, batch
+         assert_kind_of Post, batch.first
+       end
+     end
+   end
+ 
+-  def test_find_in_batches_shouldnt_excute_query_unless_needed
+-    post_count = Post.count
++  def test_find_in_batches_should_return_records_in_the_order_specified
++    posts = []
++    Post.find_in_batches(:batch_size => 5, :order => "title DESC") do |batch|
++      posts << batch
++    end
++    assert_equal posts.flatten, Post.order("title DESC").all
++  end
+ 
+-    assert_queries(2) do
+-      Post.find_in_batches(:batch_size => post_count) {|batch| assert_kind_of Array, batch }
++  def find_in_batches_should_return_self
++    assert_equal Post, Post.find_in_batches{ |batch| }
++  end
++
++  def test_find_in_batches_shouldnt_excute_query_unless_needed
++    assert_queries(4) do
++      Post.find_in_batches(:batch_size => @total / 2) do |batch|
++        assert_kind_of Array, batch
++      end
+     end
+ 
+-    assert_queries(1) do
+-      Post.find_in_batches(:batch_size => post_count + 1) {|batch| assert_kind_of Array, batch }
++    assert_queries(2) do
++      Post.find_in_batches(:batch_size => @total + 1) do |batch|
++        assert_kind_of Array, batch
++      end
+     end
+   end
+-end
++end
+\ No newline at end of file
+-- 
+1.6.3.3
+

@@ -1,0 +1,83 @@
+From 9a0cb7feca6c4f56392aabac668ea2f2fcbebf4b Mon Sep 17 00:00:00 2001
+From: Adam Meehan <adam.meehan@gmail.com>
+Date: Tue, 1 Mar 2011 22:18:46 +1100
+Subject: [PATCH] Fix before_type_cast for timezone aware attributes by caching converted value on write. Also remove read method reload arg on timezone attributes.
+
+---
+ .../attribute_methods/time_zone_conversion.rb      |    9 ++++---
+ activerecord/test/cases/attribute_methods_test.rb  |   26 ++++++++-----------
+ 2 files changed, 16 insertions(+), 19 deletions(-)
+
+diff --git a/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb b/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
+index 76218d2..6aac96d 100644
+--- a/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
++++ b/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
+@@ -21,9 +21,9 @@ module ActiveRecord
+           def define_method_attribute(attr_name)
+             if create_time_zone_conversion_attribute?(attr_name, columns_hash[attr_name])
+               method_body, line = <<-EOV, __LINE__ + 1
+-                def _#{attr_name}(reload = false)
++                def _#{attr_name}
+                   cached = @attributes_cache['#{attr_name}']
+-                  return cached if cached && !reload
++                  return cached if cached
+                   time = _read_attribute('#{attr_name}')
+                   @attributes_cache['#{attr_name}'] = time.acts_like?(:time) ? time.in_time_zone : time
+                 end
+@@ -41,12 +41,13 @@ module ActiveRecord
+             if create_time_zone_conversion_attribute?(attr_name, columns_hash[attr_name])
+               method_body, line = <<-EOV, __LINE__ + 1
+                 def #{attr_name}=(original_time)
+-                  time = original_time.dup unless original_time.nil?
++                  time = original_time
+                   unless time.acts_like?(:time)
+                     time = time.is_a?(String) ? Time.zone.parse(time) : time.to_time rescue time
+                   end
+                   time = time.in_time_zone rescue nil if time
+-                  write_attribute(:#{attr_name}, (time || original_time))
++                  write_attribute(:#{attr_name}, original_time)
++                  @attributes_cache["#{attr_name}"] = time
+                 end
+               EOV
+               generated_attribute_methods.module_eval(method_body, __FILE__, line)
+diff --git a/activerecord/test/cases/attribute_methods_test.rb b/activerecord/test/cases/attribute_methods_test.rb
+index dfacf58..d8638ee 100644
+--- a/activerecord/test/cases/attribute_methods_test.rb
++++ b/activerecord/test/cases/attribute_methods_test.rb
+@@ -118,22 +118,18 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_read_attributes_before_type_cast_on_datetime
+-    developer = Developer.find(:first)
+-    if current_adapter?(:Mysql2Adapter, :OracleAdapter)
+-      # Mysql2 and Oracle adapters keep the value in Time instance
+-      assert_equal developer.created_at.to_s(:db), developer.attributes_before_type_cast["created_at"].to_s(:db)
+-    else
+-      assert_equal developer.created_at.to_s(:db), developer.attributes_before_type_cast["created_at"].to_s
++    in_time_zone "Pacific Time (US & Canada)" do
++      record = @target.new
++    
++      record.written_on = "345643456"
++      assert_equal "345643456", record.written_on_before_type_cast
++      assert_equal nil, record.written_on
++    
++      record.written_on = "2009-10-11 12:13:14"
++      assert_equal "2009-10-11 12:13:14", record.written_on_before_type_cast
++      assert_equal Time.zone.parse("2009-10-11 12:13:14"), record.written_on
++      assert_equal ActiveSupport::TimeZone["Pacific Time (US & Canada)"], record.written_on.time_zone
+     end
+-
+-    developer.created_at = "345643456"
+-
+-    assert_equal developer.created_at_before_type_cast, "345643456"
+-    assert_equal developer.created_at, nil
+-
+-    developer.created_at = "2010-03-21 21:23:32"
+-    assert_equal developer.created_at_before_type_cast, "2010-03-21 21:23:32"
+-    assert_equal developer.created_at, Time.parse("2010-03-21 21:23:32")
+   end
+ 
+   def test_hash_content
+-- 
+1.7.2.3
+

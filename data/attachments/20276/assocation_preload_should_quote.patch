@@ -1,0 +1,235 @@
+From 682a8b14443ab03f73454e0c35e7f693b6cf1d2e Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Fri, 25 Apr 2008 23:23:48 +0100
+Subject: [PATCH] make association preload quote table names
+
+---
+ .../lib/active_record/association_preload.rb       |   16 +++++------
+ activerecord/test/cases/associations/eager_test.rb |   28 +++++++++++++++++++-
+ activerecord/test/fixtures/jobs.yml                |    7 +++++
+ activerecord/test/fixtures/references.yml          |   17 ++++++++++++
+ activerecord/test/models/job.rb                    |    5 +++
+ activerecord/test/models/person.rb                 |    5 +++
+ activerecord/test/models/reference.rb              |    4 +++
+ activerecord/test/schema/schema.rb                 |   11 ++++++++
+ 8 files changed, 83 insertions(+), 10 deletions(-)
+ create mode 100644 activerecord/test/fixtures/jobs.yml
+ create mode 100644 activerecord/test/fixtures/references.yml
+ create mode 100644 activerecord/test/models/job.rb
+ create mode 100644 activerecord/test/models/reference.rb
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index 7e4f7a5..55c0cdd 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -85,9 +85,8 @@ module ActiveRecord
+         return id_to_record_map, ids
+       end
+ 
+-      # FIXME: quoting
+       def preload_has_and_belongs_to_many_association(records, reflection, preload_options={})
+-        table_name = reflection.klass.table_name
++        table_name = reflection.klass.quoted_table_name
+         id_to_record_map, ids = construct_id_map(records)
+         records.each {|record| record.send(reflection.name).loaded}
+         options = reflection.options
+@@ -97,7 +96,7 @@ module ActiveRecord
+ 
+         associated_records = reflection.klass.find(:all, :conditions => [conditions, ids],
+         :include => options[:include],
+-        :joins => "INNER JOIN #{options[:join_table]} as t0 ON #{reflection.klass.table_name}.#{reflection.klass.primary_key} = t0.#{reflection.association_foreign_key}",
++        :joins => "INNER JOIN #{connection.quote_table_name options[:join_table]} as t0 ON #{reflection.klass.quoted_table_name}.#{reflection.klass.primary_key} = t0.#{reflection.association_foreign_key}",
+         :select => "#{options[:select] || table_name+'.*'}, t0.#{reflection.primary_key_name} as _parent_record_id",
+         :order => options[:order])
+ 
+@@ -157,7 +156,7 @@ module ActiveRecord
+ 
+         if reflection.options[:source_type]
+           interface = reflection.source_reflection.options[:foreign_type]
+-          preload_options = {:conditions => ["#{interface} = ?", reflection.options[:source_type]]}
++          preload_options = {:conditions => ["#{connection.quote_column_name interface} = ?", reflection.options[:source_type]]}
+ 
+           records.compact!
+           records.first.class.preload_associations(records, through_association, preload_options)
+@@ -216,7 +215,7 @@ module ActiveRecord
+           klass_name, id_map = *klass_and_id
+           klass = klass_name.constantize
+ 
+-          table_name = klass.table_name
++          table_name = klass.quoted_table_name
+           primary_key = klass.primary_key
+           conditions = "#{table_name}.#{primary_key} IN (?)"
+           conditions << append_conditions(options, preload_options)
+@@ -229,16 +228,15 @@ module ActiveRecord
+         end
+       end
+ 
+-      # FIXME: quoting
+       def find_associated_records(ids, reflection, preload_options)
+         options = reflection.options
+-        table_name = reflection.klass.table_name
++        table_name = reflection.klass.quoted_table_name
+ 
+         if interface = reflection.options[:as]
+-          conditions = "#{reflection.klass.table_name}.#{interface}_id IN (?) and #{reflection.klass.table_name}.#{interface}_type = '#{self.base_class.name.demodulize}'"
++          conditions = "#{reflection.klass.quoted_table_name}.#{connection.quote_column_name "#{interface}_id"} IN (?) and #{reflection.klass.quoted_table_name}.#{connection.quote_column_name "#{interface}_type"} = '#{self.base_class.name.demodulize}'"
+         else
+           foreign_key = reflection.primary_key_name
+-          conditions = "#{reflection.klass.table_name}.#{foreign_key} IN (?)"
++          conditions = "#{reflection.klass.quoted_table_name}.#{foreign_key} IN (?)"
+         end
+ 
+         conditions << append_conditions(options, preload_options)
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 0bc3454..d7f526e 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -9,11 +9,13 @@ require 'models/person'
+ require 'models/reader'
+ require 'models/owner'
+ require 'models/pet'
++require 'models/reference'
++require 'models/job'
+ 
+ class EagerAssociationTest < ActiveRecord::TestCase
+   fixtures :posts, :comments, :authors, :categories, :categories_posts,
+             :companies, :accounts, :tags, :taggings, :people, :readers,
+-            :owners, :pets, :author_favorites
++            :owners, :pets, :author_favorites, :jobs, :references
+ 
+   def test_loading_with_one_association
+     posts = Post.find(:all, :include => :comments)
+@@ -194,6 +196,30 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_equal authors(:mary), assert_no_queries { author_favorite.favorite_author }
+   end
+ 
++  def test_eager_load_belongs_to_quotes_table_and_column_names
++    job = Job.find jobs(:unicyclist).id, :include => :ideal_reference
++    references(:michael_unicyclist)
++    assert_no_queries{ assert_equal references(:michael_unicyclist), job.ideal_reference}
++  end
++
++  def test_eager_load_has_one_quotes_table_and_column_names
++    michael = Person.find(people(:michael), :include => :favourite_reference)
++    references(:michael_unicyclist)
++    assert_no_queries{ assert_equal references(:michael_unicyclist), michael.favourite_reference}
++  end
++
++  def test_eager_load_has_many_quotes_table_and_column_names
++    michael = Person.find(people(:michael), :include => :references)
++    references(:michael_magician,:michael_unicyclist)
++    assert_no_queries{ assert_equal references(:michael_magician,:michael_unicyclist), michael.references.sort_by(&:id) }
++  end
++
++  def test_eager_load_has_many_through_quotes_table_and_column_names
++    michael = Person.find(people(:michael), :include => :jobs)
++    jobs(:magician, :unicyclist)
++    assert_no_queries{ assert_equal jobs(:unicyclist, :magician), michael.jobs.sort_by(&:id) }
++  end
++  
+   def test_eager_association_loading_with_explicit_join
+     posts = Post.find(:all, :include => :comments, :joins => "INNER JOIN authors ON posts.author_id = authors.id AND authors.name = 'Mary'", :limit => 1, :order => 'author_id')
+     assert_equal 1, posts.length
+diff --git a/activerecord/test/fixtures/jobs.yml b/activerecord/test/fixtures/jobs.yml
+new file mode 100644
+index 0000000..f5775d2
+--- /dev/null
++++ b/activerecord/test/fixtures/jobs.yml
+@@ -0,0 +1,7 @@
++unicyclist:
++  id: 1
++  ideal_reference_id: 2
++clown:
++  id: 2
++magician:
++  id: 3
+diff --git a/activerecord/test/fixtures/references.yml b/activerecord/test/fixtures/references.yml
+new file mode 100644
+index 0000000..e0a99af
+--- /dev/null
++++ b/activerecord/test/fixtures/references.yml
+@@ -0,0 +1,17 @@
++michael_magician:
++  id: 1
++  person_id: 1
++  job_id: 3
++  favourite: false
++  
++michael_unicyclist:
++  id: 2
++  person_id: 1
++  job_id: 1
++  favourite: true
++    
++david_unicyclist:
++  id: 3
++  person_id: 2
++  job_id: 1
++  favourite: false
+diff --git a/activerecord/test/models/job.rb b/activerecord/test/models/job.rb
+new file mode 100644
+index 0000000..3333a02
+--- /dev/null
++++ b/activerecord/test/models/job.rb
+@@ -0,0 +1,5 @@
++class Job < ActiveRecord::Base
++  has_many :references
++  has_many :people, :through => :references
++  belongs_to :ideal_reference, :class_name => 'Reference'
++end
+diff --git a/activerecord/test/models/person.rb b/activerecord/test/models/person.rb
+index 366f9fb..4f4d695 100644
+--- a/activerecord/test/models/person.rb
++++ b/activerecord/test/models/person.rb
+@@ -2,4 +2,9 @@ class Person < ActiveRecord::Base
+   has_many :readers
+   has_many :posts, :through => :readers
+   has_many :posts_with_no_comments, :through => :readers, :source => :post, :include => :comments, :conditions => 'comments.id is null'
++
++  has_many :references
++  has_many :jobs, :through => :references
++  has_one :favourite_reference, :class_name => 'Reference', :conditions => ['favourite=?', true]
++
+ end
+diff --git a/activerecord/test/models/reference.rb b/activerecord/test/models/reference.rb
+new file mode 100644
+index 0000000..479e8b7
+--- /dev/null
++++ b/activerecord/test/models/reference.rb
+@@ -0,0 +1,4 @@
++class Reference < ActiveRecord::Base
++  belongs_to :person
++  belongs_to :job
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 2e78844..daec6cf 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -162,6 +162,11 @@ ActiveRecord::Schema.define do
+     t.column :type, :string
+   end
+ 
++  
++  create_table :jobs, :force => true do |t|
++    t.integer :ideal_reference_id
++  end
++  
+   create_table :keyboards, :force => true, :id  => false do |t|
+     t.primary_key :key_number
+     t.string      :name
+@@ -197,6 +202,12 @@ ActiveRecord::Schema.define do
+     t.string :type
+   end
+ 
++  create_table :references, :force => true do |t|
++    t.integer :person_id
++    t.integer :job_id
++    t.boolean :favourite
++  end
++    
+   create_table :minimalistics, :force => true do |t|
+   end
+ 
+-- 
+1.5.4.4
+

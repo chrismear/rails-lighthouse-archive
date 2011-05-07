@@ -1,0 +1,223 @@
+From 0b69e3762ae332aff88ab32b758c1b79e98b033a Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Sat, 30 Oct 2010 12:10:23 -0400
+Subject: [PATCH] Fix issues when including the same association multiple times and mixing joins/includes together.
+
+---
+ activerecord/lib/active_record/associations.rb     |   64 ++++++++++++++------
+ .../lib/active_record/relation/query_methods.rb    |   10 ++--
+ .../associations/cascaded_eager_loading_test.rb    |   26 ++++++++
+ 3 files changed, 76 insertions(+), 24 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index ad9b077..44e54c4 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1840,7 +1840,7 @@ module ActiveRecord
+ 
+           def initialize(base, associations, joins)
+             @joins                 = [JoinBase.new(base, joins)]
+-            @associations          = associations
++            @associations          = {}
+             @reflections           = []
+             @base_records_hash     = {}
+             @base_records_in_order = []
+@@ -1852,7 +1852,7 @@ module ActiveRecord
+           def graft(*associations)
+             associations.each do |association|
+               join_associations.detect {|a| association == a} ||
+-              build(association.reflection.name, association.find_parent_in(self) || join_base, association.join_class)
++              build(association.reflection.name, association.find_parent_in(self) || join_base, association.join_type)
+             end
+             self
+           end
+@@ -1920,28 +1920,57 @@ module ActiveRecord
+ 
+           protected
+ 
+-            def build(associations, parent = nil, join_class = Arel::InnerJoin)
++            def cache_joined_association(association)
++              associations = []
++              parent = association.parent
++              while parent != join_base
++                associations.unshift(parent.reflection.name)
++                parent = parent.parent
++              end
++              ref = @associations
++              associations.each do |key|
++                ref = ref[key]
++              end
++              ref[association.reflection.name] ||= {}
++            end
++
++            def build(associations, parent = nil, join_type = Arel::InnerJoin)
+               parent ||= @joins.last
+               case associations
+                 when Symbol, String
+                   reflection = parent.reflections[associations.to_s.intern] or
+                   raise ConfigurationError, "Association named '#{ associations }' was not found; perhaps you misspelled it?"
+-                  @reflections << reflection
+-                  @joins << build_join_association(reflection, parent).with_join_class(join_class)
++                  unless join_association = find_join_association(reflection, parent)
++                    @reflections << reflection
++                    join_association = build_join_association(reflection, parent)
++                    join_association.join_type = join_type
++                    @joins << join_association
++                    cache_joined_association(join_association)
++                  end
++                  join_association
+                 when Array
+                   associations.each do |association|
+-                    build(association, parent, join_class)
++                    build(association, parent, join_type)
+                   end
+                 when Hash
+                   associations.keys.sort{|a,b|a.to_s<=>b.to_s}.each do |name|
+-                    build(name, parent, join_class)
+-                    build(associations[name], nil, join_class)
++                    join_association = build(name, parent, join_type)
++                    build(associations[name], join_association, join_type)
+                   end
+                 else
+                   raise ConfigurationError, associations.inspect
+               end
+             end
+ 
++            def find_join_association(name_or_reflection, parent)
++              case name_or_reflection
++              when Symbol, String
++                join_associations.detect {|j| (j.reflection.name == name_or_reflection.to_s.intern) && (j.parent == parent)}
++              else
++                join_associations.detect {|j| (j.reflection == name_or_reflection) && (j.parent == parent)}
++              end
++            end
++
+             def remove_uniq_by_reflection(reflection, records)
+               if reflection && reflection.collection?
+                 records.each { |record| record.send(reflection.name).target.uniq! }
+@@ -2020,8 +2049,7 @@ module ActiveRecord
+ 
+             def ==(other)
+               other.class == self.class &&
+-              other.active_record == active_record &&
+-              other.table_joins == table_joins
++              other.active_record == active_record
+             end
+ 
+             def aliased_prefix
+@@ -2062,7 +2090,9 @@ module ActiveRecord
+           end
+ 
+           class JoinAssociation < JoinBase # :nodoc:
+-            attr_reader :reflection, :parent, :aliased_table_name, :aliased_prefix, :aliased_join_table_name, :parent_table_name, :join_class
++            attr_reader :reflection, :parent, :aliased_table_name, :aliased_prefix, :aliased_join_table_name, :parent_table_name
++            # What type of join will be generated, either Arel::InnerJoin (default) or Arel::OuterJoin
++            attr_accessor :join_type
+             delegate    :options, :klass, :through_reflection, :source_reflection, :to => :reflection
+ 
+             def initialize(reflection, join_dependency, parent = nil)
+@@ -2079,7 +2109,7 @@ module ActiveRecord
+               @parent_table_name  = parent.active_record.table_name
+               @aliased_table_name = aliased_table_name_for(table_name)
+               @join               = nil
+-              @join_class         = Arel::InnerJoin
++              @join_type          = Arel::InnerJoin
+ 
+               if reflection.macro == :has_and_belongs_to_many
+                 @aliased_join_table_name = aliased_table_name_for(reflection.options[:join_table], "_join")
+@@ -2102,11 +2132,6 @@ module ActiveRecord
+               end
+             end
+ 
+-            def with_join_class(join_class)
+-              @join_class = join_class
+-              self
+-            end
+-
+             def association_join
+               return @join if @join
+ 
+@@ -2212,8 +2237,9 @@ module ActiveRecord
+               end
+             end
+ 
+-            def join_relation(joining_relation, join = nil)
+-              joining_relation.joins(self.with_join_class(Arel::OuterJoin))
++            def join_relation(joining_relation)
++              self.join_type = Arel::OuterJoin
++              joining_relation.joins(self)
+             end
+ 
+             protected
+diff --git a/activerecord/lib/active_record/relation/query_methods.rb b/activerecord/lib/active_record/relation/query_methods.rb
+index 2f1bc96..926f471 100644
+--- a/activerecord/lib/active_record/relation/query_methods.rb
++++ b/activerecord/lib/active_record/relation/query_methods.rb
+@@ -236,15 +236,15 @@ module ActiveRecord
+ 
+       join_dependency.join_associations.each do |association|
+         if (association_relation = association.relation).is_a?(Array)
+-          to_join << [association_relation.first, association.join_class, association.association_join.first]
+-          to_join << [association_relation.last, association.join_class, association.association_join.last]
++          to_join << [association_relation.first, association.join_type, association.association_join.first]
++          to_join << [association_relation.last, association.join_type, association.association_join.last]
+         else
+-          to_join << [association_relation, association.join_class, association.association_join]
++          to_join << [association_relation, association.join_type, association.association_join]
+         end
+       end
+ 
+-      to_join.uniq.each do |left, join_class, right|
+-        relation = relation.join(left, join_class).on(*right)
++      to_join.uniq.each do |left, join_type, right|
++        relation = relation.join(left, join_type).on(*right)
+       end
+ 
+       relation.join(custom_joins)
+diff --git a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+index b93e496..d166f6d 100644
+--- a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
++++ b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+@@ -3,6 +3,7 @@ require 'models/post'
+ require 'models/comment'
+ require 'models/author'
+ require 'models/categorization'
++require 'models/category'
+ require 'models/company'
+ require 'models/topic'
+ require 'models/reply'
+@@ -45,6 +46,31 @@ class CascadedEagerLoadingTest < ActiveRecord::TestCase
+     assert_equal people(:michael), Person.eager_load(:primary_contact => :primary_contact).where('primary_contacts_people_2.first_name = ?', 'Susan').order('people.id').first
+   end
+ 
++  def test_cascaded_eager_association_loading_with_join_for_count
++    categories = Category.joins(:categorizations).includes([{:posts=>:comments}, :authors])
++
++    assert_nothing_raised do
++      assert_equal 2, categories.count
++      assert_equal 2, categories.all.uniq.size # Must uniq since instantiating with inner joins will get dupes
++    end
++  end
++
++  def test_cascaded_eager_association_loading_with_duplicated_includes
++    categories = Category.includes(:categorizations).includes(:categorizations => :author).where("categorizations.id is not null")
++    assert_nothing_raised do
++      assert_equal 2, categories.count
++      assert_equal 2, categories.all.size
++    end
++  end
++
++  def test_cascaded_eager_association_loading_with_twice_includes_edge_cases
++    categories = Category.includes(:categorizations => :author).includes(:categorizations => :post).where("posts.id is not null")
++    assert_nothing_raised do
++      assert_equal 2, categories.count
++      assert_equal 2, categories.all.size
++    end
++  end
++
+   def test_eager_association_loading_with_join_for_count
+     authors = Author.joins(:special_posts).includes([:posts, :categorizations])
+ 
+-- 
+1.7.2.2
+

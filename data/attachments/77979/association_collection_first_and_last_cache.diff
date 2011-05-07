@@ -1,0 +1,494 @@
+From 154be2f0625cf0447d001d4985bda11c3bfebaee Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 13 Jan 2009 01:11:55 +0100
+Subject: [PATCH] Cache the first and last records and replace them in the collection of load_target.
+
+---
+ .../associations/association_collection.rb         |    8 +++-
+ .../associations/has_many_associations_test.rb     |   40 ++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0fefec1..52a78b3 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -64,7 +64,7 @@ module ActiveRecord
+       # Fetches the first one using SQL if possible.
+       def first(*args)
+         if fetch_first_or_last_using_find?(args)
+-          find(:first, *args)
++          @first = find(:first, *args)
+         else
+           load_target unless loaded?
+           @target.first(*args)
+@@ -74,7 +74,7 @@ module ActiveRecord
+       # Fetches the last one using SQL if possible.
+       def last(*args)
+         if fetch_first_or_last_using_find?(args)
+-          find(:last, *args)
++          @last = find(:last, *args)
+         else
+           load_target unless loaded?
+           @target.last(*args)
+@@ -93,6 +93,7 @@ module ActiveRecord
+       def reset
+         reset_target!
+         @loaded = false
++        @first = @last = nil
+       end
+ 
+       def build(attributes = {}, &block)
+@@ -346,6 +347,9 @@ module ActiveRecord
+                   @target = find_target + @target.find_all {|t| t.new_record? }
+                 else
+                   @target = find_target
++                  @target[@target.index(@first)] = @first if @first
++                  @target[@target.index(@last)] = @last if @last
++                  @target
+                 end
+               end
+             rescue ActiveRecord::RecordNotFound
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index a5ae5cd..45c1b2e 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1078,6 +1078,46 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert firm.clients.loaded?
+   end
+ 
++  def test_calling_first_or_last_then_load_target_should_not_replace_first_or_last_object
++    firm = companies(:first_firm)
++
++    # why the extra show fields ?
++    # because first/last and load_target both query for it...
++    assert_queries 4 do
++      expected = firm.clients.first.object_id
++      firm.clients.class # force load target
++      result = firm.clients.first.object_id
++
++      assert_equal expected, result
++    end
++
++    firm.clients.reset
++
++    assert_queries 2 do
++      expected = firm.clients.last.object_id
++      firm.clients.class # force load target
++      result = firm.clients.last.object_id
++
++      assert_equal expected, result
++    end
++  end
++
++  def test_calling_reset_should_clear_the_first_and_last_cache
++    firm = companies(:first_firm)
++    def (firm.clients).first_ivar; @first end
++    def (firm.clients).last_ivar; @last end
++
++    firm.clients.first
++    firm.clients.reset
++    assert_nil firm.clients.first_ivar
++
++    firm.clients.reset
++
++    firm.clients.last
++    firm.clients.reset
++    assert_nil firm.clients.last_ivar
++  end
++
+   def test_joins_with_namespaced_model_should_use_correct_type
+     old = ActiveRecord::Base.store_full_sti_class
+     ActiveRecord::Base.store_full_sti_class = true
+-- 
+1.5.5.3
+
+
+From febf7af29a0184f12a9b0cd44db72439f63bae61 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 13 Jan 2009 19:33:16 +0100
+Subject: [PATCH] AssociationCollection#first and #last returns the same object if called twice without arguments.
+
+Cleaned tests.
+---
+ .../associations/association_collection.rb         |   12 +++--
+ .../associations/has_many_associations_test.rb     |   46 +++++++++++---------
+ 2 files changed, 33 insertions(+), 25 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 52a78b3..e54c378 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -63,8 +63,10 @@ module ActiveRecord
+       
+       # Fetches the first one using SQL if possible.
+       def first(*args)
+-        if fetch_first_or_last_using_find?(args)
++        if fetch_first_or_last_using_find?(@first, args)
+           @first = find(:first, *args)
++        elsif @first
++          @first
+         else
+           load_target unless loaded?
+           @target.first(*args)
+@@ -73,8 +75,10 @@ module ActiveRecord
+ 
+       # Fetches the last one using SQL if possible.
+       def last(*args)
+-        if fetch_first_or_last_using_find?(args)
++        if fetch_first_or_last_using_find?(@last, args)
+           @last = find(:last, *args)
++        elsif @last
++          @last
+         else
+           load_target unless loaded?
+           @target.last(*args)
+@@ -452,8 +456,8 @@ module ActiveRecord
+           end
+         end
+ 
+-        def fetch_first_or_last_using_find?(args)
+-          args.first.kind_of?(Hash) || !(loaded? || @owner.new_record? || @reflection.options[:finder_sql] ||
++        def fetch_first_or_last_using_find?(record, args)
++          args.first.kind_of?(Hash) || !(record || loaded? || @owner.new_record? || @reflection.options[:finder_sql] ||
+                                          @target.any? { |record| record.new_record? } || args.first.kind_of?(Integer))
+         end
+     end
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 45c1b2e..0fc7475 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1079,43 +1079,47 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_calling_first_or_last_then_load_target_should_not_replace_first_or_last_object
+-    firm = companies(:first_firm)
++    clients = companies(:first_firm).clients
+ 
+-    # why the extra show fields ?
+-    # because first/last and load_target both query for it...
+-    assert_queries 4 do
+-      expected = firm.clients.first.object_id
+-      firm.clients.class # force load target
+-      result = firm.clients.first.object_id
++    assert_queries 2 do
++      expected = clients.first.object_id
++      clients.class # force load target
++      result = clients.first.object_id
+ 
+       assert_equal expected, result
+     end
+ 
+-    firm.clients.reset
++    clients.reset
+ 
+     assert_queries 2 do
+-      expected = firm.clients.last.object_id
+-      firm.clients.class # force load target
+-      result = firm.clients.last.object_id
++      expected = clients.last.object_id
++      clients.class # force load target
++      result = clients.last.object_id
+ 
+       assert_equal expected, result
+     end
+   end
++  
++  def test_calling_first_or_last_twice_should_return_the_same_objects
++    clients = companies(:first_firm).clients
++    assert_equal clients.first.object_id, clients.first.object_id
++    assert_equal clients.last.object_id,  clients.last.object_id
++  end
+ 
+   def test_calling_reset_should_clear_the_first_and_last_cache
+-    firm = companies(:first_firm)
+-    def (firm.clients).first_ivar; @first end
+-    def (firm.clients).last_ivar; @last end
++    clients = companies(:first_firm).clients
++    def clients.first_ivar; @first end
++    def clients.last_ivar; @last end
+ 
+-    firm.clients.first
+-    firm.clients.reset
+-    assert_nil firm.clients.first_ivar
++    clients.first
++    clients.reset
++    assert_nil clients.first_ivar
+ 
+-    firm.clients.reset
++    clients.reset
+ 
+-    firm.clients.last
+-    firm.clients.reset
+-    assert_nil firm.clients.last_ivar
++    clients.last
++    clients.reset
++    assert_nil clients.last_ivar
+   end
+ 
+   def test_joins_with_namespaced_model_should_use_correct_type
+-- 
+1.5.5.3
+
+
+From de0d023288c53acfceda04b7becf1440695a11da Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 13 Jan 2009 19:36:13 +0100
+Subject: [PATCH] Added test that calling AssociationProxy #first and #last a second time with arguments should not return the same objects.
+
+---
+ .../associations/has_many_associations_test.rb     |    6 ++++++
+ 1 files changed, 6 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 0fc7475..f244da5 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1106,6 +1106,12 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal clients.last.object_id,  clients.last.object_id
+   end
+ 
++  def test_calling_first_or_last_a_second_time_with_arguments_should_not_return_the_same_object
++    clients = companies(:first_firm).clients
++    assert_not_equal clients.first.object_id, clients.first(:order => :name).object_id
++    assert_not_equal clients.last.object_id,  clients.last(:order => :name).object_id
++  end
++
+   def test_calling_reset_should_clear_the_first_and_last_cache
+     clients = companies(:first_firm).clients
+     def clients.first_ivar; @first end
+-- 
+1.5.5.3
+
+
+From 4228636e8e4901213d5a34fae76e81641234f7ee Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 13 Jan 2009 20:06:08 +0100
+Subject: [PATCH] Make sure the first and last cache is cleared if the object is not present in the target.
+
+---
+ .../associations/association_collection.rb         |   11 +++++++-
+ .../associations/has_many_associations_test.rb     |   26 ++++++++++++++++++++
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index e54c378..a36052c 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -351,8 +351,8 @@ module ActiveRecord
+                   @target = find_target + @target.find_all {|t| t.new_record? }
+                 else
+                   @target = find_target
+-                  @target[@target.index(@first)] = @first if @first
+-                  @target[@target.index(@last)] = @last if @last
++                  @first  = replace_in_target(@first)
++                  @last   = replace_in_target(@last)
+                   @target
+                 end
+               end
+@@ -460,6 +460,13 @@ module ActiveRecord
+           args.first.kind_of?(Hash) || !(record || loaded? || @owner.new_record? || @reflection.options[:finder_sql] ||
+                                          @target.any? { |record| record.new_record? } || args.first.kind_of?(Integer))
+         end
++
++        # Returns the +record+ if it was replaced or +nil+ otherwise.
++        def replace_in_target(record)
++          if record && index = @target.index(record)
++            @target[index] = record
++          end
++        end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index f244da5..545831e 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1112,8 +1112,34 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_not_equal clients.last.object_id,  clients.last(:order => :name).object_id
+   end
+ 
++  def test_calling_first_then_load_target_should_clear_the_first_cache_if_not_in_the_result_set
++    clients = companies(:first_firm).clients
++    first = clients.first
++
++    # add singleton methods to get the ivar and stub find_target
++    def clients.first_ivar; @first end
++    def clients.find_target; [] end
++
++    clients.class # force load target
++    assert_nil clients.first_ivar
++  end
++
++  def test_calling_last_then_load_target_should_clear_the_last_cache_if_not_in_the_result_set
++    clients = companies(:first_firm).clients
++    last = clients.last
++
++    # add singleton methods to get the ivar and stub find_target
++    def clients.last_ivar; @last end
++    def clients.find_target; [] end
++
++    clients.class # force load target
++    assert_nil clients.last_ivar
++  end
++
+   def test_calling_reset_should_clear_the_first_and_last_cache
+     clients = companies(:first_firm).clients
++
++    # add singleton methods to get the ivars
+     def clients.first_ivar; @first end
+     def clients.last_ivar; @last end
+ 
+-- 
+1.5.5.3
+
+
+From 8fbf8fb2451ce81bdf201992bff6301c0435bec3 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 13 Jan 2009 20:21:13 +0100
+Subject: [PATCH] Make sure that calling AssociationCollection #first or #last always clears the first and last cache.
+
+---
+ .../associations/association_collection.rb         |    8 ++++++--
+ .../associations/has_many_associations_test.rb     |    6 ++++++
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index a36052c..7d12b01 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -64,7 +64,9 @@ module ActiveRecord
+       # Fetches the first one using SQL if possible.
+       def first(*args)
+         if fetch_first_or_last_using_find?(@first, args)
+-          @first = find(:first, *args)
++          record = find(:first, *args)
++          @first = args.first.is_a?(Hash) ? nil : record
++          record
+         elsif @first
+           @first
+         else
+@@ -76,7 +78,9 @@ module ActiveRecord
+       # Fetches the last one using SQL if possible.
+       def last(*args)
+         if fetch_first_or_last_using_find?(@last, args)
+-          @last = find(:last, *args)
++          record = find(:last, *args)
++          @last = args.first.is_a?(Hash) ? nil : record
++          record
+         elsif @last
+           @last
+         else
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 545831e..b03c5cc 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1112,6 +1112,12 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_not_equal clients.last.object_id,  clients.last(:order => :name).object_id
+   end
+ 
++  def test_calling_first_or_last_with_arguments_and_a_second_time_without_should_not_return_the_same_object
++    clients = companies(:first_firm).clients
++    assert_not_equal clients.first(:order => :name).object_id, clients.first.object_id
++    assert_not_equal clients.last(:order => :name).object_id,  clients.last.object_id
++  end
++
+   def test_calling_first_then_load_target_should_clear_the_first_cache_if_not_in_the_result_set
+     clients = companies(:first_firm).clients
+     first = clients.first
+-- 
+1.5.5.3
+
+
+From 9adc7b635d93a6aac7d55203d73e81001440f4a6 Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 13 Jan 2009 20:32:03 +0100
+Subject: [PATCH] Added documentation about AssociationCollection #first and #last caching.
+
+---
+ .../associations/association_collection.rb         |   20 ++++++++++++++++++++
+ 1 files changed, 20 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 7d12b01..1d04f70 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -62,6 +62,16 @@ module ActiveRecord
+       end
+       
+       # Fetches the first one using SQL if possible.
++      #
++      # It will always return the same instance, unless first is called with
++      # arguments
++      #
++      # If the target is loaded _after_ first _and_ the record is present in
++      # the target, it will replace the new instance. Thus always yielding the
++      # same instance.
++      #
++      #   firm.clients.first.object_id # => 297990
++      #   firm.clients.map(&:object_id) # => [297990, 287070]
+       def first(*args)
+         if fetch_first_or_last_using_find?(@first, args)
+           record = find(:first, *args)
+@@ -76,6 +86,16 @@ module ActiveRecord
+       end
+ 
+       # Fetches the last one using SQL if possible.
++      #
++      # It will always return the same instance, unless last is called with
++      # arguments
++      #
++      # If the target is loaded _after_ last _and_ the record is present in the
++      # target, it will replace the new instance. Thus always yielding the same
++      # instance.
++      #
++      #   firm.clients.last.object_id # => 297990
++      #   firm.clients.last(&:object_id) # => [297990, 287070]
+       def last(*args)
+         if fetch_first_or_last_using_find?(@last, args)
+           record = find(:last, *args)
+-- 
+1.5.5.3
+
+
+From bf127cd9397762ce8754d81bbbdae8db83bd909d Mon Sep 17 00:00:00 2001
+From: Eloy Duran <eloy.de.enige@gmail.com>
+Date: Tue, 13 Jan 2009 20:33:42 +0100
+Subject: [PATCH] Forgot to save before committing.
+
+---
+ .../associations/association_collection.rb         |   10 ++++------
+ 1 files changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 1d04f70..301d962 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -61,10 +61,9 @@ module ActiveRecord
+         end
+       end
+       
+-      # Fetches the first one using SQL if possible.
++      # Fetches the first record using SQL if possible.
+       #
+-      # It will always return the same instance, unless first is called with
+-      # arguments
++      # It will always return the same instance, unless called with arguments.
+       #
+       # If the target is loaded _after_ first _and_ the record is present in
+       # the target, it will replace the new instance. Thus always yielding the
+@@ -85,10 +84,9 @@ module ActiveRecord
+         end
+       end
+ 
+-      # Fetches the last one using SQL if possible.
++      # Fetches the last record using SQL if possible.
+       #
+-      # It will always return the same instance, unless last is called with
+-      # arguments
++      # It will always return the same instance, unless called with arguments.
+       #
+       # If the target is loaded _after_ last _and_ the record is present in the
+       # target, it will replace the new instance. Thus always yielding the same
+-- 
+1.5.5.3
+

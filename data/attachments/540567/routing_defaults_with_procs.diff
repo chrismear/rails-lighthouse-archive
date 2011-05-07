@@ -1,0 +1,150 @@
+From b2473c82168c98b7ef3ee794b0cff0b5fb20372c Mon Sep 17 00:00:00 2001
+From: Szymon Nowak <szimek@gmail.com>
+Date: Mon, 31 May 2010 14:01:18 +0200
+Subject: [PATCH] Allow to use procs when specifying defaults for routes.
+
+Example:
+scope "/:locale", :defaults => { :locale => Proc.new { I18n.locale } } do
+  resources :pages
+end
+
+page_path(5) => "/en/pages/5"
+page_path(5, :locale => :de) => "/de/pages/5"
+---
+ actionpack/lib/action_dispatch/routing/route.rb    |   22 ++++++++++++++
+ .../lib/action_dispatch/routing/route_set.rb       |   30 ++++++++++++-------
+ actionpack/test/dispatch/routing_test.rb           |    8 +++++
+ 3 files changed, 49 insertions(+), 11 deletions(-)
+
+diff --git a/actionpack/lib/action_dispatch/routing/route.rb b/actionpack/lib/action_dispatch/routing/route.rb
+index 6f37ead..829ca4b 100644
+--- a/actionpack/lib/action_dispatch/routing/route.rb
++++ b/actionpack/lib/action_dispatch/routing/route.rb
+@@ -41,6 +41,28 @@ module ActionDispatch
+         @segment_keys ||= conditions[:path_info].names.compact.map { |key| key.to_sym }
+       end
+ 
++      def required_with_default_segment_keys
++        @required_with_default_segment_keys ||= begin
++          required_defaults = @defaults.dup
++          required_defaults.delete(:controller)
++          required_defaults.delete(:action)
++
++          non_optional_segment_keys = path.sub(/\(.+\)/, "").sub(/^\//, "").split("/")
++
++          mark_as_optional = true
++          required_dynamic_segment_keys = []
++          non_optional_segment_keys.reverse_each do |key|
++            is_dynamic = !!(key =~ /^:/)
++            mark_as_optional  &&= is_dynamic
++            if is_dynamic && !mark_as_optional
++              required_dynamic_segment_keys << key[1..-1].to_sym
++            end
++          end
++
++          required_defaults.keys & required_dynamic_segment_keys
++        end
++      end
++
+       def to_a
+         [@app, @conditions, @defaults, @name]
+       end
+diff --git a/actionpack/lib/action_dispatch/routing/route_set.rb b/actionpack/lib/action_dispatch/routing/route_set.rb
+index 0d071dd..17f20ec 100644
+--- a/actionpack/lib/action_dispatch/routing/route_set.rb
++++ b/actionpack/lib/action_dispatch/routing/route_set.rb
+@@ -139,12 +139,12 @@ module ActionDispatch
+             selector = hash_access_name(name, kind)
+ 
+             # We use module_eval to avoid leaks
+-            @module.module_eval <<-END_EVAL, __FILE__, __LINE__ + 1
+-              def #{selector}(options = nil)                                      # def hash_for_users_url(options = nil)
+-                options ? #{options.inspect}.merge(options) : #{options.inspect}  #   options ? {:only_path=>false}.merge(options) : {:only_path=>false}
++            @module.module_eval do
++              define_method(selector) do |*args|                                  # def hash_for_users_url(*args)
++                args.first ? options.merge(args.first) : options                  #   args.first ? {:only_path=>false}.merge(args.first) : {:only_path=>false}
+               end                                                                 # end
+-              protected :#{selector}                                              # protected :hash_for_users_url
+-            END_EVAL
++              protected selector                                                  # protected :hash_for_users_url
++            end
+             helpers << selector
+           end
+ 
+@@ -165,19 +165,19 @@ module ActionDispatch
+             selector = url_helper_name(name, kind)
+             hash_access_method = hash_access_name(name, kind)
+ 
+-            @module.module_eval <<-END_EVAL, __FILE__, __LINE__ + 1
+-              def #{selector}(*args)
+-                options =  #{hash_access_method}(args.extract_options!)
++            @module.module_eval do
++              define_method(selector) do |*args|
++                options =  send(hash_access_method, args.extract_options!)
+ 
+                 if args.any?
+                   options[:_positional_args] = args
+-                  options[:_positional_keys] = #{route.segment_keys.inspect}
++                  options[:_positional_keys] = route.segment_keys - route.required_with_default_segment_keys
+                 end
+ 
+                 url_for(options)
+               end
+-              protected :#{selector}
+-            END_EVAL
++              protected selector
++            end
+             helpers << selector
+           end
+       end
+@@ -297,6 +297,7 @@ module ActionDispatch
+           use_relative_controller!
+           controller.sub!(%r{^/}, '') if controller
+           handle_nil_action!
++          evaluate_default_options!
+         end
+ 
+         def controller
+@@ -366,6 +367,13 @@ module ActionDispatch
+           recall[:action] = options.delete(:action) if options[:action] == 'index'
+         end
+ 
++        def evaluate_default_options!
++          @options = options.inject({}) do |h, (k, v)|
++            h[k] = v.is_a?(Proc) ? v.call : v
++            h
++          end
++        end
++
+         def generate
+           error = ActionController::RoutingError.new("No route matches #{options.inspect}")
+           path, params = @set.generate(:path_info, named_route, options, recall, opts)
+diff --git a/actionpack/test/dispatch/routing_test.rb b/actionpack/test/dispatch/routing_test.rb
+index 180889d..b6df369 100644
+--- a/actionpack/test/dispatch/routing_test.rb
++++ b/actionpack/test/dispatch/routing_test.rb
+@@ -138,6 +138,7 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+       # default params
+       match 'inline_pages/(:id)', :to => 'pages#show', :id => 'home'
+       match 'default_pages/(:id)', :to => 'pages#show', :defaults => { :id => 'home' }
++      match ':locale/:book/pages/(:id)', :to => 'pages#show', :as => :page, :defaults => { :locale => Proc.new { I18n.locale }, :id => 'home' }
+       defaults :id => 'home' do
+         match 'scoped_pages/(:id)', :to => 'pages#show'
+       end
+@@ -957,6 +958,13 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+ 
+       get '/scoped_pages'
+       assert_equal 'home', @request.params[:id]
++
++      get '/en/catch-22/pages'
++      assert_equal 'en',   @request.params[:locale]
++      assert_equal 'home', @request.params[:id]
++
++      assert_equal '/en/catch-22/pages', page_path("catch-22")
++      assert_equal '/de/catch-22/pages', page_path("catch-22", :locale => :de)
+     end
+   end
+ 
+-- 
+1.7.1
+

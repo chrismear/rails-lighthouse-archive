@@ -1,0 +1,158 @@
+From 033ca74f513c558b37da7b2513829a79dcb1a903 Mon Sep 17 00:00:00 2001
+From: Matt Bauer <bauer@Mosquito.local>
+Date: Sat, 20 Dec 2008 12:47:25 -0600
+Subject: [PATCH] Added reset! and reset? to SessionHash
+
+---
+ actionpack/lib/action_controller/rack_process.rb   |    4 ++--
+ .../action_controller/session/abstract_store.rb    |   15 +++++++++++++--
+ .../lib/action_controller/session/cookie_store.rb  |    2 +-
+ .../test/controller/session/cookie_store_test.rb   |   17 +++++++++++++++++
+ .../controller/session/mem_cache_store_test.rb     |   18 ++++++++++++++++++
+ 5 files changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/rack_process.rb b/actionpack/lib/action_controller/rack_process.rb
+index 8c6db91..e37c34e 100644
+--- a/actionpack/lib/action_controller/rack_process.rb
++++ b/actionpack/lib/action_controller/rack_process.rb
+@@ -63,11 +63,11 @@ module ActionController #:nodoc:
+     end
+ 
+     def session
+-      @env['rack.session'] ||= {}
++      @env['rack.session'] ||= Session::AbstractStore::SessionHash.new(nil, {})
+     end
+ 
+     def reset_session
+-      @env['rack.session'] = {}
++      @env['rack.session'].reset!
+     end
+   end
+ end
+diff --git a/actionpack/lib/action_controller/session/abstract_store.rb b/actionpack/lib/action_controller/session/abstract_store.rb
+index d4b185a..8c9adbe 100644
+--- a/actionpack/lib/action_controller/session/abstract_store.rb
++++ b/actionpack/lib/action_controller/session/abstract_store.rb
+@@ -14,7 +14,8 @@ module ActionController
+           super()
+           @by = by
+           @env = env
+-          @loaded = false
++          @loaded = by.nil?
++          @reset = false
+         end
+ 
+         def id
+@@ -51,6 +52,16 @@ module ActionController
+            "has been deprecated.Please use #to_hash instead.", caller)
+           to_hash
+         end
++        
++        def reset!
++          @reset = true
++          @loaded = true
++          self
++        end
++
++        def reset?
++          @reset
++        end
+ 
+         private
+           def load!
+@@ -99,7 +110,7 @@ module ActionController
+         response = @app.call(env)
+ 
+         session = env[ENV_SESSION_KEY]
+-        unless session == original_session
++        if session != original_session || session.reset?
+           options = env[ENV_SESSION_OPTIONS_KEY]
+           sid = session.id
+ 
+diff --git a/actionpack/lib/action_controller/session/cookie_store.rb b/actionpack/lib/action_controller/session/cookie_store.rb
+index ba63f85..b7322d7 100644
+--- a/actionpack/lib/action_controller/session/cookie_store.rb
++++ b/actionpack/lib/action_controller/session/cookie_store.rb
+@@ -97,7 +97,7 @@ module ActionController
+ 
+         status, headers, body = @app.call(env)
+ 
+-        unless env[ENV_SESSION_KEY] == original_value
++        if env[ENV_SESSION_KEY] != original_value || env[ENV_SESSION_KEY].reset?
+           session_data = marshal(env[ENV_SESSION_KEY].to_hash)
+ 
+           raise CookieOverflow if session_data.size > MAX
+diff --git a/actionpack/test/controller/session/cookie_store_test.rb b/actionpack/test/controller/session/cookie_store_test.rb
+index ad8ff09..a08fad9 100644
+--- a/actionpack/test/controller/session/cookie_store_test.rb
++++ b/actionpack/test/controller/session/cookie_store_test.rb
+@@ -31,6 +31,11 @@ class CookieStoreTest < ActionController::IntegrationTest
+     def get_session_value
+       render :text => "foo: #{session[:foo].inspect}"
+     end
++    
++    def call_reset_session
++      reset_session
++      head :ok
++    end
+ 
+     def raise_data_overflow
+       session[:foo] = 'bye!' * 1024
+@@ -139,6 +144,18 @@ class CookieStoreTest < ActionController::IntegrationTest
+     end
+   end
+ 
++  def test_setting_session_value_after_session_reset
++     with_test_route_set do
++       initial_session_key = "BAh7BjoIZm9vIghiYXI%3D--" +
++         "fef868465920f415f2c0652d6910d3af288a0367"
++       cookies[SessionKey] = initial_session_key
++       get '/call_reset_session'
++       assert_response :success
++       assert_not_equal [], headers['Set-Cookie']
++       assert_not_equal initial_session_key, cookies[SessionKey]
++    end
++  end
++
+   def test_persistent_session_id
+     with_test_route_set do
+       cookies[SessionKey] = SignedBar
+diff --git a/actionpack/test/controller/session/mem_cache_store_test.rb b/actionpack/test/controller/session/mem_cache_store_test.rb
+index 52e31b7..9cd1b10 100644
+--- a/actionpack/test/controller/session/mem_cache_store_test.rb
++++ b/actionpack/test/controller/session/mem_cache_store_test.rb
+@@ -15,6 +15,11 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+     def get_session_value
+       render :text => "foo: #{session[:foo].inspect}"
+     end
++    
++    def call_reset_session
++      reset_session
++      head :ok
++    end
+ 
+     def rescue_action(e) raise end
+   end
+@@ -63,6 +68,19 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+         assert_equal nil, cookies['_session_id']
+       end
+     end
++    
++    def test_setting_session_value_after_session_reset
++       with_test_route_set do
++         initial_session_key = "BAh7BjoIZm9vIghiYXI%3D--" +
++           "fef868465920f415f2c0652d6910d3af288a0367"
++         cookies['_session_id'] = initial_session_key
++         get '/call_reset_session'
++         assert_response :success
++         assert_not_equal [], headers['Set-Cookie']
++         assert_not_equal initial_session_key, cookies['_session_id']
++      end
++    end
++
+   rescue LoadError, RuntimeError
+     $stderr.puts "Skipping MemCacheStoreTest tests. Start memcached and try again."
+   end
+-- 
+1.6.0.4
+

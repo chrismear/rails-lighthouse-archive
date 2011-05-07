@@ -1,0 +1,124 @@
+From 3edbf90886613e32be8e298c32ad120fbdde1b14 Mon Sep 17 00:00:00 2001
+From: Andrew Grim <andrew@kongregate.com>
+Date: Mon, 21 Dec 2009 11:08:37 -0800
+Subject: [PATCH 1/2] Use newer tests to incorporate more test cases.  Because ERB#src always returns strings encoded as ASCII or ASCII-8BIT, use the src magic comment to force encoding of the string.
+
+---
+ .../lib/action_view/template_handlers/erb.rb       |    4 ++-
+ actionpack/test/fixtures/test/utf8.html.erb        |    4 ++-
+ actionpack/test/fixtures/test/utf8_magic.html.erb  |    5 ++++
+ actionpack/test/template/render_test.rb            |   25 ++++++++++++++++---
+ 4 files changed, 32 insertions(+), 6 deletions(-)
+ create mode 100644 actionpack/test/fixtures/test/utf8_magic.html.erb
+
+diff --git a/actionpack/lib/action_view/template_handlers/erb.rb b/actionpack/lib/action_view/template_handlers/erb.rb
+index e3120ba..c1ca60e 100644
+--- a/actionpack/lib/action_view/template_handlers/erb.rb
++++ b/actionpack/lib/action_view/template_handlers/erb.rb
+@@ -11,7 +11,9 @@ module ActionView
+       self.erb_trim_mode = '-'
+ 
+       def compile(template)
+-        src = ::ERB.new("<% __in_erb_template=true %>#{template.source}", nil, erb_trim_mode, '@output_buffer').src
++        magic = $1 if template.source =~ /\A(<%#.*coding:\s*(\S+)\s*-?%>)/
++        src = ::ERB.new("#{magic}<% __in_erb_template=true %>#{template.source}", nil, erb_trim_mode, '@output_buffer').src
++        src.force_encoding(src.match(/\A#coding:(.*)\n/)[1]) # Use the encoding that ERB thinks the string should be
+ 
+         # Ruby 1.9 prepends an encoding to the source. However this is
+         # useless because you can only set an encoding on the first line
+diff --git a/actionpack/test/fixtures/test/utf8.html.erb b/actionpack/test/fixtures/test/utf8.html.erb
+index 0b4d19a..14fe12d 100644
+--- a/actionpack/test/fixtures/test/utf8.html.erb
++++ b/actionpack/test/fixtures/test/utf8.html.erb
+@@ -1,2 +1,4 @@
+ Русский текст
+-日本語のテキスト
+\ No newline at end of file
++<%= "日".encoding %>
++<%= @output_buffer.encoding %>
++<%= __ENCODING__ %>
+diff --git a/actionpack/test/fixtures/test/utf8_magic.html.erb b/actionpack/test/fixtures/test/utf8_magic.html.erb
+new file mode 100644
+index 0000000..58cd03b
+--- /dev/null
++++ b/actionpack/test/fixtures/test/utf8_magic.html.erb
+@@ -0,0 +1,5 @@
++<%# encoding: utf-8 -%>
++Русский текст
++<%= "日".encoding %>
++<%= @output_buffer.encoding %>
++<%= __ENCODING__ %>
+diff --git a/actionpack/test/template/render_test.rb b/actionpack/test/template/render_test.rb
+index 9adf053..ffadc9a 100644
+--- a/actionpack/test/template/render_test.rb
++++ b/actionpack/test/template/render_test.rb
+@@ -249,10 +249,27 @@ module RenderTestCases
+   end
+ 
+   if '1.9'.respond_to?(:force_encoding)
+-    def test_render_utf8_template
+-      result = @view.render(:file => "test/utf8.html.erb", :layouts => "layouts/yield")
+-      assert_equal "Русский текст\n日本語のテキスト", result
+-      assert_equal Encoding::UTF_8, result.encoding
++    def test_render_utf8_template_with_magic_comment
++      with_external_encoding Encoding::ASCII_8BIT do
++        result = @view.render(:file => "test/utf8_magic.html.erb", :layouts => "layouts/yield")
++        assert_equal "Русский текст\nUTF-8\nUTF-8\nUTF-8\n", result
++        assert_equal Encoding::UTF_8, result.encoding
++      end
++    end
++
++    def test_render_utf8_template_with_default_external_encoding
++      with_external_encoding Encoding::UTF_8 do
++        result = @view.render(:file => "test/utf8.html.erb", :layouts => "layouts/yield")
++        assert_equal "Русский текст\nUTF-8\nUTF-8\nUTF-8\n", result
++        assert_equal Encoding::UTF_8, result.encoding
++      end
++    end
++
++    def with_external_encoding(encoding)
++      old, Encoding.default_external = Encoding.default_external, encoding
++      yield
++    ensure
++      Encoding.default_external = old
+     end
+   end
+ end
+-- 
+1.6.5
+
+
+From 9e46199323cbcb4426c457a8a3f76fb6a6c33988 Mon Sep 17 00:00:00 2001
+From: Andrew Grim <andrew@kongregate.com>
+Date: Mon, 21 Dec 2009 11:27:44 -0800
+Subject: [PATCH 2/2] ruby 1.8 backwards compat
+
+---
+ .../lib/action_view/template_handlers/erb.rb       |    8 ++++++--
+ 1 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/actionpack/lib/action_view/template_handlers/erb.rb b/actionpack/lib/action_view/template_handlers/erb.rb
+index c1ca60e..e683193 100644
+--- a/actionpack/lib/action_view/template_handlers/erb.rb
++++ b/actionpack/lib/action_view/template_handlers/erb.rb
+@@ -13,11 +13,15 @@ module ActionView
+       def compile(template)
+         magic = $1 if template.source =~ /\A(<%#.*coding:\s*(\S+)\s*-?%>)/
+         src = ::ERB.new("#{magic}<% __in_erb_template=true %>#{template.source}", nil, erb_trim_mode, '@output_buffer').src
+-        src.force_encoding(src.match(/\A#coding:(.*)\n/)[1]) # Use the encoding that ERB thinks the string should be
+ 
+         # Ruby 1.9 prepends an encoding to the source. However this is
+         # useless because you can only set an encoding on the first line
+-        RUBY_VERSION >= '1.9' ? src.sub(/\A#coding:.*\n/, '') : src
++        if RUBY_VERSION >= '1.9'
++          src.sub!(/\A#coding:(.*)\n/, '')
++          src.force_encoding($1) if $1 # Use the encoding that ERB thinks the string should be
++        end
++        
++        src
+       end
+     end
+   end
+-- 
+1.6.5
+

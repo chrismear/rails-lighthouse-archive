@@ -1,0 +1,73 @@
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index 40e9281..bfed7b8 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -4,6 +4,12 @@ module ActiveRecord
+       klass.extend(ClassMethods)
+     end
+ 
++    # Map of nested change <tt>reflection => { type => { attr => original value } }</tt>.
++    # We have 3 types of change :created, :updated or :destroyed
++    def nested_changes
++      @nested_changes ||= {}
++    end
++
+     private
+ 
+     # Returns +true+ if :allow_destroy was specified and the attributes contains a truthy value for the key '_destroy'.
+@@ -32,24 +38,34 @@ module ActiveRecord
+ 
+     # Build new records for each attributes hash, but skip any empty ones.
+     def build_new_nested_attributes_records(reflection, new_records)
++      created = []
+       new_records.each do |record_attributes|
+         next if record_attributes.values.all? { |v| v.blank? }
+-        send(reflection.name).build record_attributes
++        record = send(reflection.name).build(record_attributes)
++        created << record.changes if record.changed?
+       end
++      nested_changes[reflection.name] = { :created => created } if created.any?
+     end
+ 
+     # Assign the attributes to their respective records or destroy them if needed.
+     # See #should_destroy_nested_attributes_record?
+     def assign_to_or_destroy_nested_attributes_records(reflection, existing_records)
++      destroyed = []
++      updated = []
+       existing_records.each do |id, record_attributes|
+         #p id, record_attributes
+         record = send(reflection.name).detect { |record| record.id == id.to_i }
+         if should_destroy_nested_attributes_record?(reflection, record_attributes)
++          destroyed << record.attributes.inject({}) { |h,attr| h[attr.first] = [attr.last,nil]; h } if record.changed?
+           record.destroy
+         else
+           record.attributes = record_attributes
++          updated << record.changes if record.changed?
+         end
+       end
++      nested_changes[reflection.name] ||= {}
++      nested_changes[reflection.name][:destroyed] = destroyed if destroyed.any?
++      nested_changes[reflection.name][:updated] = updated if updated.any?
+     end
+ 
+     module ClassMethods
+@@ -64,9 +80,17 @@ module ActiveRecord
+       def define_nested_attributes_writer_for_one_to_one_association(reflection)
+         define_nested_attributes_writer(reflection) do |attributes|
+           if should_destroy_nested_attributes_record?(reflection, attributes)
+-            send(reflection.name).destroy
++            record = send(reflection.name)
++            nested_changes[reflection.name] = { :destroy => record.attributes.inject({}) { |h,attr| h[attr.first] = [attr.last,nil]; h } }
++            record.destroy
+           else
+-            (send(reflection.name) || send("build_#{reflection.name}")).attributes = attributes
++            if record = send(reflection.name)
++              action_type = :updated
++            elsif record = send("build_#{reflection.name}")
++              action_type = :created
++            end
++            record.attributes = attributes
++            nested_changes[reflection.name] = { action_type => record.changes } if record.changed?
+           end
+         end
+       end

@@ -1,0 +1,490 @@
+From 45a88ebc925309f4036b7ad9616480f5b760f66a Mon Sep 17 00:00:00 2001
+From: Szymon Nowak <szimek@gmail.com>
+Date: Wed, 15 Jul 2009 22:22:25 +0200
+Subject: [PATCH] Add primary_key option to belongs_to association
+
+---
+ activerecord/lib/active_record/associations.rb     |    9 +-
+ .../associations/belongs_to_association.rb         |   26 +++++-
+ .../belongs_to_polymorphic_association.rb          |    6 +-
+ .../lib/active_record/autosave_association.rb      |    3 +-
+ .../associations/belongs_to_associations_test.rb   |   98 ++++++++++++++++++++
+ activerecord/test/cases/base_test.rb               |    2 +-
+ activerecord/test/cases/reflection_test.rb         |   10 +-
+ activerecord/test/models/author.rb                 |    2 +
+ activerecord/test/models/company.rb                |    1 +
+ activerecord/test/models/essay.rb                  |    3 +
+ activerecord/test/models/reply.rb                  |    3 +-
+ activerecord/test/models/topic.rb                  |    1 +
+ activerecord/test/schema/schema.rb                 |    7 ++
+ 13 files changed, 155 insertions(+), 16 deletions(-)
+ create mode 100644 activerecord/test/models/essay.rb
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 419967b..934beb7 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -963,6 +963,8 @@ module ActiveRecord
+       #   of the association with an "_id" suffix. So a class that defines a <tt>belongs_to :person</tt> association will use
+       #   "person_id" as the default <tt>:foreign_key</tt>. Similarly, <tt>belongs_to :favorite_person, :class_name => "Person"</tt>
+       #   will use a foreign key of "favorite_person_id".
++      # [:primary_key]
++      #   Specify the method that returns the primary key of associated object used for the association. By default this is id.
+       # [:dependent]
+       #   If set to <tt>:destroy</tt>, the associated object is destroyed when this object is. If set to
+       #   <tt>:delete</tt>, the associated object is deleted *without* calling its destroy method. This option should not be specified when
+@@ -993,6 +995,7 @@ module ActiveRecord
+       #
+       # Option examples:
+       #   belongs_to :firm, :foreign_key => "client_of"
++      #   belongs_to :person, :primary_key => "name", :foreign_key => "person_name"
+       #   belongs_to :author, :class_name => "Person", :foreign_key => "author_id"
+       #   belongs_to :valid_coupon, :class_name => "Coupon", :foreign_key => "coupon_id",
+       #              :conditions => 'discounts > #{payments_count}'
+@@ -1328,14 +1331,14 @@ module ActiveRecord
+           method_name = "belongs_to_counter_cache_after_create_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+             association = send(reflection.name)
+-            association.class.increment_counter(cache_column, send(reflection.primary_key_name)) unless association.nil?
++            association.class.increment_counter(cache_column, association.id) unless association.nil?
+           end
+           after_create(method_name)
+ 
+           method_name = "belongs_to_counter_cache_before_destroy_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+             association = send(reflection.name)
+-            association.class.decrement_counter(cache_column, send(reflection.primary_key_name)) unless association.nil?
++            association.class.decrement_counter(cache_column, association.id) unless association.nil?
+           end
+           before_destroy(method_name)
+ 
+@@ -1527,7 +1530,7 @@ module ActiveRecord
+ 
+         mattr_accessor :valid_keys_for_belongs_to_association
+         @@valid_keys_for_belongs_to_association = [
+-          :class_name, :foreign_key, :foreign_type, :remote, :select, :conditions,
++          :class_name, :primary_key, :foreign_key, :foreign_type, :remote, :select, :conditions,
+           :include, :dependent, :counter_cache, :extend, :polymorphic, :readonly,
+           :validate, :touch, :inverse_of
+         ]
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index c885750..628033c 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -14,7 +14,7 @@ module ActiveRecord
+ 
+         if record.nil?
+           if counter_cache_name && !@owner.new_record?
+-            @reflection.klass.decrement_counter(counter_cache_name, @owner[@reflection.primary_key_name]) if @owner[@reflection.primary_key_name]
++            @reflection.klass.decrement_counter(counter_cache_name, previous_record_id) if @owner[@reflection.primary_key_name]
+           end
+ 
+           @target = @owner[@reflection.primary_key_name] = nil
+@@ -27,7 +27,7 @@ module ActiveRecord
+           end
+ 
+           @target = (AssociationProxy === record ? record.target : record)
+-          @owner[@reflection.primary_key_name] = record.id unless record.new_record?
++          @owner[@reflection.primary_key_name] = record_id(record) unless record.new_record?
+           @updated = true
+         end
+ 
+@@ -43,13 +43,18 @@ module ActiveRecord
+       
+       private
+         def find_target
+-          the_target = @reflection.klass.find(
++          find_method = if @reflection.options[:primary_key]
++                          "find_by_#{@reflection.options[:primary_key]}"
++                        else
++                          "find"
++                        end
++          the_target = @reflection.klass.send(find_method,
+             @owner[@reflection.primary_key_name],
+             :select     => @reflection.options[:select],
+             :conditions => conditions,
+             :include    => @reflection.options[:include],
+             :readonly   => @reflection.options[:readonly]
+-          )
++          ) if @owner[@reflection.primary_key_name]
+           set_inverse_instance(the_target, @owner)
+           the_target
+         end
+@@ -63,6 +68,19 @@ module ActiveRecord
+         def we_can_set_the_inverse_on_this?(record)
+           @reflection.has_inverse? && @reflection.inverse_of.macro == :has_one
+         end
++
++        def record_id(record)
++          record.send(@reflection.options[:primary_key] || :id)
++        end
++
++        def previous_record_id
++          @previous_record_id ||= if @reflection.options[:primary_key]
++                                    previous_record = @owner.send(@reflection.name)
++                                    previous_record.nil? ? nil : previous_record.id
++                                  else
++                                    @owner[@reflection.primary_key_name]
++                                  end
++        end
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+index d8146da..67e18d6 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+@@ -7,7 +7,7 @@ module ActiveRecord
+         else
+           @target = (AssociationProxy === record ? record.target : record)
+ 
+-          @owner[@reflection.primary_key_name] = record.id
++          @owner[@reflection.primary_key_name] = record_id(record)
+           @owner[@reflection.options[:foreign_type]] = record.class.base_class.name.to_s
+ 
+           @updated = true
+@@ -41,6 +41,10 @@ module ActiveRecord
+           !@owner[@reflection.primary_key_name].nil?
+         end
+ 
++        def record_id(record)
++          record.send(@reflection.options[:primary_key] || :id)
++        end
++
+         def association_class
+           @owner[@reflection.options[:foreign_type]] ? @owner[@reflection.options[:foreign_type]].constantize : nil
+         end
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index a540570..c1bc842 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -339,7 +339,8 @@ module ActiveRecord
+           association.save(!autosave) if association.new_record? || autosave
+ 
+           if association.updated?
+-            self[reflection.primary_key_name] = association.id
++            association_id = association.send(reflection.options[:primary_key] || :id)
++            self[reflection.primary_key_name] = association_id
+             # TODO: Removing this code doesn't seem to matter…
+             if reflection.options[:polymorphic]
+               self[reflection.options[:foreign_type]] = association.class.base_class.name.to_s
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 13a78a1..ab6f752 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -14,6 +14,7 @@ require 'models/tagging'
+ require 'models/comment'
+ require 'models/sponsor'
+ require 'models/member'
++require 'models/essay'
+ 
+ class BelongsToAssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :companies, :developers, :projects, :topics,
+@@ -25,6 +26,11 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert !Client.find(3).firm.nil?, "Microsoft should have a firm"
+   end
+ 
++  def test_belongs_to_with_primary_key
++    client = Client.create(:name => "Primary key client", :firm_name => companies(:first_firm).name)
++    assert_equal companies(:first_firm).name, client.firm_with_primary_key.name
++  end
++
+   def test_proxy_assignment
+     account = Account.find(1)
+     assert_nothing_raised { account.firm = account.firm }
+@@ -47,6 +53,13 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal apple.id, citibank.firm_id
+   end
+ 
++  def test_natural_assignment_with_primary_key
++    apple = Firm.create("name" => "Apple")
++    citibank = Client.create("name" => "Primary key client")
++    citibank.firm_with_primary_key = apple
++    assert_equal apple.name, citibank.firm_name
++  end
++
+   def test_no_unexpected_aliasing
+     first_firm = companies(:first_firm)
+     another_firm = companies(:another_firm)
+@@ -69,6 +82,15 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal apple, citibank.firm
+   end
+ 
++  def test_creating_the_belonging_object_with_primary_key
++    client = Client.create(:name => "Primary key client")
++    apple  = client.create_firm_with_primary_key("name" => "Apple")
++    assert_equal apple, client.firm_with_primary_key
++    client.save
++    client.reload
++    assert_equal apple, client.firm_with_primary_key
++  end
++
+   def test_building_the_belonging_object
+     citibank = Account.create("credit_limit" => 10)
+     apple    = citibank.build_firm("name" => "Apple")
+@@ -76,6 +98,13 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal apple.id, citibank.firm_id
+   end
+ 
++  def test_building_the_belonging_object_with_primary_key
++    client = Client.create(:name => "Primary key client")
++    apple  = client.build_firm_with_primary_key("name" => "Apple")
++    client.save
++    assert_equal apple.name, client.firm_name
++  end
++
+   def test_natural_assignment_to_nil
+     client = Client.find(3)
+     client.firm = nil
+@@ -84,6 +113,14 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_nil client.client_of
+   end
+ 
++  def test_natural_assignment_to_nil_with_primary_key
++    client = Client.create(:name => "Primary key client", :firm_name => companies(:first_firm).name)
++    client.firm_with_primary_key = nil
++    client.save
++    assert_nil client.firm_with_primary_key(true)
++    assert_nil client.client_of
++  end
++
+   def test_with_different_class_name
+     assert_equal Company.find(1).name, Company.find(3).firm_with_other_name.name
+     assert_not_nil Company.find(3).firm_with_other_name, "Microsoft should have a firm"
+@@ -110,6 +147,17 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal 0, Topic.find(debate.id).send(:read_attribute, "replies_count"), "First reply deleted"
+   end
+ 
++  def test_belongs_to_with_primary_key_counter
++    debate = Topic.create("title" => "debate")
++    assert_equal 0, debate.send(:read_attribute, "replies_count"), "No replies yet"
++
++    trash = debate.replies_with_primary_key.create("title" => "blah!", "content" => "world around!")
++    assert_equal 1, Topic.find(debate.id).send(:read_attribute, "replies_count"), "First reply created"
++
++    trash.destroy
++    assert_equal 0, Topic.find(debate.id).send(:read_attribute, "replies_count"), "First reply deleted"
++  end
++
+   def test_belongs_to_counter_with_assigning_nil
+     p = Post.find(1)
+     c = Comment.find(1)
+@@ -122,6 +170,18 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal 1, Post.find(p.id).comments.size
+   end
+ 
++  def test_belongs_to_with_primary_key_counter_with_assigning_nil
++    debate = Topic.create("title" => "debate")
++    reply  = Reply.create("title" => "blah!", "content" => "world around!", "parent_title" => "debate")
++
++    assert_equal debate.title, reply.parent_title
++    assert_equal 1, Topic.find(debate.id).send(:read_attribute, "replies_count")
++
++    reply.topic_with_primary_key = nil
++
++    assert_equal 0, Topic.find(debate.id).send(:read_attribute, "replies_count")
++  end
++
+   def test_belongs_to_counter_with_reassigning
+     t1 = Topic.create("title" => "t1")
+     t2 = Topic.create("title" => "t2")
+@@ -219,6 +279,18 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal firm, final_cut.firm(true)
+   end
+ 
++  def test_assignment_before_child_saved_with_primary_key
++    final_cut = Client.new("name" => "Final Cut")
++    firm = Firm.find(1)
++    final_cut.firm_with_primary_key = firm
++    assert final_cut.new_record?
++    assert final_cut.save
++    assert !final_cut.new_record?
++    assert !firm.new_record?
++    assert_equal firm, final_cut.firm_with_primary_key
++    assert_equal firm, final_cut.firm_with_primary_key(true)
++  end
++
+   def test_new_record_with_foreign_key_but_no_object
+     c = Client.new("firm_id" => 1)
+     assert_equal Firm.find(:first), c.firm_with_basic_id
+@@ -304,6 +376,20 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     sponsor.sponsorable = member
+     assert_equal "Member", sponsor.sponsorable_type
+   end
++
++  def test_polymorphic_assignment_with_primary_key_foreign_type_field_updating
++    # should update when assigning a saved record
++    essay = Essay.new
++    writer = Author.create(:name => "David")
++    essay.writer = writer
++    assert_equal "Author", essay.writer_type
++
++    # should update when assigning a new record
++    essay = Essay.new
++    writer = Author.new
++    essay.writer = writer
++    assert_equal "Author", essay.writer_type
++  end
+   
+   def test_polymorphic_assignment_updates_foreign_id_field_for_new_and_saved_records
+     sponsor = Sponsor.new
+@@ -317,6 +403,18 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal nil, sponsor.sponsorable_id
+   end
+ 
++  def test_polymorphic_assignment_with_primary_key_updates_foreign_id_field_for_new_and_saved_records
++    essay = Essay.new
++    saved_writer = Author.create(:name => "David")
++    new_writer = Author.new
++
++    essay.writer = saved_writer
++    assert_equal saved_writer.name, essay.writer_id
++
++    essay.writer = new_writer
++    assert_equal nil, essay.writer_id
++  end
++
+   def test_belongs_to_proxy_should_not_respond_to_private_methods
+     assert_raise(NoMethodError) { companies(:first_firm).private_method }
+     assert_raise(NoMethodError) { companies(:second_client).firm.private_method }
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index f9ac37c..e47f898 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -2026,7 +2026,7 @@ class BasicsTest < ActiveRecord::TestCase
+ 
+   def test_inspect_instance
+     topic = topics(:first)
+-    assert_equal %(#<Topic id: 1, title: "The First Topic", author_name: "David", author_email_address: "david@loudthinking.com", written_on: "#{topic.written_on.to_s(:db)}", bonus_time: "#{topic.bonus_time.to_s(:db)}", last_read: "#{topic.last_read.to_s(:db)}", content: "Have a nice day", approved: false, replies_count: 1, parent_id: nil, type: nil>), topic.inspect
++    assert_equal %(#<Topic id: 1, title: "The First Topic", author_name: "David", author_email_address: "david@loudthinking.com", written_on: "#{topic.written_on.to_s(:db)}", bonus_time: "#{topic.bonus_time.to_s(:db)}", last_read: "#{topic.last_read.to_s(:db)}", content: "Have a nice day", approved: false, replies_count: 1, parent_id: nil, parent_title: nil, type: nil>), topic.inspect
+   end
+ 
+   def test_inspect_new_instance
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 194d5e9..4083b99 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -27,25 +27,25 @@ class ReflectionTest < ActiveRecord::TestCase
+ 
+   def test_read_attribute_names
+     assert_equal(
+-      %w( id title author_name author_email_address bonus_time written_on last_read content approved replies_count parent_id type ).sort,
++      %w( id title author_name author_email_address bonus_time written_on last_read content approved replies_count parent_id parent_title type ).sort,
+       @first.attribute_names
+     )
+   end
+ 
+   def test_columns
+-    assert_equal 12, Topic.columns.length
++    assert_equal 13, Topic.columns.length
+   end
+ 
+   def test_columns_are_returned_in_the_order_they_were_declared
+     column_names = Topic.columns.map { |column| column.name }
+-    assert_equal %w(id title author_name author_email_address written_on bonus_time last_read content approved replies_count parent_id type), column_names
++    assert_equal %w(id title author_name author_email_address written_on bonus_time last_read content approved replies_count parent_id parent_title type), column_names
+   end
+ 
+   def test_content_columns
+     content_columns        = Topic.content_columns
+     content_column_names   = content_columns.map {|column| column.name}
+-    assert_equal 8, content_columns.length
+-    assert_equal %w(title author_name author_email_address written_on bonus_time last_read content approved).sort, content_column_names.sort
++    assert_equal 9, content_columns.length
++    assert_equal %w(title author_name author_email_address written_on bonus_time last_read content approved parent_title).sort, content_column_names.sort
+   end
+ 
+   def test_column_string_type_and_limit
+diff --git a/activerecord/test/models/author.rb b/activerecord/test/models/author.rb
+index 0d9ee36..b844c7c 100644
+--- a/activerecord/test/models/author.rb
++++ b/activerecord/test/models/author.rb
+@@ -87,6 +87,8 @@ class Author < ActiveRecord::Base
+   has_many :tags,     :through => :posts # through has_many :through
+   has_many :post_categories, :through => :posts, :source => :categories
+ 
++  has_one :essay, :primary_key => :name, :as => :writer
++
+   belongs_to :author_address, :dependent => :destroy
+   belongs_to :author_address_extra, :dependent => :delete, :class_name => "AuthorAddress"
+ 
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index 840527d..2216846 100644
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -88,6 +88,7 @@ class Client < Company
+   belongs_to :firm_with_select, :class_name => "Firm", :foreign_key => "firm_id", :select => "id"
+   belongs_to :firm_with_other_name, :class_name => "Firm", :foreign_key => "client_of"
+   belongs_to :firm_with_condition, :class_name => "Firm", :foreign_key => "client_of", :conditions => ["1 = ?", 1]
++  belongs_to :firm_with_primary_key, :class_name => "Firm", :primary_key => "name", :foreign_key => "firm_name"
+   belongs_to :readonly_firm, :class_name => "Firm", :foreign_key => "firm_id", :readonly => true
+ 
+   # Record destruction so we can test whether firm.clients.clear has
+diff --git a/activerecord/test/models/essay.rb b/activerecord/test/models/essay.rb
+new file mode 100644
+index 0000000..6c28f5e
+--- /dev/null
++++ b/activerecord/test/models/essay.rb
+@@ -0,0 +1,3 @@
++class Essay < ActiveRecord::Base
++  belongs_to :writer, :primary_key => :name, :polymorphic => true
++end
+diff --git a/activerecord/test/models/reply.rb b/activerecord/test/models/reply.rb
+index 616c076..f5906de 100644
+--- a/activerecord/test/models/reply.rb
++++ b/activerecord/test/models/reply.rb
+@@ -4,12 +4,13 @@ class Reply < Topic
+   named_scope :base
+ 
+   belongs_to :topic, :foreign_key => "parent_id", :counter_cache => true
++  belongs_to :topic_with_primary_key, :class_name => "Topic", :primary_key => "title", :foreign_key => "parent_title", :counter_cache => "replies_count"
+   has_many :replies, :class_name => "SillyReply", :dependent => :destroy, :foreign_key => "parent_id"
+ 
+   validate :errors_on_empty_content
+   validate_on_create :title_is_wrong_create
+ 
+-  attr_accessible :title, :author_name, :author_email_address, :written_on, :content, :last_read
++  attr_accessible :title, :author_name, :author_email_address, :written_on, :content, :last_read, :parent_title
+ 
+   validate :check_empty_title
+   validate_on_create :check_content_mismatch
+diff --git a/activerecord/test/models/topic.rb b/activerecord/test/models/topic.rb
+index 51012d2..201d96d 100644
+--- a/activerecord/test/models/topic.rb
++++ b/activerecord/test/models/topic.rb
+@@ -39,6 +39,7 @@ class Topic < ActiveRecord::Base
+   named_scope :by_rejected_ids, lambda {{ :conditions => { :id => all(:conditions => {:approved => false}).map(&:id) } }}
+ 
+   has_many :replies, :dependent => :destroy, :foreign_key => "parent_id"
++  has_many :replies_with_primary_key, :class_name => "Reply", :dependent => :destroy, :primary_key => "title", :foreign_key => "parent_title"
+   serialize :content
+ 
+   before_create  :default_written_on
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index d2d6d1f..2b7d385 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -161,6 +161,12 @@ ActiveRecord::Schema.define do
+     t.integer :course_id, :null => false
+   end
+ 
++  create_table :essays, :force => true do |t|
++    t.string :name
++    t.string :writer_id
++    t.string :writer_type
++  end
++
+   create_table :events, :force => true do |t|
+     t.string :title, :limit => 5
+   end
+@@ -421,6 +427,7 @@ ActiveRecord::Schema.define do
+     t.boolean  :approved, :default => true
+     t.integer  :replies_count, :default => 0
+     t.integer  :parent_id
++    t.string   :parent_title
+     t.string   :type
+   end
+ 
+-- 
+1.6.3.3
+

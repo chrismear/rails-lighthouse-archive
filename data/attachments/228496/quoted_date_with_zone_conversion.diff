@@ -1,0 +1,125 @@
+From 3c7c6aa7399a58fee7c72f3f001f424bef91b8f8 Mon Sep 17 00:00:00 2001
+From: Geoff Buesing <gbuesing@gmail.com>
+Date: Thu, 23 Jul 2009 08:30:05 -0500
+Subject: [PATCH] quoted_date: convert time objects to default_timezone
+
+---
+ .../connection_adapters/abstract/quoting.rb        |    7 +++-
+ activerecord/test/cases/base_test.rb               |   35 ++++++++++++++++++++
+ activerecord/test/cases/finder_test.rb             |   26 ++++++++++++++
+ 3 files changed, 67 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/quoting.rb b/activerecord/lib/active_record/connection_adapters/abstract/quoting.rb
+index 720fba2..8649f96 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/quoting.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/quoting.rb
+@@ -60,7 +60,12 @@ module ActiveRecord
+       end
+ 
+       def quoted_date(value)
+-        value.to_s(:db)
++        if value.acts_like?(:time)
++          zone_conversion_method = ActiveRecord::Base.default_timezone == :utc ? :getutc : :getlocal
++          value.respond_to?(zone_conversion_method) ? value.send(zone_conversion_method) : value
++        else
++          value
++        end.to_s(:db)
+       end
+ 
+       def quoted_string_prefix
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index e47f898..128c16a 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1489,6 +1489,33 @@ class BasicsTest < ActiveRecord::TestCase
+     topic = Topic.create('author_name' => author_name)
+     assert_equal author_name, Topic.find(topic.id).author_name
+   end
++  
++  def test_date_quoting_converts_local_time_to_default_timezone_utc
++    with_env_tz 'America/New_York' do
++      begin
++        ActiveRecord::Base.default_timezone = :utc
++        time = Time.local(2000)
++        topic = Topic.create('written_on' => time)
++        saved_time = Topic.find(topic.id).written_on
++        assert_equal time, saved_time
++        assert_equal [0, 0, 0, 1, 1, 2000, 6, 1, false, "EST"], time.to_a
++        assert_equal [0, 0, 5, 1, 1, 2000, 6, 1, false, "UTC"], saved_time.to_a
++      ensure
++        ActiveRecord::Base.default_timezone = :local
++      end
++    end
++  end
++  
++  def test_date_quoting_converts_utc_time_to_default_timezone_local
++    with_env_tz 'America/New_York' do
++      time = Time.utc(2000)
++      topic = Topic.create('written_on' => time)
++      saved_time = Topic.find(topic.id).written_on
++      assert_equal time, saved_time
++      assert_equal [0, 0, 0, 1, 1, 2000, 6, 1, false, "UTC"], time.to_a
++      assert_equal [0, 0, 19, 31, 12, 1999, 5, 365, false, "EST"], saved_time.to_a
++    end
++  end
+ 
+   if RUBY_VERSION < '1.9'
+     def test_quote_chars
+@@ -2120,4 +2147,12 @@ class BasicsTest < ActiveRecord::TestCase
+   def test_dup
+     assert !Minimalistic.new.freeze.dup.frozen?
+   end
++  
++  protected
++    def with_env_tz(new_tz = 'US/Eastern')
++      old_tz, ENV['TZ'] = ENV['TZ'], new_tz
++      yield
++    ensure
++      old_tz ? ENV['TZ'] = old_tz : ENV.delete('TZ')
++    end
+ end
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index d8f5695..e5e10e8 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -357,6 +357,25 @@ class FinderTest < ActiveRecord::TestCase
+     assert_nil Company.find(:first, :conditions => { :name => "37signals!"})
+     assert_kind_of Time, Topic.find(:first, :conditions => {:id => 1}).written_on
+   end
++  
++  def test_condition_utc_time_interpolation_with_default_timezone_local
++    with_env_tz 'America/New_York' do
++      topic = Topic.first
++      assert_equal topic, Topic.find(:first, :conditions => {:written_on => topic.written_on.getutc})
++    end
++  end
++  
++  def test_condition_local_time_interpolation_with_default_timezone_utc
++    with_env_tz 'America/New_York' do
++      begin
++        ActiveRecord::Base.default_timezone = :utc
++        topic = Topic.first
++        assert_equal topic, Topic.find(:first, :conditions => {:written_on => topic.written_on.getlocal})
++      ensure
++        ActiveRecord::Base.default_timezone = :local
++      end
++    end
++  end
+ 
+   def test_hash_condition_find_malformed
+     assert_raise(ActiveRecord::StatementInvalid) {
+@@ -1087,4 +1106,11 @@ class FinderTest < ActiveRecord::TestCase
+         ActiveRecord::Base.send(:replace_bind_variables, statement, vars)
+       end
+     end
++    
++    def with_env_tz(new_tz = 'US/Eastern')
++      old_tz, ENV['TZ'] = ENV['TZ'], new_tz
++      yield
++    ensure
++      old_tz ? ENV['TZ'] = old_tz : ENV.delete('TZ')
++    end  
+ end
+-- 
+1.6.1
+

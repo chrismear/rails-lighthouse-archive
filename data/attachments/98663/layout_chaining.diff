@@ -1,0 +1,487 @@
+From c6a520d54f37f86ce34a0398bbebed6872da4096 Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Sat, 7 Mar 2009 17:07:47 +1100
+Subject: [PATCH 1/3] Layout chaining
+
+Allows you to put multiple layout statements into your controller and it
+will fall through to the appropriate one.
+---
+ actionpack/lib/action_controller/layout.rb         |   59 ++++++++++++-------
+ actionpack/test/controller/layout_test.rb          |   36 ++++++++++++
+ .../fixtures/layout_tests/layouts/bar.html.erb     |    1 +
+ .../fixtures/layout_tests/layouts/foo.html.erb     |    1 +
+ .../test/fixtures/layout_tests/views/bye.html.erb  |    1 +
+ .../test/fixtures/layout_tests/views/choo.html.erb |    1 +
+ 6 files changed, 77 insertions(+), 22 deletions(-)
+ create mode 100644 actionpack/test/fixtures/layout_tests/layouts/bar.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/layouts/foo.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/views/bye.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/views/choo.html.erb
+
+diff --git a/actionpack/lib/action_controller/layout.rb b/actionpack/lib/action_controller/layout.rb
+index 6ec0c1b..ded2709 100644
+--- a/actionpack/lib/action_controller/layout.rb
++++ b/actionpack/lib/action_controller/layout.rb
+@@ -163,13 +163,21 @@ module ActionController #:nodoc:
+       # when the layout <tt>yield</tt>s. This layout can itself depend on instance variables assigned during action
+       # performance and have access to them as any normal template would.
+       def layout(template_name, conditions = {}, auto = false)
+-        add_layout_conditions(conditions)
+-        write_inheritable_attribute(:layout, template_name)
++        # clear any automatically set layout
++        if read_inheritable_attribute(:auto_layout)
++          write_inheritable_attribute(:layout_chain, [])
++        end
++
++        # add _this_ layout to the layout chain
++        write_inheritable_array( :layout_chain, [{
++          :conditions => normalize_conditions(conditions),
++          :template   => template_name
++        }])
+         write_inheritable_attribute(:auto_layout, auto)
+       end
+ 
+-      def layout_conditions #:nodoc:
+-        @layout_conditions ||= read_inheritable_attribute(:layout_conditions)
++      def layout_chain #:nodoc:
++        @layout_chain ||= read_inheritable_attribute(:layout_chain).reverse
+       end
+ 
+       def layout_list #:nodoc:
+@@ -185,10 +193,6 @@ module ActionController #:nodoc:
+           end
+         end
+ 
+-        def add_layout_conditions(conditions)
+-          write_inheritable_hash(:layout_conditions, normalize_conditions(conditions))
+-        end
+-
+         def normalize_conditions(conditions)
+           conditions.inject({}) {|hash, (key, value)| hash.merge(key => [value].flatten.map {|action| action.to_s})}
+         end
+@@ -213,7 +217,7 @@ module ActionController #:nodoc:
+ 
+     private
+       def default_layout #:nodoc:
+-        layout = self.class.read_inheritable_attribute(:layout)
++        layout = layout_for_action
+         return layout unless self.class.read_inheritable_attribute(:auto_layout)
+         find_layout(layout, default_template_format)
+       rescue ActionView::MissingTemplate
+@@ -232,28 +236,39 @@ module ActionController #:nodoc:
+           when FalseClass
+             nil
+           when NilClass, TrueClass
+-            active_layout if action_has_layout? && candidate_for_layout?(:template => default_template_name)
++            active_layout if candidate_for_layout?(:template => default_template_name)
+           else
+             active_layout(layout, :html_fallback => true)
+           end
+         else
+-          active_layout if action_has_layout? && candidate_for_layout?(options)
++          active_layout if candidate_for_layout?(options)
+         end
+       end
+ 
+-      def action_has_layout?
+-        if conditions = self.class.layout_conditions
+-          case
+-            when only = conditions[:only]
+-              only.include?(action_name)
+-            when except = conditions[:except]
+-              !except.include?(action_name)
+-            else
+-              true
++      def layout_for_action
++        self.class.layout_chain.each do |layout|
++          if conditions = layout[:conditions]
++            case
++              when only = conditions[:only]
++                if only.include?(action_name)
++                  return layout[:template]
++                else
++                  next  # no explicit :only for us, so try the next layout in the chain
++                end
++              when except = conditions[:except]
++                if !except.include?(action_name)
++                  return layout[:template]
++                else
++                  next  # no explicit :except for us, so try the next layout in the chain
++                end
++              else
++                return layout[:template]
++            end
++          else
++            return layout[:template]
+           end
+-        else
+-          true
+         end
++        return nil
+       end
+ 
+       def candidate_for_layout?(options)
+diff --git a/actionpack/test/controller/layout_test.rb b/actionpack/test/controller/layout_test.rb
+index 1575674..616ec58 100644
+--- a/actionpack/test/controller/layout_test.rb
++++ b/actionpack/test/controller/layout_test.rb
+@@ -202,3 +202,39 @@ unless RUBY_PLATFORM =~ /(:?mswin|mingw|bccwin)/
+   end
+ end
+ 
++#TODO: didn't have a test that failed when my layout_for_action returned the
++#      whole hash - write a test that fails for that
++#
++#      Then test the various combinations of having multiple layout statements.
++
++class FooExceptHelloWithBarFallback < LayoutTest
++  layout 'bar'
++  layout 'foo', :except => :hello
++end
++
++class FooOnlyHelloWithBarFallback < LayoutTest
++  layout 'bar'
++  layout 'foo', :only => :hello
++end
++
++class FooOnlyHelloBarExceptByeFoobarFallback < LayoutTest
++  layout 'foobar'
++  layout 'bar', :except => :bye
++  layout 'foo', :only => :hello
++end
++
++class LayoutChainingTest < ActionController::TestCase
++  def test_excepted_actions_falls_through
++    @controller = FooExceptHelloWithBarFallback.new
++    get :hello
++    assert_equal 'bar.html.erb hello.rhtml', @response.body
++  end
++
++  def test_non_excepted_actions_are_caught
++    @controller = FooExceptHelloWithBarFallback.new
++    get :bye
++    assert_equal 'foo.html.erb bye.html.erb', @response.body
++  end
++end
++
++
+diff --git a/actionpack/test/fixtures/layout_tests/layouts/bar.html.erb b/actionpack/test/fixtures/layout_tests/layouts/bar.html.erb
+new file mode 100644
+index 0000000..075c808
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/layouts/bar.html.erb
+@@ -0,0 +1 @@
++bar.html.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/layouts/foo.html.erb b/actionpack/test/fixtures/layout_tests/layouts/foo.html.erb
+new file mode 100644
+index 0000000..6999d44
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/layouts/foo.html.erb
+@@ -0,0 +1 @@
++foo.html.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/views/bye.html.erb b/actionpack/test/fixtures/layout_tests/views/bye.html.erb
+new file mode 100644
+index 0000000..2cda92e
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/views/bye.html.erb
+@@ -0,0 +1 @@
++bye.html.erb
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/views/choo.html.erb b/actionpack/test/fixtures/layout_tests/views/choo.html.erb
+new file mode 100644
+index 0000000..09fb966
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/views/choo.html.erb
+@@ -0,0 +1 @@
++choo.html.erb
+\ No newline at end of file
+-- 
+1.6.1
+
+
+From 1ba97c3f93cbd0c73ef6b17849939be5d67612de Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Sat, 7 Mar 2009 18:23:05 +1100
+Subject: [PATCH 2/3] More test and some refactoring
+
+---
+ actionpack/lib/action_controller/layout.rb         |   14 +----
+ actionpack/test/controller/layout_test.rb          |   62 +++++++++++++++----
+ .../test/fixtures/layout_tests/layouts/bar.erb     |    1 +
+ .../fixtures/layout_tests/layouts/bar.html.erb     |    1 -
+ .../test/fixtures/layout_tests/layouts/foo.erb     |    1 +
+ .../fixtures/layout_tests/layouts/foo.html.erb     |    1 -
+ .../test/fixtures/layout_tests/layouts/foobar.erb  |    1 +
+ .../test/fixtures/layout_tests/views/bye.erb       |    1 +
+ .../test/fixtures/layout_tests/views/bye.html.erb  |    1 -
+ .../test/fixtures/layout_tests/views/choo.erb      |    1 +
+ .../test/fixtures/layout_tests/views/choo.html.erb |    1 -
+ 11 files changed, 57 insertions(+), 28 deletions(-)
+ create mode 100644 actionpack/test/fixtures/layout_tests/layouts/bar.erb
+ delete mode 100644 actionpack/test/fixtures/layout_tests/layouts/bar.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/layouts/foo.erb
+ delete mode 100644 actionpack/test/fixtures/layout_tests/layouts/foo.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/layouts/foobar.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/views/bye.erb
+ delete mode 100644 actionpack/test/fixtures/layout_tests/views/bye.html.erb
+ create mode 100644 actionpack/test/fixtures/layout_tests/views/choo.erb
+ delete mode 100644 actionpack/test/fixtures/layout_tests/views/choo.html.erb
+
+diff --git a/actionpack/lib/action_controller/layout.rb b/actionpack/lib/action_controller/layout.rb
+index ded2709..19879b3 100644
+--- a/actionpack/lib/action_controller/layout.rb
++++ b/actionpack/lib/action_controller/layout.rb
+@@ -250,25 +250,17 @@ module ActionController #:nodoc:
+           if conditions = layout[:conditions]
+             case
+               when only = conditions[:only]
+-                if only.include?(action_name)
+-                  return layout[:template]
+-                else
++                if !only.include?(action_name)
+                   next  # no explicit :only for us, so try the next layout in the chain
+                 end
+               when except = conditions[:except]
+-                if !except.include?(action_name)
+-                  return layout[:template]
+-                else
++                if except.include?(action_name)
+                   next  # no explicit :except for us, so try the next layout in the chain
+                 end
+-              else
+-                return layout[:template]
+             end
+-          else
+-            return layout[:template]
+           end
++          return layout[:template]
+         end
+-        return nil
+       end
+ 
+       def candidate_for_layout?(options)
+diff --git a/actionpack/test/controller/layout_test.rb b/actionpack/test/controller/layout_test.rb
+index 616ec58..06ee04c 100644
+--- a/actionpack/test/controller/layout_test.rb
++++ b/actionpack/test/controller/layout_test.rb
+@@ -202,38 +202,74 @@ unless RUBY_PLATFORM =~ /(:?mswin|mingw|bccwin)/
+   end
+ end
+ 
+-#TODO: didn't have a test that failed when my layout_for_action returned the
+-#      whole hash - write a test that fails for that
+-#
+-#      Then test the various combinations of having multiple layout statements.
+-
+-class FooExceptHelloWithBarFallback < LayoutTest
++class FooExceptHelloWithBarFallThrough < LayoutTest
+   layout 'bar'
+   layout 'foo', :except => :hello
+ end
+ 
+-class FooOnlyHelloWithBarFallback < LayoutTest
++class FooOnlyHelloWithBarFallThrough < LayoutTest
+   layout 'bar'
+   layout 'foo', :only => :hello
+ end
+ 
+-class FooOnlyHelloBarExceptByeFoobarFallback < LayoutTest
++class FooOnlyHelloBarExceptByeFoobarFallThrough < LayoutTest
+   layout 'foobar'
+   layout 'bar', :except => :bye
+   layout 'foo', :only => :hello
+ end
+ 
++class OverlappingLayout < LayoutTest
++  layout 'bar'
++  layout 'foo'
++end
++
+ class LayoutChainingTest < ActionController::TestCase
+-  def test_excepted_actions_falls_through
+-    @controller = FooExceptHelloWithBarFallback.new
++  def test_excepted_actions_fall_through
++    @controller = FooExceptHelloWithBarFallThrough.new
+     get :hello
+-    assert_equal 'bar.html.erb hello.rhtml', @response.body
++    assert_equal 'bar.erb hello.rhtml', @response.body
+   end
+ 
+   def test_non_excepted_actions_are_caught
+-    @controller = FooExceptHelloWithBarFallback.new
++    @controller = FooExceptHelloWithBarFallThrough.new
++    get :bye
++    assert_equal 'foo.erb bye.erb', @response.body
++  end
++
++  def test_only_actions_are_caught
++    @controller = FooOnlyHelloWithBarFallThrough.new
++    get :hello
++    assert_equal 'foo.erb hello.rhtml', @response.body
++  end
++
++  def test_non_only_actions_fall_through
++    @controller = FooOnlyHelloWithBarFallThrough.new
+     get :bye
+-    assert_equal 'foo.html.erb bye.html.erb', @response.body
++    assert_equal 'bar.erb bye.erb', @response.body
++  end
++
++  def test_only_and_except_catches_only
++    @controller = FooOnlyHelloBarExceptByeFoobarFallThrough.new
++    get :hello
++    assert_equal 'foo.erb hello.rhtml', @response.body
++  end
++
++  def test_only_and_except_catches_non_except
++    @controller = FooOnlyHelloBarExceptByeFoobarFallThrough.new
++    get :choo
++    assert_equal 'bar.erb choo.erb', @response.body
++  end
++
++  def test_only_and_except_lets_except_fall_through
++    @controller = FooOnlyHelloBarExceptByeFoobarFallThrough.new
++    get :bye
++    assert_equal 'foobar.erb bye.erb', @response.body
++  end
++
++  def test_overlapping_layouts
++    @controller = OverlappingLayout.new
++    get :choo
++    assert_equal 'foo.erb choo.erb', @response.body
+   end
+ end
+ 
+diff --git a/actionpack/test/fixtures/layout_tests/layouts/bar.erb b/actionpack/test/fixtures/layout_tests/layouts/bar.erb
+new file mode 100644
+index 0000000..b4c3ee0
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/layouts/bar.erb
+@@ -0,0 +1 @@
++bar.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/layouts/bar.html.erb b/actionpack/test/fixtures/layout_tests/layouts/bar.html.erb
+deleted file mode 100644
+index 075c808..0000000
+--- a/actionpack/test/fixtures/layout_tests/layouts/bar.html.erb
++++ /dev/null
+@@ -1 +0,0 @@
+-bar.html.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/layouts/foo.erb b/actionpack/test/fixtures/layout_tests/layouts/foo.erb
+new file mode 100644
+index 0000000..1c1ecd8
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/layouts/foo.erb
+@@ -0,0 +1 @@
++foo.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/layouts/foo.html.erb b/actionpack/test/fixtures/layout_tests/layouts/foo.html.erb
+deleted file mode 100644
+index 6999d44..0000000
+--- a/actionpack/test/fixtures/layout_tests/layouts/foo.html.erb
++++ /dev/null
+@@ -1 +0,0 @@
+-foo.html.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/layouts/foobar.erb b/actionpack/test/fixtures/layout_tests/layouts/foobar.erb
+new file mode 100644
+index 0000000..bde9698
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/layouts/foobar.erb
+@@ -0,0 +1 @@
++foobar.erb <%= yield %>
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/views/bye.erb b/actionpack/test/fixtures/layout_tests/views/bye.erb
+new file mode 100644
+index 0000000..ffc0644
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/views/bye.erb
+@@ -0,0 +1 @@
++bye.erb
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/views/bye.html.erb b/actionpack/test/fixtures/layout_tests/views/bye.html.erb
+deleted file mode 100644
+index 2cda92e..0000000
+--- a/actionpack/test/fixtures/layout_tests/views/bye.html.erb
++++ /dev/null
+@@ -1 +0,0 @@
+-bye.html.erb
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/views/choo.erb b/actionpack/test/fixtures/layout_tests/views/choo.erb
+new file mode 100644
+index 0000000..6506395
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/views/choo.erb
+@@ -0,0 +1 @@
++choo.erb
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/layout_tests/views/choo.html.erb b/actionpack/test/fixtures/layout_tests/views/choo.html.erb
+deleted file mode 100644
+index 09fb966..0000000
+--- a/actionpack/test/fixtures/layout_tests/views/choo.html.erb
++++ /dev/null
+@@ -1 +0,0 @@
+-choo.html.erb
+\ No newline at end of file
+-- 
+1.6.1
+
+
+From f4255d46d546f56fb4c1e34e835b802886e3d80a Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Sat, 7 Mar 2009 18:46:17 +1100
+Subject: [PATCH 3/3] One more test case
+
+---
+ actionpack/lib/action_controller/layout.rb |    1 +
+ actionpack/test/controller/layout_test.rb  |   12 ++++++++++++
+ 2 files changed, 13 insertions(+), 0 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/layout.rb b/actionpack/lib/action_controller/layout.rb
+index 19879b3..33e4e62 100644
+--- a/actionpack/lib/action_controller/layout.rb
++++ b/actionpack/lib/action_controller/layout.rb
+@@ -261,6 +261,7 @@ module ActionController #:nodoc:
+           end
+           return layout[:template]
+         end
++        return nil
+       end
+ 
+       def candidate_for_layout?(options)
+diff --git a/actionpack/test/controller/layout_test.rb b/actionpack/test/controller/layout_test.rb
+index 06ee04c..0b21d19 100644
+--- a/actionpack/test/controller/layout_test.rb
++++ b/actionpack/test/controller/layout_test.rb
+@@ -223,6 +223,10 @@ class OverlappingLayout < LayoutTest
+   layout 'foo'
+ end
+ 
++class NoFallThrough < LayoutTest
++  layout 'foo', :only => :hello
++end
++
+ class LayoutChainingTest < ActionController::TestCase
+   def test_excepted_actions_fall_through
+     @controller = FooExceptHelloWithBarFallThrough.new
+@@ -271,6 +275,14 @@ class LayoutChainingTest < ActionController::TestCase
+     get :choo
+     assert_equal 'foo.erb choo.erb', @response.body
+   end
++
++  def test_no_fall_through
++    @controller = NoFallThrough.new
++    get :choo
++    assert_nothing_raised do
++      @controller.active_layout
++    end
++  end
+ end
+ 
+ 
+-- 
+1.6.1
+

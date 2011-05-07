@@ -1,0 +1,2415 @@
+From 1b788088dd462087635e539fe3fe15c82ceac85e Mon Sep 17 00:00:00 2001
+From: Brian Durand <bdurand@bdurand.local>
+Date: Wed, 21 Apr 2010 23:22:05 -0500
+Subject: [PATCH] ActiveSupport::Cache refactoring
+
+All Caches
+
+* Add default options to initializer that will be sent to all read, write, fetch, exist?, increment, and decrement
+* Add support for the :expires_in option to fetch and write for all caches. Cache entries are stored with the create timestamp and a ttl so that expiration can be handled independently of the implementation.
+* Add support for a :namespace option. This can be used to set a global prefix for cache entries.
+* Deprecate expand_cache_key on ActiveSupport::Cache and move it to ActionController::Caching and ActionDispatch::Http::Cache since the logic in the method used some Rails specific environment variables and was only used by ActionPack classes. Not very DRY but there didn't seem to be a good shared spot and ActiveSupport really shouldn't be Rails specific.
+* Add support for :race_condition_ttl to fetch. This setting can prevent race conditions on fetch calls where several processes try to regenerate a recently expired entry at once.
+* Add support for :compress option to fetch and write which will compress any data over a configurable threshold.
+* Nil values can now be stored in the cache and are distinct from cache misses for fetch.
+* Easier API to create new implementations. Just need to implement the methods read_entry, write_entry, and delete_entry instead of overwriting existing methods.
+* Since all cache implementations support storing objects, update the docs to state that ActiveCache::Cache::Store implementations should store objects. Keys, however, must be strings since some implementations require that.
+* Increase test coverage.
+* Document methods which are provided as convenience but which may not be universally available.
+
+MemoryStore
+
+* MemoryStore can now safely be used as the cache for single server sites.
+* Make thread safe so that the default cache implementation used by Rails is thread safe. The overhead is minimal and it is still the fastest store available.
+* Provide :size initialization option indicating the maximum size of the cache in memory (defaults to 32Mb).
+* Add prune logic that removes the least recently used cache entries to keep the cache size from exceeding the max.
+* Deprecated SynchronizedMemoryStore since it isn't needed anymore.
+
+FileStore
+
+* Escape key values so they will work as file names on all file systems, be consistent, and case sensitive
+* Use a hash algorithm to segment the cache into sub directories so that a large cache doesn't exceed file system limits.
+* FileStore can be slow so implement the LocalCache strategy to cache reads for the duration of a request.
+* Add cleanup method to keep the disk from filling up with expired entries.
+* Fix increment and decrement to use file system locks so they are consistent between processes.
+
+MemCacheStore
+
+* Support all keys. Previously keys with spaces in them would fail
+* Deprecate CompressedMemCacheStore since it isn't needed anymore (use :compress => true)
+---
+ activesupport/lib/active_support/cache.rb          |  496 ++++++++++++--
+ .../cache/compressed_mem_cache_store.rb            |   21 +-
+ .../lib/active_support/cache/file_store.rb         |  182 ++++--
+ .../lib/active_support/cache/mem_cache_store.rb    |  184 ++++---
+ .../lib/active_support/cache/memory_store.rb       |  156 ++++-
+ .../active_support/cache/strategy/local_cache.rb   |  154 +++--
+ .../cache/synchronized_memory_store.rb             |   40 +--
+ activesupport/test/caching_test.rb                 |  681 ++++++++++++++------
+ 8 files changed, 1388 insertions(+), 526 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index 7213b24..4a11a98 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -1,8 +1,12 @@
+ require 'benchmark'
++require 'zlib'
++require 'active_support/core_ext/array/extract_options'
+ require 'active_support/core_ext/array/wrap'
+ require 'active_support/core_ext/benchmark'
+ require 'active_support/core_ext/exception'
+ require 'active_support/core_ext/class/attribute_accessors'
++require 'active_support/core_ext/numeric/bytes'
++require 'active_support/core_ext/numeric/time'
+ require 'active_support/core_ext/object/to_param'
+ require 'active_support/core_ext/string/inflections'
+ 
+@@ -11,10 +15,16 @@ module ActiveSupport
+   module Cache
+     autoload :FileStore, 'active_support/cache/file_store'
+     autoload :MemoryStore, 'active_support/cache/memory_store'
+-    autoload :SynchronizedMemoryStore, 'active_support/cache/synchronized_memory_store'
+     autoload :MemCacheStore, 'active_support/cache/mem_cache_store'
++    autoload :SynchronizedMemoryStore, 'active_support/cache/synchronized_memory_store'
+     autoload :CompressedMemCacheStore, 'active_support/cache/compressed_mem_cache_store'
+ 
++    EMPTY_OPTIONS = {}.freeze
++
++    # These options mean something to all cache implementations. Individual cache
++    # implementations may support additional optons.
++    UNIVERSAL_OPTIONS = [:namespace, :compress, :compress_threshold, :expires_in, :race_condition_ttl]
++
+     module Strategy
+       autoload :LocalCache, 'active_support/cache/strategy/local_cache'
+     end
+@@ -59,15 +69,12 @@ module ActiveSupport
+       end
+     end
+ 
+-    RAILS_CACHE_ID   = ENV["RAILS_CACHE_ID"]
+-    RAILS_APP_VERION = ENV["RAILS_APP_VERION"]
+-    EXPANDED_CACHE   = RAILS_CACHE_ID || RAILS_APP_VERION
+-
+     def self.expand_cache_key(key, namespace = nil)
+       expanded_cache_key = namespace ? "#{namespace}/" : ""
+ 
+-      if EXPANDED_CACHE
+-        expanded_cache_key << "#{RAILS_CACHE_ID || RAILS_APP_VERION}/"
++      prefix = ENV["RAILS_CACHE_ID"] || ENV["RAILS_APP_VERSION"]
++      if prefix
++        expanded_cache_key << "#{prefix}/"
+       end
+ 
+       expanded_cache_key <<
+@@ -92,26 +99,75 @@ module ActiveSupport
+     # ActiveSupport::Cache::MemCacheStore. MemCacheStore is currently the most
+     # popular cache store for large production websites.
+     #
+-    # ActiveSupport::Cache::Store is meant for caching strings. Some cache
+-    # store implementations, like MemoryStore, are able to cache arbitrary
+-    # Ruby objects, but don't count on every cache store to be able to do that.
++    # Some implementations may not support all methods beyond the basic cache
++    # methods of +fetch+, +write+, +read+, +exist?+, and +delete+.
++    #
++    # ActiveSupport::Cache::Store can store any serializable Ruby object.
+     #
+     #   cache = ActiveSupport::Cache::MemoryStore.new
+     #
+     #   cache.read("city")   # => nil
+     #   cache.write("city", "Duckburgh")
+     #   cache.read("city")   # => "Duckburgh"
++    #
++    # Keys are always translated into Strings and are case sensitive. When an
++    # object is specified as a key, its +cache_key+ method will be called if it
++    # is defined. Otherwise, the +to_param+ method will be called. Hashes and
++    # Arrays can be used as keys. The elements will be delimited by slashes
++    # and Hashes elements will be sorted by key so they are consistent.
++    #
++    #   cache.read("city") == cache.read(:city)   # => true
++    #
++    # Nil values can be cached.
++    #
++    # If your cache is on a shared infrastructure, you can define a namespace for
++    # your cache entries. If a namespace is defined, it will be prefixed on to every
++    # key. The namespace can be either a static value or a Proc. If it is a Proc, it
++    # will be invoked when each key is evaluated so that you can use application logic
++    # to invalidate keys.
++    #
++    #   cache.namespace = lambda { @last_mod_time }  # Set the namespace to a variable
++    #   @last_mod_time = Time.now  # Invalidate the entire cache by changing namespace
++    #
++    # All caches support auto expiring content after a specified number of seconds.
++    # To set the cache entry time to live, you can either specify +:expires_in+ as
++    # an option to the constructor to have it affect all entries or to the +fetch+
++    # or +write+ methods for just one entry.
++    #
++    #   cache = ActiveSupport::Cache::MemoryStore.new(:expire_in => 5.minutes)
++    #   cache.write(key, value, :expire_in => 1.minute)  # Set a lower value for one entry
++    #
++    # Caches can also store values in a compressed format to save space and reduce
++    # time spent sending data. Since there is some overhead, values must be large
++    # enough to warrant compression. To turn on compression either pass
++    # <tt>:compress => true</tt> in the initializer or to +fetch+ or +write+.
++    # To specify the threshold at which to compress values, set
++    # <tt>:compress_threshold</tt>. The default threshold is 32K.
+     class Store
+-      cattr_accessor :logger, :instance_writter => false
++
++      cattr_accessor :logger, :instance_writer => true
+ 
+       attr_reader :silence
+       alias :silence? :silence
+ 
++      # Create a new cache. The options will be passed to any write method calls except
++      # for :namespace which can be used to set the global namespace for the cache.
++      def initialize (options = nil)
++        @options = options ? options.dup : {}
++      end
++
++      # Get the default options set when the cache was created.
++      def options
++        @options ||= {}
++      end
++
++      # Silence the logger.
+       def silence!
+         @silence = true
+         self
+       end
+ 
++      # Silence the logger within a block.
+       def mute
+         previous_silence, @silence = defined?(@silence) && @silence, true
+         yield
+@@ -152,28 +208,85 @@ module ActiveSupport
+       #   cache.write("today", "Monday")
+       #   cache.fetch("today", :force => true)  # => nil
+       #
++      # Setting <tt>:compress</tt> will store a large cache entry set by the call
++      # in a compressed format.
++      #
++      # Setting <tt>:expires_in</tt> will set an expiration time on the cache
++      # entry if it is set by call.
++      #
++      # Setting <tt>:race_condition_ttl</tt> will invoke logic on entries set with
++      # an <tt>:expires_in</tt> option. If an entry is found in the cache that is
++      # expired and it has been expired for less than the number of seconds specified
++      # by this option and a block was passed to the method call, then the expiration
++      # future time of the entry in the cache will be updated to that many seconds
++      # in the and the block will be evaluated and written to the cache.
++      #
++      # This is very useful in situations where a cache entry is used very frequently
++      # under heavy load. The first process to find an expired cache entry will then
++      # become responsible for regenerating that entry while other processes continue
++      # to use the slightly out of date entry. This can prevent race conditions where
++      # too many processes are trying to regenerate the entry all at once. If the
++      # process regenerating the entry errors out, the entry will be regenerated
++      # after the specified number of seconds.
++      #
++      #   # Set all values to expire after one minute.
++      #   cache = ActiveSupport::Cache::MemoryCache.new(:expires_in => 1.minute)
++      #
++      #   cache.write("foo", "original value")
++      #   val_1 = nil
++      #   val_2 = nil
++      #   sleep 60
++      #
++      #   Thread.new do
++      #     val_1 = cache.fetch("foo", :race_condition_ttl => 10) do
++      #       sleep 1
++      #       "new value 1"
++      #     end
++      #   end
++      #
++      #   Thread.new do
++      #     val_2 = cache.fetch("foo", :race_condition_ttl => 10) do
++      #       "new value 2"
++      #     end
++      #   end
++      #
++      #   # val_1 => "new value 1"
++      #   # val_2 => "original value"
++      #   # cache.fetch("foo") => "new value 1"
++      #
+       # Other options will be handled by the specific cache store implementation.
+-      # Internally, #fetch calls #read, and calls #write on a cache miss.
++      # Internally, #fetch calls #read_entry, and calls #write_entry on a cache miss.
+       # +options+ will be passed to the #read and #write calls.
+       #
+-      # For example, MemCacheStore's #write method supports the +:expires_in+
+-      # option, which tells the memcached server to automatically expire the
+-      # cache item after a certain period. This options is also supported by
+-      # FileStore's #read method. We can use this option with #fetch too:
++      # For example, MemCacheStore's #write method supports the +:raw+
++      # option, which tells the memcached server to store all values as strings.
++      # We can use this option with #fetch too:
+       #
+       #   cache = ActiveSupport::Cache::MemCacheStore.new
+-      #   cache.fetch("foo", :force => true, :expires_in => 5.seconds) do
+-      #     "bar"
++      #   cache.fetch("foo", :force => true, :raw => true) do
++      #     :bar
+       #   end
+       #   cache.fetch("foo")  # => "bar"
+-      #   sleep(6)
+-      #   cache.fetch("foo")  # => nil
+-      def fetch(key, options = {}, &block)
+-        if !options[:force] && value = read(key, options)
+-          value
++      def fetch(name, options = nil, &block)
++        options = merged_options(options)
++        key = namespaced_key(name, options)
++        entry = instrument(:read, name, options) { read_entry(key, options) } unless options[:force]
++        if entry && entry.expired?
++          race_ttl = options[:race_condition_ttl].to_f
++          if race_ttl and Time.now.to_f - entry.expires_at <= race_ttl
++            entry.expires_at = Time.now + race_ttl
++            write_entry(key, entry, :expires_in => race_ttl * 2)
++          else
++            delete_entry(key, options)
++          end
++          entry = nil
++        end
++
++        if entry
++          entry.value
+         elsif block_given?
+-          result = instrument(:generate, key, options, &block)
+-          write(key, result, options)
++          result = instrument(:generate, name, options, &block)
++          write(name, result, options)
+           result
+         end
+       end
+@@ -182,15 +295,47 @@ module ActiveSupport
+       # the cache with the given key, then that data is returned. Otherwise,
+       # nil is returned.
+       #
+-      # You may also specify additional options via the +options+ argument.
+-      # The specific cache store implementation will decide what to do with
+-      # +options+.
++      # Options are passed to the underlying cache implementation.
++      def read(name, options = nil)
++        options = merged_options(options)
++        key = namespaced_key(name, options)
++        instrument(:read, name, options) do
++          entry = read_entry(key, options)
++          if entry
++            if entry.expired?
++              delete_entry(key, options)
++              nil
++            else
++              entry.value
++            end
++          else
++            nil
++          end
++        end
++      end
++
++      # Read multiple values at once from the cache. Options can be passed
++      # in the last argument.
++      #
++      # Some cache implementation may optimize this method.
+       #
+-      # For example, FileStore supports the +:expires_in+ option, which
+-      # makes the method return nil for cache items older than the specified
+-      # period.
+-      def read(key, options = nil, &block)
+-        instrument(:read, key, options, &block)
++      # Returns a hash mapping the names provided to the values found.
++      def read_multi(*names)
++        options = names.extract_options!
++        options = merged_options(options)
++        results = {}
++        names.each do |name|
++          key = namespaced_key(name, options)
++          entry = read_entry(key, options)
++          if entry
++            if entry.expired?
++              delete_entry(key)
++            else
++              results[name] = entry.value
++            end
++          end
++        end
++        results
+       end
+ 
+       # Writes the given value to the cache, with the given key.
+@@ -198,56 +343,160 @@ module ActiveSupport
+       # You may also specify additional options via the +options+ argument.
+       # The specific cache store implementation will decide what to do with
+       # +options+.
++      def write(name, value, options = nil)
++        options = merged_options(options)
++        instrument(:write, name, options) do
++          entry = Entry.new(value, options)
++          write_entry(namespaced_key(name, options), entry, options)
++        end
++      end
++
++      # Delete an entry in the cache. Returns +true+ if there was an entry to delete.
+       #
+-      # For example, MemCacheStore supports the +:expires_in+ option, which
+-      # tells the memcached server to automatically expire the cache item after
+-      # a certain period:
++      # Options are passed to the underlying cache implementation.
++      def delete(name, options = nil)
++        options = merged_options(options)
++        instrument(:delete, name) do
++          delete_entry(namespaced_key(name, options), options)
++        end
++      end
++
++      # Return true if the cache contains an entry with this name.
+       #
+-      #   cache = ActiveSupport::Cache::MemCacheStore.new
+-      #   cache.write("foo", "bar", :expires_in => 5.seconds)
+-      #   cache.read("foo")  # => "bar"
+-      #   sleep(6)
+-      #   cache.read("foo")  # => nil
+-      def write(key, value, options = nil, &block)
+-        instrument(:write, key, options, &block)
++      # Options are passed to the underlying cache implementation.
++      def exist?(name, options = nil)
++        options = merged_options(options)
++        instrument(:exist?, name) do
++          entry = read_entry(namespaced_key(name, options), options)
++          if entry && !entry.expired?
++            true
++          else
++            false
++          end
++        end
+       end
+ 
+-      def delete(key, options = nil, &block)
+-        instrument(:delete, key, options, &block)
++      # Delete all entries whose keys match a pattern.
++      #
++      # Options are passed to the underlying cache implementation.
++      #
++      # Not all implementations may support +delete_matched+.
++      def delete_matched(matcher, options = nil)
++        raise NotImplementedError.new("#{self.class.name} does not support delete_matched")
+       end
+ 
+-      def delete_matched(matcher, options = nil, &block)
+-        instrument(:delete_matched, matcher.inspect, options, &block)
++      # Increment an integer value in the cache.
++      #
++      # Options are passed to the underlying cache implementation.
++      #
++      # Not all implementations may support +delete_matched+.
++      def increment(name, amount = 1, options = nil)
++        raise NotImplementedError.new("#{self.class.name} does not support increment")
+       end
+ 
+-      def exist?(key, options = nil, &block)
+-        instrument(:exist?, key, options, &block)
++      # Increment an integer value in the cache.
++      #
++      # Options are passed to the underlying cache implementation.
++      #
++      # Not all implementations may support +delete_matched+.
++      def decrement(name, amount = 1, options = nil)
++        raise NotImplementedError.new("#{self.class.name} does not support decrement")
+       end
+ 
+-      def increment(key, amount = 1)
+-        if num = read(key)
+-          write(key, num + amount)
+-        else
+-          nil
+-        end
++      # Cleanup the cache by removing expired entries. Not all cache implementations may
++      # support this method.
++      #
++      # Options are passed to the underlying cache implementation.
++      #
++      # Not all implementations may support +delete_matched+.
++      def cleanup(options = nil)
++        raise NotImplementedError.new("#{self.class.name} does not support cleanup")
+       end
+ 
+-      def decrement(key, amount = 1)
+-        if num = read(key)
+-          write(key, num - amount)
+-        else
+-          nil
+-        end
++      # Clear the entire cache. Not all cache implementations may support this method.
++      # You should be careful with this method since it could affect other processes
++      # if you are using a shared cache.
++      #
++      # Options are passed to the underlying cache implementation.
++      #
++      # Not all implementations may support +delete_matched+.
++      def clear(options = nil)
++        raise NotImplementedError.new("#{self.class.name} does not support clear")
+       end
+ 
++      protected
++        # Add the namespace defined in the options to a pattern designed to match keys.
++        # Implementations that support delete_matched should call this method to translate
++        # a pattern that matches names into one that matches namespaced keys.
++        def key_matcher(pattern, options)
++          prefix = options[:namespace].is_a?(Proc) ? options[:namespace].call : options[:namespace]
++          if prefix
++            source = pattern.source
++            if source.start_with?('^')
++              source = source[1, source.length]
++            else
++              source = ".*#{source[0, source.length]}"
++            end
++            Regexp.new("^#{Regexp.escape(prefix)}:#{source}", pattern.options)
++          else
++            pattern
++          end
++        end
++
++        # Read an entry from the cache implementation. Subclasses must implement this method.
++        def read_entry(key, options) # :nodoc:
++          raise NotImplementedError.new
++        end
++
++        # Write an entry to the cache implementation. Subclasses must implement this method.
++        def write_entry(key, entry, options) # :nodoc:
++          raise NotImplementedError.new
++        end
++
++        # Delete an entry from the cache implementation. Subclasses must implement this method.
++        def delete_entry(key, options) # :nodoc:
++          raise NotImplementedError.new
++        end
++
+       private
+-        def expires_in(options)
+-          expires_in = options && options[:expires_in]
+-          raise ":expires_in must be a number" if expires_in && !expires_in.is_a?(Numeric)
+-          expires_in || 0
++        # Merge the default options with ones specific to a method call.
++        def merged_options(call_options) # :nodoc:
++          if call_options
++            options.merge(call_options)
++          else
++            options.dup
++          end
+         end
+ 
+-        def instrument(operation, key, options)
++        # Expand a key to be a consistent string value. If the object responds to +cache_key+,
++        # it will be called. Otherwise, the to_param method will be called. If the key is a
++        # Hash, the keys will be sorted alphabetically.
++        def expanded_key(key) # :nodoc:
++          if key.respond_to?(:cache_key)
++            key = key.cache_key.to_s
++          elsif key.is_a?(Array)
++            if key.size > 1
++              key.collect{|element| expanded_key(element)}.to_param
++            else
++              key.first.to_param
++            end
++          elsif key.is_a?(Hash)
++            key = key.to_a.sort{|a,b| a.first.to_s <=> b.first.to_s}.collect{|k,v| "#{k}=#{v}"}.to_param
++          else
++            key = key.to_param
++          end
++        end
++
++        # Prefix a key with the namespace. The two values will be delimited with a colon.
++        def namespaced_key(key, options)
++          key = expanded_key(key)
++          namespace = options[:namespace] if options
++          prefix = namespace.is_a?(Proc) ? namespace.call : namespace
++          key = "#{prefix}:#{key}" if prefix
++          key
++        end
++
++        def instrument(operation, key, options = nil)
+           log(operation, key, options)
+ 
+           if self.class.instrument
+@@ -259,9 +508,118 @@ module ActiveSupport
+           end
+         end
+ 
+-        def log(operation, key, options)
+-          return unless logger && !silence?
+-          logger.debug("Cache #{operation}: #{key}#{options ? " (#{options.inspect})" : ""}")
++        def log(operation, key, options = nil)
++          return unless logger && logger.debug? && !silence?
++          logger.debug("Cache #{operation}: #{key}#{options.blank? ? "" : " (#{options.inspect})"}")
++        end
++    end
++
++    # Entry that is put into caches. It supports expiration time on entries and can compress values
++    # to save space in the cache.
++    class Entry
++      attr_reader :created_at, :expires_in
++
++      DEFAULT_COMPRESS_LIMIT = 16.kilobytes
++
++      class << self
++        # Create an entry with internal attributes set. This method is intended to be
++        # used by implementations that store cache entries in a native format instead
++        # of as serialized Ruby objects.
++        def create (raw_value, created_at, options = {})
++          entry = new(nil)
++          entry.instance_variable_set(:@value, raw_value)
++          entry.instance_variable_set(:@created_at, created_at.to_f)
++          entry.instance_variable_set(:@compressed, !!options[:compressed])
++          entry.instance_variable_set(:@expires_in, options[:expires_in])
++          entry
++        end
++      end
++      
++      # Create a new cache entry for the specified value. Options supported are
++      # +:compress+, +:compress_threshold+, and +:expires_in+.
++      def initialize(value, options = {})
++        @compressed = false
++        @expires_in = options[:expires_in]
++        @expires_in = @expires_in.to_f if @expires_in
++        @created_at = Time.now.to_f
++        if value
++          if should_compress?(value, options)
++            @value = Zlib::Deflate.deflate(Marshal.dump(value))
++            @compressed = true
++          else
++            @value = value
++          end
++        else
++          @value = nil
++        end
++      end
++
++      # Get the raw value. This value may be serialized and compressed.
++      def raw_value
++        @value
++      end
++      
++      # Get the value stored in the cache.
++      def value
++        if @value
++          val = compressed? ? Marshal.load(Zlib::Inflate.inflate(@value)) : @value
++          unless val.frozen?
++            val.freeze rescue nil
++          end
++          val
++        end
++      end
++      
++      def compressed?
++        @compressed
++      end
++
++      # Check if the entry is expired. The +expires_in+ parameter can override the
++      # value set when the entry was created.
++      def expired?
++        if @expires_in && @created_at + @expires_in <= Time.now.to_f
++          true
++        else
++          false
++        end
++      end
++
++      # Set a new time to live on the entry so it expires at the given time.
++      def expires_at=(time)
++        if time
++          @expires_in = time.to_f - @created_at
++        else
++          @expires_in = nil
++        end
++      end
++
++      # Seconds since the epoch when the cache entry will expire.
++      def expires_at
++        @expires_in ? @created_at + @expires_in : nil
++      end
++
++      # Get the size of the cached value. This could be less than value.size
++      # if the data is compressed.
++      def size
++        if @value.nil?
++          0
++        elsif @value.respond_to?(:bytesize)
++          @value.bytesize
++        else
++          Marshal.dump(@value).bytesize
++        end
++      end
++      
++      private
++        def should_compress?(value, options)
++          if options[:compress] && value
++            unless value.is_a?(Numeric)
++              compress_threshold = options[:compress_threshold] || DEFAULT_COMPRESS_LIMIT
++              serialized_value = value.is_a?(String) ? value : Marshal.dump(value)
++              return true if serialized_value.size >= compress_threshold
++            end
++          end
++          false
+         end
+     end
+   end
+diff --git a/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb b/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
+index d2370d7..7c7d1c4 100644
+--- a/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
+@@ -1,21 +1,12 @@
+-require 'active_support/gzip'
+-
+ module ActiveSupport
+   module Cache
+     class CompressedMemCacheStore < MemCacheStore
+-      def read(name, options = nil)
+-        if value = super(name, (options || {}).merge(:raw => true))
+-          if raw?(options)
+-            value
+-          else
+-            Marshal.load(ActiveSupport::Gzip.decompress(value))
+-          end
+-        end
+-      end
+-
+-      def write(name, value, options = nil)
+-        value = ActiveSupport::Gzip.compress(Marshal.dump(value)) unless raw?(options)
+-        super(name, value, (options || {}).merge(:raw => true))
++      def initialize(*args)
++        ActiveSupport::Deprecation.warn('ActiveSupport::Cache::CompressedMemCacheStore has been deprecated in favor of ActiveSupport::Cache::MemCacheStore(:compress => true).', caller)
++        addresses = args.dup
++        options = addresses.extract_options!
++        args = addresses + [options.merge(:compress => true)]
++        super(*args)
+       end
+     end
+   end
+diff --git a/activesupport/lib/active_support/cache/file_store.rb b/activesupport/lib/active_support/cache/file_store.rb
+index 7521efe..347e61e 100644
+--- a/activesupport/lib/active_support/cache/file_store.rb
++++ b/activesupport/lib/active_support/cache/file_store.rb
+@@ -3,73 +3,171 @@ require 'active_support/core_ext/file/atomic'
+ module ActiveSupport
+   module Cache
+     # A cache store implementation which stores everything on the filesystem.
++    #
++    # FileStore implements the Strategy::LocalCache strategy which implements
++    # an in memory cache inside of a block.
+     class FileStore < Store
+       attr_reader :cache_path
+ 
+-      def initialize(cache_path)
++      DIR_FORMATTER = "%03X"
++      ESCAPE_FILENAME_CHARS = /[^a-z0-9_.-]/i
++      UNESCAPE_FILENAME_CHARS = /%[0-9A-F]{2}/
++
++      def initialize(cache_path, options = nil)
++        super(options)
+         @cache_path = cache_path
++        extend Strategy::LocalCache
+       end
+ 
+-      # Reads a value from the cache.
+-      #
+-      # Possible options:
+-      # - +:expires_in+ - the number of seconds that this value may stay in
+-      #   the cache.
+-      def read(name, options = nil)
+-        super do
+-          file_name = real_file_path(name)
+-          expires = expires_in(options)
+-
+-          if File.exist?(file_name) && (expires <= 0 || Time.now - File.mtime(file_name) < expires)
+-            File.open(file_name, 'rb') { |f| Marshal.load(f) }
+-          end
+-        end
++      def clear(options = nil)
++        root_dirs = Dir.entries(cache_path).reject{|f| ['.', '..'].include?(f)}
++        FileUtils.rm_r(root_dirs.collect{|f| File.join(cache_path, f)})
+       end
+ 
+-      # Writes a value to the cache.
+-      def write(name, value, options = nil)
+-        super do
+-          ensure_cache_path(File.dirname(real_file_path(name)))
+-          File.atomic_write(real_file_path(name), cache_path) { |f| Marshal.dump(value, f) }
+-          value
++      def cleanup(options = nil)
++        options = merged_options(options)
++        each_key(options) do |key|
++          entry = read_entry(key, options)
++          delete_entry(key, options) if entry && entry.expired?
+         end
+-      rescue => e
+-        logger.error "Couldn't create cache directory: #{name} (#{e.message})" if logger
+       end
+ 
+-      def delete(name, options = nil)
+-        super do
+-          File.delete(real_file_path(name))
++      def increment(name, amount = 1, options = nil)
++        file_name = key_file_path(namespaced_key(name, options))
++        lock_file(file_name) do
++          options = merged_options(options)
++          if num = read(name, options)
++            num = num.to_i + amount
++            write(name, num, options)
++            num
++          else
++            nil
++          end
+         end
+-      rescue SystemCallError => e
+-        # If there's no cache, then there's nothing to complain about
+       end
+ 
++      def decrement(name, amount = 1, options = nil)
++        file_name = key_file_path(namespaced_key(name, options))
++        lock_file(file_name) do
++          options = merged_options(options)
++          if num = read(name, options)
++            num = num.to_i - amount
++            write(name, num, options)
++            num
++          else
++            nil
++          end
++        end
++      end
++      
+       def delete_matched(matcher, options = nil)
+-        super do
+-          search_dir(@cache_path) do |f|
+-            if f =~ matcher
+-              begin
+-                File.delete(f)
+-              rescue SystemCallError => e
+-                # If there's no cache, then there's nothing to complain about
++        options = merged_options(options)
++        instrument(:delete_matched, matcher.inspect) do
++          matcher = key_matcher(matcher, options)
++          search_dir(cache_path) do |path|
++            key = file_path_key(path)
++            delete_entry(key, options) if key.match(matcher)
++          end
++        end
++      end
++
++      protected
++
++        def read_entry(key, options)
++          file_name = key_file_path(key)
++          if File.exist?(file_name)
++            entry = File.open(file_name) { |f| Marshal.load(f) }
++            if entry && !entry.expired? && !entry.expires_in && !self.options[:expires_in]
++              # Check for deprecated use of +:expires_in+ option from versions < 3.0
++              deprecated_expires_in = options[:expires_in]
++              if deprecated_expires_in
++                ActiveSupport::Deprecation.warn('Setting :expires_in on read has been deprecated in favor of setting it on write.', caller)
++                if entry.created_at + deprecated_expires_in.to_f <= Time.now.to_f
++                  delete_entry(key, options)
++                  entry = nil
++                end
+               end
+             end
++            entry
+           end
++        rescue
++          nil
+         end
+-      end
+ 
+-      def exist?(name, options = nil)
+-        super do
+-          File.exist?(real_file_path(name))
++        def write_entry(key, entry, options)
++          file_name = key_file_path(key)
++          ensure_cache_path(File.dirname(file_name))
++          File.atomic_write(file_name, cache_path) {|f| Marshal.dump(entry, f)}
++          true
++        end
++
++        def delete_entry(key, options)
++          file_name = key_file_path(key)
++          if File.exist?(file_name)
++            begin
++              File.delete(file_name)
++              delete_empty_directories(File.dirname(file_name))
++              true
++            rescue => e
++              # Just in case the error was caused by another process deleting the file first.
++              raise e if File.exist?(file_name)
++              false
++            end
++          end
+         end
+-      end
+ 
+       private
+-        def real_file_path(name)
+-          '%s/%s.cache' % [@cache_path, name.gsub('?', '.').gsub(':', '.')]
++        # Lock a file for a block so only one process can modify it at a time.
++        def lock_file(file_name, &block) # :nodoc:
++          if File.exist?(file_name)
++            File.open(file_name, 'r') do |f|
++              begin
++                f.flock File::LOCK_EX
++                yield
++              ensure
++                f.flock File::LOCK_UN
++              end
++            end
++          else
++            yield
++          end
++        end
++
++        # Translate a key into a file path.
++        def key_file_path(key)
++          fname = key.to_s.gsub(ESCAPE_FILENAME_CHARS){|match| "%#{match[0].to_s(16).upcase}"}
++          hash = Zlib.adler32(fname)
++          hash, dir_1 = hash.divmod(0x1000)
++          dir_2 = hash.modulo(0x1000)
++          fname_paths = []
++          # Make sure file name is < 255 characters so it doesn't exceed file system limits.
++          if fname.size <= 255
++            fname_paths << fname
++          else
++            while fname.size <= 255
++              fname_path << fname[0, 255]
++              fname = fname[255, -1]
++            end
++          end
++          File.join(cache_path, DIR_FORMATTER % dir_1, DIR_FORMATTER % dir_2, *fname_paths)
++        end
++
++        # Translate a file path into a key.
++        def file_path_key(path)
++          fname = path[cache_path.size, path.size].split(File::SEPARATOR, 4).last
++          fname.gsub(UNESCAPE_FILENAME_CHARS){|match| $1.to_s(16)}
++        end
++
++        # Delete empty directories in the cache.
++        def delete_empty_directories(dir)
++          return if dir == cache_path
++          if Dir.entries(dir).reject{|f| ['.', '..'].include?(f)}.empty?
++            File.delete(dir) rescue nil
++            delete_empty_directories(File.dirname(dir))
++          end
+         end
+ 
++        # Make sure a file path's directories exist.
+         def ensure_cache_path(path)
+           FileUtils.makedirs(path) unless File.exist?(path)
+         end
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index c56fedc..334a894 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -1,5 +1,5 @@
+ require 'memcache'
+-require 'active_support/core_ext/array/extract_options'
++require 'md5'
+ 
+ module ActiveSupport
+   module Cache
+@@ -13,8 +13,9 @@ module ActiveSupport
+     #   and MemCacheStore will load balance between all available servers. If a
+     #   server goes down, then MemCacheStore will ignore it until it goes back
+     #   online.
+-    # - Time-based expiry support. See #write and the <tt>:expires_in</tt> option.
+-    # - Per-request in memory cache for all communication with the MemCache server(s).
++    #
++    # MemCacheStore implements the Strategy::LocalCache strategy which implements
++    # an in memory cache inside of a block.
+     class MemCacheStore < Store
+       module Response # :nodoc:
+         STORED      = "STORED\r\n"
+@@ -24,6 +25,8 @@ module ActiveSupport
+         DELETED     = "DELETED\r\n"
+       end
+ 
++      ESCAPE_KEY_CHARS = /[\x00-\x20%\x7F-\xFF]/
++
+       def self.build_mem_cache(*addresses)
+         addresses = addresses.flatten
+         options = addresses.extract_options!
+@@ -45,108 +48,139 @@ module ActiveSupport
+       #   require 'memcached' # gem install memcached; uses C bindings to libmemcached
+       #   ActiveSupport::Cache::MemCacheStore.new(Memcached::Rails.new("localhost:11211"))
+       def initialize(*addresses)
++        addresses = addresses.flatten
++        options = addresses.extract_options!
++        super(options)
++
+         if addresses.first.respond_to?(:get)
+           @data = addresses.first
+         else
+-          @data = self.class.build_mem_cache(*addresses)
++          mem_cache_options = options.dup
++          UNIVERSAL_OPTIONS.each{|name| mem_cache_options.delete(name)}
++          @data = self.class.build_mem_cache(*(addresses + [mem_cache_options]))
+         end
+ 
+         extend Strategy::LocalCache
++        extend LocalCacheWithRaw
+       end
+ 
+-      # Reads multiple keys from the cache.
+-      def read_multi(*keys)
+-        @data.get_multi keys
+-      end
+-
+-      def read(key, options = nil) # :nodoc:
+-        super do
+-          @data.get(key, raw?(options))
+-        end
+-      rescue MemCache::MemCacheError => e
+-        logger.error("MemCacheError (#{e}): #{e.message}") if logger
+-        nil
+-      end
+-
+-      # Writes a value to the cache.
+-      #
+-      # Possible options:
+-      # - <tt>:unless_exist</tt> - set to true if you don't want to update the cache
+-      #   if the key is already set.
+-      # - <tt>:expires_in</tt> - the number of seconds that this value may stay in
+-      #   the cache. See ActiveSupport::Cache::Store#write for an example.
+-      def write(key, value, options = nil)
+-        super do
+-          method = options && options[:unless_exist] ? :add : :set
+-          # memcache-client will break the connection if you send it an integer
+-          # in raw mode, so we convert it to a string to be sure it continues working.
+-          value = value.to_s if raw?(options)
+-          response = @data.send(method, key, value, expires_in(options), raw?(options))
+-          response == Response::STORED
+-        end
+-      rescue MemCache::MemCacheError => e
+-        logger.error("MemCacheError (#{e}): #{e.message}") if logger
+-        false
+-      end
+-
+-      def delete(key, options = nil) # :nodoc:
+-        super do
+-          response = @data.delete(key)
+-          response == Response::DELETED
+-        end
+-      rescue MemCache::MemCacheError => e
+-        logger.error("MemCacheError (#{e}): #{e.message}") if logger
+-        false
+-      end
+-
+-      def exist?(key, options = nil) # :nodoc:
+-        # Doesn't call super, cause exist? in memcache is in fact a read
+-        # But who cares? Reading is very fast anyway
+-        # Local cache is checked first, if it doesn't know then memcache itself is read from
+-        super do
+-          !read(key, options).nil?
++      # Reads multiple keys from the cache using a single call to the
++      # servers for all keys. Options can be passed in the last argument.
++      def read_multi(*names)
++        options = names.extract_options!
++        options = merged_options(options)
++        keys_to_names = names.inject({}){|map, name| map[escape_key(namespaced_key(name, options))] = name; map}
++        raw_values = @data.get_multi(keys_to_names.keys, :raw => true)
++        values = {}
++        raw_values.each do |key, value|
++          entry = deserialize_entry(value)
++          values[keys_to_names[key]] = entry.value unless entry.expired?
+         end
++        values
+       end
+ 
+-      def increment(key, amount = 1) # :nodoc:
+-        response = instrument(:increment, key, :amount => amount) do
+-          @data.incr(key, amount)
++      # Increment a cached value. This method uses the memcached incr atomic
++      # operator and can only be used on values written with the :raw option.
++      # Calling it on a value not stored with :raw will initialize that value
++      # to zero.
++      def increment(name, amount = 1, options = nil) # :nodoc:
++        options = merged_options(options)
++        response = instrument(:increment, name, :amount => amount) do
++          @data.incr(escape_key(namespaced_key(name, options)), amount)
+         end
+-
+-        response == Response::NOT_FOUND ? nil : response
++        response == Response::NOT_FOUND ? nil : response.to_i
+       rescue MemCache::MemCacheError
+         nil
+       end
+ 
+-      def decrement(key, amount = 1) # :nodoc:
+-        response = instrument(:decrement, key, :amount => amount) do
+-          @data.decr(key, amount)
++      # Decrement a cached value. This method uses the memcached decr atomic
++      # operator and can only be used on values written with the :raw option.
++      # Calling it on a value not stored with :raw will initialize that value
++      # to zero.
++      def decrement(name, amount = 1, options = nil) # :nodoc:
++        options = merged_options(options)
++        response = instrument(:decrement, name, :amount => amount) do
++          @data.decr(escape_key(namespaced_key(name, options)), amount)
+         end
+-
+-        response == Response::NOT_FOUND ? nil : response
++        response == Response::NOT_FOUND ? nil : response.to_i
+       rescue MemCache::MemCacheError
+         nil
+       end
+ 
+-      def delete_matched(matcher, options = nil) # :nodoc:
+-        # don't do any local caching at present, just pass
+-        # through and let the error happen
+-        super
+-        raise "Not supported by Memcache"
+-      end
+-
+-      def clear
++      # Clear the entire cache on all memcached servers. This method should
++      # be used with care when using a shared cache.
++      def clear(options = nil)
+         @data.flush_all
+       end
+ 
++      # Get the statistics from the memcached servers.
+       def stats
+         @data.stats
+       end
+ 
++      protected
++        # Read an entry from the cache.
++        def read_entry(key, options) # :nodoc:
++          deserialize_entry(@data.get(escape_key(key), true))
++        rescue MemCache::MemCacheError => e
++          logger.error("MemCacheError (#{e}): #{e.message}") if logger
++          nil
++        end
++
++        # Write an entry to the cache.
++        def write_entry(key, entry, options) # :nodoc:
++          method = options && options[:unless_exist] ? :add : :set
++          value = options[:raw] ? entry.value.to_s : entry
++          expires_in = options[:expires_in].to_i
++          if expires_in > 0 && !options[:raw]
++            # Set the memcache expire a few minutes in the future to support race condition ttls on read
++            expires_in += 5.minutes
++          end
++          response = @data.send(method, escape_key(key), value, expires_in, options[:raw])
++          response == Response::STORED
++        rescue MemCache::MemCacheError => e
++          logger.error("MemCacheError (#{e}): #{e.message}") if logger
++          false
++        end
++
++        # Delete an entry from the cache.
++        def delete_entry(key, options) # :nodoc:
++          response = @data.delete(escape_key(key))
++          response == Response::DELETED
++        rescue MemCache::MemCacheError => e
++          logger.error("MemCacheError (#{e}): #{e.message}") if logger
++          false
++        end
++
+       private
+-        def raw?(options)
+-          options && options[:raw]
++        def escape_key(key)
++          key = key.to_s.gsub(ESCAPE_KEY_CHARS){|match| "%#{match[0].to_s(16).upcase}"}
++          key = "#{key[0, 213]}:md5:#{MD5.md5(key).to_s}" if key.size > 250
++          key
+         end
++
++        def deserialize_entry(raw_value)
++          if raw_value
++            entry = Marshal.load(raw_value) rescue raw_value
++            entry.is_a?(Entry) ? entry : Entry.new(entry)
++          else
++            nil
++          end
++        end
++
++      # Provide support for raw values in the local cache strategy.
++      module LocalCacheWithRaw # :nodoc:
++        protected
++          def write_entry(key, entry, options) # :nodoc:
++            retval = super
++            if options[:raw] && local_cache && retval
++              raw_entry = Entry.new(entry.value.to_s)
++              raw_entry.expires_at = entry.expires_at
++              local_cache.write_entry(key, raw_entry, options)
++            end
++            retval
++          end
++      end
+     end
+   end
+ end
+diff --git a/activesupport/lib/active_support/cache/memory_store.rb b/activesupport/lib/active_support/cache/memory_store.rb
+index 379922f..5c2d9ce 100644
+--- a/activesupport/lib/active_support/cache/memory_store.rb
++++ b/activesupport/lib/active_support/cache/memory_store.rb
+@@ -1,4 +1,4 @@
+-require 'active_support/core_ext/object/duplicable'
++require 'monitor'
+ 
+ module ActiveSupport
+   module Cache
+@@ -6,60 +6,154 @@ module ActiveSupport
+     # same process. If you're running multiple Ruby on Rails server processes
+     # (which is the case if you're using mongrel_cluster or Phusion Passenger),
+     # then this means that your Rails server process instances won't be able
+-    # to share cache data with each other. If your application never performs
+-    # manual cache item expiry (e.g. when you're using generational cache keys),
+-    # then using MemoryStore is ok. Otherwise, consider carefully whether you
+-    # should be using this cache store.
++    # to share cache data with each other and this may not be the most
++    # appropriate cache for you.
+     #
+-    # MemoryStore is not only able to store strings, but also arbitrary Ruby
+-    # objects.
++    # This cache has a bounded size specified by the :size options to the
++    # initializer (default is 32Mb). When the cache exceeds the alotted size,
++    # a cleanup will occur which tries to prune the cache down to three quarters
++    # of the maximum size by removing the least recently used entries.
+     #
+-    # MemoryStore is not thread-safe. Use SynchronizedMemoryStore instead
+-    # if you need thread-safety.
++    # MemoryStore is thread-safe.
+     class MemoryStore < Store
+-      def initialize
++      def initialize(options = nil)
++        options ||= {}
++        super(options)
+         @data = {}
++        @key_access = {}
++        @max_size = options[:size] || 32.megabytes
++        @max_prune_time = options[:max_prune_time] || 2
++        @cache_size = 0
++        @monitor = Monitor.new
++        @pruning = false
+       end
+ 
+-      def read_multi(*names)
+-        results = {}
+-        names.each { |n| results[n] = read(n) }
+-        results
++      def clear(options = nil)
++        synchronize do
++          @data.clear
++          @key_access.clear
++          @cache_size = 0
++        end
+       end
+ 
+-      def read(name, options = nil)
+-        super do
+-          @data[name]
++      def cleanup(options = nil)
++        options = merged_options(options)
++        instrument(:cleanup, :size => @data.size) do
++          keys = synchronize{ @data.keys }
++          keys.each do |key|
++            entry = @data[key]
++            delete_entry(key, options) if entry && entry.expired?
++          end
+         end
+       end
+ 
+-      def write(name, value, options = nil)
+-        super do
+-          @data[name] = (value.duplicable? ? value.dup : value).freeze
++      # Prune the cache down so the entries fit within the specified memory size by removing
++      # the least recently accessed entries.
++      def prune(target_size, max_time = nil)
++        return if pruning?
++        @pruning = true
++        begin
++          start_time = Time.now
++          cleanup
++          instrument(:prune, target_size, :from => @cache_size) do
++            keys = synchronize{ @key_access.keys.sort{|a,b| @key_access[a].to_f <=> @key_access[b].to_f} }
++            keys.each do |key|
++              delete_entry(key, options)
++              return if @cache_size <= target_size || (max_time && Time.now - start_time > max_time)
++            end
++          end
++        ensure
++          @pruning = false
+         end
+       end
++      
++      # Return true if the cache is currently be pruned to remove older entries.
++      def pruning?
++        @pruning
++      end
+ 
+-      def delete(name, options = nil)
+-        super do
+-          @data.delete(name)
++      # Increment an integer value in the cache.
++      def increment(name, amount = 1, options = nil)
++        synchronize do
++          options = merged_options(options)
++          if num = read(name, options)
++            num = num.to_i + amount
++            write(name, num, options)
++            num
++          else
++            nil
++          end
+         end
+       end
+ 
++      # Decrement an integer value in the cache.
++      def decrement(name, amount = 1, options = nil)
++        synchronize do
++          options = merged_options(options)
++          if num = read(name, options)
++            num = num.to_i - amount
++            write(name, num, options)
++            num
++          else
++            nil
++          end
++        end
++      end
++      
+       def delete_matched(matcher, options = nil)
+-        super do
+-          @data.delete_if { |k,v| k =~ matcher }
++        options = merged_options(options)
++        instrument(:delete_matched, matcher.inspect) do
++          matcher = key_matcher(matcher, options)
++          keys = synchronize { @data.keys }
++          keys.each do |key|
++            delete_entry(key, options) if key.match(matcher)
++          end
+         end
+       end
+ 
+-      def exist?(name, options = nil)
+-        super do
+-          @data.has_key?(name)
+-        end
++      def inspect # :nodoc:
++        "<##{self.class.name} entries=#{@data.size}, size=#{@cache_size}, options=#{@options.inspect}>"
+       end
+ 
+-      def clear
+-        @data.clear
++      # Synchronize calls to the cache. This should be called wherever the underlying cache implementation
++      # is not thread safe.
++      def synchronize(&block) # :nodoc:
++        @monitor.synchronize(&block)
+       end
++
++      protected
++        def read_entry(key, options) # :nodoc:
++          entry = @data[key]
++          synchronize do
++            if entry
++              @key_access[key] = Time.now.to_f
++            else
++              @key_access.delete(key)
++            end
++          end
++          entry
++        end
++
++        def write_entry(key, entry, options) # :nodoc:
++          synchronize do
++            old_entry = @data[key]
++            @cache_size -= old_entry.size if old_entry
++            @cache_size += entry.size
++            @key_access[key] = Time.now.to_f
++            @data[key] = entry
++            prune(@max_size * 0.75, @max_prune_time) if @cache_size > @max_size
++            true
++          end
++        end
++
++        def delete_entry(key, options) # :nodoc:
++          synchronize do
++            @key_access.delete(key)
++            entry = @data.delete(key)
++            @cache_size -= entry.size if entry
++            !!entry
++          end
++        end
+     end
+   end
+ end
+diff --git a/activesupport/lib/active_support/cache/strategy/local_cache.rb b/activesupport/lib/active_support/cache/strategy/local_cache.rb
+index bbbd643..8942587 100644
+--- a/activesupport/lib/active_support/cache/strategy/local_cache.rb
++++ b/activesupport/lib/active_support/cache/strategy/local_cache.rb
+@@ -4,17 +4,54 @@ require 'active_support/core_ext/string/inflections'
+ module ActiveSupport
+   module Cache
+     module Strategy
++      # Caches that implement LocalCache will be backed by an in memory cache for the
++      # duration of a block. Repeated calls to the cache for the same key will hit the
++      # in memory cache for faster access.
+       module LocalCache
+-        # this allows caching of the fact that there is nothing in the remote cache
+-        NULL = 'remote_cache_store:null'
++        # Simple memory backed cache. This cache is not thread safe but is intended only
++        # for serving as a temporary memory cache for a single thread.
++        class LocalStore < Store
++          def initialize
++            super
++            @data = {}
++          end
++
++          # Since it isn't thread safe, don't allow synchronizing.
++          def synchronize # :nodoc:
++            yield
++          end
++
++          def clear(options = nil)
++            @data.clear
++          end
++
++          def read_entry(key, options)
++            @data[key]
++          end
+ 
++          def write_entry(key, value, options)
++            @data[key] = value
++            true
++          end
++
++          def delete_entry(key, options)
++            !!@data.delete(key)
++          end
++        end
++
++        # Use a local cache to front for the cache for the duration of a block.
+         def with_local_cache
+-          Thread.current[thread_local_key] = MemoryStore.new
+-          yield
+-        ensure
+-          Thread.current[thread_local_key] = nil
++          save_val = Thread.current[thread_local_key]
++          begin
++            Thread.current[thread_local_key] = LocalStore.new
++            yield
++          ensure
++            Thread.current[thread_local_key] = save_val
++          end
+         end
+ 
++        # Middleware class can be inserted as a Rack handler to use a local cache for the
++        # duration of a request.
+         def middleware
+           @middleware ||= begin
+             klass = Class.new
+@@ -24,7 +61,7 @@ module ActiveSupport
+               end
+ 
+               def call(env)
+-                Thread.current[:#{thread_local_key}] = MemoryStore.new
++                Thread.current[:#{thread_local_key}] = LocalStore.new
+                 @app.call(env)
+               ensure
+                 Thread.current[:#{thread_local_key}] = nil
+@@ -39,73 +76,86 @@ module ActiveSupport
+           end
+         end
+ 
+-        def read(key, options = nil)
+-          value = local_cache && local_cache.read(key)
+-          if value == NULL
+-            nil
+-          elsif value.nil?
+-            value = super
+-            local_cache.mute { local_cache.write(key, value || NULL) } if local_cache
+-            value.duplicable? ? value.dup : value
+-          else
+-            # forcing the value to be immutable
+-            value.duplicable? ? value.dup : value
+-          end
+-        end
+-
+-        def write(key, value, options = nil)
+-          value = value.to_s if respond_to?(:raw?) && raw?(options)
+-          local_cache.mute { local_cache.write(key, value || NULL) } if local_cache
++        def clear(options = nil) # :nodoc:
++          local_cache.clear(options) if local_cache
+           super
+         end
+ 
+-        def delete(key, options = nil)
+-          local_cache.mute { local_cache.write(key, NULL) } if local_cache
++        def cleanup(options = nil) # :nodoc:
++          local_cache.clear(options) if local_cache
+           super
+         end
+ 
+-        def exist(key, options = nil)
+-          value = local_cache.read(key) if local_cache
+-          if value == NULL
+-            false
+-          elsif value
+-            true
+-          else
+-            super
++        def increment(name, amount = 1, options = nil) # :nodoc:
++          value = bypass_local_cache{super}
++          if local_cache
++            local_cache.mute do
++              if value
++                local_cache.write(name, value, options)
++              else
++                local_cache.delete(name, options)
++              end
++            end
+           end
++          value
+         end
+ 
+-        def increment(key, amount = 1)
+-          if value = super
+-            local_cache.mute { local_cache.write(key, value.to_s) } if local_cache
+-            value
+-          else
+-            nil
++        def decrement(name, amount = 1, options = nil) # :nodoc:
++          value = bypass_local_cache{super}
++          if local_cache
++            local_cache.mute do
++              if value
++                local_cache.write(name, value, options)
++              else
++                local_cache.delete(name, options)
++              end
++            end
+           end
++          value
+         end
+ 
+-        def decrement(key, amount = 1)
+-          if value = super
+-            local_cache.mute { local_cache.write(key, value.to_s) } if local_cache
+-            value
+-          else
+-            nil
++        protected
++          def read_entry(key, options) # :nodoc:
++            if local_cache
++              entry = local_cache.read_entry(key, options)
++              unless entry
++                entry = super
++                local_cache.write_entry(key, entry, options)
++              end
++              entry
++            else
++              super
++            end
+           end
+-        end
+ 
+-        def clear
+-          local_cache.clear if local_cache
+-          super
+-        end
++          def write_entry(key, entry, options) # :nodoc:
++            local_cache.write_entry(key, entry, options) if local_cache
++            super
++          end
++
++          def delete_entry(key, options) # :nodoc:
++            local_cache.delete_entry(key, options) if local_cache
++            super
++          end
+ 
+         private
+           def thread_local_key
+-            @thread_local_key ||= "#{self.class.name.underscore}_local_cache".gsub("/", "_").to_sym
++            @thread_local_key ||= "#{self.class.name.underscore}_local_cache_#{self.object_id}".gsub("/", "_").to_sym
+           end
+ 
+           def local_cache
+             Thread.current[thread_local_key]
+           end
++
++          def bypass_local_cache
++            save_cache = Thread.current[thread_local_key]
++            begin
++              Thread.current[thread_local_key] = nil
++              yield
++            ensure
++              Thread.current[thread_local_key] = save_cache
++            end
++          end
+       end
+     end
+   end
+diff --git a/activesupport/lib/active_support/cache/synchronized_memory_store.rb b/activesupport/lib/active_support/cache/synchronized_memory_store.rb
+index ea03a11..37caa6b 100644
+--- a/activesupport/lib/active_support/cache/synchronized_memory_store.rb
++++ b/activesupport/lib/active_support/cache/synchronized_memory_store.rb
+@@ -2,45 +2,9 @@ module ActiveSupport
+   module Cache
+     # Like MemoryStore, but thread-safe.
+     class SynchronizedMemoryStore < MemoryStore
+-      def initialize
++      def initialize(*args)
++        ActiveSupport::Deprecation.warn('ActiveSupport::Cache::SynchronizedMemoryStore has been deprecated in favor of ActiveSupport::Cache::MemoryStore.', caller)
+         super
+-        @guard = Monitor.new
+-      end
+-
+-      def fetch(key, options = {})
+-        @guard.synchronize { super }
+-      end
+-
+-      def read(name, options = nil)
+-        @guard.synchronize { super }
+-      end
+-
+-      def write(name, value, options = nil)
+-        @guard.synchronize { super }
+-      end
+-
+-      def delete(name, options = nil)
+-        @guard.synchronize { super }
+-      end
+-
+-      def delete_matched(matcher, options = nil)
+-        @guard.synchronize { super }
+-      end
+-
+-      def exist?(name,options = nil)
+-        @guard.synchronize { super }
+-      end
+-
+-      def increment(key, amount = 1)
+-        @guard.synchronize { super }
+-      end
+-
+-      def decrement(key, amount = 1)
+-        @guard.synchronize { super }
+-      end
+-
+-      def clear
+-        @guard.synchronize { super }
+       end
+     end
+   end
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index e62e7ef..5c6ef16 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -4,6 +4,7 @@ require 'active_support/cache'
+ 
+ class CacheKeyTest < ActiveSupport::TestCase
+   def test_expand_cache_key
++    assert_equal '1/2/true', ActiveSupport::Cache.expand_cache_key([1, '2', true])
+     assert_equal 'name/1/2/true', ActiveSupport::Cache.expand_cache_key([1, '2', true], :name)
+   end
+ end
+@@ -43,9 +44,10 @@ class CacheStoreSettingTest < ActiveSupport::TestCase
+   end
+ 
+   def test_mem_cache_fragment_cache_store_with_options
+-    MemCache.expects(:new).with(%w[localhost 192.168.1.1], { :namespace => "foo" })
+-    store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost", '192.168.1.1', :namespace => 'foo'
++    MemCache.expects(:new).with(%w[localhost 192.168.1.1], { :timeout => 10 })
++    store = ActiveSupport::Cache.lookup_store :mem_cache_store, "localhost", '192.168.1.1', :namespace => 'foo', :timeout => 10
+     assert_kind_of(ActiveSupport::Cache::MemCacheStore, store)
++    assert_equal 'foo', store.options[:namespace]
+   end
+ 
+   def test_object_assigned_fragment_cache_store
+@@ -55,306 +57,542 @@ class CacheStoreSettingTest < ActiveSupport::TestCase
+   end
+ end
+ 
+-class CacheStoreTest < ActiveSupport::TestCase
+-  def setup
+-    @cache = ActiveSupport::Cache.lookup_store(:memory_store)
++class CacheStoreNamespaceTest < ActiveSupport::TestCase
++  def test_static_namespace
++    cache = ActiveSupport::Cache.lookup_store(:memory_store, :namespace => "tester")
++    cache.write("foo", "bar")
++    assert_equal "bar", cache.read("foo")
++    assert_equal "bar", cache.instance_variable_get(:@data)["tester:foo"].value
++  end
++  
++  def test_proc_namespace
++    test_val = "tester"
++    proc = lambda{test_val}
++    cache = ActiveSupport::Cache.lookup_store(:memory_store, :namespace => proc)
++    cache.write("foo", "bar")
++    assert_equal "bar", cache.read("foo")
++    assert_equal "bar", cache.instance_variable_get(:@data)["tester:foo"].value
++  end
++  
++  def test_delete_matched_key_start
++    cache = ActiveSupport::Cache.lookup_store(:memory_store, :namespace => "tester")
++    cache.write("foo", "bar")
++    cache.write("fu", "baz")
++    cache.delete_matched(/^fo/)
++    assert_equal false, cache.exist?("foo")
++    assert_equal true, cache.exist?("fu")
++  end
++  
++  def test_delete_matched_key
++    cache = ActiveSupport::Cache.lookup_store(:memory_store, :namespace => "foo")
++    cache.write("foo", "bar")
++    cache.write("fu", "baz")
++    cache.delete_matched(/OO/i)
++    assert_equal false, cache.exist?("foo")
++    assert_equal true, cache.exist?("fu")
++  end
++end
++
++# Tests the base functionality that should be identical across all cache stores.
++module CacheStoreBehavior
++  def test_should_read_and_write_strings
++    assert_equal true, @cache.write('foo', 'bar')
++    assert_equal 'bar', @cache.read('foo')
++  end
++  
++  def test_should_overwrite
++    @cache.write('foo', 'bar')
++    @cache.write('foo', 'baz')
++    assert_equal 'baz', @cache.read('foo')
+   end
+ 
+   def test_fetch_without_cache_miss
+-    @cache.stubs(:read).with('foo', {}).returns('bar')
++    @cache.write('foo', 'bar')
+     @cache.expects(:write).never
+     assert_equal 'bar', @cache.fetch('foo') { 'baz' }
+   end
+ 
+   def test_fetch_with_cache_miss
+-    @cache.stubs(:read).with('foo', {}).returns(nil)
+-    @cache.expects(:write).with('foo', 'baz', {})
++    @cache.expects(:write).with('foo', 'baz', @cache.options)
+     assert_equal 'baz', @cache.fetch('foo') { 'baz' }
+   end
+ 
+   def test_fetch_with_forced_cache_miss
++    @cache.write('foo', 'bar')
+     @cache.expects(:read).never
+-    @cache.expects(:write).with('foo', 'bar', :force => true)
++    @cache.expects(:write).with('foo', 'bar', @cache.options.merge(:force => true))
+     @cache.fetch('foo', :force => true) { 'bar' }
+   end
+-end
+-
+-# Tests the base functionality that should be identical across all cache stores.
+-module CacheStoreBehavior
+-  def test_should_read_and_write_strings
+-    @cache.write('foo', 'bar')
+-    assert_equal 'bar', @cache.read('foo')
++  
++  def test_fetch_with_cached_nil
++    @cache.write('foo', nil)
++    @cache.expects(:write).never
++    assert_nil @cache.fetch('foo') { 'baz' }
+   end
+ 
+   def test_should_read_and_write_hash
+-    @cache.write('foo', {:a => "b"})
++    assert_equal true, @cache.write('foo', {:a => "b"})
+     assert_equal({:a => "b"}, @cache.read('foo'))
+   end
+ 
+   def test_should_read_and_write_integer
+-    @cache.write('foo', 1)
++    assert_equal true, @cache.write('foo', 1)
+     assert_equal 1, @cache.read('foo')
+   end
+ 
+   def test_should_read_and_write_nil
+-    @cache.write('foo', nil)
++    assert_equal true, @cache.write('foo', nil)
+     assert_equal nil, @cache.read('foo')
+   end
+-
+-  def test_fetch_without_cache_miss
++  
++  def test_read_multi
+     @cache.write('foo', 'bar')
+-    assert_equal 'bar', @cache.fetch('foo') { 'baz' }
++    @cache.write('fu', 'baz')
++    @cache.write('fud', 'biz')
++    assert_equal({"foo" => "bar", "fu" => "baz"}, @cache.read_multi('foo', 'fu'))
++  end
++  
++  def test_read_and_write_compressed_small_data
++    @cache.write('foo', 'bar', :compress => true)
++    raw_value = @cache.send(:read_entry, 'foo', {}).raw_value
++    assert_equal 'bar', @cache.read('foo')
++    assert_equal 'bar', raw_value
+   end
+-
+-  def test_fetch_with_cache_miss
+-    assert_equal 'baz', @cache.fetch('foo') { 'baz' }
++  
++  def test_read_and_write_compressed_large_data
++    @cache.write('foo', 'bar', :compress => true, :compress_threshold => 2)
++    raw_value = @cache.send(:read_entry, 'foo', {}).raw_value
++    assert_equal 'bar', @cache.read('foo')
++    assert_equal 'bar', Marshal.load(Zlib::Inflate.inflate(raw_value))
++  end
++  
++  def test_read_and_write_compressed_nil
++    @cache.write('foo', nil, :compress => true)
++    assert_nil @cache.read('foo')
++  end
++  
++  def test_cache_key
++    obj = Object.new
++    def obj.cache_key
++      :foo
++    end
++    @cache.write(obj, "bar")
++    assert_equal "bar", @cache.read("foo")
++  end
++  
++  def test_param_as_cache_key
++    obj = Object.new
++    def obj.to_param
++      "foo"
++    end
++    @cache.write(obj, "bar")
++    assert_equal "bar", @cache.read("foo")
+   end
+-
+-  def test_fetch_with_forced_cache_miss
+-    @cache.fetch('foo', :force => true) { 'bar' }
++  
++  def test_array_as_cache_key
++    @cache.write([:fu, "foo"], "bar")
++    assert_equal "bar", @cache.read("fu/foo")
+   end
+-
+-  def test_increment
+-    @cache.write('foo', 1, :raw => true)
+-    assert_equal 1, @cache.read('foo', :raw => true).to_i
+-    assert_equal 2, @cache.increment('foo')
+-    assert_equal 2, @cache.read('foo', :raw => true).to_i
+-    assert_equal 3, @cache.increment('foo')
+-    assert_equal 3, @cache.read('foo', :raw => true).to_i
++  
++  def test_hash_as_cache_key
++    @cache.write({:foo => 1, :fu => 2}, "bar")
++    assert_equal "bar", @cache.read("foo=1/fu=2")
+   end
+-
+-  def test_decrement
+-    @cache.write('foo', 3, :raw => true)
+-    assert_equal 3, @cache.read('foo', :raw => true).to_i
+-    assert_equal 2, @cache.decrement('foo')
+-    assert_equal 2, @cache.read('foo', :raw => true).to_i
+-    assert_equal 1, @cache.decrement('foo')
+-    assert_equal 1, @cache.read('foo', :raw => true).to_i
++  
++  def test_keys_are_case_sensitive
++    @cache.write("foo", "bar")
++    assert_nil @cache.read("FOO")
+   end
+ 
+   def test_exist
+     @cache.write('foo', 'bar')
++    assert_equal true, @cache.exist?('foo')
++    assert_equal false, @cache.exist?('bar')
++  end
++  
++  def test_nil_exist
++    @cache.write('foo', nil)
++    assert_equal true, @cache.exist?('foo')
++  end
++  
++  def test_delete
++    @cache.write('foo', 'bar')
+     assert @cache.exist?('foo')
+-    assert !@cache.exist?('bar')
++    assert_equal true, @cache.delete('foo')
++    assert !@cache.exist?('foo')
+   end
+-end
+-
+-class FileStoreTest < ActiveSupport::TestCase
+-  def setup
+-    @cache = ActiveSupport::Cache.lookup_store(:file_store, Dir.pwd)
++  
++  def test_store_objects_should_be_immutable
++    @cache.write('foo', 'bar')
++    assert_raise(ActiveSupport::FrozenObjectError) { @cache.read('foo').gsub!(/.*/, 'baz') }
++    assert_equal 'bar', @cache.read('foo')
+   end
+ 
+-  def teardown
+-    File.delete("foo.cache")
++  def test_original_store_objects_should_not_be_immutable
++    bar = 'bar'
++    @cache.write('foo', bar)
++    assert_nothing_raised { bar.gsub!(/.*/, 'baz') }
+   end
+ 
+-  include CacheStoreBehavior
+-
+   def test_expires_in
+     time = Time.local(2008, 4, 24)
+     Time.stubs(:now).returns(time)
+-    File.stubs(:mtime).returns(time)
+ 
+     @cache.write('foo', 'bar')
+-    cache_read = lambda { @cache.read('foo', :expires_in => 60) }
+-    assert_equal 'bar', cache_read.call
++    assert_equal 'bar', @cache.read('foo')
+ 
+     Time.stubs(:now).returns(time + 30)
+-    assert_equal 'bar', cache_read.call
++    assert_equal 'bar', @cache.read('foo')
+ 
+-    Time.stubs(:now).returns(time + 120)
+-    assert_nil cache_read.call
++    Time.stubs(:now).returns(time + 61)
++    assert_nil @cache.read('foo')
++  end
++  
++  def test_race_condition_protection
++    time = Time.now
++    @cache.write('foo', 'bar', :expires_in => 60)
++    Time.stubs(:now).returns(time + 61)
++    result = @cache.fetch('foo', :race_condition_ttl => 10) do
++      assert_equal 'bar', @cache.read('foo')
++      "baz"
++    end
++    assert_equal "baz", result
++  end
++  
++  def test_race_condition_protection_is_limited
++    time = Time.now
++    @cache.write('foo', 'bar', :expires_in => 60)
++    Time.stubs(:now).returns(time + 71)
++    result = @cache.fetch('foo', :race_condition_ttl => 10) do
++      assert_equal nil, @cache.read('foo')
++      "baz"
++    end
++    assert_equal "baz", result
++  end
++  
++  def test_race_condition_protection_is_safe
++    time = Time.now
++    @cache.write('foo', 'bar', :expires_in => 60)
++    Time.stubs(:now).returns(time + 61)
++    begin
++      @cache.fetch('foo', :race_condition_ttl => 10) do
++        assert_equal 'bar', @cache.read('foo')
++        raise ArgumentError.new
++      end
++    rescue ArgumentError => e
++    end
++    assert_equal "bar", @cache.read('foo')
++    Time.stubs(:now).returns(time + 71)
++    assert_nil @cache.read('foo')
++  end
++  
++  def test_crazy_key_characters
++    crazy_key = "#/:*(<+=> )&$%@?;'\"\'`~-"
++    assert_equal true, @cache.write(crazy_key, "1", :raw => true)
++    assert_equal "1", @cache.read(crazy_key)
++    assert_equal "1", @cache.fetch(crazy_key)
++    assert_equal true, @cache.delete(crazy_key)
++    assert_equal "2", @cache.fetch(crazy_key, :raw => true) { "2" }
++    assert_equal 3, @cache.increment(crazy_key)
++    assert_equal 2, @cache.decrement(crazy_key)
++  end
++  
++  def test_really_long_keys
++    key = ""
++    1000.times{key << "x"}
++    assert_equal true, @cache.write(key, "bar")
++    assert_equal "bar", @cache.read(key)
++    assert_equal "bar", @cache.fetch(key)
++    assert_nil @cache.read("#{key}x")
++    assert_equal({key => "bar"}, @cache.read_multi(key))
++    assert_equal true, @cache.delete(key)
+   end
+ end
+ 
+-class MemoryStoreTest < ActiveSupport::TestCase
+-  def setup
+-    @cache = ActiveSupport::Cache.lookup_store(:memory_store)
++module CacheDeleteMatchedBehavior
++  def test_delete_matched
++    @cache.write("foo", "bar")
++    @cache.write("fu", "baz")
++    @cache.delete_matched(/oo/)
++    assert_equal false, @cache.exist?("foo")
++    assert_equal true, @cache.exist?("fu")
+   end
++end
+ 
+-  include CacheStoreBehavior
+-
+-  def test_store_objects_should_be_immutable
+-    @cache.write('foo', 'bar')
+-    assert_raise(ActiveSupport::FrozenObjectError) { @cache.read('foo').gsub!(/.*/, 'baz') }
+-    assert_equal 'bar', @cache.read('foo')
++module CacheIncrementDecrementBehavior
++  def test_increment
++    @cache.write('foo', 1, :raw => true)
++    assert_equal 1, @cache.read('foo').to_i
++    assert_equal 2, @cache.increment('foo')
++    assert_equal 2, @cache.read('foo').to_i
++    assert_equal 3, @cache.increment('foo')
++    assert_equal 3, @cache.read('foo').to_i
+   end
+ 
+-  def test_original_store_objects_should_not_be_immutable
+-    bar = 'bar'
+-    @cache.write('foo', bar)
+-    assert_nothing_raised { bar.gsub!(/.*/, 'baz') }
++  def test_decrement
++    @cache.write('foo', 3, :raw => true)
++    assert_equal 3, @cache.read('foo').to_i
++    assert_equal 2, @cache.decrement('foo')
++    assert_equal 2, @cache.read('foo').to_i
++    assert_equal 1, @cache.decrement('foo')
++    assert_equal 1, @cache.read('foo').to_i
+   end
++end
+ 
+-  def test_multi_get
+-    @cache.write('foo', 1)
+-    @cache.write('goo', 2)
+-    result = @cache.read_multi('foo', 'goo')
+-    assert_equal({'foo' => 1, 'goo' => 2}, result)
++module LocalCacheBehavior
++  def test_local_writes_are_persistent_on_the_remote_cache
++    retval = @cache.with_local_cache do
++      @cache.write('foo', 'bar')
++    end
++    assert_equal true, retval
++    assert_equal 'bar', @cache.read('foo')
+   end
+-end
+ 
+-uses_memcached 'memcached backed store' do
+-  class MemCacheStoreTest < ActiveSupport::TestCase
+-    def setup
+-      @cache = ActiveSupport::Cache.lookup_store(:mem_cache_store)
+-      @data = @cache.instance_variable_get(:@data)
++  def test_clear_also_clears_local_cache
++    @cache.with_local_cache do
++      @cache.write('foo', 'bar')
+       @cache.clear
+-      @cache.silence!
+-      @cache.logger = Logger.new("/dev/null")
++      assert_nil @cache.read('foo')
+     end
++    
++    assert_nil @cache.read('foo')
++  end
+ 
+-    include CacheStoreBehavior
+-
+-    def test_store_objects_should_be_immutable
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-        @cache.read('foo').gsub!(/.*/, 'baz')
+-        assert_equal 'bar', @cache.read('foo')
+-      end
++  def test_local_cache_of_write
++    @cache.with_local_cache do
++      @cache.write('foo', 'bar')
++      @peek.delete('foo')
++      assert_equal 'bar', @cache.read('foo')
+     end
++  end
+ 
+-    def test_stored_objects_should_not_be_frozen
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-      end
+-      @cache.with_local_cache do
+-        assert !@cache.read('foo').frozen?
+-      end
++  def test_local_cache_of_read
++    @cache.write('foo', 'bar')
++    @cache.with_local_cache do
++      assert_equal 'bar', @cache.read('foo')
+     end
++  end
+ 
+-    def test_write_should_return_true_on_success
+-      @cache.with_local_cache do
+-        result = @cache.write('foo', 'bar')
+-        assert_equal 'bar', @cache.read('foo') # make sure 'foo' was written
+-        assert result
+-      end
++  def test_local_cache_of_write_nil
++    @cache.with_local_cache do
++      assert true, @cache.write('foo', nil)
++      assert_nil @cache.read('foo')
++      @peek.write('foo', 'bar')
++      assert_nil @cache.read('foo')
+     end
++  end
+ 
+-    def test_local_writes_are_persistent_on_the_remote_cache
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-      end
+-
+-      assert_equal 'bar', @cache.read('foo')
++  def test_local_cache_of_delete
++    @cache.with_local_cache do
++      @cache.write('foo', 'bar')
++      @cache.delete('foo')
++      assert_nil @cache.read('foo')
+     end
++  end
+ 
+-    def test_clear_also_clears_local_cache
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-        @cache.clear
+-        assert_nil @cache.read('foo')
+-      end
++  def test_local_cache_of_exist
++    @cache.with_local_cache do
++      @cache.write('foo', 'bar')
++      @peek.delete('foo')
++      assert true, @cache.exist?('foo')
+     end
++  end
+ 
+-    def test_local_cache_of_read_and_write
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-        @data.flush_all # Clear remote cache
+-        assert_equal 'bar', @cache.read('foo')
+-      end
++  def test_local_cache_of_increment
++    @cache.with_local_cache do
++      @cache.write('foo', 1, :raw => true)
++      @peek.write('foo', 2, :raw => true)
++      @cache.increment('foo')
++      assert_equal 3, @cache.read('foo')
+     end
++  end
+ 
+-    def test_local_cache_should_read_and_write_integer
+-      @cache.with_local_cache do
+-        @cache.write('foo', 1)
+-        assert_equal 1, @cache.read('foo')
+-      end
++  def test_local_cache_of_decrement
++    @cache.with_local_cache do
++      @cache.write('foo', 1, :raw => true)
++      @peek.write('foo', 3, :raw => true)
++      @cache.decrement('foo')
++      assert_equal 2, @cache.read('foo')
+     end
++  end
+ 
+-    def test_local_cache_of_delete
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-        @cache.delete('foo')
+-        @data.flush_all # Clear remote cache
+-        assert_nil @cache.read('foo')
+-      end
+-    end
++  def test_middleware
++    app = lambda { |env|
++      result = @cache.write('foo', 'bar')
++      assert_equal 'bar', @cache.read('foo') # make sure 'foo' was written
++      assert result
++    }
++    app = @cache.middleware.new(app)
++    app.call({})
++  end
++end
+ 
+-    def test_local_cache_of_exist
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-        @cache.instance_variable_set(:@data, nil)
+-        @data.flush_all # Clear remote cache
+-        assert @cache.exist?('foo')
+-      end
+-    end
++class FileStoreTest < ActiveSupport::TestCase
++  def setup
++    Dir.mkdir(cache_dir) unless File.exist?(cache_dir)
++    @cache = ActiveSupport::Cache.lookup_store(:file_store, cache_dir, :expires_in => 60)
++    @peek = ActiveSupport::Cache.lookup_store(:file_store, cache_dir, :expires_in => 60)
++  end
+ 
+-    def test_local_cache_of_increment
+-      @cache.with_local_cache do
+-        @cache.write('foo', 1, :raw => true)
+-        @cache.increment('foo')
+-        @data.flush_all # Clear remote cache
+-        assert_equal 2, @cache.read('foo', :raw => true).to_i
+-      end
+-    end
++  def teardown
++    FileUtils.rm_r(cache_dir)
++  end
++  
++  def cache_dir
++    File.join(Dir.pwd, 'tmp_cache')
++  end
+ 
+-    def test_local_cache_of_decrement
+-      @cache.with_local_cache do
+-        @cache.write('foo', 1, :raw => true)
+-        @cache.decrement('foo')
+-        @data.flush_all # Clear remote cache
+-        assert_equal 0, @cache.read('foo', :raw => true).to_i
+-      end
++  include CacheStoreBehavior
++  include LocalCacheBehavior
++  include CacheDeleteMatchedBehavior
++  include CacheIncrementDecrementBehavior
++    
++  def test_deprecated_expires_in_on_read
++    ActiveSupport::Deprecation.silence do
++      old_cache = ActiveSupport::Cache.lookup_store(:file_store, cache_dir)
++    
++      time = Time.local(2008, 4, 24)
++      Time.stubs(:now).returns(time)
++
++      old_cache.write("foo", "bar")
++      assert_equal 'bar', old_cache.read('foo', :expires_in => 60)
++
++      Time.stubs(:now).returns(time + 30)
++      assert_equal 'bar', old_cache.read('foo', :expires_in => 60)
++
++      Time.stubs(:now).returns(time + 61)
++      assert_equal 'bar', old_cache.read('foo')
++      assert_nil old_cache.read('foo', :expires_in => 60)
++      assert_nil old_cache.read('foo')
+     end
++  end
++end
+ 
+-    def test_exist_with_nulls_cached_locally
+-      @cache.with_local_cache do
+-        @cache.write('foo', 'bar')
+-        @cache.delete('foo')
+-        assert !@cache.exist?('foo')
+-      end
+-    end
++class MemoryStoreTest < ActiveSupport::TestCase
++  def setup
++    @cache = ActiveSupport::Cache.lookup_store(:memory_store, :expires_in => 60, :size => 100)
++  end
+ 
+-    def test_multi_get
+-      @cache.with_local_cache do
+-        @cache.write('foo', 1)
+-        @cache.write('goo', 2)
+-        result = @cache.read_multi('foo', 'goo')
+-        assert_equal({'foo' => 1, 'goo' => 2}, result)
+-      end
++  include CacheStoreBehavior
++  include CacheDeleteMatchedBehavior
++  include CacheIncrementDecrementBehavior
++  
++  def test_prune_size
++    @cache.write(1, "aaaaaaaaaa") && sleep(0.001)
++    @cache.write(2, "bbbbbbbbbb") && sleep(0.001)
++    @cache.write(3, "cccccccccc") && sleep(0.001)
++    @cache.write(4, "dddddddddd") && sleep(0.001)
++    @cache.write(5, "eeeeeeeeee") && sleep(0.001)
++    @cache.read(2) && sleep(0.001)
++    @cache.read(4)
++    @cache.prune(30)
++    assert_equal true, @cache.exist?(5)
++    assert_equal true, @cache.exist?(4)
++    assert_equal false, @cache.exist?(3)
++    assert_equal true, @cache.exist?(2)
++    assert_equal false, @cache.exist?(1)
++  end
++  
++  def test_prune_size_on_write
++    @cache.write(1, "aaaaaaaaaa") && sleep(0.001)
++    @cache.write(2, "bbbbbbbbbb") && sleep(0.001)
++    @cache.write(3, "cccccccccc") && sleep(0.001)
++    @cache.write(4, "dddddddddd") && sleep(0.001)
++    @cache.write(5, "eeeeeeeeee") && sleep(0.001)
++    @cache.write(6, "ffffffffff") && sleep(0.001)
++    @cache.write(7, "gggggggggg") && sleep(0.001)
++    @cache.write(8, "hhhhhhhhhh") && sleep(0.001)
++    @cache.write(9, "iiiiiiiiii") && sleep(0.001)
++    @cache.write(10, "kkkkkkkkkk") && sleep(0.001)
++    @cache.read(2) && sleep(0.001)
++    @cache.read(4) && sleep(0.001)
++    @cache.write(11, "llllllllll")
++    assert_equal true, @cache.exist?(11)
++    assert_equal true, @cache.exist?(10)
++    assert_equal true, @cache.exist?(9)
++    assert_equal true, @cache.exist?(8)
++    assert_equal true, @cache.exist?(7)
++    assert_equal false, @cache.exist?(6)
++    assert_equal false, @cache.exist?(5)
++    assert_equal true, @cache.exist?(4)
++    assert_equal false, @cache.exist?(3)
++    assert_equal true, @cache.exist?(2)
++    assert_equal false, @cache.exist?(1)
++  end
++  
++  def test_pruning_is_capped_at_a_max_time
++    def @cache.delete_entry (*args)
++      sleep(0.01)
++      super
+     end
++    @cache.write(1, "aaaaaaaaaa") && sleep(0.001)
++    @cache.write(2, "bbbbbbbbbb") && sleep(0.001)
++    @cache.write(3, "cccccccccc") && sleep(0.001)
++    @cache.write(4, "dddddddddd") && sleep(0.001)
++    @cache.write(5, "eeeeeeeeee") && sleep(0.001)
++    @cache.prune(30, 0.001)
++    assert_equal true, @cache.exist?(5)
++    assert_equal true, @cache.exist?(4)
++    assert_equal true, @cache.exist?(3)
++    assert_equal true, @cache.exist?(2)
++    assert_equal false, @cache.exist?(1)
++  end
++end
+ 
+-    def test_middleware
+-      app = lambda { |env|
+-        result = @cache.write('foo', 'bar')
+-        assert_equal 'bar', @cache.read('foo') # make sure 'foo' was written
+-        assert result
+-      }
+-      app = @cache.middleware.new(app)
+-      app.call({})
++class SynchronizedStoreTest < ActiveSupport::TestCase
++  def setup
++    ActiveSupport::Deprecation.silence do
++      @cache = ActiveSupport::Cache.lookup_store(:memory_store, :expires_in => 60)
+     end
++  end
++  
++  include CacheStoreBehavior
++  include CacheDeleteMatchedBehavior
++  include CacheIncrementDecrementBehavior
++end
+ 
+-    def test_expires_in
+-      result = @cache.write('foo', 'bar', :expires_in => 1)
+-      assert_equal 'bar', @cache.read('foo')
+-      sleep 2
+-      assert_equal nil, @cache.read('foo')
++uses_memcached 'memcached backed store' do
++  class MemCacheStoreTest < ActiveSupport::TestCase
++    def setup
++      @cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :expires_in => 60)
++      @peek = ActiveSupport::Cache.lookup_store(:mem_cache_store)
++      @data = @cache.instance_variable_get(:@data)
++      @cache.clear
++      @cache.silence!
++      @cache.logger = Logger.new("/dev/null")
+     end
+ 
+-    def test_expires_in_with_invalid_value
+-      @cache.write('baz', 'bat')
+-      assert_raise(RuntimeError) do
+-        @cache.write('foo', 'bar', :expires_in => 'Mon Jun 29 13:10:40 -0700 2150')
+-      end
+-      assert_equal 'bat', @cache.read('baz')
+-      assert_equal nil, @cache.read('foo')
++    include CacheStoreBehavior
++    include LocalCacheBehavior
++    include CacheIncrementDecrementBehavior
++    
++    def test_raw_values
++      cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :raw => true)
++      cache.clear
++      cache.write("foo", 2)
++      assert_equal "2", cache.read("foo")
+     end
+-
+-    def test_delete_should_only_pass_key_to_data
+-      key = 'foo'
+-      @data.expects(:delete).with(key)
+-      @cache.delete(key)
++    
++    def test_local_cache_raw_values
++      cache = ActiveSupport::Cache.lookup_store(:mem_cache_store, :raw => true)
++      cache.clear
++      cache.with_local_cache do
++        cache.write("foo", 2)
++        assert_equal "2", cache.read("foo")
++      end
+     end
+   end
+-
++  
+   class CompressedMemCacheStore < ActiveSupport::TestCase
+     def setup
+-      @cache = ActiveSupport::Cache.lookup_store(:compressed_mem_cache_store)
+-      @cache.clear
++      ActiveSupport::Deprecation.silence do
++        @cache = ActiveSupport::Cache.lookup_store(:compressed_mem_cache_store, :expires_in => 60)
++        @cache.clear
++      end
+     end
+-
++  
+     include CacheStoreBehavior
++    include CacheIncrementDecrementBehavior
+   end
+ end
+ 
+@@ -376,3 +614,38 @@ class CacheStoreLoggerTest < ActiveSupport::TestCase
+     assert @buffer.string.blank?
+   end
+ end
++
++class CacheEntryTest < ActiveSupport::TestCase
++  def test_create_raw_entry
++    time = Time.now
++    entry = ActiveSupport::Cache::Entry.create("raw", time, :compress => false, :expires_in => 300)
++    assert_equal "raw", entry.raw_value
++    assert_equal time.to_f, entry.created_at
++    assert_equal false, entry.compressed?
++    assert_equal 300, entry.expires_in
++  end
++  
++  def test_expired
++    entry = ActiveSupport::Cache::Entry.new("value")
++    assert_equal false, entry.expired?
++    entry = ActiveSupport::Cache::Entry.new("value", :expires_in => 60)
++    assert_equal false, entry.expired?
++    time = Time.now + 61
++    Time.stubs(:now).returns(time)
++    assert_equal true, entry.expired?
++  end
++  
++  def test_compress_values
++    entry = ActiveSupport::Cache::Entry.new("value", :compress => true, :compress_threshold => 1)
++    assert_equal "value", entry.value
++    assert_equal true, entry.compressed?
++    assert_equal "value", Marshal.load(Zlib::Inflate.inflate(entry.raw_value))
++  end
++  
++  def test_non_compress_values
++    entry = ActiveSupport::Cache::Entry.new("value")
++    assert_equal "value", entry.value
++    assert_equal "value", entry.raw_value
++    assert_equal false, entry.compressed?
++  end
++end
+-- 
+1.6.4.1
+

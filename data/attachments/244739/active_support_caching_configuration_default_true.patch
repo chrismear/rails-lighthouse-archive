@@ -1,0 +1,268 @@
+From 9af5a03d21f623880d5f7547cd0bae04507af655 Mon Sep 17 00:00:00 2001
+From: John Pignata <john.pignata@gmail.com>
+Date: Sun, 9 Aug 2009 00:38:54 -0400
+Subject: [PATCH] Allowing ActiveSupport cache to be disabled
+
+---
+ activesupport/lib/active_support/cache.rb          |   13 +++++++++
+ .../cache/compressed_mem_cache_store.rb            |   12 +++++---
+ .../lib/active_support/cache/file_store.rb         |   20 +++++++++-----
+ .../lib/active_support/cache/mem_cache_store.rb    |   16 +++++++++---
+ .../lib/active_support/cache/memory_store.rb       |   14 +++++++---
+ activesupport/test/caching_test.rb                 |   27 ++++++++++++++++++++
+ 6 files changed, 82 insertions(+), 20 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index e28df8e..5b7239e 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -2,6 +2,7 @@ require 'benchmark'
+ require 'active_support/core_ext/benchmark'
+ require 'active_support/core_ext/exception'
+ require 'active_support/core_ext/class/attribute_accessors'
++require 'active_support/core_ext/module/delegation'
+ 
+ %w(hash nil string time date date_time array big_decimal range object boolean).each do |library|
+   require "active_support/core_ext/#{library}/conversions"
+@@ -10,8 +11,16 @@ end
+ # require 'active_support/core_ext' # FIXME: pulling in all to_param extensions
+ 
+ module ActiveSupport
++  class << self
++    delegate :perform_caching=, :to => :'ActiveSupport::Cache'  
++  end
++  
+   # See ActiveSupport::Cache::Store for documentation.
+   module Cache
++    class << self
++      cattr_accessor :perform_caching
++    end
++    
+     autoload :FileStore, 'active_support/cache/file_store'
+     autoload :MemoryStore, 'active_support/cache/memory_store'
+     autoload :SynchronizedMemoryStore, 'active_support/cache/synchronized_memory_store'
+@@ -88,6 +97,10 @@ module ActiveSupport
+ 
+       expanded_cache_key
+     end
++    
++    def self.cache_configured?
++      perform_caching.nil? ? true : perform_caching
++    end
+ 
+     # An abstract cache store class. There are multiple cache store
+     # implementations, each having its own additional features. See the classes
+diff --git a/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb b/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
+index d87eb17..f9cc909 100644
+--- a/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/compressed_mem_cache_store.rb
+@@ -2,11 +2,13 @@ module ActiveSupport
+   module Cache
+     class CompressedMemCacheStore < MemCacheStore
+       def read(name, options = nil)
+-        if value = super(name, (options || {}).merge(:raw => true))
+-          if raw?(options)
+-            value
+-          else
+-            Marshal.load(ActiveSupport::Gzip.decompress(value))
++        if Cache.cache_configured?
++          if value = super(name, (options || {}).merge(:raw => true))
++            if raw?(options)
++              value
++            else
++              Marshal.load(ActiveSupport::Gzip.decompress(value))
++            end
+           end
+         end
+       end
+diff --git a/activesupport/lib/active_support/cache/file_store.rb b/activesupport/lib/active_support/cache/file_store.rb
+index 75eed5e..4651cd9 100644
+--- a/activesupport/lib/active_support/cache/file_store.rb
++++ b/activesupport/lib/active_support/cache/file_store.rb
+@@ -16,13 +16,15 @@ module ActiveSupport
+       # - +:expires_in+ - the number of seconds that this value may stay in
+       #   the cache.
+       def read(name, options = nil)
+-        super
++        if Cache.cache_configured?
++          super
+ 
+-        file_name = real_file_path(name)
+-        expires = expires_in(options)
++          file_name = real_file_path(name)
++          expires = expires_in(options)
+ 
+-        if File.exist?(file_name) && (expires <= 0 || Time.now - File.mtime(file_name) < expires)
+-          File.open(file_name, 'rb') { |f| Marshal.load(f) }
++          if File.exist?(file_name) && (expires <= 0 || Time.now - File.mtime(file_name) < expires)
++            File.open(file_name, 'rb') { |f| Marshal.load(f) }
++          end
+         end
+       end
+ 
+@@ -57,8 +59,12 @@ module ActiveSupport
+       end
+ 
+       def exist?(name, options = nil)
+-        super
+-        File.exist?(real_file_path(name))
++        if Cache.cache_configured?        
++          super
++          File.exist?(real_file_path(name))
++        else
++          false
++        end
+       end
+ 
+       private
+diff --git a/activesupport/lib/active_support/cache/mem_cache_store.rb b/activesupport/lib/active_support/cache/mem_cache_store.rb
+index 96a8000..601894e 100644
+--- a/activesupport/lib/active_support/cache/mem_cache_store.rb
++++ b/activesupport/lib/active_support/cache/mem_cache_store.rb
+@@ -50,12 +50,16 @@ module ActiveSupport
+ 
+       # Reads multiple keys from the cache.
+       def read_multi(*keys)
+-        @data.get_multi keys
++        if Cache.cache_configured?          
++          @data.get_multi keys
++        end
+       end
+ 
+       def read(key, options = nil) # :nodoc:
+-        super
+-        @data.get(key, raw?(options))
++        if Cache.cache_configured?
++          super
++          @data.get(key, raw?(options))
++        end
+       rescue MemCache::MemCacheError => e
+         logger.error("MemCacheError (#{e}): #{e.message}")
+         nil
+@@ -94,7 +98,11 @@ module ActiveSupport
+         # Doesn't call super, cause exist? in memcache is in fact a read
+         # But who cares? Reading is very fast anyway
+         # Local cache is checked first, if it doesn't know then memcache itself is read from
+-        !read(key, options).nil?
++        if Cache.cache_configured?
++          !read(key, options).nil?
++        else
++          false
++        end
+       end
+ 
+       def increment(key, amount = 1) # :nodoc:
+diff --git a/activesupport/lib/active_support/cache/memory_store.rb b/activesupport/lib/active_support/cache/memory_store.rb
+index 21ba79c..651107d 100644
+--- a/activesupport/lib/active_support/cache/memory_store.rb
++++ b/activesupport/lib/active_support/cache/memory_store.rb
+@@ -20,8 +20,10 @@ module ActiveSupport
+       end
+ 
+       def read(name, options = nil)
+-        super
+-        @data[name]
++        if Cache.cache_configured?        
++          super
++          @data[name]
++        end
+       end
+ 
+       def write(name, value, options = nil)
+@@ -40,8 +42,12 @@ module ActiveSupport
+       end
+ 
+       def exist?(name,options = nil)
+-        super
+-        @data.has_key?(name)
++        if Cache.cache_configured?
++          super
++          @data.has_key?(name)
++        else
++          false
++        end
+       end
+ 
+       def clear
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index 7667f11..759f297 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -137,6 +137,32 @@ module CacheStoreBehavior
+   end
+ end
+ 
++class CacheStoreDisabledBehavior < ActiveSupport::TestCase
++  def setup
++    ActiveSupport::Cache.perform_caching = false
++    @cache = ActiveSupport::Cache.lookup_store(:memory_store)
++  end
++  
++  def test_exist_should_return_false_when_caching_disabled
++    @cache.write('foo', 'bar')
++    assert_equal(@cache.exist?('foo'), false)
++  end
++  
++  def test_read_should_return_nil_when_caching_disabled
++    @cache.write('bar', 'foo')
++    assert_nil(@cache.read('bar'))
++  end
++  
++  def test_fetch_should_return_nil_when_caching_disabled
++    @cache.fetch('foo') { 'bar' }
++    assert_nil(@cache.read('foo'))
++  end
++  
++  def teardown
++    ActiveSupport::Cache.perform_caching = true
++  end
++end
++
+ class FileStoreTest < ActiveSupport::TestCase
+   def setup
+     @cache = ActiveSupport::Cache.lookup_store(:file_store, Dir.pwd)
+@@ -183,6 +209,7 @@ class MemoryStoreTest < ActiveSupport::TestCase
+     @cache.write('foo', bar)
+     assert_nothing_raised { bar.gsub!(/.*/, 'baz') }
+   end
++  
+ end
+ 
+ uses_memcached 'memcached backed store' do
+-- 
+1.6.0
+
+
+From 530260b15c083dd5ac533e0d273765d481be8fa1 Mon Sep 17 00:00:00 2001
+From: David Reese <david@whatcould.com>
+Date: Sat, 15 Aug 2009 08:59:13 -0500
+Subject: [PATCH] make @@perform_caching default to true
+
+---
+ activesupport/lib/active_support/cache.rb |    3 ++-
+ 1 files changed, 2 insertions(+), 1 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index 5b7239e..be6aff0 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -18,6 +18,7 @@ module ActiveSupport
+   # See ActiveSupport::Cache::Store for documentation.
+   module Cache
+     class << self
++      @@perform_caching = true
+       cattr_accessor :perform_caching
+     end
+     
+@@ -99,7 +100,7 @@ module ActiveSupport
+     end
+     
+     def self.cache_configured?
+-      perform_caching.nil? ? true : perform_caching
++      perform_caching
+     end
+ 
+     # An abstract cache store class. There are multiple cache store
+-- 
+1.6.0
+

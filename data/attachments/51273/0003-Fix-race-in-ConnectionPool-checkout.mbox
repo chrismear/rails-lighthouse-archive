@@ -1,0 +1,89 @@
+From e712798a9ce01715fa0eb2a681ad1d552a085037 Mon Sep 17 00:00:00 2001
+From: Aliaksey Kandratsenka <alk@tut.by>
+Date: Thu, 2 Oct 2008 21:44:49 +0300
+Subject: [PATCH] Fix race in ConnectionPool#checkout
+
+After releasing monitor some connection(s) may appear in pool before monitor is re-aquired.
+When this happens we'll wait for connection which is already available.
+---
+ .../abstract/connection_pool.rb                    |   29 +++++++++----------
+ 1 files changed, 14 insertions(+), 15 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+index 54a39db..7438143 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+@@ -131,21 +131,20 @@ module ActiveRecord
+       # Check-out a database connection from the pool.
+       def checkout
+         # Checkout an available connection
+-        conn = @connection_mutex.synchronize do
+-          if @checked_out.size < @connections.size
+-            checkout_existing_connection
+-          elsif @connections.size < @size
+-            checkout_new_connection
+-          end
+-        end
+-        return conn if conn
+-
+-        # No connections available; wait for one
+         @connection_mutex.synchronize do
+-          if @queue.wait(@timeout)
+-            checkout_existing_connection
+-          else
+-            raise ConnectionTimeoutError, "could not obtain a database connection within #{@timeout} seconds.  The pool size is currently #{@size}, perhaps you need to increase it?"
++          loop do
++            conn = if @checked_out.size < @connections.size
++                     checkout_existing_connection
++                   elsif @connections.size < @size
++                     checkout_new_connection
++                   end
++            return conn if conn
++            # No connections available; wait for one
++            if @queue.wait(@timeout)
++              next
++            else
++              raise ConnectionTimeoutError, "could not obtain a database connection within #{@timeout} seconds.  The pool size is currently #{@size}, perhaps you need to increase it?"
++            end
+           end
+         end
+       end
+@@ -275,4 +274,4 @@ module ActiveRecord
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+-- 
+1.5.6.5
+
+From 474d5ea744474c746beb0187999c23b2be7af5d3 Mon Sep 17 00:00:00 2001
+From: Aliaksey Kandratsenka <alk@tut.by>
+Date: Thu, 2 Oct 2008 22:59:49 +0300
+Subject: [PATCH] made ConnectionPool#checkout more robust by trying to loot dead threads when pool is empty
+
+---
+ .../abstract/connection_pool.rb                    |    6 +++++-
+ 1 files changed, 5 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+index 7438143..b7d7384 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+@@ -143,7 +143,11 @@ module ActiveRecord
+             if @queue.wait(@timeout)
+               next
+             else
+-              raise ConnectionTimeoutError, "could not obtain a database connection within #{@timeout} seconds.  The pool size is currently #{@size}, perhaps you need to increase it?"
++              # try looting dead threads
++              clear_stale_cached_connections!
++              if @size == @checked_out.size
++                raise ConnectionTimeoutError, "could not obtain a database connection within #{@timeout} seconds.  The pool size is currently #{@size}, perhaps you need to increase it?"
++              end
+             end
+           end
+         end
+-- 
+1.5.6.5
+

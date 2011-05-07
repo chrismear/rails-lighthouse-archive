@@ -1,0 +1,146 @@
+From 7da863141c62ac3e5ea2ecbb329521760d227663 Mon Sep 17 00:00:00 2001
+From: David Dollar <ddollar@gmail.com>
+Date: Fri, 27 Mar 2009 14:53:01 -0400
+Subject: [PATCH] Attempt to deal with more cases of gems with native components
+
+This commit adds a rudimentary check for 'unbuilt' gems, so that we can abort
+the application load if there are any gems that have native components that
+have not yet been built.
+
+The rake task gems:build has now only builds 'unbuilt' gems as a result.
+
+The rake task gems:build:force has been added to deal with cases of incomplete
+builds, or any case where you need to force the build of all of your gems.
+
+Changes the gems:build task to get its gem list by parsing directory entries
+in vendor/gems, which sidesteps the chicken/egg issues involved with having a
+gem unpacked into vendor/gems without before its native bits are compiled.
+---
+ railties/lib/initializer.rb          |   21 +++++++++++++++++++++
+ railties/lib/rails/gem_dependency.rb |   19 +++++++++++++++----
+ railties/lib/tasks/gems.rake         |   18 ++++++++++++++++--
+ 3 files changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index a04405a..1750afa 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -159,6 +159,8 @@ module Rails
+ 
+       add_support_load_paths
+ 
++      check_for_unbuilt_gems
++
+       load_gems
+       load_plugins
+ 
+@@ -306,6 +308,25 @@ module Rails
+       end
+     end
+ 
++    def check_for_unbuilt_gems
++      unbuilt_gems = @configuration.gems.select(&:frozen?).reject(&:built?)
++      if unbuilt_gems.size > 0
++        # don't print if the gems:build rake tasks are being run
++        unless $gems_build_rake_task
++          abort <<-end_error
++The following gems have native components that need to be built
++  #{unbuilt_gems.map { |gem| "#{gem.name}  #{gem.requirement}" } * "\n  "}
++
++You're running:
++  ruby #{Gem.ruby_version} at #{Gem.ruby}
++  rubygems #{Gem::RubyGemsVersion} at #{Gem.path * ', '}
++
++Run `rake gems:build` to build the unbuilt gems.
++          end_error
++        end
++      end
++    end
++
+     def check_gem_dependencies
+       unloaded_gems = @configuration.gems.reject { |g| g.loaded? }
+       if unloaded_gems.size > 0
+diff --git a/railties/lib/rails/gem_dependency.rb b/railties/lib/rails/gem_dependency.rb
+index 3062a77..8068608 100644
+--- a/railties/lib/rails/gem_dependency.rb
++++ b/railties/lib/rails/gem_dependency.rb
+@@ -29,6 +29,13 @@ module Rails
+       end
+     end
+ 
++    def self.from_directory_name(directory_name)
++      directory_name_parts = File.basename(directory_name).split('-')
++      name    = directory_name_parts[0..-2].join('-')
++      version = directory_name_parts.last
++      self.new(name, :version => version)
++    end
++
+     def initialize(name, options = {})
+       require 'rubygems' unless Object.const_defined?(:Gem)
+ 
+@@ -101,8 +108,12 @@ module Rails
+     end
+ 
+     def built?
+-      # TODO: If Rubygems ever gives us a way to detect this, we should use it
+-      false
++      return false unless frozen?
++      specification.extensions.each do |ext|
++        makefile = File.join(unpacked_gem_directory, File.dirname(ext), 'Makefile')
++        return false unless File.exists?(makefile)
++      end
++      true
+     end
+ 
+     def framework_gem?
+@@ -155,9 +166,9 @@ module Rails
+       specification && File.exists?(unpacked_gem_directory)
+     end
+ 
+-    def build
++    def build(options={})
+       require 'rails/gem_builder'
+-      unless built?
++      if options[:force] || !built?
+         return unless File.exists?(unpacked_specification_filename)
+         spec = YAML::load_file(unpacked_specification_filename)
+         Rails::GemBuilder.new(spec, unpacked_gem_directory).build_extensions
+diff --git a/railties/lib/tasks/gems.rake b/railties/lib/tasks/gems.rake
+index ed07bf2..efadb1d 100644
+--- a/railties/lib/tasks/gems.rake
++++ b/railties/lib/tasks/gems.rake
+@@ -20,8 +20,16 @@ namespace :gems do
+   desc "Build any native extensions for unpacked gems"
+   task :build do
+     $gems_build_rake_task = true
+-    Rake::Task['gems:unpack'].invoke
+-    current_gems.each &:build
++    frozen_gems.each &:build
++  end
++
++  namespace :build do
++    desc "Force the build of all gems"
++    task :force do
++      $gems_build_rake_task = true
++      Rake::Task['gems:unpack'].invoke
++      current_gems.each { |gem| gem.build(:force => true) }
++    end
+   end
+ 
+   desc "Installs all required gems."
+@@ -53,6 +61,12 @@ def current_gems
+   gems
+ end
+ 
++def frozen_gems
++  Dir[File.join(RAILS_ROOT, 'vendor', 'gems', '*-*')].map do |gem_dir|
++    Rails::GemDependency.from_directory_name(gem_dir)
++  end
++end
++
+ def print_gem_status(gem, indent=1)
+   code = case
+     when gem.framework_gem? then 'R'
+-- 
+1.6.0.4
+

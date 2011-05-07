@@ -1,0 +1,448 @@
+From b162a9f407f9f6793e9b41e1ffb1dc7801820cb9 Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Jos=C3=A9=20Valim?= <jose.valim@gmail.com>
+Date: Sun, 12 Jul 2009 23:49:44 +0200
+Subject: [PATCH] Avoid copying errors from child to parent in autosave and deal with it on error messages for. In order to do so, two options were added: :associations and :except.
+
+---
+ .../action_view/helpers/active_record_helper.rb    |   35 +++++++--
+ .../test/template/active_record_helper_test.rb     |   37 ++++++++--
+ actionpack/test/template/form_helper_test.rb       |    2 +-
+ .../lib/active_record/autosave_association.rb      |   39 ++++++----
+ activerecord/lib/active_record/validations.rb      |    3 +
+ .../test/cases/autosave_association_test.rb        |   82 ++++++++++++++++----
+ activerecord/test/cases/validations_i18n_test.rb   |    8 ++
+ 7 files changed, 163 insertions(+), 43 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/active_record_helper.rb b/actionpack/lib/action_view/helpers/active_record_helper.rb
+index 541899e..72b1896 100644
+--- a/actionpack/lib/action_view/helpers/active_record_helper.rb
++++ b/actionpack/lib/action_view/helpers/active_record_helper.rb
+@@ -148,6 +148,9 @@ module ActionView
+       # * <tt>:message</tt> - The explanation message after the header message and before
+       #   the error list.  Pass +nil+ or an empty string to avoid the explanation message
+       #   altogether. (Default: "There were problems with the following fields:").
++      # * <tt>:associations</tt> - When supplied, show errors in the given association.
++      #   The errors are nested into another list.
++      # * <tt>:except</tt> - Skip the error messages in the attributes given by :except.
+       #
+       # To specify the display for one object, you simply provide its name as a parameter.
+       # For example, for the <tt>@user</tt> model:
+@@ -169,6 +172,8 @@ module ActionView
+       # instance yourself and set it up. View the source of this method to see how easy it is.
+       def error_messages_for(*params)
+         options = params.extract_options!.symbolize_keys
++        associations = Array(options.delete(:associations))
++        exceptions   = options.delete(:except) || associations
+ 
+         if object = options.delete(:object)
+           objects = [object].flatten
+@@ -176,11 +181,30 @@ module ActionView
+           objects = params.collect {|object_name| instance_variable_get("@#{object_name}") }.compact
+         end
+ 
+-        count  = objects.inject(0) {|sum, object| sum + object.errors.count }
++        error_messages = objects.sum do |object|
++          messages = object.errors.full_messages(:except => exceptions).map do |msg|
++            content_tag(:li, ERB::Util.html_escape(msg))
++          end
++
++          associations.each do |name|
++            association = object.invalid_records_by_association_name(name)
++
++            message = association.sum do |child|
++              child.errors.full_messages.map { |msg| content_tag(:li, ERB::Util.html_escape(msg)) }
++            end.uniq.join
++
++            message = content_tag(:ul, message)
++            messages << content_tag(:li, object.class.human_attribute_name(name) + message)
++          end
++
++          messages
++        end
++        count = objects.empty? ? 0 : error_messages.size
++
+         unless count.zero?
+           html = {}
+           [:id, :class].each do |key|
+-            if options.include?(key)
++            if options.key?(key)
+               value = options[key]
+               html[key] = value unless value.blank?
+             else
+@@ -190,20 +214,19 @@ module ActionView
+           options[:object_name] ||= params.first
+ 
+           I18n.with_options :locale => options[:locale], :scope => [:activerecord, :errors, :template] do |locale|
+-            header_message = if options.include?(:header_message)
++            header_message = if options.key?(:header_message)
+               options[:header_message]
+             else
+               object_name = options[:object_name].to_s.gsub('_', ' ')
+               object_name = I18n.t(object_name, :default => object_name, :scope => [:activerecord, :models], :count => 1)
+               locale.t :header, :count => count, :model => object_name
+             end
+-            message = options.include?(:message) ? options[:message] : locale.t(:body)
+-            error_messages = objects.sum {|object| object.errors.full_messages.map {|msg| content_tag(:li, ERB::Util.html_escape(msg)) } }.join
++            message = options.key?(:message) ? options[:message] : locale.t(:body)
+ 
+             contents = ''
+             contents << content_tag(options[:header_tag] || :h2, header_message) unless header_message.blank?
+             contents << content_tag(:p, message) unless message.blank?
+-            contents << content_tag(:ul, error_messages)
++            contents << content_tag(:ul, error_messages.join)
+ 
+             content_tag(:div, contents, html)
+           end
+diff --git a/actionpack/test/template/active_record_helper_test.rb b/actionpack/test/template/active_record_helper_test.rb
+index 11812e7..d1fad0b 100644
+--- a/actionpack/test/template/active_record_helper_test.rb
++++ b/actionpack/test/template/active_record_helper_test.rb
+@@ -9,6 +9,10 @@ class ActiveRecordHelperTest < ActionView::TestCase
+       alias_method :title_before_type_cast, :title unless respond_to?(:title_before_type_cast)
+       alias_method :body_before_type_cast, :body unless respond_to?(:body_before_type_cast)
+       alias_method :author_name_before_type_cast, :author_name unless respond_to?(:author_name_before_type_cast)
++
++      def self.human_attribute_name(attribute)
++        attribute.to_s.humanize
++      end
+     end
+ 
+     User = Struct.new("User", :email)
+@@ -29,7 +33,7 @@ class ActiveRecordHelperTest < ActionView::TestCase
+         1
+       end
+ 
+-      def full_messages
++      def full_messages(options={})
+         ["Author name can't be <em>empty</em>"]
+       end
+ 
+@@ -39,14 +43,14 @@ class ActiveRecordHelperTest < ActionView::TestCase
+     end
+ 
+     def errors
+-      Errors.new
++      @errors ||= Errors.new
+     end
+   end
+ 
+   def setup_post
+     @post = Post.new
+     def @post.errors
+-      Class.new {
++      @errors ||= Class.new {
+         def on(field)
+           case field.to_s
+           when "author_name"
+@@ -59,7 +63,7 @@ class ActiveRecordHelperTest < ActionView::TestCase
+         end
+         def empty?() false end
+         def count() 1 end
+-        def full_messages() [ "Author name can't be empty" ] end
++        def full_messages(options={}) [ "Author name can't be empty" ] end
+       }.new
+     end
+ 
+@@ -84,11 +88,11 @@ class ActiveRecordHelperTest < ActionView::TestCase
+   def setup_user
+     @user = User.new
+     def @user.errors
+-      Class.new {
++      @errors ||= Class.new {
+         def on(field) field == "email" end
+         def empty?() false end
+         def count() 1 end
+-        def full_messages() [ "User email can't be empty" ] end
++        def full_messages(options={}) [ "User email can't be empty" ] end
+       }.new
+     end
+ 
+@@ -277,6 +281,27 @@ class ActiveRecordHelperTest < ActionView::TestCase
+     assert_dom_equal %(<div class="errorExplanation" id="errorExplanation"><h2>#{header_message}</h2><p>#{message}</p><ul><li>User email can't be empty</li><li>Author name can't be empty</li></ul></div>), error_messages_for(:user, :post, :header_message => header_message, :message => message)
+   end
+ 
++  def test_error_messages_for_exceptions
++    @user.errors.expects(:full_messages).with(:except => :email).returns([])
++    assert_equal '', error_messages_for(:user, :except => :email)
++  end
++
++  def test_error_messages_for_with_associations
++    @post.expects(:invalid_records_by_association_name).with("user").returns([ @user ])
++    assert_dom_equal %(<div class="errorExplanation" id="errorExplanation"><h2>2 errors prohibited this post from being saved</h2><p>There were problems with the following fields:</p><ul><li>Author name can't be empty</li><li>User<ul><li>User email can't be empty</li></ul></li></ul></div>), error_messages_for("post", :associations => "user")
++  end
++
++  def test_error_messages_for_with_association_does_not_show_duplicated_messages
++    @post.expects(:invalid_records_by_association_name).with("user").returns([ @user, @user, @user ])
++    assert_dom_equal %(<div class="errorExplanation" id="errorExplanation"><h2>2 errors prohibited this post from being saved</h2><p>There were problems with the following fields:</p><ul><li>Author name can't be empty</li><li>User<ul><li>User email can't be empty</li></ul></li></ul></div>), error_messages_for("post", :associations => "user")
++  end
++
++  def test_error_messages_send_associations_as_exceptions
++    @post.expects(:invalid_records_by_association_name).with("user").returns([ @user ])
++    @post.errors.expects(:full_messages).with(:except => ["user"]).returns([])
++    error_messages_for("post", :associations => "user")
++  end
++
+   def test_error_messages_for_non_instance_variable
+     actual_user = @user
+     actual_post = @post
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 8005305..2a189f5 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -99,7 +99,7 @@ class FormHelperTest < ActionView::TestCase
+         def on(field); "can't be empty" if field == "author_name"; end
+         def empty?() false end
+         def count() 1 end
+-        def full_messages() [ "Author name can't be empty" ] end
++        def full_messages(options={}) [ "Author name can't be empty" ] end
+       }.new
+     end
+     def @post.id; 123; end
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index ffa9f29..38dbb1e 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -206,6 +206,24 @@ module ActiveRecord
+       @marked_for_destruction
+     end
+ 
++    # Given an association name, retrieve only available objects that are invalid
++    # (it does not query the database).
++    #
++    def invalid_records_by_association_name(name)
++      if reflection = self.class.reflect_on_association(name)
++        association = association_instance_get(reflection.name)
++        collection = if [ :has_one, :belongs_to ].include?(reflection.macro)
++          [ association ]
++        else
++          associated_records_to_validate_or_save(association, new_record?, reflection.options[:autosave])
++        end
++
++        collection.select { |record| !record.errors.empty? }
++      else
++        raise ArgumentError, "Could not find the association #{name.inspect} in model #{self.class.name}"
++      end
++    end
++
+     private
+ 
+     # Returns the record for an association collection that should be validated
+@@ -242,23 +260,16 @@ module ActiveRecord
+       end
+     end
+ 
+-    # Returns whether or not the association is valid and applies any errors to
+-    # the parent, <tt>self</tt>, if it wasn't. Skips any <tt>:autosave</tt>
+-    # enabled records if they're marked_for_destruction? or destroyed.
++    # Returns whether or not the association is valid and add an error to the
++    # parent. Skip validation if any record is marked_for_destruction? or destroyed.
+     def association_valid?(reflection, association)
+       return true if association.destroyed? || association.marked_for_destruction?
+ 
+-      unless valid = association.valid?
+-        if reflection.options[:autosave]
+-          association.errors.each do |attribute, message|
+-            attribute = "#{reflection.name}_#{attribute}"
+-            errors.add(attribute, message) unless errors.on(attribute)
+-          end
+-        else
+-          errors.add(reflection.name)
+-        end
++      unless association.valid?
++        errors.add(reflection.name) unless errors.on(reflection.name)
++        return false
+       end
+-      valid
++      true
+     end
+ 
+     # Is used as a before_save callback to check while saving a collection
+@@ -355,4 +366,4 @@ module ActiveRecord
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index d2d12b8..bc3bdf2 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -195,8 +195,11 @@ module ActiveRecord
+     #     ["Name is too short (minimum is 5 characters)", "Name can't be blank", "Address can't be blank"]
+     def full_messages(options = {})
+       full_messages = []
++      exceptions = Array(options.delete(:except))
+ 
+       @errors.each_key do |attr|
++        next if exceptions.include?(attr)
++
+         @errors[attr].each do |message|
+           next unless message
+ 
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 75d40fb..1972d10 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -30,6 +30,12 @@ class TestAutosaveAssociationsInGeneral < ActiveRecord::TestCase
+     assert base.valid_keys_for_has_and_belongs_to_many_association.include?(:autosave)
+   end
+ 
++  def test_invalid_records_by_association_name_raises_an_error_with_invalid_name
++    assert_raise ArgumentError, /Could not find :boat/ do
++      Pirate.new.invalid_records_by_association_name(:boat)
++    end
++  end
++
+   private
+ 
+   def base
+@@ -750,15 +756,27 @@ class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @pirate.ship.name = ''
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
++    assert !@pirate.ship.errors.on(:name).blank?
+   end
+ 
+-  def test_should_merge_errors_on_the_associated_models_onto_the_parent_even_if_it_is_not_valid
++  def test_should_add_errors_to_the_parent_even_if_its_invalid
+     @pirate.ship.name   = nil
+     @pirate.catchphrase = nil
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
+     assert !@pirate.errors.on(:catchphrase).blank?
++    assert !@pirate.ship.errors.on(:name).blank?
++  end
++
++  def test_invalid_records_by_association_name_with_valid_record
++    @pirate.ship.name = 'The Vile Insanity'
++    assert @pirate.valid?
++    assert @pirate.invalid_records_by_association_name(:ship).empty?
++  end
++
++  def test_invalid_records_by_association_name_with_invalid_record
++    @pirate.ship.name = ''
++    assert !@pirate.valid?
++    assert_equal [ @pirate.ship ], @pirate.invalid_records_by_association_name(:ship)
+   end
+ 
+   def test_should_still_allow_to_bypass_validations_on_the_associated_model
+@@ -840,15 +858,27 @@ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @ship.pirate.catchphrase = ''
+     assert !@ship.valid?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert !@ship.pirate.errors.on(:catchphrase).blank?
+   end
+ 
+-  def test_should_merge_errors_on_the_associated_model_onto_the_parent_even_if_it_is_not_valid
++  def test_should_add_error_to_the_parent_even_if_it_is_not_valid
+     @ship.name = nil
+     @ship.pirate.catchphrase = nil
+     assert !@ship.valid?
+     assert !@ship.errors.on(:name).blank?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert !@ship.pirate.errors.on(:catchphrase).blank?
++  end
++
++  def test_invalid_records_by_association_name_with_valid_record
++    @ship.pirate.catchphrase = 'Arr'
++    assert @ship.valid?
++    assert @ship.invalid_records_by_association_name(:pirate).empty?
++  end
++
++  def test_invalid_records_by_association_name_with_invalid_record
++    @ship.pirate.catchphrase = nil
++    assert !@ship.valid?
++    assert_equal [ @ship.pirate ], @ship.invalid_records_by_association_name(:pirate)
+   end
+ 
+   def test_should_still_allow_to_bypass_validations_on_the_associated_model
+@@ -907,27 +937,37 @@ module AutosaveAssociationOnACollectionAssociationTests
+   end
+ 
+   def test_should_automatically_validate_the_associated_models
+-    @pirate.send(@association_name).each { |child| child.name = '' }
++    association = @pirate.send(@association_name)
++    association.each { |child| child.name = '' }
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
+-    assert @pirate.errors.on(@association_name).blank?
++
++    association.each do |child|
++      assert_equal "can't be blank", child.errors.on(:name)
++    end
++
++    assert !@pirate.errors.on(@association_name).blank?
+   end
+ 
+-  def test_should_not_use_default_invalid_error_on_associated_models
+-    @pirate.send(@association_name).build(:name => '')
++  def test_should_add_just_one_error_to_the_parent_even_if_multiple_children_are_invalid
++    association = @pirate.send(@association_name)
++    association.each { |child| child.name = '' }
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
+-    assert @pirate.errors.on(@association_name).blank?
++    assert_equal 1, Array(@pirate.errors[@association_name]).size
+   end
+ 
+-  def test_should_merge_errors_on_the_associated_models_onto_the_parent_even_if_it_is_not_valid
+-    @pirate.send(@association_name).each { |child| child.name = '' }
++  def test_should_merge_errors_on_the_associated_models_onto_the_parent_even_if
++    association = @pirate.send(@association_name)
++    association.each { |child| child.name = '' }
+     @pirate.catchphrase = nil
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++
++    association.each do |child|
++      assert_equal "can't be blank", child.errors.on(:name)
++    end
++
+     assert !@pirate.errors.on(:catchphrase).blank?
+   end
+ 
+@@ -995,6 +1035,16 @@ module AutosaveAssociationOnACollectionAssociationTests
+       @pirate.save!
+     end
+   end
++
++  def test_invalid_records_by_association_name
++    association = @pirate.send(@association_name)
++    association.each { |child| child.name = '' }
++    association.last.name = 'Grace OMalley'
++
++    assert !@pirate.valid?
++    assert_equal association.count - 1,
++                 @pirate.invalid_records_by_association_name(@association_name).size
++  end
+ end
+ 
+ class TestAutosaveAssociationOnAHasManyAssociation < ActiveRecord::TestCase
+diff --git a/activerecord/test/cases/validations_i18n_test.rb b/activerecord/test/cases/validations_i18n_test.rb
+index 6698234..d73d7e6 100644
+--- a/activerecord/test/cases/validations_i18n_test.rb
++++ b/activerecord/test/cases/validations_i18n_test.rb
+@@ -166,6 +166,14 @@ class ActiveRecordValidationsI18nTests < ActiveSupport::TestCase
+     @topic.errors.full_messages :locale => 'en'
+   end
+ 
++  def test_attributes_are_skipped_when_except_is_given_to_full_messages
++    @topic.errors.instance_variable_set :@errors, { 'title' => ['empty'], 'content' => ['empty'] }
++
++    assert_equal 2, @topic.errors.full_messages.size
++    assert_equal 1, @topic.errors.full_messages(:except => "title").size
++    assert_equal 0, @topic.errors.full_messages(:except => ["title", "content"]).size
++  end
++
+   # ActiveRecord::Validations
+   # validates_confirmation_of w/ mocha
+   def test_validates_confirmation_of_generates_message
+-- 
+1.5.4.3
+

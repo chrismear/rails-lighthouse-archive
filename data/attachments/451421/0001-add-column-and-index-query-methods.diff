@@ -1,0 +1,231 @@
+From 566358d541642a5af0d23beb0d46b3c6364b4e20 Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Thu, 18 Mar 2010 16:49:23 +0000
+Subject: [PATCH] Add column and index query methods to ActiveRecord::Schema
+
+---
+ .../abstract/schema_definitions.rb                 |   10 ++
+ .../abstract/schema_statements.rb                  |   49 ++++++++++
+ activerecord/test/cases/migration_test.rb          |  100 ++++++++++++++++++++
+ 3 files changed, 159 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index 64faaef..86a9532 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -580,6 +580,11 @@ module ActiveRecord
+         @base.add_column(@table_name, column_name, type, options)
+       end
+ 
++      # Checks to see if a column exists. See SchemaStatements#column_exists?
++      def column_exists?(column_name, type = nil, options = nil)
++        @base.column_exists?(@table_name, column_name, type, options)
++      end
++
+       # Adds a new index to the table. +column_name+ can be a single Symbol, or
+       # an Array of Symbols. See SchemaStatements#add_index
+       #
+@@ -594,6 +599,11 @@ module ActiveRecord
+         @base.add_index(@table_name, column_name, options)
+       end
+ 
++      # Checks to see if an index exists. See SchemaStatements#index_exists?
++      def index_exists?(column_name, options = {})
++        @base.index_exists?(@table_name, column_name, options)
++      end
++
+       # Adds timestamps (created_at and updated_at) columns to the table. See SchemaStatements#add_timestamps
+       # ===== Example
+       #  t.timestamps
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+index 86ba7d7..d8a8fc0 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+@@ -27,10 +27,59 @@ module ActiveRecord
+       # Returns an array of indexes for the given table.
+       # def indexes(table_name, name = nil) end
+ 
++      # Checks to see if an index exists on a table for a given index definition
++      #
++      # === Examples
++      #  # Check an index exists
++      #  index_exists?(:suppliers, :company_id)
++      #
++      #  # Check an index on multiple columns exists
++      #  index_exists?(:suppliers, [:company_id, :company_type])
++      #
++      #  # Check a unique index exists
++      #  index_exists?(:suppliers, :company_id, :unique => true)
++      #
++      #  # Check an index with a custom name exists
++      #  index_exists?(:suppliers, :company_id, :name => "idx_company_id"
++      def index_exists?(table_name, column_name, options = {})
++        column_names = Array.wrap(column_name)
++        index_name = options.key?(:name) ? options[:name].to_s : index_name(table_name, :column => column_names)
++        if options[:unique]
++          indexes(table_name).any?{ |i| i.unique && i.name == index_name }
++        else
++          indexes(table_name).any?{ |i| i.name == index_name }
++        end
++      end
++
+       # Returns an array of Column objects for the table specified by +table_name+.
+       # See the concrete implementation for details on the expected parameter values.
+       def columns(table_name, name = nil) end
+ 
++      # Checks to see if a column exists in a given table.
++      #
++      # === Examples
++      #  # Check a column exists
++      #  column_exists?(:suppliers, :name)
++      #
++      #  # Check a column exists of a particular type
++      #  column_exists?(:suppliers, :name, :string)
++      #
++      #  # Check a column exists with a specific definition
++      #  column_exists?(:suppliers, :name, :string, :limit => 100)
++      def column_exists?(table_name, column_name, type = nil, options = nil)
++        column_name = column_name.to_s
++        if type
++          if options
++            sql_type = type_to_sql(type, options[:limit], options[:precision], options[:scale])
++            columns(table_name).any?{ |c| c.name == column_name && c.sql_type == sql_type }
++          else
++            columns(table_name).any?{ |c| c.name == column_name && c.type == type }
++          end
++        else
++          columns(table_name).any?{ |c| c.name == column_name }
++        end
++      end
++
+       # Creates a new table with the name +table_name+. +table_name+ may either
+       # be a String or a Symbol.
+       #
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index 3181f27..b25ff21 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -111,6 +111,53 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def test_index_exists
++      Person.connection.create_table :testings do |t|
++        t.column :foo, :string, :limit => 100
++        t.column :bar, :string, :limit => 100
++      end
++      Person.connection.add_index :testings, :foo
++
++      assert Person.connection.index_exists?(:testings, :foo)
++      assert !Person.connection.index_exists?(:testings, :bar)
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
++    def test_index_exists_on_multiple_columns
++      Person.connection.create_table :testings do |t|
++        t.column :foo, :string, :limit => 100
++        t.column :bar, :string, :limit => 100
++      end
++      Person.connection.add_index :testings, [:foo, :bar]
++
++      assert Person.connection.index_exists?(:testings, [:foo, :bar])
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
++    def test_unique_index_exists
++      Person.connection.create_table :testings do |t|
++        t.column :foo, :string, :limit => 100
++      end
++      Person.connection.add_index :testings, :foo, :unique => true
++
++      assert Person.connection.index_exists?(:testings, :foo, :unique => true)
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
++    def test_named_index_exists
++      Person.connection.create_table :testings do |t|
++        t.column :foo, :string, :limit => 100
++      end
++      Person.connection.add_index :testings, :foo, :name => "custom_index_name"
++
++      assert Person.connection.index_exists?(:testings, :foo, :name => "custom_index_name")
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
+     def testing_table_with_only_foo_attribute
+       Person.connection.create_table :testings, :id => false do |t|
+         t.column :foo, :string
+@@ -929,6 +976,45 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert_nil Person.new.first_name
+     end
+ 
++    def test_column_exists
++      Person.connection.create_table :testings do |t|
++        t.column :foo, :string
++      end
++
++      assert Person.connection.column_exists?(:testings, :foo)
++      assert !Person.connection.column_exists?(:testings, :bar)
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
++    def test_column_exists_with_type
++      Person.connection.create_table :testings do |t|
++        t.column :foo, :string
++        t.column :bar, :decimal, :precision => 8, :scale => 2
++      end
++
++      assert Person.connection.column_exists?(:testings, :foo, :string)
++      assert !Person.connection.column_exists?(:testings, :foo, :integer)
++      assert Person.connection.column_exists?(:testings, :bar, :decimal)
++      assert !Person.connection.column_exists?(:testings, :bar, :integer)
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
++    def test_column_exists_with_definition
++      Person.connection.create_table :testings do |t|
++        t.column :foo, :string, :limit => 100
++        t.column :bar, :decimal, :precision => 8, :scale => 2
++      end
++
++      assert Person.connection.column_exists?(:testings, :foo, :string, :limit => 100)
++      assert !Person.connection.column_exists?(:testings, :foo, :string, :limit => 50)
++      assert Person.connection.column_exists?(:testings, :bar, :decimal, :precision => 8, :scale => 2)
++      assert !Person.connection.column_exists?(:testings, :bar, :decimal, :precision => 10, :scale => 2)
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++
+     def test_add_table
+       assert !Reminder.table_exists?
+ 
+@@ -1594,6 +1680,20 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def test_index_exists
++      with_change_table do |t|
++        @connection.expects(:index_exists?).with(:delete_me, :bar, {})
++        t.index_exists?(:bar)
++      end
++    end
++
++    def test_index_exists_with_options
++      with_change_table do |t|
++        @connection.expects(:index_exists?).with(:delete_me, :bar, {:unique => true})
++        t.index_exists?(:bar, :unique => true)
++      end
++    end
++
+     def test_change_changes_column
+       with_change_table do |t|
+         @connection.expects(:change_column).with(:delete_me, :bar, :string, {})
+-- 
+1.6.4.4
+

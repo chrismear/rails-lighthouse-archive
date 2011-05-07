@@ -1,0 +1,160 @@
+From 5cf3ec46dab6f4de1f411ccc0fba17688b023c25 Mon Sep 17 00:00:00 2001
+From: Josh Symonds <jsymonds@backstopsolutions.com>
+Date: Tue, 5 Jan 2010 13:36:52 -0600
+Subject: [PATCH] Added :except option to association preloading to prevent certain fields from being preloaded
+
+---
+ .../lib/active_record/association_preload.rb       |   19 +++--
+ .../associations/eager_load_nested_include_test.rb |   86 ++++++++++++++++++++
+ 2 files changed, 98 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index 9f7b2a6..d082f02 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -93,8 +93,13 @@ module ActiveRecord
+         when Hash then
+           associations.each do |parent, child|
+             raise "parent must be an association name" unless parent.is_a?(String) || parent.is_a?(Symbol)
+-            preload_associations(records, parent, preload_options)
+             reflection = reflections[parent]
++            if reflection && child.respond_to?(:delete) && except = Array.wrap(child.delete(:except))
++              raise "except does not reference an existing column" unless except.all?{|ex| reflection.klass.column_names.include?(ex.to_s)}
++              preload_options.merge!(:select => (reflection.klass.column_names - except.collect(&:to_s)).collect{|col| "#{reflection.klass.table_name}.#{col}"}.join(", "))
++            end
++            preload_options.delete(:select) if except.nil? && !preload_options[:select].nil?
++            preload_associations(records, parent, preload_options)
+             parents = records.sum { |record| Array.wrap(record.send(reflection.name)) }
+             unless parents.empty?
+               parents.first.class.preload_associations(parents, child)
+@@ -208,7 +213,7 @@ module ActiveRecord
+           through_primary_key = through_reflection.primary_key_name
+           unless through_records.empty?
+             source = reflection.source_reflection.name
+-            through_records.first.class.preload_associations(through_records, source)
++            through_records.first.class.preload_associations(through_records, source, preload_options)
+             if through_reflection.macro == :belongs_to
+               rev_id_to_record_map, rev_ids = construct_id_map(records, through_primary_key)
+               rev_primary_key = through_reflection.klass.primary_key
+@@ -241,7 +246,7 @@ module ActiveRecord
+           through_reflection = reflections[options[:through]]
+           unless through_records.empty?
+             source = reflection.source_reflection.name
+-            through_records.first.class.preload_associations(through_records, source, options)
++            through_records.first.class.preload_associations(through_records, source, options.merge!(preload_options))
+             through_records.each do |through_record|
+               through_record_id = through_record[reflection.through_reflection_primary_key].to_s
+               add_preloaded_records_to_collection(id_to_record_map[through_record_id], reflection.name, through_record.send(source))
+@@ -340,10 +345,10 @@ module ActiveRecord
+           conditions << append_conditions(reflection, preload_options)
+           associated_records = klass.with_exclusive_scope do
+             klass.find(:all, :conditions => [conditions, ids],
+-                                          :include => options[:include],
+-                                          :select => options[:select],
+-                                          :joins => options[:joins],
+-                                          :order => options[:order])
++                                          :include => options[:include] || preload_options[:include],
++                                          :select => options[:select] || preload_options[:select],
++                                          :joins => options[:joins] || preload_options[:joins],
++                                          :order => options[:order] || preload_options[:order])
+           end
+           set_association_single_records(id_map, reflection.name, associated_records, primary_key)
+         end
+diff --git a/activerecord/test/cases/associations/eager_load_nested_include_test.rb b/activerecord/test/cases/associations/eager_load_nested_include_test.rb
+index e8db6d5..cc182cb 100644
+--- a/activerecord/test/cases/associations/eager_load_nested_include_test.rb
++++ b/activerecord/test/cases/associations/eager_load_nested_include_test.rb
+@@ -126,3 +126,89 @@ class EagerLoadNestedIncludeWithMissingDataTest < ActiveRecord::TestCase
+     end
+   end
+ end
++
++class EagerLoadExceptSpecifiedAttributes < ActiveRecord::TestCase
++  def setup
++    @joshy_mcjosh = Author.create(:name => 'Joshy McJosh')
++    @first_post = @joshy_mcjosh.posts.create(:title => 'Josh Is Thinking', :body => 'Verbose text')
++    @first_comment = @first_post.comments.create(:body => 'Glowing compliments')
++    @first_categorization = @joshy_mcjosh.categorizations.create(:category => Category.first, :post => @first_post)
++  end
++
++  def teardown
++    @joshy_mcjosh.destroy
++    @first_post.destroy
++    @first_comment.destroy
++    @first_categorization.destroy
++  end
++
++  def test_excluding_attributes_does_not_raise_error
++    assert_nothing_raised do
++      includes = {:posts => {:except => :body}}
++      Author.all :include => includes
++    end
++  end
++
++  def test_excluding_attributes_does_not_raise_error_with_multiple_includes
++    assert_nothing_raised do
++      includes = [{:posts => {:except => :body}}, :categorizations, :author_favorites]
++      Author.all(:include => includes).first.categorizations
++    end
++  end
++
++  def test_excluding_attributes_and_trying_to_access_attribute_raises_no_method_error
++    assert_raise NoMethodError do
++      includes = {:posts => {:except => :body}}
++      Author.all(:include => includes).first.body
++    end
++  end
++
++  def test_excluding_multiple_attributes_and_trying_to_access_either_attribute_raises_no_method_error
++    assert_raise NoMethodError do
++      includes = {:posts => {:except => [:body, :title]}}
++      Author.all(:include => includes).first.title
++    end
++  end
++
++  def test_excluding_a_nonexistent_attribute_raises_error
++    assert_raise RuntimeError do
++      includes = {:posts => {:except => [:body, :not_a_real_attribute]}}
++      Author.all(:include => includes)
++    end
++  end
++
++  def test_deep_attribute_excluding
++    assert_raises ActiveModel::MissingAttributeError do
++      includes = {:posts => {:comments => {:except => :body}}}
++      Author.all(:include => includes).first.posts.first.comments.first.body
++    end
++  end
++
++  def test_deep_attribute_excluding_with_two_excludes
++    assert_raises NoMethodError do
++      includes = {:posts => {:except => :body, :comments => {:except => :body}}}
++      Author.all(:include => includes).first.posts.body
++    end
++  end
++
++  def test_excluding_in_has_many_through_associations
++    assert_raises ActiveModel::MissingAttributeError do
++      includes = {:comments => {:except => :body}}
++      Author.all(:include => includes).first.comments.first.body
++    end
++  end
++
++  def test_excluding_in_has_one_through_associations
++    assert_raises ActiveModel::MissingAttributeError do
++      includes = {:post_about_thinking => {:except => :body}}
++      Author.all(:include => includes).first.post_about_thinking.body
++    end
++  end
++
++  def test_excluding_does_not_pollute_other_has_many_queries
++    assert_nothing_raised do
++      includes = [{:post_about_thinking => {:except => :body}}, {:posts => :comments}]
++      Author.all(:include => includes)
++    end
++  end
++end
+\ No newline at end of file
+-- 
+1.6.5.1
+

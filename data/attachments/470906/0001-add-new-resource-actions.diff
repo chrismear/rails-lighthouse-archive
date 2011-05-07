@@ -1,0 +1,266 @@
+From 01207a7bed6cc334c0cafd149ab8ae23286a105b Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Mon, 5 Apr 2010 06:48:02 +0100
+Subject: [PATCH] Add support for actions on a new resource to the new routing DSL
+
+---
+ actionpack/lib/action_dispatch/routing/mapper.rb |   83 ++++++++++++++++-----
+ actionpack/test/dispatch/routing_test.rb         |   46 +++++++++++-
+ 2 files changed, 106 insertions(+), 23 deletions(-)
+
+diff --git a/actionpack/lib/action_dispatch/routing/mapper.rb b/actionpack/lib/action_dispatch/routing/mapper.rb
+index 925e91f..0aacb96 100644
+--- a/actionpack/lib/action_dispatch/routing/mapper.rb
++++ b/actionpack/lib/action_dispatch/routing/mapper.rb
+@@ -444,6 +444,10 @@ module ActionDispatch
+             name.to_s.singularize
+           end
+ 
++          def member_prefix
++            ':id'
++          end
++
+           def member_name
+             singular
+           end
+@@ -490,6 +494,10 @@ module ActionDispatch
+             end
+           end
+ 
++          def nested_prefix
++            id_segment
++          end
++
+           def nested_options
+             options = { :name_prefix => member_name }
+             options["#{singular}_id".to_sym] = id_constraint if id_constraint?
+@@ -513,9 +521,21 @@ module ActionDispatch
+             end
+           end
+ 
++          def member_prefix
++            ''
++          end
++
+           def member_name
+             name
+           end
++
++          def nested_prefix
++            ''
++          end
++
++          def nested_options
++            { :name_prefix => member_name }
++          end
+         end
+ 
+         def initialize(*args) #:nodoc:
+@@ -534,18 +554,17 @@ module ActionDispatch
+ 
+           scope(:path => resource.path, :controller => resource.controller) do
+             with_scope_level(:resource, resource) do
++              yield if block_given?
+ 
+-              scope(:name_prefix => resource.name.to_s, :as => "") do
+-                yield if block_given?
+-              end
+-
+-              scope(resource.options) do
+-                get    :show if resource.actions.include?(:show)
+-                post   :create if resource.actions.include?(:create)
+-                put    :update if resource.actions.include?(:update)
+-                delete :destroy if resource.actions.include?(:destroy)
+-                get    :new, :as => resource.name if resource.actions.include?(:new)
+-                get    :edit, :as => resource.name if resource.actions.include?(:edit)
++              with_scope_level(:member) do
++                scope(resource.options) do
++                  get    :show if resource.actions.include?(:show)
++                  post   :create if resource.actions.include?(:create)
++                  put    :update if resource.actions.include?(:update)
++                  delete :destroy if resource.actions.include?(:destroy)
++                  get    :new, :as => resource.name if resource.actions.include?(:new)
++                  get    :edit, :as => resource.name if resource.actions.include?(:edit)
++                end
+               end
+             end
+           end
+@@ -603,24 +622,38 @@ module ActionDispatch
+         end
+ 
+         def member
+-          unless @scope[:scope_level] == :resources
+-            raise ArgumentError, "can't use member outside resources scope"
++          unless resource_scope?
++            raise ArgumentError, "can't use member outside resource(s) scope"
+           end
+ 
+           with_scope_level(:member) do
+-            scope(':id', :name_prefix => parent_resource.member_name, :as => "") do
++            scope(parent_resource.member_prefix, :name_prefix => parent_resource.member_name, :as => "") do
+               yield
+             end
+           end
+         end
+ 
++        def new
++          unless resource_scope?
++            raise ArgumentError, "can't use new outside resource(s) scope"
++          end
++
++          with_scope_level(:new) do
++            with_exclusive_name_prefix(:new) do
++              scope(new_scope_prefix, :name_prefix => parent_resource.member_name, :as => "") do
++                yield
++              end
++            end
++          end
++        end
++
+         def nested
+-          unless @scope[:scope_level] == :resources
+-            raise ArgumentError, "can't use nested outside resources scope"
++          unless resource_scope?
++            raise ArgumentError, "can't use nested outside resource(s) scope"
+           end
+ 
+           with_scope_level(:nested) do
+-            scope(parent_resource.id_segment, parent_resource.nested_options) do
++            scope(parent_resource.nested_prefix, parent_resource.nested_options) do
+               yield
+             end
+           end
+@@ -665,10 +698,12 @@ module ActionDispatch
+             return collection { match(*args) }
+           when :member
+             return member { match(*args) }
++          when :new
++            return new { match(*args) }
+           end
+ 
+-          if @scope[:scope_level] == :resources
+-            raise ArgumentError, "can't define route directly in resources scope"
++          if resource_scope?
++            raise ArgumentError, "can't define route directly in resource(s) scope"
+           end
+ 
+           super
+@@ -698,7 +733,7 @@ module ActionDispatch
+               return true
+             end
+ 
+-            if @scope[:scope_level] == :resources
++            if resource_scope?
+               nested do
+                 send(method, resources.pop, options, &block)
+               end
+@@ -708,6 +743,14 @@ module ActionDispatch
+             false
+           end
+ 
++          def new_scope_prefix
++            @scope[:resources_path_names][:new] || 'new'
++          end
++
++          def resource_scope?
++            @scope[:scope_level] == :resources || @scope[:scope_level] == :resource
++          end
++
+           def with_exclusive_name_prefix(prefix)
+             begin
+               old_name_prefix = @scope[:name_prefix]
+diff --git a/actionpack/test/dispatch/routing_test.rb b/actionpack/test/dispatch/routing_test.rb
+index 6ff478a..e0f4c43 100644
+--- a/actionpack/test/dispatch/routing_test.rb
++++ b/actionpack/test/dispatch/routing_test.rb
+@@ -24,8 +24,10 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+       end
+ 
+       resource :session do
+-        get :create
+-        post :reset
++        member do
++          get :create
++          post :reset
++        end
+ 
+         resource :info
+       end
+@@ -63,6 +65,11 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+       scope 'pt', :name_prefix => 'pt' do
+         resources :projects, :path_names => { :edit => 'editar' }, :path => 'projetos'
+         resource  :admin,    :path_names => { :new => 'novo' },    :path => 'administrador'
++        resources :products, :path_names => { :new => 'novo' } do
++          new do
++            post :preview
++          end
++        end
+       end
+ 
+       resources :projects, :controller => :project do
+@@ -82,7 +89,9 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+         end
+ 
+         resource :manager, :as => :super_manager do
+-          post :fire
++          member do
++            post :fire
++          end
+         end
+ 
+         resources :people do
+@@ -111,6 +120,10 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+       end
+ 
+       resources :replies do
++        new do
++          post :preview
++        end
++
+         member do
+           put :answer, :to => :mark_as_answer
+           delete :answer, :to => :unmark_as_answer
+@@ -186,6 +199,16 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+       end
+ 
+       resource :dashboard, :constraints => { :ip => /192\.168\.1\.\d{1,3}/ }
++
++      resource :profile do
++        member do
++          get :settings
++        end
++
++        new do
++          post :preview
++        end
++      end
+     end
+   end
+ 
+@@ -942,6 +965,23 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  def test_resource_new_actions
++    with_test_routes do
++      assert_equal '/replies/new/preview', preview_new_reply_path
++      assert_equal '/pt/products/novo/preview', preview_new_pt_product_path
++      assert_equal '/profile/new/preview', preview_new_profile_path
++
++      post '/replies/new/preview'
++      assert_equal 'replies#preview', @response.body
++
++      post '/pt/products/novo/preview'
++      assert_equal 'products#preview', @response.body
++
++      post '/profile/new/preview'
++      assert_equal 'profiles#preview', @response.body
++    end
++  end
++
+   private
+     def with_test_routes
+       yield
+-- 
+1.6.4.4
+

@@ -1,0 +1,159 @@
+From 8823ba5dfae7a117bd01d0e22c3de68f62f4d872 Mon Sep 17 00:00:00 2001
+From: Scott Barr <scottb@globalitcreations.com>
+Date: Fri, 15 May 2009 12:18:23 +0800
+Subject: [PATCH] Added pending_changes to ActiveRecord::Dirty
+
+I added this feature so that a Map of changed fields could be retrieved
+after a model had been saved. This is useful in the after_save callback
+when you need to know what fields changed. At present there is no way
+to do this other than have code in the before_save callback that takes
+a copy of the changes Map, which I thought was a bit messy.
+
+Example.
+
+  person = Person.find_by_name('bob')
+  person.name = 'robert'
+  person.changes # => {'name' => ['bob, 'robert']}
+  person.save
+  person.changes # => {}
+  person.previous_changes # => {'name' => ['bob, 'robert']}
+  person.reload
+  person.previous_changes # => {}
+---
+ activerecord/lib/active_record/dirty.rb |   17 ++++++++++++
+ activerecord/test/cases/dirty_test.rb   |   42 ++++++++++++++++++++++++++++---
+ 2 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/activerecord/lib/active_record/dirty.rb b/activerecord/lib/active_record/dirty.rb
+index ac84f6b..ce142d6 100644
+--- a/activerecord/lib/active_record/dirty.rb
++++ b/activerecord/lib/active_record/dirty.rb
+@@ -67,6 +67,15 @@ module ActiveRecord
+       changed_attributes.keys
+     end
+ 
++    # Map of attributes that were changed when the model was saved.
++    #   person.name # => 'bob'
++    #   person.name = 'robert'
++    #   person.save
++    #   person.previous_changes # => {'name' => ['bob, 'robert']}
++    def previous_changes
++      previously_changed_attributes
++    end
++    
+     # Map of changed attrs => [original value, new value].
+     #   person.changes # => {}
+     #   person.name = 'bob'
+@@ -78,6 +87,7 @@ module ActiveRecord
+     # Attempts to +save+ the record and clears changed attributes if successful.
+     def save_with_dirty(*args) #:nodoc:
+       if status = save_without_dirty(*args)
++        @previously_changed = changes
+         changed_attributes.clear
+       end
+       status
+@@ -86,6 +96,7 @@ module ActiveRecord
+     # Attempts to <tt>save!</tt> the record and clears changed attributes if successful.
+     def save_with_dirty!(*args) #:nodoc:
+       status = save_without_dirty!(*args)
++      @previously_changed = changes
+       changed_attributes.clear
+       status
+     end
+@@ -93,6 +104,7 @@ module ActiveRecord
+     # <tt>reload</tt> the record and clears changed attributes.
+     def reload_with_dirty(*args) #:nodoc:
+       record = reload_without_dirty(*args)
++      previously_changed_attributes.clear
+       changed_attributes.clear
+       record
+     end
+@@ -102,6 +114,11 @@ module ActiveRecord
+       def changed_attributes
+         @changed_attributes ||= {}
+       end
++      
++      # Map of fields that were changed when the model was saved
++      def previously_changed_attributes
++        @previously_changed ||= {}
++      end
+ 
+       # Handle <tt>*_changed?</tt> for +method_missing+.
+       def attribute_changed?(attr)
+diff --git a/activerecord/test/cases/dirty_test.rb b/activerecord/test/cases/dirty_test.rb
+index ac95bac..3a7383e 100644
+--- a/activerecord/test/cases/dirty_test.rb
++++ b/activerecord/test/cases/dirty_test.rb
+@@ -31,24 +31,24 @@ class DirtyTest < ActiveRecord::TestCase
+     pirate = Pirate.new
+     assert !pirate.catchphrase_changed?
+     assert_nil pirate.catchphrase_change
+-
++    
+     # Change catchphrase.
+     pirate.catchphrase = 'arrr'
+     assert pirate.catchphrase_changed?
+     assert_nil pirate.catchphrase_was
+     assert_equal [nil, 'arrr'], pirate.catchphrase_change
+-
++    
+     # Saved - no changes.
+     pirate.save!
+     assert !pirate.catchphrase_changed?
+     assert_nil pirate.catchphrase_change
+-
++    
+     # Same value - no changes.
+     pirate.catchphrase = 'arrr'
+     assert !pirate.catchphrase_changed?
+     assert_nil pirate.catchphrase_change
+   end
+-
++  
+   def test_aliased_attribute_changes
+     # the actual attribute here is name, title is an
+     # alias setup via alias_attribute
+@@ -288,6 +288,40 @@ class DirtyTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_previous_changes
++    # original values should be in previous_changes
++    pirate = Pirate.new
++    
++    assert_equal Hash.new, pirate.previous_changes
++    pirate.catchphrase = "arrr"
++    pirate.save!
++    
++    assert_equal 4, pirate.previous_changes.size
++    assert_equal [nil, "arrr"], pirate.previous_changes['catchphrase']
++    assert_equal [nil, pirate.id], pirate.previous_changes['id']
++    assert_nil pirate.previous_changes['updated_on'][0]
++    assert_not_nil pirate.previous_changes['updated_on'][1]
++    assert_nil pirate.previous_changes['created_on'][0]
++    assert_not_nil pirate.previous_changes['created_on'][1]
++    
++    # original values should be in previous_changes
++    pirate = Pirate.new
++    
++    assert_equal Hash.new, pirate.previous_changes
++    pirate.catchphrase = "arrr"
++    pirate.save
++    
++    assert_equal 4, pirate.previous_changes.size
++    assert_equal [nil, "arrr"], pirate.previous_changes['catchphrase']
++    assert_equal [nil, pirate.id], pirate.previous_changes['id']
++    assert pirate.previous_changes.include?('updated_on')
++    assert pirate.previous_changes.include?('created_on')
++    
++    pirate.catchphrase = "Yar!!"
++    pirate.reload
++    assert_equal Hash.new, pirate.previous_changes
++  end
++  
+   private
+     def with_partial_updates(klass, on = true)
+       old = klass.partial_updates?
+-- 
+1.6.2.1
+

@@ -1,0 +1,123 @@
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index b3a7512..3b22fd2 100755
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -801,6 +801,27 @@ module ActiveRecord
+         end
+       end
+ 
++      def validates_associated(*attr_names)
++        configuration = { :message => nil, :on => :save }
++        configuration.update(attr_names.extract_options!)
++
++        validates_each(attr_names, configuration) do |record, attr_name, associate|
++          associations = associate.is_a?(Array) ? associate : [associate]
++          associations.each do |association|
++            if association && !association.valid?
++              if configuration[:message]
++                record.errors.add(attr_name, configuration[:message])
++              else
++                record.errors.add(attr_name, ActiveRecord::Errors.default_error_messages[:invalid])
++                association.errors.each do |error_name, error_value|
++                  record.errors.add(error_name, error_value)
++                end
++              end
++            end
++          end
++        end
++      end
++
+       # Validates whether the value of the specified attribute is numeric by trying to convert it to
+       # a float with Kernel.Float (if <tt>only_integer</tt> is false) or applying it to the regular expression
+       # <tt>/\A[\+\-]?\d+\Z/</tt> (if <tt>only_integer</tt> is set to true).
+diff --git a/activerecord/test/cases/validations_test.rb b/activerecord/test/cases/validations_test.rb
+index a4d9da4..87e2e24 100755
+--- a/activerecord/test/cases/validations_test.rb
++++ b/activerecord/test/cases/validations_test.rb
+@@ -54,6 +54,21 @@ end
+ class Thaumaturgist < IneptWizard
+ end
+ 
++class ParentModel < ActiveRecord::Base
++  has_one :child_model
++  has_many :child_models
++  has_many :child_models_ordered_by_descending_field, :class_name => "ChildModel", :order => "field DESC"
++  has_many :child_models_including_nonexistent_association, :class_name => "ChildModel", :include => :nonexistent_association
++  has_many :associated_models, :through => :child_models, :source => :associated_model
++  has_and_belongs_to_many :habtm_associated_models, :join_table => "parent_associated_joins", :class_name => "AssociatedModel"
++end
++
++class ChildModel < ActiveRecord::Base
++  belongs_to :parent_model
++  has_one :nonexistent_association
++  belongs_to :associated_model
++end
++
+ 
+ class ValidationsTest < ActiveRecord::TestCase
+   fixtures :topics, :developers, 'warehouse-things'
+@@ -1089,6 +1104,36 @@ class ValidationsTest < ActiveRecord::TestCase
+     assert r.valid?
+   end
+ 
++  def test_display_associated_errors_without_message_argument
++    [:validate, :validate_on_create, :validate_on_update].each {|method| ParentModel.write_inheritable_attribute(method, nil)}
++    [:validate, :validate_on_create, :validate_on_update].each {|method| ChildModel.write_inheritable_attribute(method, nil)}
++    parent = ParentModel.new
++    child = parent.build_child_model
++
++    ParentModel.validates_associated :child_model
++    ChildModel.validates_presence_of :field, :message => "from Child is fieldless."
++
++    assert !child.valid?
++    assert child.errors.full_messages.include?("Field from Child is fieldless.")
++    assert !parent.valid?
++    assert parent.errors.full_messages.include?("Field from Child is fieldless.")
++  end
++
++  def test_works_with_message_argument
++    [:validate, :validate_on_create, :validate_on_update].each {|method| ParentModel.write_inheritable_attribute(method, nil)}
++    [:validate, :validate_on_create, :validate_on_update].each {|method| ChildModel.write_inheritable_attribute(method, nil)}
++    parent = ParentModel.new
++    child = parent.build_child_model
++
++    ParentModel.validates_associated :child_model, :message => "Hey, my children are bad!"
++    ChildModel.validates_presence_of :field, :message => "from Child is fieldless."
++
++    assert !child.valid?
++    assert child.errors.full_messages.include?("Field from Child is fieldless.")
++    assert !parent.valid?
++    assert parent.errors.full_messages.include?("Child model Hey, my children are bad!")
++  end
++
+   def test_validate_block
+     Topic.validate { |topic| topic.errors.add("title", "will never be valid") }
+     t = Topic.create("title" => "Title", "content" => "whatever")
+@@ -1188,7 +1233,7 @@ class ValidationsTest < ActiveRecord::TestCase
+     r = Reply.create("title" => "A reply", "content" => "with content!")
+     r.topic = Topic.create("title" => "uhohuhoh")
+     assert !r.valid?
+-    assert_equal "This string contains 'single' and \"double\" quotes", r.errors.on(:topic).last
++    assert r.errors.on(:topic).include?("This string contains 'single' and \"double\" quotes")
+   end
+ 
+   def test_if_validation_using_method_true
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 423929f..5738b54 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -162,6 +162,14 @@ ActiveRecord::Schema.define do
+     t.column :type, :string
+   end
+ 
++  create_table :parent_models, :force => true do |t|
++
++  end
++
++  create_table :child_models, :force => true do |t|
++    t.column :parent_model_id, :integer, :null => false
++  end
++
+ 
+   create_table :jobs, :force => true do |t|
+     t.integer :ideal_reference_id

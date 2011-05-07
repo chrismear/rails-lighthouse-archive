@@ -1,0 +1,176 @@
+From 45df92cd60c2f50928dbdb5e3f818b96c40a1cab Mon Sep 17 00:00:00 2001
+From: David Calavera <david.calavera@gmail.com>
+Date: Thu, 28 May 2009 13:14:14 +0200
+Subject: [PATCH] counter_cache not updated when an item updates its polymorphic owner
+
+---
+ .../belongs_to_polymorphic_association.rb          |   12 +++++
+ .../test/cases/associations/counter_cache_test.rb  |   44 ++++++++++++++++++++
+ activerecord/test/models/project.rb                |    2 +
+ activerecord/test/models/task.rb                   |    4 +-
+ activerecord/test/models/user.rb                   |    5 ++
+ activerecord/test/schema/schema.rb                 |   11 +++++
+ 6 files changed, 77 insertions(+), 1 deletions(-)
+ create mode 100644 activerecord/test/cases/associations/counter_cache_test.rb
+ create mode 100644 activerecord/test/models/user.rb
+
+diff --git a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+index d8146da..be8a8bb 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+@@ -2,11 +2,22 @@ module ActiveRecord
+   module Associations
+     class BelongsToPolymorphicAssociation < AssociationProxy #:nodoc:
+       def replace(record)
++        counter_cache_name = @reflection.counter_cache_column
++
+         if record.nil?
++          if counter_cache_name && !@owner.new_record?
++            record.class.base_class.decrement_counter(counter_cache_name, @owner[@reflection.primary_key_name]) if @owner[@reflection.primary_key_name]
++          end
++
+           @target = @owner[@reflection.primary_key_name] = @owner[@reflection.options[:foreign_type]] = nil
+         else
+           @target = (AssociationProxy === record ? record.target : record)
+ 
++          if counter_cache_name && !@owner.new_record?
++            record.class.base_class.increment_counter(counter_cache_name, record.id)
++            record.class.base_class.decrement_counter(counter_cache_name, @owner[@reflection.primary_key_name]) if @owner[@reflection.primary_key_name]
++          end
++
+           @owner[@reflection.primary_key_name] = record.id
+           @owner[@reflection.options[:foreign_type]] = record.class.base_class.name.to_s
+ 
+@@ -47,3 +58,4 @@ module ActiveRecord
+     end
+   end
+ end
++
+diff --git a/activerecord/test/cases/associations/counter_cache_test.rb b/activerecord/test/cases/associations/counter_cache_test.rb
+new file mode 100644
+index 0000000..d18f3fb
+--- /dev/null
++++ b/activerecord/test/cases/associations/counter_cache_test.rb
+@@ -0,0 +1,44 @@
++require "cases/helper"
++require "models/project"
++require 'models/user'
++require 'models/task'
++
++class CounterCacheTest < ActiveSupport::TestCase
++
++  def setup
++    @paul = User.create :name => 'Paul'
++    @sara = User.create :name => 'Sara'
++    @rails = Project.create :name => 'rails'
++    @sinatra = Project.create :name => 'sinatra'
++  end
++
++  test "the counter works ok when a task is assigned" do
++    @paul.tasks.create :title => 'wash dishes'
++    assert_equal 1, @paul.reload.tasks_count
++  end
++
++  test "the counter works ok when a task is deleted" do
++    @paul.tasks.create :title => 'wash dishes'
++    assert_equal 1, @paul.reload.tasks_count
++    @paul.tasks.first.destroy
++    assert_equal 0, @paul.reload.tasks_count
++  end
++
++  test "the counter works ok when a task is transferred on non polymorphic project" do
++    @rails.tasks.create :title => 'testing'
++    t = @rails.tasks.first
++    t.update_attribute :project, @sinatra
++    assert_equal 0, @rails.reload.tasks_count
++    assert_equal 1, @sinatra.reload.tasks_count
++  end
++
++  test "the counter works ok when a task is transferred on polymorphic owner" do
++    @paul.tasks.create :title => 'wash dishes'
++    t = @paul.tasks.first
++    t.update_attribute :owner, @sara
++    assert_equal 1, @sara.reload.tasks_count
++    assert_equal 0, @paul.reload.tasks_count # FAIL!!!
++  end
++
++end
++
+diff --git a/activerecord/test/models/project.rb b/activerecord/test/models/project.rb
+index f25b2dd..5ea1f45 100644
+--- a/activerecord/test/models/project.rb
++++ b/activerecord/test/models/project.rb
+@@ -14,6 +14,7 @@ class Project < ActiveRecord::Base
+                             :before_remove => Proc.new {|o, r| o.developers_log << "before_removing#{r.id}"},
+                             :after_remove => Proc.new {|o, r| o.developers_log << "after_removing#{r.id}"}
+   has_and_belongs_to_many :well_payed_salary_groups, :class_name => "Developer", :group => "developers.salary", :having => "SUM(salary) > 10000", :select => "SUM(salary) as salary"
++  has_many :tasks
+ 
+   attr_accessor :developers_log
+ 
+@@ -28,3 +29,4 @@ class SpecialProject < Project
+     "hello there!"
+   end
+ end
++
+diff --git a/activerecord/test/models/task.rb b/activerecord/test/models/task.rb
+index ee0282c..f623a5e 100644
+--- a/activerecord/test/models/task.rb
++++ b/activerecord/test/models/task.rb
+@@ -1,3 +1,5 @@
+ class Task < ActiveRecord::Base
+-
++  belongs_to :owner, :polymorphic => true, :counter_cache => true
++  belongs_to :project, :counter_cache => true
+ end
++
+diff --git a/activerecord/test/models/user.rb b/activerecord/test/models/user.rb
+new file mode 100644
+index 0000000..15184ed
+--- /dev/null
++++ b/activerecord/test/models/user.rb
+@@ -0,0 +1,5 @@
++class User < ActiveRecord::Base
++  has_many :tasks, :as => :owner
++  attr_readonly :tasks_count
++end
++
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 6e8813d..333b8d4 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -355,9 +355,15 @@ ActiveRecord::Schema.define do
+     t.integer :price
+   end
+ 
++  create_table :users, :force => true do |t|
++    t.string :name
++    t.integer :tasks_count
++  end
++
+   create_table :projects, :force => true do |t|
+     t.string :name
+     t.string :type
++    t.integer :tasks_count
+   end
+ 
+   create_table :readers, :force => true do |t|
+@@ -404,6 +410,10 @@ ActiveRecord::Schema.define do
+   end
+ 
+   create_table :tasks, :force => true do |t|
++    t.string :title
++    t.string :owner_type
++    t.integer :owner_id
++    t.integer :project_id
+     t.datetime :starting
+     t.datetime :ending
+   end
+@@ -504,3 +514,4 @@ end
+ Course.connection.create_table :courses, :force => true do |t|
+   t.column :name, :string, :null => false
+ end
++
+-- 
+1.6.0.4
+

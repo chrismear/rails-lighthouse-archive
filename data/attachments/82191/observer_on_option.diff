@@ -1,0 +1,230 @@
+From 9616243694718347d19bcf9b25dbe69260cbb845 Mon Sep 17 00:00:00 2001
+From: Gabriel Gironda <gabriel.gironda@gmail.com>
+Date: Tue, 27 Jan 2009 16:33:54 -0600
+Subject: [PATCH] Adds an :on and :after/:before option to AR observers
+
+---
+ activerecord/lib/active_record/observer.rb |   89 ++++++++++++++++++++++------
+ activerecord/test/cases/observer_test.rb   |   78 ++++++++++++++++++++++++
+ 2 files changed, 148 insertions(+), 19 deletions(-)
+ create mode 100644 activerecord/test/cases/observer_test.rb
+
+diff --git a/activerecord/lib/active_record/observer.rb b/activerecord/lib/active_record/observer.rb
+index b35e407..c16284e 100644
+--- a/activerecord/lib/active_record/observer.rb
++++ b/activerecord/lib/active_record/observer.rb
+@@ -107,6 +107,21 @@ module ActiveRecord
+   #
+   # The AuditObserver will now act on both updates to Account and Balance by treating them both as records.
+   #
++  # If the audit observer only needs to watch a separate set of observable object updates on each kind of model, the
++  # observed updates can be specified via the :on option to observe
++  #
++  #   class AuditObserver < ActiveRecord::Observer
++  #     observe :account, :after => [:create, :update]
++  #     observe :balance, :on => :after_save
++  #
++  #     def after_update(record)
++  #       AuditTrail.new(record, "UPDATED")
++  #     end
++  #     
++  #     def after_create(record); '...'; end
++  #     def after_save(record); '...'; end
++  #   end
++  #
+   # == Available callback methods
+   #
+   # The observer can implement callback methods for each of the methods described in the Callbacks module.
+@@ -141,13 +156,17 @@ module ActiveRecord
+   #
+   class Observer
+     include Singleton
+-
++    write_inheritable_hash :observable_updates, {}
++    
+     class << self
++      
+       # Attaches the observer to the supplied model classes.
+       def observe(*models)
+-        models.flatten!
+-        models.collect! { |model| model.is_a?(Symbol) ? model.to_s.camelize.constantize : model }
+-        define_method(:observed_classes) { Set.new(models) }
++        options = models.extract_options!
++        set_watch_options(models, options)
++        models = constantize_models(models)
++        already_observed = read_inheritable_attribute(:observed_classes)
++        write_inheritable_attribute(:observed_classes, Set.new(Array(already_observed)) + Set.new(models))
+       end
+ 
+       # The class observed by default is inferred from the observer's class name:
+@@ -159,6 +178,28 @@ module ActiveRecord
+           nil
+         end
+       end
++    
++    private
++
++      def set_watch_options(models, options)
++        on_methods = options.inject([]) do |methods,(key,val)|
++          if [:before, :after].include?(key)
++            methods.concat(Array(val).map {|v| :"#{key}_#{v}"})
++          elsif key == :on
++            methods.concat(Array(val).map(&:to_sym))
++          end
++          methods
++        end
++        constantize_models(models).each do |model|
++          existing = (obs = read_inheritable_attribute(:observable_updates)) ? obs[model] : []
++          write_inheritable_hash(:observable_updates, model => Array(existing) + on_methods)
++        end
++      end
++      
++      def constantize_models(models)
++        models.flatten.collect { |model| model.is_a?(Symbol) ? model.to_s.camelize.constantize : model }
++      end
++      
+     end
+ 
+     # Start observing the declared classes and their subclasses.
+@@ -168,7 +209,7 @@ module ActiveRecord
+ 
+     # Send observed_method(object) if the method exists.
+     def update(observed_method, object) #:nodoc:
+-      send(observed_method, object) if respond_to?(observed_method)
++      send(observed_method, object) if listening_for?(object, observed_method)
+     end
+ 
+     # Special method sent by the observed class when it is inherited.
+@@ -177,21 +218,31 @@ module ActiveRecord
+       self.class.observe(observed_classes + [subclass])
+       add_observer!(subclass)
+     end
++    
++    def observed_classes
++      self.class.read_inheritable_attribute(:observed_classes) || Set.new([self.class.observed_class].compact.flatten)
++    end
++    
++  protected
++    
++    def listening_for?(object, observed_method)
++      respond_to?(observed_method) && watching?(object, observed_method)
++    end
++      
++    def watching?(object, observed_method)
++      observed = self.class.read_inheritable_attribute(:observable_updates)
++      observed[object.class].blank? || observed[object.class].include?(observed_method.to_sym)
++    end
++    
++    def observed_subclasses
++      observed_classes.sum([]) { |klass| klass.send(:subclasses) }
++    end
+ 
+-    protected
+-      def observed_classes
+-        Set.new([self.class.observed_class].compact.flatten)
+-      end
+-
+-      def observed_subclasses
+-        observed_classes.sum([]) { |klass| klass.send(:subclasses) }
+-      end
+-
+-      def add_observer!(klass)
+-        klass.add_observer(self)
+-        if respond_to?(:after_find) && !klass.method_defined?(:after_find)
+-          klass.class_eval 'def after_find() end'
+-        end
++    def add_observer!(klass)
++      klass.add_observer(self)
++      if respond_to?(:after_find) && !klass.method_defined?(:after_find)
++        klass.class_eval 'def after_find() end'
+       end
++    end
+   end
+ end
+diff --git a/activerecord/test/cases/observer_test.rb b/activerecord/test/cases/observer_test.rb
+new file mode 100644
+index 0000000..515b7fe
+--- /dev/null
++++ b/activerecord/test/cases/observer_test.rb
+@@ -0,0 +1,78 @@
++require "cases/helper"
++require 'models/topic'
++require 'models/developer'
++require 'models/reply'
++
++class ActivityObserver < ActiveRecord::Observer
++  observe :topic, :after => [:create, :destroy], :before => :update
++  observe :topic, :developer, :on => [:before_destroy, 'before_save']
++  observe :reply
++end
++
++class ObserverTest < ActiveRecord::TestCase
++  
++  def setup
++    @observer = ActivityObserver.instance
++  end
++  
++  lambda do # with topic 
++    topic = Topic.new
++    
++    test "should observe after_create on Topic" do
++      @observer.expects(:after_create).with(topic)
++      topic.send(:notify, :after_create)
++    end
++
++    test "should observe after_destroy on Topic" do
++      @observer.expects(:after_destroy).with(topic)
++      topic.send(:notify, :after_destroy)
++    end
++    
++    test "should observe before_update on Topic" do
++      @observer.expects(:before_update).with(topic)
++      topic.send(:notify, :before_update)
++    end
++    
++    test "should observe before_destroy on Topic" do 
++      @observer.expects(:before_destroy).with(topic)
++      topic.send(:notify, :before_destroy)
++    end
++  
++    test "should observe before_save on Topic" do
++      @observer.expects(:before_save).with(topic)
++      topic.send(:notify, :before_save)
++    end
++  
++    test "should ignore after_save and after_validation on topic" do
++      @observer.expects(:after_save).with(topic).never
++      @observer.expects(:after_validation).with(topic).never
++      topic.send(:notify, :after_save)
++      topic.send(:notify, :after_validation)
++    end
++    
++  end.call
++
++  lambda do # with developer
++    developer = Developer.new
++    
++    test "should observe before_destroy on Developer" do
++      @observer.expects(:before_destroy).with(developer)
++      developer.send(:notify, :before_destroy)
++    end
++  
++    test "should observe before_save on Developer" do
++      @observer.expects(:before_save).with(developer)
++      developer.send(:notify, :before_save)
++    end
++    
++  end.call
++  
++  test "should observe all callbacks on Reply" do
++    reply = Reply.new
++    ActiveRecord::Callbacks::CALLBACKS.each do |callback|
++      @observer.expects(callback).with(reply)
++      reply.send(:notify, callback)
++    end
++  end
++  
++end
+-- 
+1.6.0.5
+

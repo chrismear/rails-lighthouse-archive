@@ -1,0 +1,125 @@
+From d3509a2026db774173a555347722567d5c6e13d3 Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Jos=C3=A9=20Valim?= <jose.valim@gmail.com>
+Date: Tue, 10 Nov 2009 11:15:37 -0200
+Subject: [PATCH] Optimize Error I18n to avoid unecessary lookups and just retrieve values
+ when needed [#3477 status:resolved].
+
+---
+ activerecord/lib/active_record/validations.rb |   36 ++++++++++++++----------
+ activerecord/test/cases/validations_test.rb   |   14 +++++++++
+ 2 files changed, 35 insertions(+), 15 deletions(-)
+
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index 33fc09c..568e530 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -22,21 +22,18 @@ module ActiveRecord
+       self.base      = base
+       self.attribute = attribute
+       self.type      = type || :invalid
++      self.options   = options
+       self.message   = options.delete(:message) || self.type
+-      self.options   = {
+-        :scope => [:activerecord, :errors],
+-        :model => @base.class.human_name,
+-        :attribute => @base.class.human_attribute_name(attribute.to_s),
+-        :value => value
+-      }.merge!(options)
+     end
+ 
+     def message
+-      generate_message(@message, options.dup)
++      # When type is a string, it means that we do not have to do a lookup, because
++      # the user already sent the "final" message.
++      type.is_a?(String) ? type : generate_message(default_options)
+     end
+ 
+     def full_message
+-      attribute.to_s == 'base' ? message : generate_full_message(message, options.dup)
++      attribute.to_s == 'base' ? message : generate_full_message(default_options)
+     end
+ 
+     alias :to_s :message
+@@ -65,16 +62,16 @@ module ActiveRecord
+       # <li><tt>activerecord.errors.messages.blank</tt></li>
+       # <li>any default you provided through the +options+ hash (in the activerecord.errors scope)</li>
+       # </ol>
+-      def generate_message(message, options = {})
++      def generate_message(options = {})
+         keys = @base.class.self_and_descendants_from_active_record.map do |klass|
+-          [ :"models.#{klass.name.underscore}.attributes.#{attribute}.#{message}",
+-            :"models.#{klass.name.underscore}.#{message}" ]
++          [ :"models.#{klass.name.underscore}.attributes.#{attribute}.#{@message}",
++            :"models.#{klass.name.underscore}.#{@message}" ]
+         end.flatten
+ 
+         keys << options.delete(:default)
+-        keys << :"messages.#{message}"
+-        keys << message if message.is_a?(String)
+-        keys << @type unless @type == message
++        keys << :"messages.#{@message}"
++        keys << @message if @message.is_a?(String)
++        keys << @type unless @type == @message
+         keys.compact!
+ 
+         options.merge!(:default => keys)
+@@ -108,7 +105,7 @@ module ActiveRecord
+       #         full_messages:
+       #           title:
+       #             blank: This title is screwed!
+-      def generate_full_message(message, options = {})
++      def generate_full_message(options = {})
+         keys = [
+           :"full_messages.#{@message}",
+           :'full_messages.format',
+@@ -118,6 +115,15 @@ module ActiveRecord
+         options.merge!(:default => keys, :message => self.message)
+         I18n.translate(keys.shift, options)
+       end
++
++      # Return user options with default options.
++      #
++      def default_options
++        options.reverse_merge :scope => [:activerecord, :errors],
++                              :model => @base.class.human_name,
++                              :attribute => @base.class.human_attribute_name(attribute.to_s),
++                              :value => value
++      end
+   end
+ 
+   # Active Record validation is reported to and from this object, which is used by Base#save to
+diff --git a/activerecord/test/cases/validations_test.rb b/activerecord/test/cases/validations_test.rb
+index 5678da2..00d915d 100644
+--- a/activerecord/test/cases/validations_test.rb
++++ b/activerecord/test/cases/validations_test.rb
+@@ -28,6 +28,12 @@ class ProtectedPerson < ActiveRecord::Base
+   set_table_name 'people'
+   attr_accessor :addon
+   attr_protected :first_name
++
++  def special_error
++    this_method_does_not_exist!
++  rescue
++    errors.add(:special_error, "This method does not exist")
++  end
+ end
+ 
+ class UniqueReply < Reply
+@@ -172,6 +178,14 @@ class ValidationsTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_values_are_not_retrieved_unless_needed
++    assert_nothing_raised do
++      person = ProtectedPerson.new
++      person.special_error
++      assert_equal "This method does not exist", person.errors[:special_error]
++    end
++  end
++
+   def test_single_error_per_attr_iteration
+     r = Reply.new
+     r.save
+-- 
+1.5.4.3
+

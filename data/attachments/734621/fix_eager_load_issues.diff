@@ -1,0 +1,171 @@
+From 53e8f9b2e0b832e2a8d68513f5ba3143aaf0aba1 Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Wed, 20 Oct 2010 22:54:43 -0400
+Subject: [PATCH 1/2] Fix issue with count when used with association joins and includes together.
+
+---
+ activerecord/lib/active_record/associations.rb     |    7 +++----
+ .../associations/cascaded_eager_loading_test.rb    |    9 +++++++++
+ 2 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 59d328f..56e721c 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -2013,7 +2013,7 @@ module ActiveRecord
+             end
+ 
+           # A JoinPart represents a part of a JoinDependency. It is an abstract class, inherited
+-          # by JoinBase and JoinAssociation. A JoinBase represents the Active Record which 
++          # by JoinBase and JoinAssociation. A JoinBase represents the Active Record which
+           # everything else is being joined onto. A JoinAssociation represents an association which
+           # is joining to the base. A JoinAssociation may result in more than one actual join
+           # operations (for example a has_and_belongs_to_many JoinAssociation would result in
+@@ -2092,8 +2092,7 @@ module ActiveRecord
+ 
+             def ==(other)
+               other.class == self.class &&
+-              other.active_record == active_record &&
+-              other.table_joins == table_joins
++              other.active_record == active_record
+             end
+ 
+             def aliased_prefix
+@@ -2114,7 +2113,7 @@ module ActiveRecord
+             attr_reader :reflection
+ 
+             # The JoinDependency object which this JoinAssociation exists within. This is mainly
+-            # relevant for generating aliases which do not conflict with other joins which are 
++            # relevant for generating aliases which do not conflict with other joins which are
+             # part of the query.
+             attr_reader :join_dependency
+ 
+diff --git a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+index c7c32da..d1d34f3 100644
+--- a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
++++ b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+@@ -3,6 +3,7 @@ require 'models/post'
+ require 'models/comment'
+ require 'models/author'
+ require 'models/categorization'
++require 'models/category'
+ require 'models/company'
+ require 'models/topic'
+ require 'models/reply'
+@@ -45,6 +46,14 @@ class CascadedEagerLoadingTest < ActiveRecord::TestCase
+     assert_equal people(:michael), Person.eager_load(:primary_contact => :primary_contact).where('primary_contacts_people_2.first_name = ?', 'Susan').order('people.id').first
+   end
+ 
++  def test_cascaded_eager_association_loading_with_join_for_count
++    categories = Category.joins(:categorizations).includes([{:posts=>:comments}, :authors])
++
++    assert_nothing_raised do
++      assert_equal 2, categories.count
++    end
++  end
++
+   def test_eager_association_loading_with_join_for_count
+     authors = Author.joins(:special_posts).includes([:posts, :categorizations])
+ 
+-- 
+1.7.2.2
+
+
+From 447960d3c0a3b7096cf29d5ab8d0f080febc0d3c Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Sat, 23 Oct 2010 15:08:12 -0400
+Subject: [PATCH 2/2] Fix attempt to select from unjoined tables when includes or eager_load contains duplicate associaitons
+
+---
+ activerecord/lib/active_record/associations.rb     |   36 +++++++++++++++++---
+ .../associations/cascaded_eager_loading_test.rb    |    7 ++++
+ 2 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 56e721c..2659a05 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1837,7 +1837,7 @@ module ActiveRecord
+ 
+           def initialize(base, associations, joins)
+             @join_parts            = [JoinBase.new(base, joins)]
+-            @associations          = associations
++            @associations          = {}
+             @reflections           = []
+             @base_records_hash     = {}
+             @base_records_in_order = []
+@@ -1917,16 +1917,33 @@ module ActiveRecord
+ 
+           protected
+ 
++            def cache_joined_association(association)
++              associations = []
++              parent = association.parent
++              while parent != join_base
++                associations.unshift(parent.reflection.name)
++                parent = parent.parent
++              end
++              ref = @associations
++              associations.each do |key|
++                ref = ref[key]
++              end
++              ref[association.reflection.name] = {}
++            end
++
+             def build(associations, parent = nil, join_type = Arel::InnerJoin)
+               parent ||= join_parts.last
+               case associations
+                 when Symbol, String
+                   reflection = parent.reflections[associations.to_s.intern] or
+                   raise ConfigurationError, "Association named '#{ associations }' was not found; perhaps you misspelled it?"
+-                  @reflections << reflection
+-                  join_association = build_join_association(reflection, parent)
+-                  join_association.join_type = join_type
+-                  @join_parts << join_association
++                  unless join_association = find_join_association(reflection, parent)
++                    @reflections << reflection
++                    join_association = build_join_association(reflection, parent)
++                    join_association.join_type = join_type
++                    @join_parts << join_association
++                    cache_joined_association(join_association)
++                  end
+                 when Array
+                   associations.each do |association|
+                     build(association, parent, join_type)
+@@ -1941,6 +1958,15 @@ module ActiveRecord
+               end
+             end
+ 
++            def find_join_association(name_or_reflection, parent)
++              case name_or_reflection
++              when Symbol, String
++                join_associations.detect {|j| (j.reflection.name == name_or_reflection.to_s.intern) && (j.parent == parent)}
++              else
++                join_associations.detect {|j| (j.reflection == name_or_reflection) && (j.parent == parent)}
++              end
++            end
++
+             def remove_uniq_by_reflection(reflection, records)
+               if reflection && reflection.collection?
+                 records.each { |record| record.send(reflection.name).target.uniq! }
+diff --git a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+index d1d34f3..ff0d51e 100644
+--- a/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
++++ b/activerecord/test/cases/associations/cascaded_eager_loading_test.rb
+@@ -54,6 +54,13 @@ class CascadedEagerLoadingTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_cascaded_eager_association_loading_with_duplicated_includes
++    categories = Category.includes(:categorizations).includes(:categorizations => :author).where("categorizations.id is not null")
++    assert_nothing_raised do
++      assert_equal 2, categories.count
++    end
++  end
++
+   def test_eager_association_loading_with_join_for_count
+     authors = Author.joins(:special_posts).includes([:posts, :categorizations])
+ 
+-- 
+1.7.2.2
+

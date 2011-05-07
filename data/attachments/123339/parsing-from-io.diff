@@ -1,0 +1,376 @@
+From 15f295b288e99b8f26e79843c961d37835072718 Mon Sep 17 00:00:00 2001
+From: Brian Lopez <seniorlopez@gmail.com>
+Date: Sat, 16 May 2009 15:49:50 -0700
+Subject: [PATCH] Add support for parsing XML and JSON from an IO as well as a string
+
+---
+ .../action_dispatch/middleware/params_parser.rb    |   12 ++---
+ .../lib/active_support/json/backends/jsongem.rb    |    5 ++-
+ .../lib/active_support/json/backends/yajl.rb       |   40 ++++++++++++++++++++
+ .../lib/active_support/json/backends/yaml.rb       |    5 ++-
+ activesupport/lib/active_support/xml_mini/jdom.rb  |   16 +++++---
+ .../lib/active_support/xml_mini/libxml.rb          |   16 +++++---
+ .../lib/active_support/xml_mini/nokogiri.rb        |   16 +++++---
+ activesupport/lib/active_support/xml_mini/rexml.rb |   14 ++++--
+ activesupport/test/json/decoding_test.rb           |   38 ++++++++++++++++--
+ .../test/xml_mini/nokogiri_engine_test.rb          |   13 ++++++
+ activesupport/test/xml_mini/rexml_engine_test.rb   |   14 +++++++
+ 11 files changed, 152 insertions(+), 37 deletions(-)
+ create mode 100644 activesupport/lib/active_support/json/backends/yajl.rb
+
+diff --git a/actionpack/lib/action_dispatch/middleware/params_parser.rb b/actionpack/lib/action_dispatch/middleware/params_parser.rb
+index 58d527a..2295ab0 100644
+--- a/actionpack/lib/action_dispatch/middleware/params_parser.rb
++++ b/actionpack/lib/action_dispatch/middleware/params_parser.rb
+@@ -30,18 +30,16 @@ module ActionDispatch
+ 
+         case strategy
+           when Proc
+-            strategy.call(request.raw_post)
++            strategy.call(request.body)
+           when :xml_simple, :xml_node
+-            body = request.raw_post
+-            body.blank? ? {} : Hash.from_xml(body).with_indifferent_access
++            request.body.size == 0 ? {} : Hash.from_xml(request.body).with_indifferent_access
+           when :yaml
+-            YAML.load(request.raw_post)
++            YAML.load_stream(request.body)
+           when :json
+-            body = request.raw_post
+-            if body.blank?
++            if request.body.size == 0
+               {}
+             else
+-              data = ActiveSupport::JSON.decode(body)
++              data = ActiveSupport::JSON.decode(request.body)
+               data = {:_json => data} unless data.is_a?(Hash)
+               data.with_indifferent_access
+             end
+diff --git a/activesupport/lib/active_support/json/backends/jsongem.rb b/activesupport/lib/active_support/json/backends/jsongem.rb
+index de847e3..d1a1cdd 100644
+--- a/activesupport/lib/active_support/json/backends/jsongem.rb
++++ b/activesupport/lib/active_support/json/backends/jsongem.rb
+@@ -6,8 +6,11 @@ module ActiveSupport
+       module JSONGem
+         extend self
+ 
+-        # Converts a JSON string into a Ruby object.
++        # Parses a JSON string or IO and convert it into an object
+         def decode(json)
++          if json.respond_to?(:read)
++            json = json.read
++          end
+           data = ::JSON.parse(json)
+           if ActiveSupport.parse_json_times
+             convert_dates_from(data)
+diff --git a/activesupport/lib/active_support/json/backends/yajl.rb b/activesupport/lib/active_support/json/backends/yajl.rb
+new file mode 100644
+index 0000000..42efce6
+--- /dev/null
++++ b/activesupport/lib/active_support/json/backends/yajl.rb
+@@ -0,0 +1,40 @@
++require 'stringio' unless defined?(StringIO)
++module ActiveSupport
++  module JSON
++    ParseError = ::Yajl::ParseError
++    
++    module Backends
++      module Yajl
++        extend self
++ 
++        # Parses a JSON string or IO and converts it into an object
++        def decode(json)
++          unless json.respond_to?(:read)
++            json = StringIO.new(json)
++          end
++          data = ::Yajl::Stream.parse(json)
++          if ActiveSupport.parse_json_times
++            convert_dates_from(data)
++          else
++            data
++          end
++        end
++ 
++      private
++        def convert_dates_from(data)
++          case data
++            when DATE_REGEX
++              DateTime.parse(data)
++            when Array
++              data.map! { |d| convert_dates_from(d) }
++            when Hash
++              data.each do |key, value|
++                data[key] = convert_dates_from(value)
++              end
++            else data
++          end
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activesupport/lib/active_support/json/backends/yaml.rb b/activesupport/lib/active_support/json/backends/yaml.rb
+index c7db508..1c18fc4 100644
+--- a/activesupport/lib/active_support/json/backends/yaml.rb
++++ b/activesupport/lib/active_support/json/backends/yaml.rb
+@@ -9,8 +9,11 @@ module ActiveSupport
+       module Yaml
+         extend self
+ 
+-        # Converts a JSON string into a Ruby object.
++        # Parses a JSON string or IO and converts it into an object
+         def decode(json)
++          if json.respond_to?(:read)
++            json = json.read
++          end
+           YAML.load(convert_json_to_yaml(json))
+         rescue ArgumentError => e
+           raise ParseError, "Invalid JSON string"
+diff --git a/activesupport/lib/active_support/xml_mini/jdom.rb b/activesupport/lib/active_support/xml_mini/jdom.rb
+index d795d55..2f86df5 100644
+--- a/activesupport/lib/active_support/xml_mini/jdom.rb
++++ b/activesupport/lib/active_support/xml_mini/jdom.rb
+@@ -24,15 +24,19 @@ module ActiveSupport
+     node_type_map = {}
+     NODE_TYPE_NAMES.each { |type| node_type_map[Node.send(type)] = type }
+ 
+-    # Parse an XML Document string into a simple hash using Java's jdom.
+-    # string::
+-    #   XML Document string to parse
+-    def parse(string)
+-      if string.blank?
++    # Parse an XML Document string or IO into a simple hash using Java's jdom.
++    # data::
++    #   XML Document string or IO to parse
++    def parse(data)
++      if data.respond_to?(:read)
++        data = data.read
++      end
++      
++      if data.blank?
+         {}
+       else
+         @dbf = DocumentBuilderFactory.new_instance
+-        xml_string_reader = StringReader.new(string)
++        xml_string_reader = StringReader.new(data)
+         xml_input_source = InputSource.new(xml_string_reader)
+         doc = @dbf.new_document_builder.parse(xml_input_source)
+         merge_element!({}, doc.document_element)
+diff --git a/activesupport/lib/active_support/xml_mini/libxml.rb b/activesupport/lib/active_support/xml_mini/libxml.rb
+index 3702054..5f66cea 100644
+--- a/activesupport/lib/active_support/xml_mini/libxml.rb
++++ b/activesupport/lib/active_support/xml_mini/libxml.rb
+@@ -5,16 +5,20 @@ module ActiveSupport
+   module XmlMini_LibXML #:nodoc:
+     extend self
+ 
+-    # Parse an XML Document string into a simple hash using libxml.
+-    # string::
+-    #   XML Document string to parse
+-    def parse(string)
++    # Parse an XML Document string or IO into a simple hash using libxml.
++    # data::
++    #   XML Document string or IO to parse
++    def parse(data)
++      if data.respond_to?(:read)
++        data = data.read
++      end
++      
+       LibXML::XML.default_keep_blanks = false
+ 
+-      if string.blank?
++      if data.blank?
+         {}
+       else
+-        LibXML::XML::Parser.string(string.strip).parse.to_hash
++        LibXML::XML::Parser.string(data.strip).parse.to_hash
+       end
+     end
+ 
+diff --git a/activesupport/lib/active_support/xml_mini/nokogiri.rb b/activesupport/lib/active_support/xml_mini/nokogiri.rb
+index 8f9676e..8108b8b 100644
+--- a/activesupport/lib/active_support/xml_mini/nokogiri.rb
++++ b/activesupport/lib/active_support/xml_mini/nokogiri.rb
+@@ -5,14 +5,18 @@ module ActiveSupport
+   module XmlMini_Nokogiri #:nodoc:
+     extend self
+ 
+-    # Parse an XML Document string into a simple hash using libxml / nokogiri.
+-    # string::
+-    #   XML Document string to parse
+-    def parse(string)
+-      if string.blank?
++    # Parse an XML Document string or IO into a simple hash using libxml / nokogiri.
++    # data::
++    #   XML Document string or IO to parse
++    def parse(data)
++      if data.respond_to?(:read)
++        data = data.read
++      end
++      
++      if data.blank?
+         {}
+       else
+-        doc = Nokogiri::XML(string)
++        doc = Nokogiri::XML(data)
+         raise doc.errors.first if doc.errors.length > 0
+         doc.to_hash
+       end
+diff --git a/activesupport/lib/active_support/xml_mini/rexml.rb b/activesupport/lib/active_support/xml_mini/rexml.rb
+index 5033210..1f40d8c 100644
+--- a/activesupport/lib/active_support/xml_mini/rexml.rb
++++ b/activesupport/lib/active_support/xml_mini/rexml.rb
+@@ -7,16 +7,20 @@ module ActiveSupport
+ 
+     CONTENT_KEY = '__content__'.freeze
+ 
+-    # Parse an XML Document string into a simple hash
++    # Parse an XML Document string or IO into a simple hash
+     #
+     # Same as XmlSimple::xml_in but doesn't shoot itself in the foot,
+     # and uses the defaults from ActiveSupport
+     #
+-    # string::
+-    #   XML Document string to parse
+-    def parse(string)
++    # data::
++    #   XML Document string or IO to parse
++    def parse(data)
++      if data.respond_to?(:read)
++        data = data.read
++      end
++      
+       require 'rexml/document' unless defined?(REXML::Document)
+-      doc = REXML::Document.new(string)
++      doc = REXML::Document.new(data)
+       merge_element!({}, doc.root)
+     end
+ 
+diff --git a/activesupport/test/json/decoding_test.rb b/activesupport/test/json/decoding_test.rb
+index 7e1bfcc..f4d47c3 100644
+--- a/activesupport/test/json/decoding_test.rb
++++ b/activesupport/test/json/decoding_test.rb
+@@ -2,6 +2,7 @@
+ require 'abstract_unit'
+ require 'active_support/json'
+ require 'active_support/core_ext/kernel/reporting'
++require 'stringio'
+ 
+ class TestJSONDecoding < ActiveSupport::TestCase
+   TESTS = {
+@@ -36,6 +37,7 @@ class TestJSONDecoding < ActiveSupport::TestCase
+     %q({"b":["\u003ci\u003e","\u003cb\u003e","\u003cu\u003e"]}) => {'b' => ["<i>","<b>","<u>"]}
+   }
+ 
++  time_parsing_backends = %w(JSONGem Yajl)
+   backends = %w(Yaml)
+   begin
+     gem 'json', '>= 1.1'
+@@ -44,6 +46,19 @@ class TestJSONDecoding < ActiveSupport::TestCase
+   rescue Gem::LoadError
+     # Skip JSON gem tests
+   end
++  gem_name = 'yajl-ruby'
++  begin
++    gem gem_name
++    require 'yajl'
++    backends << "Yajl"
++  rescue Gem::LoadError
++    if gem_name =~ /^yajl/
++      gem_name = "brianmario-#{gem_name}"
++      retry
++    end
++    puts $!
++    # Skip JSON gem tests
++  end
+ 
+   backends.each do |backend|
+     TESTS.each do |json, expected|
+@@ -60,17 +75,30 @@ class TestJSONDecoding < ActiveSupport::TestCase
+     end
+   end
+ 
+-  if backends.include?("JSONGem")
+-    test "json decodes time json with time parsing disabled" do
++  (backends & time_parsing_backends).each do |backend|
++    test "json decodes with time parsing disabled using #{backend} backend" do
+       ActiveSupport.parse_json_times = false
+       expected = {"a" => "2007-01-01 01:12:34 Z"}
+-      ActiveSupport::JSON.with_backend "JSONGem" do
++      ActiveSupport::JSON.with_backend backend do
+         assert_equal expected, ActiveSupport::JSON.decode(%({"a": "2007-01-01 01:12:34 Z"}))
+       end
+     end
+   end
+ 
+   def test_failed_json_decoding
+-    assert_raise(ActiveSupport::JSON::ParseError) { ActiveSupport::JSON.decode(%({: 1})) }
++    assert_raise(ActiveSupport::JSON::ParseError) {
++      ActiveSupport::JSON.decode(%({: 1}))
++    }
++  end
++  
++  (backends & time_parsing_backends).each do |backend|
++    test "json decodes from an IO using #{backend} backend" do
++      ActiveSupport.parse_json_times = false
++      expected = {"a" => "2007-01-01 01:12:34 Z"}
++      ActiveSupport::JSON.with_backend backend do
++        io = StringIO.new(%({"a": "2007-01-01 01:12:34 Z"}))
++        assert_equal expected, ActiveSupport::JSON.decode(io)
++      end
++    end
+   end
+-end
++end
+\ No newline at end of file
+diff --git a/activesupport/test/xml_mini/nokogiri_engine_test.rb b/activesupport/test/xml_mini/nokogiri_engine_test.rb
+index 886a9d1..15ce610 100644
+--- a/activesupport/test/xml_mini/nokogiri_engine_test.rb
++++ b/activesupport/test/xml_mini/nokogiri_engine_test.rb
+@@ -147,6 +147,19 @@ class NokogiriEngineTest < Test::Unit::TestCase
+     </root>
+     eoxml
+   end
++  
++  def test_parse_from_io
++    io = StringIO.new(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++    XmlMini.parse(io)
++  end
+ 
+   private
+   def assert_equal_rexml(xml)
+diff --git a/activesupport/test/xml_mini/rexml_engine_test.rb b/activesupport/test/xml_mini/rexml_engine_test.rb
+index a412d8c..e09dfac 100644
+--- a/activesupport/test/xml_mini/rexml_engine_test.rb
++++ b/activesupport/test/xml_mini/rexml_engine_test.rb
+@@ -12,4 +12,18 @@ class REXMLEngineTest < Test::Unit::TestCase
+     XmlMini.backend = 'REXML'
+     assert_equal XmlMini_REXML, XmlMini.backend
+   end
++  
++  def test_parse_from_io
++    XmlMini.backend = 'REXML'
++    io = StringIO.new(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++    XmlMini.parse(io)
++  end
+ end
+-- 
+1.6.1
+

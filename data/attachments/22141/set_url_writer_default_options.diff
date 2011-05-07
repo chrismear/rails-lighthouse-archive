@@ -1,0 +1,175 @@
+From 77a5218830d0737655a626b7fa5b840889fb59e9 Mon Sep 17 00:00:00 2001
+From: pivotal <pivotal@cypress.flood.pivotallabs.com>
+Date: Thu, 8 May 2008 12:24:14 -0700
+Subject: [PATCH] nw/ch - URL writer default options
+
+---
+ actionpack/lib/action_controller/base.rb           |    2 +
+ actionpack/lib/action_controller/url_rewriter.rb   |   20 ++++
+ .../controller/url_writer_default_options_test.rb  |   92 ++++++++++++++++++++
+ .../fixtures/url_testing_mailer/mail_with_url.erb  |    1 +
+ 4 files changed, 115 insertions(+), 0 deletions(-)
+ create mode 100644 actionpack/test/controller/url_writer_default_options_test.rb
+ create mode 100644 actionpack/test/fixtures/url_testing_mailer/mail_with_url.erb
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index c6d28b4..b9b024d 100755
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -1136,6 +1136,7 @@ module ActionController #:nodoc:
+ 
+       def initialize_current_url
+         @url = UrlRewriter.new(request, params.clone)
++        UrlWriter.set_default_url_options_from_request(request)
+       end
+ 
+       def log_processing
+@@ -1258,6 +1259,7 @@ module ActionController #:nodoc:
+ 
+       def process_cleanup
+         close_session
++        UrlWriter.reset_default_url_options
+       end
+   end
+ end
+diff --git a/actionpack/lib/action_controller/url_rewriter.rb b/actionpack/lib/action_controller/url_rewriter.rb
+index b143806..ef26d17 100644
+--- a/actionpack/lib/action_controller/url_rewriter.rb
++++ b/actionpack/lib/action_controller/url_rewriter.rb
+@@ -75,6 +75,26 @@ module ActionController
+ 
+       url
+     end
++    
++    def self.set_default_url_options_from_request(request)
++      @old_default_url_options = default_url_options.clone
++      default_url_options[:protocol] = request.protocol
++      default_url_options[:host] = request.host
++      if request.port == request.standard_port
++        default_url_options.delete(:port)
++      else
++        default_url_options[:port] = request.port
++      end
++    rescue => e
++      reset_default_url_options
++    end
++    
++    def self.reset_default_url_options
++      default_url_options[:host] = @old_default_url_options[:host]
++      default_url_options[:port] = @old_default_url_options[:port]
++      default_url_options[:protocol] = @old_default_url_options[:protocol]
++    end
++    
+   end
+ 
+   # Rewrites URLs for Base.redirect_to and Base.url_for in the controller.
+diff --git a/actionpack/test/controller/url_writer_default_options_test.rb b/actionpack/test/controller/url_writer_default_options_test.rb
+new file mode 100644
+index 0000000..6b788bf
+--- /dev/null
++++ b/actionpack/test/controller/url_writer_default_options_test.rb
+@@ -0,0 +1,92 @@
++require 'abstract_unit'
++
++unless defined?(ActionMailer)
++  begin
++    $:.unshift(File.dirname(__FILE__) + "/../../../actionmailer/lib")
++    require 'action_mailer'
++  rescue LoadError
++    require 'rubygems'
++    gem 'actionmailer'
++  end
++end
++ActionMailer::Base.template_root = "#{File.dirname(__FILE__)}/../fixtures"
++
++class UrlTestingController < ActionController::Base
++  def index
++    UrlTestingMailer.deliver_mail_with_url
++    head :ok
++  end
++  
++  def rescue_action(e)
++    raise e
++  end
++end
++
++class UrlTestingMailer < ActionMailer::Base
++  def mail_with_url
++  end
++end
++
++class UrlWriterDefaultOptionsTest < Test::Unit::TestCase
++  def setup
++    super
++    ActionMailer::Base.delivery_method = :test
++    ActionMailer::Base.perform_deliveries = true
++    ActionMailer::Base.deliveries = []
++    @old_host = ActionController::UrlWriter.default_url_options[:host]
++  end
++  
++  def teardown
++    ActionController::UrlWriter.default_url_options[:host] = @old_host
++  end
++  
++  def test_passes_host_port_protocols_to_all_associated_mailers
++    assert_mail_sent_from_domain_includes_link(false, "host", "3333", "http://host:3333/")
++  end
++
++  def test_drops_default_port
++    assert_mail_sent_from_domain_includes_link(false, "host", "80", "http://host/")
++  end
++
++  def test_handles_ssl
++    assert_mail_sent_from_domain_includes_link(true, "host", "3333", "https://host:3333/")
++  end
++
++  def test_handles_ssl_with_default_port
++    assert_mail_sent_from_domain_includes_link(true, "host", "443", "https://host/")
++  end
++  
++  def test_raises_exception_if_mailing_in_isolation_without_a_host_parameter
++    ActionController::UrlWriter.default_url_options[:host] = nil
++    assert_raises(ActionView::TemplateError) {UrlTestingMailer.deliver_mail_with_url}
++  end
++  
++  def test_mail_is_ok_if_mailing_in_isolation_with_a_host_parameter
++    ActionController::UrlWriter.default_url_options[:host] = "hostname"
++    ActionController::UrlWriter.default_url_options[:port] = "3000"
++    UrlTestingMailer.deliver_mail_with_url
++    assert_latest_mail_includes_link("http://hostname:3000/")
++  end
++  
++  def assert_mail_sent_from_domain_includes_link(is_ssl, host, port, expected_link)
++    @request = make_request_with(is_ssl, host, port)
++    @response = ActionController::TestResponse.new
++    @controller = UrlTestingController.new
++    get :index
++    assert_latest_mail_includes_link(expected_link)
++  end
++  
++  def assert_latest_mail_includes_link(expected_link)
++    mail = ActionMailer::Base.deliveries.last
++    assert_not_nil mail, "Did not find any mail"
++    assert mail.body.include?(expected_link), "Expected mail #{mail.body} to include link #{expected_link}"
++  end
++  
++  def make_request_with(is_ssl, host, port)
++    request = ActionController::TestRequest.new
++    request.host = host
++    request.env["SERVER_PORT"] = port
++    request.env["HTTPS"] = is_ssl ? "on" : "off"
++    request
++  end
++end
+\ No newline at end of file
+diff --git a/actionpack/test/fixtures/url_testing_mailer/mail_with_url.erb b/actionpack/test/fixtures/url_testing_mailer/mail_with_url.erb
+new file mode 100644
+index 0000000..c93dc4c
+--- /dev/null
++++ b/actionpack/test/fixtures/url_testing_mailer/mail_with_url.erb
+@@ -0,0 +1 @@
++<%= url_for(:controller => "url_testing", :action => "index", :only_path => false) %>
+\ No newline at end of file
+-- 
+1.5.4.5
+

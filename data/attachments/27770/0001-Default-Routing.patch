@@ -1,0 +1,195 @@
+From ea9be5989b5eb4465d9e057f2d7b77a9a7292e50 Mon Sep 17 00:00:00 2001
+From: Chris Eppstein <chris@eppsteins.net>
+Date: Mon, 16 Jun 2008 18:59:58 -0700
+Subject: [PATCH] Default Routing
+
+This is an Search Engine Optimization enabling change that allows you to specify that one or more nested routes will not have
+a path segment added to their url.  When combined with pretty urls, this results in nice tight urls without any redundant
+folders in them in the cases where the nesting resource member is primarily a container for a collection of nested resources.
+
+This plugin adds new new routing options:
+* :default - When true, causes the resource to not generate a namespace prefix
+* :show - a symbol identifying a nested resource whose index action should *replace* this resources show action.
+
+It's important to note that using a :default nesting results in a url collision that hides the index action of the nested
+resource. If routing to the index action is more desirable, use the :show option on the parent resource instead.
+
+Example
+=======
+
+map.namespace :forum do |forum|
+  forum.resources :boards, :default => true, :show => :threads do |boards|
+    boards.resources :threads, :show => posts do |threads|
+      threads.resources :posts
+    end
+  end
+end
+
+% rake routes | grep forum | grep -v format
+
+                forum_boards GET    /forum
+                             POST   /forum
+             new_forum_board GET    /forum/new
+            edit_forum_board GET    /forum/:id/edit
+                             PUT    /forum/:id
+                             DELETE /forum/:id
+         forum_board_threads GET    /forum/:board_id             # prevents recognition of forum_board
+                             POST   /forum/:board_id
+      new_forum_board_thread GET    /forum/:board_id/new
+     edit_forum_board_thread GET    /forum/:board_id/:id/edit
+                             PUT    /forum/:board_id/:id
+                             DELETE /forum/:board_id/:id
+    forum_board_thread_posts GET    /forum/:board_id/:thread_id  # prevents recognition of forum_board_thread
+                             POST   /forum/:board_id/:thread_id
+ new_forum_board_thread_post GET    /forum/:board_id/:thread_id/new
+edit_forum_board_thread_post GET    /forum/:board_id/:thread_id/:id/edit
+     forum_board_thread_post GET    /forum/:board_id/:thread_id/:id
+                             PUT    /forum/:board_id/:thread_id/:id
+                             DELETE /forum/:board_id/:thread_id/:id
+          forum_board_thread GET    /forum/:board_id/:id
+                 forum_board GET    /forum/:id
+
+% script/console
+>> app.forum_board_thread_post_path(Board.first, Thread.first, Post.first)
+=> "/forum/star-wars/droids/r2d2-rocks-c3po-sucks"
+
+Copyright (c) 2008 Chris Eppstein, released under the MIT license
+---
+ actionpack/lib/action_controller/resources.rb |   28 +++++++++++++---
+ actionpack/test/controller/resources_test.rb  |   45 +++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/resources.rb b/actionpack/lib/action_controller/resources.rb
+index 9fb1f9f..851e9c4 100644
+--- a/actionpack/lib/action_controller/resources.rb
++++ b/actionpack/lib/action_controller/resources.rb
+@@ -52,6 +52,10 @@ module ActionController
+         @plural   ||= entities
+         @singular ||= options[:singular] || plural.to_s.singularize
+         @path_segment = options.delete(:as) || @plural
++        default = options.delete(:default)
++        if default.to_s == entities.to_s || default == true
++          @path_segment = nil
++        end
+ 
+         @options = options
+ 
+@@ -76,7 +80,7 @@ module ActionController
+       end
+ 
+       def path
+-        @path ||= "#{path_prefix}/#{path_segment}"
++        @path ||= "#{path_prefix}#{'/' if path_segment}#{path_segment}"
+       end
+ 
+       def new_path
+@@ -252,6 +256,8 @@ module ActionController
+     #       # product_reviews_path(product) == '/productos/1234/comentarios'
+     #       product.resources :product_reviews, :as => 'comentarios'
+     #     end
++    # * <tt>:show</tt> - Specifies a nested resource collection whose index action should *replace* this resource's show action.
++    # * <tt>:default</tt> - When true, causes the resource to not generate a namespace prefix.
+     #
+     # * <tt>:has_one</tt> - Specify nested resources, this is a shorthand for mapping singleton resources beneath the current.
+     # * <tt>:has_many</tt> - Same has <tt>:has_one</tt>, but for plural resources.
+@@ -438,8 +444,12 @@ module ActionController
+           map_associations(resource, options)
+ 
+           if block_given?
+-            with_options(:path_prefix => resource.nesting_path_prefix, :name_prefix => resource.nesting_name_prefix, :namespace => options[:namespace], &block)
++            nested_options = {:path_prefix => resource.nesting_path_prefix, :name_prefix => resource.nesting_name_prefix, :namespace => options[:namespace]}
++            nested_options[:default] = options[:show] if options[:show]
++            with_options(nested_options, &block)
+           end
++
++          map_low_priority_actions(map, resource)
+         end
+       end
+ 
+@@ -533,9 +543,7 @@ module ActionController
+           end
+         end
+ 
+-        show_action_options = action_options_for("show", resource)
+-        map.named_route("#{resource.name_prefix}#{resource.singular}", resource.member_path, show_action_options)
+-        map.named_route("formatted_#{resource.name_prefix}#{resource.singular}", "#{resource.member_path}.:format", show_action_options)
++        map_member_get(map,resource) unless resource.options[:show]
+ 
+         update_action_options = action_options_for("update", resource)
+         map.connect(resource.member_path, update_action_options)
+@@ -546,6 +554,16 @@ module ActionController
+         map.connect("#{resource.member_path}.:format", destroy_action_options)
+       end
+ 
++      def map_low_priority_actions(map, resource)
++        map_member_get(map,resource) if resource.options[:show]
++      end
++
++      def map_member_get(map, resource)
++        show_action_options = action_options_for("show", resource)
++        map.named_route("#{resource.name_prefix}#{resource.singular}", resource.member_path, show_action_options)
++        map.named_route("formatted_#{resource.name_prefix}#{resource.singular}", "#{resource.member_path}.:format", show_action_options)
++      end
++
+       def add_conditions_for(conditions, method)
+         returning({:conditions => conditions.dup}) do |options|
+           options[:conditions][:method] = method unless method == :any
+diff --git a/actionpack/test/controller/resources_test.rb b/actionpack/test/controller/resources_test.rb
+index 0d089d0..c0cf753 100644
+--- a/actionpack/test/controller/resources_test.rb
++++ b/actionpack/test/controller/resources_test.rb
+@@ -682,6 +682,51 @@ class ResourcesTest < Test::Unit::TestCase
+       assert_recognizes(expected_options, :path => 'thread/1.1.1/comments/1', :method => :get)
+     end
+   end
++  
++  def test_default_routing
++    expected_nested_member_get = {:controller => 'messages', :action => 'show', :thread_id => 'a-thread', :id => 'a-comment'}
++    expected_nested_collection_index = {:controller => 'threads', :action => 'show', :id => 'a-thread'}
++    with_routing do |set|
++      set.draw do |map|
++        map.resources :threads do |threads|
++          threads.resources :messages, :default => true
++        end
++      end
++      assert_recognizes(expected_nested_member_get, :path => 'threads/a-thread/a-comment', :method => :get)
++      assert_recognizes(expected_nested_collection_index, :path => 'threads/a-thread/', :method => :get)
++    end
++  end
++
++  def test_show_routing
++    expected_default_nested_member_show = {
++      :controller => 'messages', :action => 'show',
++      :thread_id => 'a-thread', :id => 'a-comment'
++    }
++    expected_default_nested_collection_index = {
++      :controller => 'messages', :action => 'index',
++      :thread_id => 'a-thread'
++    }
++    expected_normal_nested_member_show = {
++      :controller => 'authors', :action => 'show',
++      :thread_id => 'a-thread', :id => 'an-author'
++    }
++    expected_normal_nested_collection_index = {
++      :controller => 'authors', :action => 'index',
++      :thread_id => 'a-thread'
++    }
++    with_routing do |set|
++      set.draw do |map|
++        map.resources :threads, :show => :messages do |threads|
++          threads.resources :authors
++          threads.resources :messages
++        end
++      end
++      assert_recognizes(expected_default_nested_member_show, :path => 'threads/a-thread/a-comment', :method => :get)
++      assert_recognizes(expected_default_nested_collection_index, :path => 'threads/a-thread/', :method => :get)
++      assert_recognizes(expected_normal_nested_member_show, :path => 'threads/a-thread/authors/an-author', :method => :get)
++      assert_recognizes(expected_normal_nested_collection_index, :path => 'threads/a-thread/authors', :method => :get)
++    end
++  end
+ 
+   protected
+     def with_restful_routing(*args)
+-- 
+1.5.5.1
+

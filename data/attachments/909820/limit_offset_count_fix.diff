@@ -1,0 +1,90 @@
+diff --git a/activerecord/lib/active_record/relation.rb b/activerecord/lib/active_record/relation.rb
+index 852f407..2d994ef 100644
+--- a/activerecord/lib/active_record/relation.rb
++++ b/activerecord/lib/active_record/relation.rb
+@@ -102,12 +102,12 @@ module ActiveRecord
+ 
+     # Returns size of the records.
+     def size
+-      loaded? ? @records.length : count
++      loaded? ? @records.length : apply_limit_offset(count)
+     end
+ 
+     # Returns true if there are no records.
+     def empty?
+-      loaded? ? @records.empty? : count.zero?
++      loaded? ? @records.empty? : apply_limit_offset(count).zero?
+     end
+ 
+     def any?
+@@ -408,5 +408,13 @@ module ActiveRecord
+       string.scan(/([a-zA-Z_][.\w]+).?\./).flatten.map{ |s| s.downcase }.uniq - ['raw_sql_']
+     end
+ 
++    def apply_limit_offset(value)
++      # called in size and empty? on relations that have not yet been loaded to
++      # work around an issue with limit and offset in SELECT COUNT(*) queries
++      value -= @offset_value if @offset_value
++      value = 0 if value < 0
++      value = @limit_value if @limit_value && value > @limit_value
++      value
++    end
+   end
+ end
+diff --git a/activerecord/lib/active_record/relation/calculations.rb b/activerecord/lib/active_record/relation/calculations.rb
+index abc4c54..fdc76c0 100644
+--- a/activerecord/lib/active_record/relation/calculations.rb
++++ b/activerecord/lib/active_record/relation/calculations.rb
+@@ -199,7 +199,12 @@ module ActiveRecord
+       column = aggregate_column(column_name)
+ 
+       # Postgresql doesn't like ORDER BY when there are no GROUP BY
+-      relation = except(:order)
++      unless operation == "count"
++        relation = except(:order)
++      else
++        # if this is a COUNT query, limit and offset should be excluded
++        relation = except(:limit, :offset, :order)
++      end
+       select_value = operation_over_aggregate_column(column, operation, distinct)
+ 
+       relation.select_values = [select_value]
+diff --git a/activerecord/test/cases/calculations_test.rb b/activerecord/test/cases/calculations_test.rb
+index 3121f16..5208f22 100644
+--- a/activerecord/test/cases/calculations_test.rb
++++ b/activerecord/test/cases/calculations_test.rb
+@@ -379,4 +379,34 @@ class CalculationsTest < ActiveRecord::TestCase
+     distinct_authors_for_approved_count = Topic.group(:approved).count(:author_name, :distinct => true)[true]
+     assert_equal distinct_authors_for_approved_count, 2
+   end
++
++  def test_limit_with_size
++    assert_equal Company.limit(5).size, 5
++    assert_equal Company.limit(15).size, 10
++  end
++
++  def test_offset_with_size
++    assert_equal Company.offset(2).size, 8
++    assert_equal Company.offset(10).size, 0
++  end
++
++  def test_limit_and_offset_with_size
++    assert_equal Company.limit(10).offset(3).size, 7
++    assert_equal Company.limit(2).offset(10).size, 0
++  end
++  
++  def test_limit_with_empty
++    assert Company.limit(5).empty? == false
++    assert Company.limit(0).empty? == true
++  end
++
++  def test_offset_with_empty
++    assert Company.offset(1).empty? == false
++    assert Company.offset(10).empty? == true
++  end
++
++  def test_limit_and_offset_with_empty
++    assert Company.limit(2).offset(1).empty? == false
++    assert Company.limit(3).offset(10).empty? == true
++  end
+ end

@@ -1,0 +1,103 @@
+From fa03a21b0a1669a1156eeb03c0cdd3c3e03158e4 Mon Sep 17 00:00:00 2001
+From: josevalim <jose.valim@gmail.com>
+Date: Sat, 14 Jun 2008 10:45:32 +0200
+Subject: [PATCH] caches_action accepts cache_store options such as :expires_in
+
+---
+ .../lib/action_controller/caching/actions.rb       |   18 +++++++++++-------
+ actionpack/test/controller/caching_test.rb         |   10 +++++++++-
+ 2 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/caching/actions.rb b/actionpack/lib/action_controller/caching/actions.rb
+index 65a36f7..c96366e 100644
+--- a/actionpack/lib/action_controller/caching/actions.rb
++++ b/actionpack/lib/action_controller/caching/actions.rb
+@@ -27,13 +27,15 @@ module ActionController #:nodoc:
+     # You can set modify the default action cache path by passing a :cache_path option.  This will be passed directly to ActionCachePath.path_for.  This is handy
+     # for actions with multiple possible routes that should be cached differently.  If a block is given, it is called with the current controller instance.
+     #
+-    # And you can also use :if to pass a Proc that specifies when the action should be cached.
++    # And you can also use :if (or :unless) to pass a Proc that specifies when the action should be cached.
++    # 
++    # Finally, if you are using memcached, you can also pass :expires_in.
+     #
+     #   class ListsController < ApplicationController
+     #     before_filter :authenticate, :except => :public
+     #     caches_page   :public
+     #     caches_action :index, :if => Proc.new { |c| !c.request.format.json? } # cache if is not a JSON request
+-    #     caches_action :show, :cache_path => { :project => 1 }
++    #     caches_action :show, :cache_path => { :project => 1 }, :expires_in => 1.hour
+     #     caches_action :feed, :cache_path => Proc.new { |controller|
+     #       controller.params[:user_id] ?
+     #         controller.send(:user_list_url, c.params[:user_id], c.params[:id]) :
+@@ -56,8 +58,10 @@ module ActionController #:nodoc:
+         def caches_action(*actions)
+           return unless cache_configured?
+           options = actions.extract_options!
+-          cache_filter = ActionCacheFilter.new(:layout => options.delete(:layout), :cache_path => options.delete(:cache_path))
+-          around_filter(cache_filter, {:only => actions}.merge(options))
++          filter_options = { :only => actions, :if => options.delete(:if), :unless => options.delete(:unless) }
++
++          cache_filter = ActionCacheFilter.new(:layout => options.delete(:layout), :cache_path => options.delete(:cache_path), :store_options => options)
++          around_filter(cache_filter, filter_options)
+         end
+       end
+ 
+@@ -80,8 +84,8 @@ module ActionController #:nodoc:
+         end
+ 
+         def before(controller)
+-          cache_path = ActionCachePath.new(controller, path_options_for(controller, @options))
+-          if cache = controller.read_fragment(cache_path.path)
++          cache_path = ActionCachePath.new(controller, path_options_for(controller, @options.slice(:cache_path)))
++          if cache = controller.read_fragment(cache_path.path, @options[:store_options])
+             controller.rendered_action_cache = true
+             set_content_type!(controller, cache_path.extension)
+             options = { :text => cache }
+@@ -96,7 +100,7 @@ module ActionController #:nodoc:
+         def after(controller)
+           return if controller.rendered_action_cache || !caching_allowed(controller)
+           action_content = cache_layout? ? content_for_layout(controller) : controller.response.body
+-          controller.write_fragment(controller.action_cache_path.path, action_content)
++          controller.write_fragment(controller.action_cache_path.path, action_content, @options[:store_options])
+         end
+ 
+         private
+diff --git a/actionpack/test/controller/caching_test.rb b/actionpack/test/controller/caching_test.rb
+index 14cf0a8..fdf8f00 100644
+--- a/actionpack/test/controller/caching_test.rb
++++ b/actionpack/test/controller/caching_test.rb
+@@ -152,7 +152,7 @@ end
+ 
+ 
+ class ActionCachingTestController < ActionController::Base
+-  caches_action :index, :redirected, :forbidden, :if => Proc.new { |c| !c.request.format.json? }
++  caches_action :index, :redirected, :forbidden, :if => Proc.new { |c| !c.request.format.json? }, :expires_in => 1.hour
+   caches_action :show, :cache_path => 'http://test.host/custom/show'
+   caches_action :edit, :cache_path => Proc.new { |c| c.params[:id] ? "http://test.host/#{c.params[:id]};edit" : "http://test.host/edit" }
+   caches_action :with_layout
+@@ -188,6 +188,7 @@ class ActionCachingTestController < ActionController::Base
+     expire_action :controller => 'action_caching_test', :action => 'index'
+     render :nothing => true
+   end
++
+   def expire_xml
+     expire_action :controller => 'action_caching_test', :action => 'index', :format => 'xml'
+     render :nothing => true
+@@ -289,6 +290,13 @@ class ActionCacheTest < Test::Unit::TestCase
+     assert !fragment_exist?('hostname.com/action_caching_test')
+   end
+ 
++  def test_action_cache_with_store_options
++    MockTime.expects(:now).returns(12345).once
++    @controller.expects(:read_fragment).with('hostname.com/action_caching_test', :expires_in => 1.hour).once
++    @controller.expects(:write_fragment).with('hostname.com/action_caching_test', '12345.0', :expires_in => 1.hour).once
++    get :index
++  end
++
+   def test_action_cache_with_custom_cache_path
+     get :show
+     cached_time = content_to_cache
+-- 
+1.5.5.1
+

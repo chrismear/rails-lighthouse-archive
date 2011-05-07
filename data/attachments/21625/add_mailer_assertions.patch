@@ -1,0 +1,226 @@
+From 9c4252182b31616f5fd0ef5309a525f776bfed77 Mon Sep 17 00:00:00 2001
+From: pivotal <pivotal@cypress.flood.pivotallabs.com>
+Date: Mon, 5 May 2008 11:47:50 -0700
+Subject: [PATCH] nw/ch - Assert_not_valid
+
+---
+ .../assertions/model_assertions.rb                 |   17 ++++++++
+ .../test/controller/action_pack_assertions_test.rb |   41 ++++++++++++++++++--
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/assertions/model_assertions.rb b/actionpack/lib/action_controller/assertions/model_assertions.rb
+index 0b43130..d1d0d62 100644
+--- a/actionpack/lib/action_controller/assertions/model_assertions.rb
++++ b/actionpack/lib/action_controller/assertions/model_assertions.rb
+@@ -14,6 +14,23 @@ module ActionController
+           assert record.valid?, record.errors.full_messages.join("\n")
+         end
+       end
++      
++      
++      # Asserts that the passed record is NOT valid by ActiveRecord standards, with a particular set of error messages.
++      #
++      # ==== Examples
++      #
++      #   # assert that the name cannot be blank
++      #   model = Model.new(:name => "")
++      #   assert_not_valid(model, "Name cannot be blank")
++      #
++      def assert_not_valid(model, *messages)
++        clean_backtrace do
++          messages.flatten!
++          assert !model.valid?, "Found valid active record: expected errors [#{messages.join(',')}] but got #{model.errors.full_messages.sort.join(',')}"
++          assert_equal messages.sort, model.errors.full_messages.sort
++        end
++      end
+     end
+   end
+ end
+diff --git a/actionpack/test/controller/action_pack_assertions_test.rb b/actionpack/test/controller/action_pack_assertions_test.rb
+index 1db0575..017fdfc 100644
+--- a/actionpack/test/controller/action_pack_assertions_test.rb
++++ b/actionpack/test/controller/action_pack_assertions_test.rb
+@@ -105,6 +105,9 @@ class ActionPackAssertionsController < ActionController::Base
+ 
+   def get_invalid_record
+     @record = Class.new do
++      def initialize(expected_error)
++        @expected_error = expected_error
++      end
+ 
+       def valid?
+         false
+@@ -112,10 +115,11 @@ class ActionPackAssertionsController < ActionController::Base
+ 
+       def errors
+         Class.new do
+-           def full_messages; ['...stuff...']; end
+-        end.new
++           def initialize(expected_error); @expected_error = expected_error; end
++           def full_messages; [@expected_error]; end
++        end.new(@expected_error)
+       end
+-    end.new
++    end.new(params[:error] || '...stuff...')
+ 
+     render :nothing => true
+   end
+@@ -466,14 +470,43 @@ class ActionPackAssertionsControllerTest < Test::Unit::TestCase
+   end
+ 
+   def test_assert_valid_failing
+-    get :get_invalid_record
++    get :get_invalid_record, :error => "...stuff..."
+ 
+     begin
+       assert_valid assigns('record')
+       assert false
+     rescue Test::Unit::AssertionFailedError => e
++      assert e.message.include?("...stuff...")
+     end
+   end
++  
++  def test_assert_not_valid
++    get :get_invalid_record, :error => "...stuff..."
++    assert_not_valid assigns('record'), '...stuff...'
++  end
++  
++  def test_assert_not_valid_failing_because_record_is_valid
++    get :get_valid_record
++    
++    begin
++      assert_not_valid assigns('record'), '...stuff...'
++      assert false
++    rescue Test::Unit::AssertionFailedError => e
++      assert e.message.include?("Found valid active record: expected errors [...stuff...] but got .")
++    end
++  end
++  
++  def test_assert_not_valid_failing_because_of_incorrect_error_messages
++    get :get_invalid_record, :error => "...stuff..."
++    
++    begin
++      assert_not_valid assigns('record'), '...notstuff...'
++      assert false
++    rescue Test::Unit::AssertionFailedError => e
++      assert e.message.include?("[\"...notstuff...\"]> expected but was\n<[\"...stuff...\"]")
++    end
++  end
++  
+ 
+   def test_assert_response_uses_exception_message
+     @controller = AssertResponseWithUnexpectedErrorController.new
+-- 
+1.5.4.5
+
+
+From 12e9a201bdd87cd35b4fa1192e39b2d15642ac79 Mon Sep 17 00:00:00 2001
+From: pivotal <pivotal@cypress.flood.pivotallabs.com>
+Date: Mon, 5 May 2008 16:13:34 -0700
+Subject: [PATCH] nw - ActionMailer assertions
+
+---
+ actionmailer/lib/action_mailer/test_helper.rb |   32 ++++++++++++++++++++++++-
+ actionmailer/test/test_helper_test.rb         |   29 ++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 1 deletions(-)
+
+diff --git a/actionmailer/lib/action_mailer/test_helper.rb b/actionmailer/lib/action_mailer/test_helper.rb
+index 3a16124..3963412 100644
+--- a/actionmailer/lib/action_mailer/test_helper.rb
++++ b/actionmailer/lib/action_mailer/test_helper.rb
+@@ -32,7 +32,8 @@ module ActionMailer
+         assert_equal number, ActionMailer::Base.deliveries.size
+       end
+     end
+-
++    
++    
+     # Assert that no emails have been sent.
+     #
+     #   def test_emails
+@@ -55,6 +56,35 @@ module ActionMailer
+     def assert_no_emails(&block)
+       assert_emails 0, &block
+     end
++    
++    # Asserts characteristics of the latest email.
++    #  
++    # CialisMailer.deliver_spam
++    # assert_last_email(:subject => "Try Cialis now!", :recipients => "foo@example.com")
++    #
++    def assert_last_email(email_options = {})
++      assert ActionMailer::Base.deliveries.length > 0, "Did not receive an email"
++      delivery = ActionMailer::Base.deliveries.last
++      assert_email(delivery, email_options)
++    end
++    
++    # Asserts characteristics of a particular email.
++    #  
++    # CialisMailer.deliver_spam
++    # delivery = ActionMailer::Base.deliveries.last
++    # assert_email(delivery, :subject => "Try Cialis now!", :recipients => "foo@example.com")
++    #
++    def assert_email(delivery, email_options = {})
++      [:subject, :from, :to, :body, :recipients].each do |email_method|
++        if email_options.has_key?(email_method)
++          assert_equal email_options[email_method], delivery.send(email_method)
++        end
++      end
++      
++      if email_options.has_key?(:body_starts_with)
++        assert_equal email_options[:body_starts_with], delivery.body[0...email_options[:body_starts_with].length]
++      end
++    end
+   end
+ end
+ 
+diff --git a/actionmailer/test/test_helper_test.rb b/actionmailer/test/test_helper_test.rb
+index f8913e5..a155b35 100644
+--- a/actionmailer/test/test_helper_test.rb
++++ b/actionmailer/test/test_helper_test.rb
+@@ -6,6 +6,12 @@ class TestHelperMailer < ActionMailer::Base
+     from       "tester@example.com"
+     body       render(:inline => "Hello, <%= @world %>", :body => { :world => "Earth" })
+   end
++  
++  def another
++    recipients "test@example.com"
++    from       "tester@example.com"
++    body       render(:inline => "Hello, <%= @world %>", :body => { :world => "Venus" })
++  end
+ end
+ 
+ class TestHelperMailerTest < ActionMailer::TestCase
+@@ -113,6 +119,29 @@ class TestHelperMailerTest < ActionMailer::TestCase
+     
+     assert_match /0 .* but 1/, error.message
+   end
++  
++  def test_assert_email
++    TestHelperMailer.deliver_test
++    email = ActionMailer::Base.deliveries.last
++    assert_email email, :body => "Hello, Earth"
++    assert_email email, :subject => ""
++    assert_email email, :from => ["tester@example.com"]
++    assert_email email, :to => ["test@example.com"]
++    assert_email email, :body_starts_with => "Hello"
++    assert_email email, :body_starts_with => "Hello", :sender => "tester@example.com", :to => ["test@example.com"]
++    
++    begin
++      assert_email email, :body => "I am not the right body"
++      fail "assert_email should have failed"
++    rescue Test::Unit::AssertionFailedError => e
++    end
++  end
++  
++  def test_assert_last_email
++    TestHelperMailer.deliver_test
++    TestHelperMailer.deliver_another
++    assert_last_email :body => "Hello, Venus"
++  end
+ end
+ 
+ class AnotherTestHelperMailerTest < ActionMailer::TestCase
+-- 
+1.5.4.5
+

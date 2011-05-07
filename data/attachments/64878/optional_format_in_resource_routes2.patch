@@ -1,0 +1,249 @@
+From 86d9a4eb19ca5e238878d06a2a6ec5d4f047e3cc Mon Sep 17 00:00:00 2001
+From: Aaron Batalion <aaron@hungrymachine.com>
+Date: Mon, 24 Nov 2008 02:24:19 -0500
+Subject: [PATCH] Added optimal formatted routes to rails, deprecating the formatted_* methods, and reducing routes creation by 50%
+
+---
+ actionpack/lib/action_controller/resources.rb      |    4 +--
+ .../lib/action_controller/routing/builder.rb       |    2 +
+ .../lib/action_controller/routing/optimisations.rb |    2 +-
+ actionpack/lib/action_controller/routing/route.rb  |    5 +++
+ .../lib/action_controller/routing/route_set.rb     |   10 +++++-
+ .../lib/action_controller/routing/segments.rb      |   31 +++++++++++++++++
+ actionpack/test/controller/resources_test.rb       |   18 +++++-----
+ actionpack/test/controller/url_rewriter_test.rb    |   35 ++++++++++++++++++++
+ 8 files changed, 93 insertions(+), 14 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/resources.rb b/actionpack/lib/action_controller/resources.rb
+index b5ea764..0b22031 100644
+--- a/actionpack/lib/action_controller/resources.rb
++++ b/actionpack/lib/action_controller/resources.rb
+@@ -639,10 +639,8 @@ module ActionController
+           formatted_route_path = "#{route_path}.:format"
+ 
+           if route_name && @set.named_routes[route_name.to_sym].nil?
+-            map.named_route(route_name, route_path, action_options)
+-            map.named_route("formatted_#{route_name}", formatted_route_path, action_options)
++            map.named_route(route_name, formatted_route_path, action_options)
+           else
+-            map.connect(route_path, action_options)
+             map.connect(formatted_route_path, action_options)
+           end
+         end
+diff --git a/actionpack/lib/action_controller/routing/builder.rb b/actionpack/lib/action_controller/routing/builder.rb
+index d4e501e..44d7594 100644
+--- a/actionpack/lib/action_controller/routing/builder.rb
++++ b/actionpack/lib/action_controller/routing/builder.rb
+@@ -34,6 +34,8 @@ module ActionController
+       def segment_for(string)
+         segment =
+           case string
++            when  /\A\.(:format)?\// 
++              OptionalFormatSegment.new
+             when /\A:(\w+)/
+               key = $1.to_sym
+               key == :controller ? ControllerSegment.new(key) : DynamicSegment.new(key)
+diff --git a/actionpack/lib/action_controller/routing/optimisations.rb b/actionpack/lib/action_controller/routing/optimisations.rb
+index 4522ebc..714cf97 100644
+--- a/actionpack/lib/action_controller/routing/optimisations.rb
++++ b/actionpack/lib/action_controller/routing/optimisations.rb
+@@ -65,7 +65,7 @@ module ActionController
+       # rather than triggering the expensive logic in +url_for+.
+       class PositionalArguments < Optimiser
+         def guard_conditions
+-          number_of_arguments = route.segment_keys.size
++          number_of_arguments = route.required_segment_keys.size
+           # if they're using foo_url(:id=>2) it's one
+           # argument, but we don't want to generate /foos/id2
+           if number_of_arguments == 1
+diff --git a/actionpack/lib/action_controller/routing/route.rb b/actionpack/lib/action_controller/routing/route.rb
+index a610ec7..e4dfdb1 100644
+--- a/actionpack/lib/action_controller/routing/route.rb
++++ b/actionpack/lib/action_controller/routing/route.rb
+@@ -35,6 +35,11 @@ module ActionController
+           segment.key if segment.respond_to? :key
+         end.compact
+       end
++      
++      def required_segment_keys
++        required_segments = segments.select {|seg| (!seg.optional? && !seg.is_a?(DividerSegment)) || seg.is_a?(PathSegment) }
++        required_segments.collect { |seg| seg.key if seg.respond_to?(:key)}.compact
++      end
+ 
+       # Build a query string from the keys of the given hash. If +only_keys+
+       # is given (as an array), only the keys indicated will be used to build
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index 3bb25db..89cdf9d 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -185,6 +185,14 @@ module ActionController
+                 end
+ 
+                 url_for(#{hash_access_method}(opts))
++                
++              end
++              #Add an alias to support the now deprecated formatted_* URL.
++              def formatted_#{selector}(*args)
++                ActiveSupport::Deprecation.warn(
++                  "formatted_#{selector}() has been deprecated. please pass format to the standard" +
++                  "#{selector}() method instead.", caller)
++                #{selector}(*args)
+               end
+               protected :#{selector}
+             end_eval
+@@ -361,7 +369,7 @@ module ActionController
+           end
+ 
+           # don't use the recalled keys when determining which routes to check
+-          routes = routes_by_controller[controller][action][options.keys.sort_by { |x| x.object_id }]
++          routes = routes_by_controller[controller][action][options.reject {|k,v| !v}.keys.sort_by { |x| x.object_id }]
+ 
+           routes.each do |route|
+             results = route.__send__(method, options, merged, expire_on)
+diff --git a/actionpack/lib/action_controller/routing/segments.rb b/actionpack/lib/action_controller/routing/segments.rb
+index f6b03ed..5dda3d4 100644
+--- a/actionpack/lib/action_controller/routing/segments.rb
++++ b/actionpack/lib/action_controller/routing/segments.rb
+@@ -308,5 +308,36 @@ module ActionController
+         end
+       end
+     end
++    
++    # The OptionalFormatSegment allows for any resource route to have an optional
++    # :format, which decreases the amount of routes created by 50%.
++    class OptionalFormatSegment < DynamicSegment
++    
++      def initialize(key = nil, options = {})
++        super(:format, {:optional => true}.merge(options))            
++      end
++    
++      def interpolation_chunk
++        "." + super
++      end
++    
++      def regexp_chunk
++        '(\.[^/?\.]+)?'
++      end
++    
++      def to_s
++        '(.:format)?'
++      end
++    
++      #the value should not include the period (.)
++      def match_extraction(next_capture)
++        %[
++          if (m = match[#{next_capture}])
++            params[:#{key}] = URI.unescape(m.from(1))
++          end
++        ]
++      end
++    end
++    
+   end
+ end
+diff --git a/actionpack/test/controller/resources_test.rb b/actionpack/test/controller/resources_test.rb
+index 541e827..ab7585e 100644
+--- a/actionpack/test/controller/resources_test.rb
++++ b/actionpack/test/controller/resources_test.rb
+@@ -187,7 +187,7 @@ class ResourcesTest < ActionController::TestCase
+ 
+       assert_restful_named_routes_for :messages, :path_prefix => 'threads/1/', :name_prefix => 'thread_', :options => { :thread_id => '1' } do |options|
+         actions.keys.each do |action|
+-          assert_named_route "/threads/1/messages/#{action}.xml", "formatted_#{action}_thread_messages_path", :action => action, :format => 'xml'
++          assert_named_route "/threads/1/messages/#{action}.xml", "#{action}_thread_messages_path", :action => action, :format => 'xml'
+         end
+       end
+     end
+@@ -316,7 +316,7 @@ class ResourcesTest < ActionController::TestCase
+       end
+ 
+       assert_restful_named_routes_for :messages, :path_prefix => 'threads/1/', :name_prefix => 'thread_', :options => { :thread_id => '1' } do |options|
+-        assert_named_route preview_path, :formatted_preview_new_thread_message_path, preview_options
++        assert_named_route preview_path, :preview_new_thread_message_path, preview_options
+       end
+     end
+   end
+@@ -1120,14 +1120,14 @@ class ResourcesTest < ActionController::TestCase
+       end
+ 
+       assert_named_route "#{full_path}", "#{name_prefix}#{controller_name}_path", options[:options]
+-      assert_named_route "#{full_path}.xml", "formatted_#{name_prefix}#{controller_name}_path", options[:options].merge(:format => 'xml')
++      assert_named_route "#{full_path}.xml", "#{name_prefix}#{controller_name}_path", options[:options].merge(:format => 'xml')
+       assert_named_route "#{shallow_path}/1", "#{shallow_prefix}#{singular_name}_path", options[:shallow_options].merge(:id => '1')
+-      assert_named_route "#{shallow_path}/1.xml", "formatted_#{shallow_prefix}#{singular_name}_path", options[:shallow_options].merge(:id => '1', :format => 'xml')
++      assert_named_route "#{shallow_path}/1.xml", "#{shallow_prefix}#{singular_name}_path", options[:shallow_options].merge(:id => '1', :format => 'xml')
+ 
+       assert_named_route "#{full_path}/#{new_action}", "new_#{name_prefix}#{singular_name}_path", options[:options]
+-      assert_named_route "#{full_path}/#{new_action}.xml", "formatted_new_#{name_prefix}#{singular_name}_path", options[:options].merge(:format => 'xml')
++      assert_named_route "#{full_path}/#{new_action}.xml", "new_#{name_prefix}#{singular_name}_path", options[:options].merge(:format => 'xml')
+       assert_named_route "#{shallow_path}/1/#{edit_action}", "edit_#{shallow_prefix}#{singular_name}_path", options[:shallow_options].merge(:id => '1')
+-      assert_named_route "#{shallow_path}/1/#{edit_action}.xml", "formatted_edit_#{shallow_prefix}#{singular_name}_path", options[:shallow_options].merge(:id => '1', :format => 'xml')
++      assert_named_route "#{shallow_path}/1/#{edit_action}.xml", "edit_#{shallow_prefix}#{singular_name}_path", options[:shallow_options].merge(:id => '1', :format => 'xml')
+ 
+       yield options[:options] if block_given?
+     end
+@@ -1179,12 +1179,12 @@ class ResourcesTest < ActionController::TestCase
+       name_prefix = options[:name_prefix]
+ 
+       assert_named_route "#{full_path}",          "#{name_prefix}#{singleton_name}_path",                options[:options]
+-      assert_named_route "#{full_path}.xml",      "formatted_#{name_prefix}#{singleton_name}_path",      options[:options].merge(:format => 'xml')
++      assert_named_route "#{full_path}.xml",      "#{name_prefix}#{singleton_name}_path",      options[:options].merge(:format => 'xml')
+ 
+       assert_named_route "#{full_path}/new",      "new_#{name_prefix}#{singleton_name}_path",            options[:options]
+-      assert_named_route "#{full_path}/new.xml",  "formatted_new_#{name_prefix}#{singleton_name}_path",  options[:options].merge(:format => 'xml')
++      assert_named_route "#{full_path}/new.xml",  "new_#{name_prefix}#{singleton_name}_path",  options[:options].merge(:format => 'xml')
+       assert_named_route "#{full_path}/edit",     "edit_#{name_prefix}#{singleton_name}_path",           options[:options]
+-      assert_named_route "#{full_path}/edit.xml", "formatted_edit_#{name_prefix}#{singleton_name}_path", options[:options].merge(:format => 'xml')
++      assert_named_route "#{full_path}/edit.xml", "edit_#{name_prefix}#{singleton_name}_path", options[:options].merge(:format => 'xml')
+     end
+ 
+     def assert_named_route(expected, route, options)
+diff --git a/actionpack/test/controller/url_rewriter_test.rb b/actionpack/test/controller/url_rewriter_test.rb
+index 8bc343e..bb714a0 100644
+--- a/actionpack/test/controller/url_rewriter_test.rb
++++ b/actionpack/test/controller/url_rewriter_test.rb
+@@ -301,6 +301,41 @@ class UrlWriterTests < ActionController::TestCase
+     assert_generates("/image", :controller=> :image)
+   end
+ 
++  def test_named_routes_with_nil_keys
++    add_host!
++    ActionController::Routing::Routes.draw do |map|
++      map.main '', :controller => 'posts'
++      map.resources :posts
++      map.connect ':controller/:action/:id'
++    end
++    # We need to create a new class in order to install the new named route.
++    kls = Class.new { include ActionController::UrlWriter }
++    controller = kls.new
++    params = {:action => :index, :controller => :posts, :format => :xml}
++    assert_equal("http://www.basecamphq.com/posts.xml", controller.send(:url_for, params))    
++    params[:format] = nil
++    assert_equal("http://www.basecamphq.com/", controller.send(:url_for, params))    
++  ensure
++    ActionController::Routing::Routes.load!
++  end
++
++  def test_formatted_url_methods_are_deprecated
++    ActionController::Routing::Routes.draw do |map|
++      map.resources :posts
++    end
++    # We need to create a new class in order to install the new named route.
++    kls = Class.new { include ActionController::UrlWriter }
++    controller = kls.new
++    params = {:id => 1, :format => :xml}
++    assert_deprecated do
++      assert_equal("/posts/1.xml", controller.send(:formatted_post_path, params))    
++    end
++    assert_deprecated do
++      assert_equal("/posts/1.xml", controller.send(:formatted_post_path, 1, :xml))    
++    end
++  ensure
++    ActionController::Routing::Routes.load!
++  end
+   private
+     def extract_params(url)
+       url.split('?', 2).last.split('&')
+-- 
+1.5.3.2
+

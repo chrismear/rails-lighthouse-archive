@@ -1,0 +1,262 @@
+From 93c9d8172ed184b9aa0d7aac67d50cbd79198e7c Mon Sep 17 00:00:00 2001
+From: Norman Clarke <norman@njclarke.com>
+Date: Wed, 7 Apr 2010 16:21:41 -0300
+Subject: [PATCH] Make tidy_bytes work on 1.9 and improve its performance. [#4350 state:resolved]
+
+---
+ .../lib/active_support/multibyte/chars.rb          |   85 +++++++++++++++----
+ activesupport/test/multibyte_chars_test.rb         |   73 +++++++++++------
+ 2 files changed, 114 insertions(+), 44 deletions(-)
+
+diff --git a/activesupport/lib/active_support/multibyte/chars.rb b/activesupport/lib/active_support/multibyte/chars.rb
+index 3eb0bf3..6ed2157 100644
+--- a/activesupport/lib/active_support/multibyte/chars.rb
++++ b/activesupport/lib/active_support/multibyte/chars.rb
+@@ -19,7 +19,7 @@ module ActiveSupport #:nodoc:
+     #   bad.explicit_checking_method "T".mb_chars.downcase.to_s
+     #
+     # The default Chars implementation assumes that the encoding of the string is UTF-8, if you want to handle different
+-    # encodings you can write your own multibyte string handler and configure it through 
++    # encodings you can write your own multibyte string handler and configure it through
+     # ActiveSupport::Multibyte.proxy_class.
+     #
+     #   class CharsForUTF32
+@@ -458,8 +458,10 @@ module ActiveSupport #:nodoc:
+       end
+ 
+       # Replaces all ISO-8859-1 or CP1252 characters by their UTF-8 equivalent resulting in a valid UTF-8 string.
+-      def tidy_bytes
+-        chars(self.class.tidy_bytes(@wrapped_string))
++      #
++      # Passing +true+ will forcibly tidy all bytes, assuming that the string's encoding is entirely CP1252 or ISO-8859-1.
++      def tidy_bytes(force = false)
++        chars(self.class.tidy_bytes(@wrapped_string, force))
+       end
+ 
+       %w(lstrip rstrip strip reverse upcase downcase tidy_bytes capitalize).each do |method|
+@@ -528,7 +530,7 @@ module ActiveSupport #:nodoc:
+               unpacked << codepoints[marker..pos-1]
+               marker = pos
+             end
+-          end 
++          end
+           unpacked
+         end
+ 
+@@ -644,33 +646,80 @@ module ActiveSupport #:nodoc:
+           codepoints
+         end
+ 
++        def tidy_byte(byte)
++          if UCD.cp1252.key? byte
++            byte = [UCD.cp1252[byte]].pack("U*").unpack("C*")
++          elsif byte < 192
++            byte = [194, byte]
++          else
++            byte = [195, byte - 64]
++          end
++        end
++        private :tidy_byte
++
+         # Replaces all ISO-8859-1 or CP1252 characters by their UTF-8 equivalent resulting in a valid UTF-8 string.
+-        def tidy_bytes(string)
+-          string.split(//u).map do |c|
+-            c.force_encoding(Encoding::ASCII) if c.respond_to?(:force_encoding)
+-
+-            if !ActiveSupport::Multibyte::VALID_CHARACTER['UTF-8'].match(c)
+-              n = c.unpack('C')[0]
+-              n < 128 ? n.chr :
+-              n < 160 ? [UCD.cp1252[n] || n].pack('U') :
+-              n < 192 ? "\xC2" + n.chr : "\xC3" + (n-64).chr
++        #
++        # Passing +true+ will forcibly tidy all bytes, assuming that the string's encoding is entirely CP-1252 or ISO-8859-1.
++        def tidy_bytes(string, force = false)
++          if force
++            return string.unpack("C*").map do |b|
++              tidy_byte(b)
++            end.flatten.compact.pack("C*").unpack("U*").pack("U*")
++          end
++
++          bytes = string.unpack("C*")
++          conts_expected = 0
++          last_lead = 0
++
++          bytes.each_index do |i|
++
++            byte          = bytes[i]
++            is_ascii      = byte < 128
++            is_cont       = byte > 127 && byte < 192
++            is_lead       = byte > 191 && byte < 245
++            is_unused     = byte > 240
++            is_restricted = byte > 244
++
++            # Impossible or highly unlikely byte? Clean it.
++            if is_unused || is_restricted
++              bytes[i] = tidy_byte(byte)
++            elsif is_cont
++              # Not expecting contination byte? Clean up. Otherwise, now expect one less.
++              conts_expected == 0 ? bytes[i] = tidy_byte(byte) : conts_expected -= 1
+             else
+-              c
++              if conts_expected > 0
++                # Expected continuation, but got ASCII or leading? Clean backwards up to
++                # the leading byte.
++                (1..(i - last_lead)).each {|j| bytes[i - j] = tidy_byte(bytes[i - j])}
++                conts_expected = 0
++              end
++              if is_lead
++                # Final byte is leading? Clean it.
++                if i == bytes.length - 1
++                  bytes[i] = tidy_byte(bytes.last)
++                else
++                  # Valid leading byte? Expect continuations determined by position of
++                  # first zero bit, with max of 3.
++                  conts_expected = byte < 224 ? 1 : byte < 240 ? 2 : 3
++                  last_lead = i
++                end
++              end
+             end
+-          end.join
++          end
++          bytes.empty? ? "" : bytes.flatten.compact.pack("C*").unpack("U*").pack("U*")
+         end
+       end
+ 
+       protected
+-        
++
+         def translate_offset(byte_offset) #:nodoc:
+           return nil if byte_offset.nil?
+           return 0   if @wrapped_string == ''
+-          
++
+           if @wrapped_string.respond_to?(:force_encoding)
+             @wrapped_string = @wrapped_string.dup.force_encoding(Encoding::ASCII_8BIT)
+           end
+-          
++
+           begin
+             @wrapped_string[0...byte_offset].unpack('U*').length
+           rescue ArgumentError => e
+diff --git a/activesupport/test/multibyte_chars_test.rb b/activesupport/test/multibyte_chars_test.rb
+index 0e489c1..1b8d13c 100644
+--- a/activesupport/test/multibyte_chars_test.rb
++++ b/activesupport/test/multibyte_chars_test.rb
+@@ -107,7 +107,7 @@ class MultibyteCharsUTF8BehaviourTest < Test::Unit::TestCase
+       # Ruby 1.9 only supports basic whitespace
+       @whitespace = "\n\t ".force_encoding(Encoding::UTF_8)
+     end
+-    
++
+     @byte_order_mark = [65279].pack('U')
+   end
+ 
+@@ -468,14 +468,6 @@ end
+ class MultibyteCharsExtrasTest < Test::Unit::TestCase
+   include MultibyteTestHelpers
+ 
+-  if RUBY_VERSION >= '1.9'
+-    def test_tidy_bytes_is_broken_on_1_9_0
+-      assert_raise(ArgumentError) do
+-        assert_equal_codepoints [0xfffd].pack('U'), chars("\xef\xbf\xbd").tidy_bytes
+-      end
+-    end
+-  end
+-
+   def test_upcase_should_be_unicode_aware
+     assert_equal "АБВГД\0F", chars("аБвгд\0f").upcase
+     assert_equal 'こにちわ', chars('こにちわ').upcase
+@@ -504,7 +496,7 @@ class MultibyteCharsExtrasTest < Test::Unit::TestCase
+   def test_limit_should_work_on_a_multibyte_string
+     example = chars(UNICODE_STRING)
+     bytesize = UNICODE_STRING.respond_to?(:bytesize) ? UNICODE_STRING.bytesize : UNICODE_STRING.size
+-    
++
+     assert_equal UNICODE_STRING, example.limit(bytesize)
+     assert_equal '', example.limit(0)
+     assert_equal '', example.limit(1)
+@@ -531,7 +523,7 @@ class MultibyteCharsExtrasTest < Test::Unit::TestCase
+       assert example.limit(limit).to_s.length <= limit
+     end
+   end
+-  
++
+   def test_composition_exclusion_is_set_up_properly
+     # Normalization of DEVANAGARI LETTER QA breaks when composition exclusion isn't used correctly
+     qa = [0x915, 0x93c].pack('U*')
+@@ -607,28 +599,57 @@ class MultibyteCharsExtrasTest < Test::Unit::TestCase
+   end
+ 
+   def test_tidy_bytes_should_tidy_bytes
++
++    single_byte_cases = {
++      "\x21" => "!",   # Valid ASCII byte, low
++      "\x41" => "A",   # Valid ASCII byte, mid
++      "\x7E" => "~",   # Valid ASCII byte, high
++      "\x80" => "€",   # Continuation byte, low (cp125)
++      "\x94" => "”",   # Continuation byte, mid (cp125)
++      "\x9F" => "Ÿ",   # Continuation byte, high (cp125)
++      "\xC0" => "À",   # Overlong encoding, start of 2-byte sequence, but codepoint < 128
++      "\xC1" => "Á",   # Overlong encoding, start of 2-byte sequence, but codepoint < 128
++      "\xC2" => "Â",   # Start of 2-byte sequence, low
++      "\xC8" => "È",   # Start of 2-byte sequence, mid
++      "\xDF" => "ß",   # Start of 2-byte sequence, high
++      "\xE0" => "à",   # Start of 3-byte sequence, low
++      "\xE8" => "è",   # Start of 3-byte sequence, mid
++      "\xEF" => "ï",   # Start of 3-byte sequence, high
++      "\xF0" => "ð",   # Start of 4-byte sequence
++      "\xF1" => "ñ",   # Unused byte
++      "\xFF" => "ÿ",   # Restricted byte
++      "\x00" => "\x00" # null char
++    }
++
++    single_byte_cases.each do |bad, good|
++      assert_equal good, chars(bad).tidy_bytes.to_s
++      assert_equal "#{good}#{good}", chars("#{bad}#{bad}").tidy_bytes
++      assert_equal "#{good}#{good}#{good}", chars("#{bad}#{bad}#{bad}").tidy_bytes
++      assert_equal "#{good}a", chars("#{bad}a").tidy_bytes
++      assert_equal "#{good}á", chars("#{bad}á").tidy_bytes
++      assert_equal "a#{good}a", chars("a#{bad}a").tidy_bytes
++      assert_equal "á#{good}á", chars("á#{bad}á").tidy_bytes
++      assert_equal "a#{good}", chars("a#{bad}").tidy_bytes
++      assert_equal "á#{good}", chars("á#{bad}").tidy_bytes
++    end
++
+     byte_string = "\270\236\010\210\245"
+     tidy_string = [0xb8, 0x17e, 0x8, 0x2c6, 0xa5].pack('U*')
+-    ascii_padding = 'aa'
+-    utf8_padding = 'éé'
+-
+     assert_equal_codepoints tidy_string, chars(byte_string).tidy_bytes
+-
+-    assert_equal_codepoints ascii_padding.dup.insert(1, tidy_string),
+-      chars(ascii_padding.dup.insert(1, byte_string)).tidy_bytes
+-    assert_equal_codepoints utf8_padding.dup.insert(2, tidy_string),
+-      chars(utf8_padding.dup.insert(2, byte_string)).tidy_bytes
+     assert_nothing_raised { chars(byte_string).tidy_bytes.to_s.unpack('U*') }
+ 
+-    assert_equal_codepoints "\xC3\xA7", chars("\xE7").tidy_bytes # iso_8859_1: small c cedilla
+-    assert_equal_codepoints "\xE2\x80\x9C", chars("\x93").tidy_bytes # win_1252: left smart quote
+-    assert_equal_codepoints "\xE2\x82\xAC", chars("\x80").tidy_bytes # win_1252: euro
+-    assert_equal_codepoints "\x00", chars("\x00").tidy_bytes # null char
+-    assert_equal_codepoints [0xfffd].pack('U'), chars("\xef\xbf\xbd").tidy_bytes # invalid char
+-  rescue ArgumentError => e
+-    raise e if RUBY_VERSION < '1.9'
++    # UTF-8 leading byte followed by too few continuation bytes
++    assert_equal_codepoints "\xc3\xb0\xc2\xa5\xc2\xa4\x21", chars("\xf0\xa5\xa4\x21").tidy_bytes
++  end
++
++  def test_tidy_bytes_should_forcibly_tidy_bytes_if_specified
++    byte_string = "\xF0\xA5\xA4\xA4" # valid as both CP-1252 and UTF-8, but with different interpretations.
++    assert_not_equal "ð¥¤¤", chars(byte_string).tidy_bytes
++    # Forcible conversion to UTF-8
++    assert_equal "ð¥¤¤", chars(byte_string).tidy_bytes(true)
+   end
+ 
++
+   private
+ 
+   def string_from_classes(classes)
+-- 
+1.7.0.3
+

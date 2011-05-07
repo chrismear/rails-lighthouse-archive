@@ -1,0 +1,107 @@
+diff --git a/actionpack/lib/action_controller/caching/pages.rb b/actionpack/lib/action_controller/caching/pages.rb
+index a70ed72..f771d3f 100644
+--- a/actionpack/lib/action_controller/caching/pages.rb
++++ b/actionpack/lib/action_controller/caching/pages.rb
+@@ -91,10 +91,19 @@ module ActionController #:nodoc:
+         #
+         #   # cache the index action except for JSON requests
+         #   caches_page :index, :if => Proc.new { |c| !c.request.format.json? }
++        #
++        #   # cache the index and append request.format to file for cases where period (.) is the url
++        #   caches_page :index, :use_request_extension => true
+         def caches_page(*actions)
+           return unless perform_caching
+           options = actions.extract_options!
+-          after_filter({:only => actions}.merge(options)) { |c| c.cache_page }
++
++          if options[:use_request_extension]
++            after_filter({:only => actions}.merge(options)) { |c| c.cache_page(nil, options.slice(:use_request_extension)) }
++          else
++            after_filter({:only => actions}.merge(options)) { |c| c.cache_page }
++          end
++
+         end
+ 
+         private
+@@ -132,6 +141,9 @@ module ActionController #:nodoc:
+       #   cache_page "I'm the cached content", :controller => "lists", :action => "show"
+       def cache_page(content = nil, options = nil)
+         return unless perform_caching && caching_allowed
++        force_extension = options.delete(:use_request_extension) if options.is_a?(Hash)
++        extension = request.format.to_sym.to_s if force_extension
++        options = nil if options.blank?
+ 
+         path = case options
+           when Hash
+@@ -141,6 +153,7 @@ module ActionController #:nodoc:
+           else
+             request.path
+         end
++        path << '.' << extension if force_extension && path.split('.').last != extension
+ 
+         self.class.cache_page(content || response.body, path)
+       end
+diff --git a/actionpack/test/controller/caching_test.rb b/actionpack/test/controller/caching_test.rb
+index 47a0fcf..3a025d8 100644
+--- a/actionpack/test/controller/caching_test.rb
++++ b/actionpack/test/controller/caching_test.rb
+@@ -9,6 +9,8 @@ ActionController::Base.cache_store = :file_store, FILE_STORE_PATH
+ 
+ class PageCachingTestController < ActionController::Base
+   caches_page :ok, :no_content, :if => Proc.new { |c| !c.request.format.json? }
++  caches_page :weird_url, :use_request_extension => true
++  caches_page :weird_url_no_js, :use_request_extension => true, :if => Proc.new { |c| !c.request.format.json? }
+   caches_page :found, :not_found
+ 
+   def ok
+@@ -23,6 +25,14 @@ class PageCachingTestController < ActionController::Base
+     redirect_to :action => 'ok'
+   end
+ 
++  def weird_url
++    head :ok
++  end
++  
++  def weird_url_no_js
++    head :ok
++  end
++
+   def not_found
+     head :not_found
+   end
+@@ -134,6 +144,35 @@ class PageCachingTest < Test::Unit::TestCase
+     assert_page_not_cached :ok
+   end
+ 
++  def test_page_caching_with_period_in_url_should_append_html
++    get :weird_url, :id => 'Not.A.extension'
++    assert File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url/Not.A.extension.html")
++  end
++
++  def test_page_caching_with_period_in_url_should_not_append_extra_html
++    get :weird_url, :id => 'Not.A.extension.html'
++    assert File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url/Not.A.extension.html")
++    assert !File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url/Not.A.extension.html.html")
++  end
++
++  def test_page_caching_with_period_in_url_should_append_js
++    xhr :get, :weird_url, :id => 'Not.A.extension'
++    assert File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url/Not.A.extension.js")
++  end
++
++  def test_page_caching_with_conditionals_does_not_break_user_request_extension
++    get :weird_url_no_js, :id => 'Not.A.extension'
++    assert File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url_no_js/Not.A.extension.html")
++  end
++
++  def test_page_caching_with_user_request_extension_should_follow_conditionals
++    get :weird_url_no_js, :id => 'Not.A.extension', :format => 'json'
++    assert !File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url_no_js/Not.A.extension")
++    assert !File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url_no_js/Not.A.extension.js")
++    assert !File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url_no_js/Not.A.extension.json")
++    assert !File.exist?("#{FILE_STORE_PATH}/page_caching_test/weird_url_no_js/Not.A.extension.html")
++  end
++  
+   private
+     def assert_page_cached(action, message = "#{action} should have been cached")
+       assert page_cached?(action), message

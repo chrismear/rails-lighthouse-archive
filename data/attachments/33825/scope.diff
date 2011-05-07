@@ -1,0 +1,896 @@
+From 84a5ab0a6fefc971721c36169a6045cae1f87826 Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Wed, 16 Jul 2008 11:35:35 +1000
+Subject: [PATCH] All attributes of a model are automatically available as scopes
+
+---
+ activerecord/lib/active_record/base.rb        |   11 +++++++++++
+ activerecord/lib/active_record/named_scope.rb |    4 +++-
+ 2 files changed, 14 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 4f5d72a..6a5e17c 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1666,11 +1666,22 @@ module ActiveRecord #:nodoc:
+               end
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
++          elsif is_anonymous_scope?(method_id)
++            anonymous_scope(self, method_id, *arguments)
+           else
+             super
+           end
+         end
+ 
++        def is_anonymous_scope?(method)
++          all_attributes_exists?([method])
++        end
++
++        def anonymous_scope(scope, method, *arguments)
++          finder_options = { method => arguments[0] }
++          scope.scoped :conditions => finder_options
++        end
++
+         def matches_dynamic_finder?(method_id)
+           /^find_(all_by|by)_([_a-zA-Z]\w*)$/.match(method_id.to_s)
+         end
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 080e3d0..6da131b 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -108,7 +108,7 @@ module ActiveRecord
+         end
+       end
+ 
+-      delegate :scopes, :with_scope, :to => :proxy_scope
++      delegate :scopes, :with_scope, :is_anonymous_scope?, :anonymous_scope, :to => :proxy_scope
+ 
+       def initialize(proxy_scope, options, &block)
+         [options[:extend]].flatten.each { |extension| extend extension } if options[:extend]
+@@ -149,6 +149,8 @@ module ActiveRecord
+       def method_missing(method, *args, &block)
+         if scopes.include?(method)
+           scopes[method].call(self, *args)
++        elsif is_anonymous_scope?(method)
++          anonymous_scope(self, method, *args)
+         else
+           with_scope :find => proxy_options, :create => proxy_options[:conditions].is_a?(Hash) ?  proxy_options[:conditions] : {} do
+             method = :new if method == :build
+-- 
+1.5.5.1
+
+
+From b50ba1974d139572149860e08bf6417ca3dfbc10 Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Wed, 16 Jul 2008 12:21:21 +1000
+Subject: [PATCH] Anonymous scopes now accept options. Refactored dynamic finder code in method missing.
+
+---
+ activerecord/lib/active_record/base.rb |   47 +++++++++++++------------------
+ 1 files changed, 20 insertions(+), 27 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 6a5e17c..341a3e9 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1610,29 +1610,9 @@ module ActiveRecord #:nodoc:
+         # attempts to use it do not run through method_missing.
+         def method_missing(method_id, *arguments)
+           if match = matches_dynamic_finder?(method_id)
+-            finder = determine_finder(match)
+-
+             attribute_names = extract_attribute_names_from_match(match)
+-            super unless all_attributes_exists?(attribute_names)
+-
+-            self.class_eval %{
+-              def self.#{method_id}(*args)
+-                options = args.extract_options!
+-                attributes = construct_attributes_from_arguments([:#{attribute_names.join(',:')}], args)
+-                finder_options = { :conditions => attributes }
+-                validate_find_options(options)
+-                set_readonly_option!(options)
+-
+-                if options[:conditions]
+-                  with_scope(:find => finder_options) do
+-                    ActiveSupport::Deprecation.silence { send(:#{finder}, options) }
+-                  end
+-                else
+-                  ActiveSupport::Deprecation.silence { send(:#{finder}, options.merge(finder_options)) }
+-                end
+-              end
+-            }, __FILE__, __LINE__
+-            send(method_id, *arguments)
++            super unless is_anonymous_scope?(attribute_names)
++            anonymous_scope(self, attribute_names, *arguments).send( determine_finder(match) )
+           elsif match = matches_dynamic_finder_with_initialize_or_create?(method_id)
+             instantiator = determine_instantiator(match)
+             attribute_names = extract_attribute_names_from_match(match)
+@@ -1673,13 +1653,26 @@ module ActiveRecord #:nodoc:
+           end
+         end
+ 
+-        def is_anonymous_scope?(method)
+-          all_attributes_exists?([method])
++        def is_anonymous_scope?(attribute_names)
++          all_attributes_exists?(attribute_names.is_a?(Symbol) ? [attribute_names] : attribute_names)
+         end
+ 
+-        def anonymous_scope(scope, method, *arguments)
+-          finder_options = { method => arguments[0] }
+-          scope.scoped :conditions => finder_options
++        def anonymous_scope(scope, attribute_names, *arguments)
++          options = arguments.extract_options!
++          validate_find_options(options)
++          set_readonly_option!(options)
++          if attribute_names.is_a?(Symbol)
++            attributes = { attribute_names => arguments[0] }
++          else
++            attributes = construct_attributes_from_arguments(attribute_names, arguments)
++          end
++          finder_options = { :conditions => attributes }
++          if options[:conditions]
++            scope = scope.scoped(finder_options)
++            scope.scoped options
++          else
++            scope.scoped options.merge(finder_options)
++          end
+         end
+ 
+         def matches_dynamic_finder?(method_id)
+-- 
+1.5.5.1
+
+
+From c9f8b3b568f11a4c7ac4e96ba5dc30f82dfca48a Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Wed, 16 Jul 2008 12:34:47 +1000
+Subject: [PATCH] anonymous_scope more concise
+
+---
+ activerecord/lib/active_record/base.rb |   11 +++--------
+ 1 files changed, 3 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 341a3e9..9a4eb6f 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1666,13 +1666,8 @@ module ActiveRecord #:nodoc:
+           else
+             attributes = construct_attributes_from_arguments(attribute_names, arguments)
+           end
+-          finder_options = { :conditions => attributes }
+-          if options[:conditions]
+-            scope = scope.scoped(finder_options)
+-            scope.scoped options
+-          else
+-            scope.scoped options.merge(finder_options)
+-          end
++          scope = scope.scoped(:conditions => attributes)
++          options.empty? ? scope : scope.scoped(options)
+         end
+ 
+         def matches_dynamic_finder?(method_id)
+@@ -1684,7 +1679,7 @@ module ActiveRecord #:nodoc:
+         end
+ 
+         def determine_finder(match)
+-          match.captures.first == 'all_by' ? :find_every : :find_initial
++          match.captures.first == 'all_by' ? :all : :first
+         end
+ 
+         def determine_instantiator(match)
+-- 
+1.5.5.1
+
+
+From ca4f140291da16886473a1197eb7e7eef48ef06a Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Wed, 16 Jul 2008 13:20:41 +1000
+Subject: [PATCH] caching method again
+
+---
+ activerecord/lib/active_record/base.rb |    9 ++++++++-
+ 1 files changed, 8 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 9a4eb6f..edba33e 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1610,9 +1610,16 @@ module ActiveRecord #:nodoc:
+         # attempts to use it do not run through method_missing.
+         def method_missing(method_id, *arguments)
+           if match = matches_dynamic_finder?(method_id)
++            finder = determine_finder(match)
+             attribute_names = extract_attribute_names_from_match(match)
+             super unless is_anonymous_scope?(attribute_names)
+-            anonymous_scope(self, attribute_names, *arguments).send( determine_finder(match) )
++
++            self.class_eval %{
++              def self.#{method_id}(*args)
++                anonymous_scope(self, [:#{attribute_names.join(',:')}], *args).send(:#{finder})
++              end
++            }, __FILE__, __LINE__
++            send(method_id, *arguments)
+           elsif match = matches_dynamic_finder_with_initialize_or_create?(method_id)
+             instantiator = determine_instantiator(match)
+             attribute_names = extract_attribute_names_from_match(match)
+-- 
+1.5.5.1
+
+
+From 9bcc32c385cdd5dfe8edecbaacfc77fd58c657bc Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Wed, 16 Jul 2008 13:30:21 +1000
+Subject: [PATCH] Caching anonymous_scope in AR::Base#method_missing
+
+---
+ activerecord/lib/active_record/base.rb |    9 ++++++++-
+ 1 files changed, 8 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index edba33e..752d6b1 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1614,6 +1614,7 @@ module ActiveRecord #:nodoc:
+             attribute_names = extract_attribute_names_from_match(match)
+             super unless is_anonymous_scope?(attribute_names)
+ 
++            # anonymous_scope(self, attribute_names, *arguments).send(finder)
+             self.class_eval %{
+               def self.#{method_id}(*args)
+                 anonymous_scope(self, [:#{attribute_names.join(',:')}], *args).send(:#{finder})
+@@ -1654,7 +1655,13 @@ module ActiveRecord #:nodoc:
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
+           elsif is_anonymous_scope?(method_id)
+-            anonymous_scope(self, method_id, *arguments)
++            #anonymous_scope(self, method_id, *arguments)
++            self.class_eval %{
++              def self.#{method_id}(*args)
++                anonymous_scope(self, :#{method_id}, *args)
++              end
++            }, __FILE__, __LINE__
++            send(method_id, *arguments)
+           else
+             super
+           end
+-- 
+1.5.5.1
+
+
+From 52b8e87fe6c20e88447696fa1ba5583d3572c05d Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Wed, 16 Jul 2008 14:23:59 +1000
+Subject: [PATCH] renamed anonymous_scope to attribute_scope, added unit tests for attribute scopes
+
+---
+ activerecord/lib/active_record/base.rb        |   16 +++++-----
+ activerecord/lib/active_record/named_scope.rb |    6 ++--
+ activerecord/test/cases/named_scope_test.rb   |   39 +++++++++++++++++++++++++
+ 3 files changed, 50 insertions(+), 11 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 752d6b1..8055ffa 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1612,12 +1612,12 @@ module ActiveRecord #:nodoc:
+           if match = matches_dynamic_finder?(method_id)
+             finder = determine_finder(match)
+             attribute_names = extract_attribute_names_from_match(match)
+-            super unless is_anonymous_scope?(attribute_names)
++            super unless is_attributes_scope?(attribute_names)
+ 
+-            # anonymous_scope(self, attribute_names, *arguments).send(finder)
++            # attributes_scope(self, attribute_names, *arguments).send(finder)
+             self.class_eval %{
+               def self.#{method_id}(*args)
+-                anonymous_scope(self, [:#{attribute_names.join(',:')}], *args).send(:#{finder})
++                attributes_scope(self, [:#{attribute_names.join(',:')}], *args).send(:#{finder})
+               end
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
+@@ -1654,11 +1654,11 @@ module ActiveRecord #:nodoc:
+               end
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
+-          elsif is_anonymous_scope?(method_id)
+-            #anonymous_scope(self, method_id, *arguments)
++          elsif is_attributes_scope?(method_id)
++            #attributes_scope(self, method_id, *arguments)
+             self.class_eval %{
+               def self.#{method_id}(*args)
+-                anonymous_scope(self, :#{method_id}, *args)
++                attributes_scope(self, :#{method_id}, *args)
+               end
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
+@@ -1667,11 +1667,11 @@ module ActiveRecord #:nodoc:
+           end
+         end
+ 
+-        def is_anonymous_scope?(attribute_names)
++        def is_attributes_scope?(attribute_names)
+           all_attributes_exists?(attribute_names.is_a?(Symbol) ? [attribute_names] : attribute_names)
+         end
+ 
+-        def anonymous_scope(scope, attribute_names, *arguments)
++        def attributes_scope(scope, attribute_names, *arguments)
+           options = arguments.extract_options!
+           validate_find_options(options)
+           set_readonly_option!(options)
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 6da131b..66ffc75 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -108,7 +108,7 @@ module ActiveRecord
+         end
+       end
+ 
+-      delegate :scopes, :with_scope, :is_anonymous_scope?, :anonymous_scope, :to => :proxy_scope
++      delegate :scopes, :with_scope, :is_attributes_scope?, :attributes_scope, :to => :proxy_scope
+ 
+       def initialize(proxy_scope, options, &block)
+         [options[:extend]].flatten.each { |extension| extend extension } if options[:extend]
+@@ -149,8 +149,8 @@ module ActiveRecord
+       def method_missing(method, *args, &block)
+         if scopes.include?(method)
+           scopes[method].call(self, *args)
+-        elsif is_anonymous_scope?(method)
+-          anonymous_scope(self, method, *args)
++        elsif is_attributes_scope?(method)
++          attributes_scope(self, method, *args)
+         else
+           with_scope :find => proxy_options, :create => proxy_options[:conditions].is_a?(Hash) ?  proxy_options[:conditions] : {} do
+             method = :new if method == :build
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index 0c1eb23..ab4f7f1 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -209,4 +209,43 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert topic.approved
+     assert_equal 'lifo', topic.author_name
+   end
++
++  def test_attributes_are_scopes
++    topics = Topic.find(:first, :conditions => "author_name = 'Nick'")
++    assert_equal topics, Topic.author_name("Nick").first
++  end
++
++  def test_attribute_scopes_are_chainable
++    topics = Topic.find(:all, :conditions => "author_name = 'Nick' AND replies_count = 1")
++    assert_equal topics, Topic.author_name("Nick").replies_count(1).all
++  end
++
++  def test_attribute_scopes_are_chainable_with_named_scopes
++    topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
++    assert_equal topics, Topic.author_name("Nick").approved.all
++  end
++
++  def test_named_scopes_are_chainable_with_attribute_scopes
++    topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
++    assert_equal topics, Topic.approved.author_name("Nick").all
++  end
++
++  def test_belongs_to_id_attributes_are_scopes
++    some_post = Post.first
++    expected_post = Post.find(:first, :conditions => ["author_id = ?", some_post.author])
++    assert_equal expected_post, Post.author_id(some_post.author).first
++  end
++
++  # Pending Nik's changes
++  #def test_belongs_to_attributes_are_scopes
++  #  some_post = Post.first
++  #  expected_post = Post.find(:first, :conditions => ["author_id = ?", some_post.author])
++  #  assert_equal expected_post, Post.author(some_post.author).first
++  #end
++
++  def test_attribute_scopes_accept_options
++    expected_topics = Topic.find(:last, :conditions => "author_name = 'Nick' AND replies_count = 1")
++    topics = Topic.author_name("Nick", :conditions => "replies_count = 1").last
++    assert_equal expected_topics, topics
++  end
+ end
+-- 
+1.5.5.1
+
+
+From 4dce307eee3f4bc7d2fb8e37788de24f16635325 Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Mon, 21 Jul 2008 11:11:25 +1000
+Subject: [PATCH] Renamed to dynamic_scope, added docs.
+
+---
+ activerecord/lib/active_record/base.rb        |   23 ++++++++++++++---------
+ activerecord/lib/active_record/named_scope.rb |    6 +++---
+ 2 files changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 8055ffa..a739f49 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1606,18 +1606,23 @@ module ActiveRecord #:nodoc:
+         # This also enables you to initialize a record if it is not found, such as find_or_initialize_by_amount(amount)
+         # or find_or_create_by_user_and_password(user, password).
+         #
+-        # Each dynamic finder or initializer/creator is also defined in the class after it is first invoked, so that future
++        # Lastly this enables dynamic scopes like User.user_name(user_name).password(password).first. It also works for
++        # belongs_to relations like Post.author(current_user).published.with_tags("ruby").last. Here too you can
++        # use all the additional parameters that you normally can, like 
++        # Post.author(current_user, :include => [:author], :order => "published_at DESC").all.
++        #
++        # Each dynamic scope or finder or initializer/creator is also defined in the class after it is first invoked, so that future
+         # attempts to use it do not run through method_missing.
+         def method_missing(method_id, *arguments)
+           if match = matches_dynamic_finder?(method_id)
+             finder = determine_finder(match)
+             attribute_names = extract_attribute_names_from_match(match)
+-            super unless is_attributes_scope?(attribute_names)
++            super unless is_dynamic_scope?(attribute_names)
+ 
+-            # attributes_scope(self, attribute_names, *arguments).send(finder)
++            # dynamic_scope(self, attribute_names, *arguments).send(finder)
+             self.class_eval %{
+               def self.#{method_id}(*args)
+-                attributes_scope(self, [:#{attribute_names.join(',:')}], *args).send(:#{finder})
++                dynamic_scope(self, [:#{attribute_names.join(',:')}], *args).send(:#{finder})
+               end
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
+@@ -1654,11 +1659,11 @@ module ActiveRecord #:nodoc:
+               end
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
+-          elsif is_attributes_scope?(method_id)
+-            #attributes_scope(self, method_id, *arguments)
++          elsif is_dynamic_scope?(method_id)
++            #dynamic_scope(self, method_id, *arguments)
+             self.class_eval %{
+               def self.#{method_id}(*args)
+-                attributes_scope(self, :#{method_id}, *args)
++                dynamic_scope(self, :#{method_id}, *args)
+               end
+             }, __FILE__, __LINE__
+             send(method_id, *arguments)
+@@ -1667,11 +1672,11 @@ module ActiveRecord #:nodoc:
+           end
+         end
+ 
+-        def is_attributes_scope?(attribute_names)
++        def is_dynamic_scope?(attribute_names)
+           all_attributes_exists?(attribute_names.is_a?(Symbol) ? [attribute_names] : attribute_names)
+         end
+ 
+-        def attributes_scope(scope, attribute_names, *arguments)
++        def dynamic_scope(scope, attribute_names, *arguments)
+           options = arguments.extract_options!
+           validate_find_options(options)
+           set_readonly_option!(options)
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 66ffc75..b75a1fd 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -108,7 +108,7 @@ module ActiveRecord
+         end
+       end
+ 
+-      delegate :scopes, :with_scope, :is_attributes_scope?, :attributes_scope, :to => :proxy_scope
++      delegate :scopes, :with_scope, :is_dynamic_scope?, :dynamic_scope, :to => :proxy_scope
+ 
+       def initialize(proxy_scope, options, &block)
+         [options[:extend]].flatten.each { |extension| extend extension } if options[:extend]
+@@ -149,8 +149,8 @@ module ActiveRecord
+       def method_missing(method, *args, &block)
+         if scopes.include?(method)
+           scopes[method].call(self, *args)
+-        elsif is_attributes_scope?(method)
+-          attributes_scope(self, method, *args)
++        elsif is_dynamic_scope?(method)
++          dynamic_scope(self, method, *args)
+         else
+           with_scope :find => proxy_options, :create => proxy_options[:conditions].is_a?(Hash) ?  proxy_options[:conditions] : {} do
+             method = :new if method == :build
+-- 
+1.5.5.1
+
+
+From 60bfad90093dbc1f1a2d35026ed7cf379008a223 Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Mon, 21 Jul 2008 11:18:12 +1000
+Subject: [PATCH] dynamic_scope test method names
+
+---
+ activerecord/test/cases/named_scope_test.rb |   14 +++++++-------
+ 1 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index ab4f7f1..e26c969 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -210,40 +210,40 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert_equal 'lifo', topic.author_name
+   end
+ 
+-  def test_attributes_are_scopes
++  def test_dynamic_scopes
+     topics = Topic.find(:first, :conditions => "author_name = 'Nick'")
+     assert_equal topics, Topic.author_name("Nick").first
+   end
+ 
+-  def test_attribute_scopes_are_chainable
++  def test_dynamic_scopes_are_chainable
+     topics = Topic.find(:all, :conditions => "author_name = 'Nick' AND replies_count = 1")
+     assert_equal topics, Topic.author_name("Nick").replies_count(1).all
+   end
+ 
+-  def test_attribute_scopes_are_chainable_with_named_scopes
++  def test_dynamic_scopes_are_chainable_with_named_scopes
+     topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
+     assert_equal topics, Topic.author_name("Nick").approved.all
+   end
+ 
+-  def test_named_scopes_are_chainable_with_attribute_scopes
++  def test_named_scopes_are_chainable_with_dynamic_scopes
+     topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
+     assert_equal topics, Topic.approved.author_name("Nick").all
+   end
+ 
+-  def test_belongs_to_id_attributes_are_scopes
++  def test_belongs_to_id_attributes_are_dynamic_scopes
+     some_post = Post.first
+     expected_post = Post.find(:first, :conditions => ["author_id = ?", some_post.author])
+     assert_equal expected_post, Post.author_id(some_post.author).first
+   end
+ 
+   # Pending Nik's changes
+-  #def test_belongs_to_attributes_are_scopes
++  #def test_belongs_to_attributes_are_dynamic_scopes
+   #  some_post = Post.first
+   #  expected_post = Post.find(:first, :conditions => ["author_id = ?", some_post.author])
+   #  assert_equal expected_post, Post.author(some_post.author).first
+   #end
+ 
+-  def test_attribute_scopes_accept_options
++  def test_dynamic_scopes_accept_options
+     expected_topics = Topic.find(:last, :conditions => "author_name = 'Nick' AND replies_count = 1")
+     topics = Topic.author_name("Nick", :conditions => "replies_count = 1").last
+     assert_equal expected_topics, topics
+-- 
+1.5.5.1
+
+
+From 4ac18d0e017576ab9f91985de1258e293a99de0e Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Mon, 21 Jul 2008 18:30:57 +1000
+Subject: [PATCH] belongs_to attributes are now directly accessible via dynamic finders and dynamic scopes.
+ dynamic_scope also used by find_or_create|initialize_by. E.g.:
+
+Post.find_by_author_and_published(current_user, true)
+Post.author(current_user).published(true).first
+Account.find_or_initialize_by_owner(current_user)
+---
+ activerecord/lib/active_record/base.rb        |   58 ++++++++++++++++---------
+ activerecord/test/cases/dynamic_scope_test.rb |   48 ++++++++++++++++++++
+ activerecord/test/cases/finder_test.rb        |   46 +++++++++++++++++++-
+ activerecord/test/cases/named_scope_test.rb   |   38 ----------------
+ activerecord/test/fixtures/companies.yml      |    1 +
+ activerecord/test/models/post.rb              |    3 +
+ 6 files changed, 135 insertions(+), 59 deletions(-)
+ create mode 100644 activerecord/test/cases/dynamic_scope_test.rb
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index a739f49..858afeb 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1608,7 +1608,7 @@ module ActiveRecord #:nodoc:
+         #
+         # Lastly this enables dynamic scopes like User.user_name(user_name).password(password).first. It also works for
+         # belongs_to relations like Post.author(current_user).published.with_tags("ruby").last. Here too you can
+-        # use all the additional parameters that you normally can, like 
++        # use all the additional parameters that you normally can, like
+         # Post.author(current_user, :include => [:author], :order => "published_at DESC").all.
+         #
+         # Each dynamic scope or finder or initializer/creator is also defined in the class after it is first invoked, so that future
+@@ -1629,26 +1629,26 @@ module ActiveRecord #:nodoc:
+           elsif match = matches_dynamic_finder_with_initialize_or_create?(method_id)
+             instantiator = determine_instantiator(match)
+             attribute_names = extract_attribute_names_from_match(match)
+-            super unless all_attributes_exists?(attribute_names)
++            super unless is_dynamic_scope?(attribute_names)
+ 
+             self.class_eval %{
+               def self.#{method_id}(*args)
++                attribute_names = [:#{attribute_names.join(',:')}]
+                 guard_protected_attributes = false
+ 
+                 if args[0].is_a?(Hash)
+                   guard_protected_attributes = true
+                   attributes = args[0].with_indifferent_access
+-                  find_attributes = attributes.slice(*[:#{attribute_names.join(',:')}])
++                  find_attributes = attributes.slice(*attribute_names)
++                  attribute_names, args = find_attributes.keys, find_attributes.values
+                 else
+-                  find_attributes = attributes = construct_attributes_from_arguments([:#{attribute_names.join(',:')}], args)
++                  attributes = {}
++                  attribute_names.each_with_index { |name, idx| attributes[name] = args[idx] }
+                 end
+ 
+-                options = { :conditions => find_attributes }
+-                set_readonly_option!(options)
+-
+-                record = find_initial(options)
++                record = dynamic_scope(self, attribute_names, *args).first
+ 
+-                 if record.nil?
++                if record.nil?
+                   record = self.new { |r| r.send(:attributes=, attributes, guard_protected_attributes) }
+                   #{'yield(record) if block_given?'}
+                   #{'record.save' if instantiator == :create}
+@@ -1680,12 +1680,8 @@ module ActiveRecord #:nodoc:
+           options = arguments.extract_options!
+           validate_find_options(options)
+           set_readonly_option!(options)
+-          if attribute_names.is_a?(Symbol)
+-            attributes = { attribute_names => arguments[0] }
+-          else
+-            attributes = construct_attributes_from_arguments(attribute_names, arguments)
+-          end
+-          scope = scope.scoped(:conditions => attributes)
++          attribute_names = [attribute_names] if attribute_names.is_a?(Symbol)
++          scope = scope_attributes_from_arguments(scope, attribute_names, arguments)
+           options.empty? ? scope : scope.scoped(options)
+         end
+ 
+@@ -1709,10 +1705,23 @@ module ActiveRecord #:nodoc:
+           match.captures.last.split('_and_')
+         end
+ 
+-        def construct_attributes_from_arguments(attribute_names, arguments)
+-          attributes = {}
+-          attribute_names.each_with_index { |name, idx| attributes[name] = arguments[idx] }
+-          attributes
++        def scope_attributes_from_arguments(scope, attribute_names, arguments)
++          conditions = {}
++          attribute_names.each_with_index do |name, idx|
++            if (!column_methods_hash.include?(name.to_sym) && reflection = reflection_for(name))
++              if reflection.options[:polymorphic]
++                conditions[reflection.options[:foreign_type]] = arguments[idx].class.base_class.name.to_s
++              end
++              name = reflection.primary_key_name
++            end
++            conditions[name] = arguments[idx]
++
++            if reflection && reflection.options[:conditions]
++              scope = scope.scoped(:conditions => conditions).scoped(:conditions => reflection.options[:conditions])
++              conditions = {}
++            end
++          end
++          conditions.size == 0 ? scope : scope.scoped(:conditions => conditions) 
+         end
+ 
+         # Similar in purpose to +expand_hash_conditions_for_aggregates+.
+@@ -1732,7 +1741,16 @@ module ActiveRecord #:nodoc:
+ 
+         def all_attributes_exists?(attribute_names)
+           attribute_names = expand_attribute_names_for_aggregates(attribute_names)
+-          attribute_names.all? { |name| column_methods_hash.include?(name.to_sym) }
++          attribute_names.all? do |name|
++            column_methods_hash.include?(name.to_sym) || reflection_for(name)
++          end
++        end
++
++        def reflection_for(attribute_name)
++          reflection = reflect_on_association(attribute_name.to_sym)
++          if reflection && reflection.macro == :belongs_to
++            return reflection if column_methods_hash.include?(reflection.primary_key_name.to_sym)
++          end
+         end
+ 
+         def attribute_condition(argument)
+diff --git a/activerecord/test/cases/dynamic_scope_test.rb b/activerecord/test/cases/dynamic_scope_test.rb
+new file mode 100644
+index 0000000..dbbe211
+--- /dev/null
++++ b/activerecord/test/cases/dynamic_scope_test.rb
+@@ -0,0 +1,48 @@
++require "cases/helper"
++require 'models/post'
++require 'models/topic'
++require 'models/comment'
++require 'models/reply'
++require 'models/author'
++
++class NamedScopeTest < ActiveRecord::TestCase
++  fixtures :posts, :authors, :topics, :comments
++
++  def test_dynamic_scopes
++    topics = Topic.find(:first, :conditions => "author_name = 'Nick'")
++    assert_equal topics, Topic.author_name("Nick").first
++  end
++
++  def test_dynamic_scopes_are_chainable
++    topics = Topic.find(:all, :conditions => "author_name = 'Nick' AND replies_count = 1")
++    assert_equal topics, Topic.author_name("Nick").replies_count(1).all
++  end
++
++  def test_dynamic_scopes_are_chainable_with_named_scopes
++    topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
++    assert_equal topics, Topic.author_name("Nick").approved.all
++  end
++
++  def test_named_scopes_are_chainable_with_dynamic_scopes
++    topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
++    assert_equal topics, Topic.approved.author_name("Nick").all
++  end
++
++  def test_belongs_to_id_attributes_are_dynamic_scopes
++    assert_equal posts(:welcome), Post.author_id(authors(:david)).first
++  end
++
++  def test_belongs_to_attributes_are_dynamic_scopes
++    assert_equal posts(:welcome), Post.author(authors(:david)).first
++  end
++
++  def test_dynamic_scopes_accept_options
++    expected_posts = Post.find(:last, :conditions => "type = 'Post' AND comments_count = 2")
++
++    posts = Post.author_id(authors(:david)).last
++    assert_not_equal expected_posts, posts
++
++    posts = Post.author_id(authors(:david), :conditions => "comments_count = 2").last
++    assert_equal expected_posts, posts
++  end
++end
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index b97db73..2e2bb0a 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -11,9 +11,11 @@ require 'models/post'
+ require 'models/customer'
+ require 'models/job'
+ require 'models/categorization'
++require 'models/member'
++require 'models/sponsor'
+ 
+ class FinderTest < ActiveRecord::TestCase
+-  fixtures :companies, :topics, :entrants, :developers, :developers_projects, :posts, :comments, :accounts, :authors, :customers
++  fixtures :companies, :topics, :entrants, :developers, :developers_projects, :posts, :comments, :accounts, :authors, :customers, :sponsors, :members
+ 
+   def test_find
+     assert_equal(topics(:first).title, Topic.find(1).title)
+@@ -464,6 +466,25 @@ class FinderTest < ActiveRecord::TestCase
+     assert_equal accounts(:rails_core_account), Account.find_by_credit_limit(50, :conditions => ['firm_id = ?', 6])
+   end
+ 
++  def test_find_by_one_attribute_that_is_a_belongs_to
++    assert_equal posts(:welcome), Post.find_by_author(authors(:david))
++    assert_equal [comments(:greetings), comments(:more_greetings)], Comment.find_all_by_post(posts(:welcome))
++  end
++
++  def test_find_by_one_attribute_that_is_a_belongs_to_with_specified_class_name_and_foreign_key
++    assert_equal posts(:welcome), Post.find_by_author_with_posts(authors(:david))
++  end
++
++  def test_find_by_one_attribute_that_is_a_belongs_to_with_conditions
++    assert_equal posts(:welcome), Post.find_by_author_with_positive_condition(authors(:david))
++    assert_nil Post.find_by_author_with_negative_condition(authors(:david))
++  end
++
++  def test_find_by_one_attribute_that_is_a_belongs_to_polymorphic
++    expected = [sponsors(:crazy_club_sponsor_for_groucho), sponsors(:boring_club_sponsor_for_groucho)]
++    assert_equal expected, Sponsor.find_all_by_sponsorable(members(:some_other_guy))
++  end
++
+   def test_find_by_one_attribute_that_is_an_aggregate
+     address = customers(:david).address
+     assert_kind_of Address, address
+@@ -667,6 +688,18 @@ class FinderTest < ActiveRecord::TestCase
+     assert_equal name, created_customer.name
+   end
+ 
++  def test_find_or_create_from_one_attribute_that_is_a_belongs_to
++    copa = Firm.create(:name => "Copa")
++    number_of_clients = Client.count
++    copawaves = Client.find_or_create_by_firm({:name => "copawaves", :firm => copa})
++    assert_equal number_of_clients + 1, Client.count
++    assert_equal copawaves, Client.find_or_create_by_firm({:name => "copawaves", :firm => copa})
++    assert !copawaves.new_record?
++    assert_equal "copawaves", copawaves.name
++    assert_equal copa, copawaves.firm
++    assert_equal copa.id, copawaves.client_of
++  end
++
+   def test_find_or_initialize_from_one_attribute
+     sig38 = Company.find_or_initialize_by_name("38signals")
+     assert_equal "38signals", sig38.name
+@@ -765,6 +798,17 @@ class FinderTest < ActiveRecord::TestCase
+     assert new_customer.new_record?
+   end
+ 
++  def test_find_or_initialize_from_one_attribute_that_is_a_belongs_to
++    copa = Firm.create(:name => "Copa")
++    number_of_clients = Client.count
++    copawaves = Client.find_or_initialize_by_firm({:name => "copawaves", :firm => copa})
++    assert_equal number_of_clients, Client.count
++    assert copawaves.new_record?
++    assert_equal "copawaves", copawaves.name
++    assert_equal copa, copawaves.firm
++    assert_equal copa.id, copawaves.client_of
++  end
++
+   def test_find_with_bad_sql
+     assert_raises(ActiveRecord::StatementInvalid) { Topic.find_by_sql "select 1 from badtable" }
+   end
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index e26c969..eba2063 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -210,42 +210,4 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert_equal 'lifo', topic.author_name
+   end
+ 
+-  def test_dynamic_scopes
+-    topics = Topic.find(:first, :conditions => "author_name = 'Nick'")
+-    assert_equal topics, Topic.author_name("Nick").first
+-  end
+-
+-  def test_dynamic_scopes_are_chainable
+-    topics = Topic.find(:all, :conditions => "author_name = 'Nick' AND replies_count = 1")
+-    assert_equal topics, Topic.author_name("Nick").replies_count(1).all
+-  end
+-
+-  def test_dynamic_scopes_are_chainable_with_named_scopes
+-    topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
+-    assert_equal topics, Topic.author_name("Nick").approved.all
+-  end
+-
+-  def test_named_scopes_are_chainable_with_dynamic_scopes
+-    topics = Topic.find(:all, :conditions => {:author_name => 'Nick', :approved => true})
+-    assert_equal topics, Topic.approved.author_name("Nick").all
+-  end
+-
+-  def test_belongs_to_id_attributes_are_dynamic_scopes
+-    some_post = Post.first
+-    expected_post = Post.find(:first, :conditions => ["author_id = ?", some_post.author])
+-    assert_equal expected_post, Post.author_id(some_post.author).first
+-  end
+-
+-  # Pending Nik's changes
+-  #def test_belongs_to_attributes_are_dynamic_scopes
+-  #  some_post = Post.first
+-  #  expected_post = Post.find(:first, :conditions => ["author_id = ?", some_post.author])
+-  #  assert_equal expected_post, Post.author(some_post.author).first
+-  #end
+-
+-  def test_dynamic_scopes_accept_options
+-    expected_topics = Topic.find(:last, :conditions => "author_name = 'Nick' AND replies_count = 1")
+-    topics = Topic.author_name("Nick", :conditions => "replies_count = 1").last
+-    assert_equal expected_topics, topics
+-  end
+ end
+diff --git a/activerecord/test/fixtures/companies.yml b/activerecord/test/fixtures/companies.yml
+index e7691fd..f5b5374 100644
+--- a/activerecord/test/fixtures/companies.yml
++++ b/activerecord/test/fixtures/companies.yml
+@@ -54,3 +54,4 @@ odegy:
+   id: 9
+   name: Odegy
+   type: ExclusivelyDependentFirm
++
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index e23818e..c1387d0 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -14,6 +14,9 @@ class Post < ActiveRecord::Base
+ 
+   belongs_to :author_with_posts, :class_name => "Author", :foreign_key => :author_id, :include => :posts
+ 
++  belongs_to :author_with_positive_condition, :class_name => "Author", :foreign_key => :author_id, :conditions => ["1 = ?", 1]
++  belongs_to :author_with_negative_condition, :class_name => "Author", :foreign_key => :author_id, :conditions => ["1 = ?", 0]
++
+   has_one :last_comment, :class_name => 'Comment', :order => 'id desc'
+ 
+   has_many   :comments, :order => "body" do
+-- 
+1.5.5.1
+

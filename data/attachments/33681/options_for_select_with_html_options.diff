@@ -1,0 +1,354 @@
+From ae70e9520ea3e8b58b8644da04e5cb6fa2804c5e Mon Sep 17 00:00:00 2001
+From: Arthur Carlsson <arthur@kiron.net>
+Date: Sat, 19 Jul 2008 12:49:34 +0200
+Subject: [PATCH] options_for_select with html_options
+
+---
+ .../lib/action_view/helpers/form_options_helper.rb |   76 ++++++++++-----
+ .../test/template/form_options_helper_test.rb      |  100 ++++++++++++++++++-
+ 2 files changed, 147 insertions(+), 29 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_options_helper.rb b/actionpack/lib/action_view/helpers/form_options_helper.rb
+index 9aae945..1f32132 100644
+--- a/actionpack/lib/action_view/helpers/form_options_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_options_helper.rb
+@@ -170,8 +170,11 @@ module ActionView
+       # Accepts a container (hash, array, enumerable, your type) and returns a string of option tags. Given a container
+       # where the elements respond to first and last (such as a two-element array), the "lasts" serve as option values and
+       # the "firsts" as option text. Hashes are turned into this form automatically, so the keys become "firsts" and values
+-      # become lasts. If +selected+ is specified, the matching "last" or element will get the selected option-tag.  +selected+
+-      # may also be an array of values to be selected when using a multiple select.
++      # become lasts sorted by the hash's keys. If +selected+ is specified, the matching "last" or element will get the
++      # selected option-tag.  +selected+ may also be an array of values to be selected when using a multiple select.
++      # +html_options+ may be either a hash or a proc. If it is a hash, the same HTML options will be applied for
++      # all generated option elements. If the +html_options+ parameter is a proc, the HTML options is calculated for each
++      # generated option element.
+       #
+       # Examples (call, result):
+       #   options_for_select([["Dollar", "$"], ["Kroner", "DKK"]])
+@@ -186,14 +189,25 @@ module ActionView
+       #   options_for_select([ "VISA", "MasterCard", "Discover" ], ["VISA", "Discover"])
+       #     <option selected="selected">VISA</option>\n<option>MasterCard</option>\n<option selected="selected">Discover</option>
+       #
++      #   options_for_select({"Dollar" => "$", "Kroner" => "DKK", "Kronor" => "SEK"}, "Kronor", :style => 'color: blue;')
++      #     <option value="$" style="color: blue;">Dollar</option>\n<option value="DKK" style="color: blue;">Kroner</option>\n<option value="SEK" style="color: blue;">Kronor</option>
++      #
++      #   options_for_select({"Dollar" => "$", "Kroner" => "DKK", "Kronor" => "SEK"}, "Kronor", lambda { |text, value, selected| {:class => cycle("odd", "even")} })
++      #     <option value="$" class="odd">Dollar</option>\n<option value="DKK" class="odd">Kroner</option>\n<option value="SEK" class="even">Kronor</option>
++      #
+       # NOTE: Only the option tags are returned, you have to wrap this call in a regular HTML select tag.
+-      def options_for_select(container, selected = nil)
+-        container = container.to_a if Hash === container
++      def options_for_select(container, selected = nil, html_options = {})
++        container = container.to_a.sort if Hash === container
+ 
+         options_for_select = container.inject([]) do |options, element|
+           text, value = option_text_and_value(element)
+-          selected_attribute = ' selected="selected"' if option_value_selected?(value, selected)
+-          options << %(<option value="#{html_escape(value.to_s)}"#{selected_attribute}>#{html_escape(text.to_s)}</option>)
++          option_selected = option_value_selected?(value, selected)
++
++          option_html_options = to_html_options(html_options, text, value, option_selected)
++          option_html_options[:value] = html_escape(value.to_s)
++          option_html_options[:selected] = 'selected' if option_selected
++          
++          options << content_tag('option', html_escape(text.to_s), option_html_options)
+         end
+ 
+         options_for_select.join("\n")
+@@ -202,17 +216,18 @@ module ActionView
+       # Returns a string of option tags that have been compiled by iterating over the +collection+ and assigning the
+       # the result of a call to the +value_method+ as the option value and the +text_method+ as the option text.
+       # If +selected+ is specified, the element returning a match on +value_method+ will get the selected option tag.
++      # See options_for_select for the usage of the +html_options+ parameter.
+       #
+       # Example (call, result). Imagine a loop iterating over each +person+ in <tt>@project.people</tt> to generate an input tag:
+       #   options_from_collection_for_select(@project.people, "id", "name")
+       #     <option value="#{person.id}">#{person.name}</option>
+       #
+       # NOTE: Only the option tags are returned, you have to wrap this call in a regular HTML select tag.
+-      def options_from_collection_for_select(collection, value_method, text_method, selected = nil)
++      def options_from_collection_for_select(collection, value_method, text_method, selected = nil, html_options = {})
+         options = collection.map do |element|
+           [element.send(text_method), element.send(value_method)]
+         end
+-        options_for_select(options, selected)
++        options_for_select(options, selected, html_options)
+       end
+ 
+       # Returns a string of <tt><option></tt> tags, like <tt>options_from_collection_for_select</tt>, but
+@@ -231,6 +246,10 @@ module ActionView
+       # * +selected_key+ - A value equal to the +value+ attribute for one of the <tt><option></tt> tags,
+       #   which will have the +selected+ attribute set. Corresponds to the return value of one of the calls
+       #   to +option_key_method+. If +nil+, no selection is made.
++      # * +group_html_options+ - Options passed as attributes to the optgroup element in the same way as
++      #   the +html_options+ parameter for options_for_select.
++      # * +option_html_options+ - Options passed as attributes to the option element in the same way as
++      #   the +html_options+ parameter for options_for_select.
+       #
+       # Example object structure for use with this method:
+       #   class Continent < ActiveRecord::Base
+@@ -243,29 +262,28 @@ module ActionView
+       #   end
+       #
+       # Sample usage:
+-      #   option_groups_from_collection_for_select(@continents, :countries, :name, :id, :name, 3)
++      #   option_groups_from_collection_for_select(@continents, :countries, :name, :id, :name, 3, {:class => "continent"}, {:class => "country"})
+       #
+       # Possible output:
+-      #   <optgroup label="Africa">
+-      #     <option value="1">Egypt</option>
+-      #     <option value="4">Rwanda</option>
++      #   <optgroup label="Africa" class="continent">
++      #     <option value="1" class="country">Egypt</option>
++      #     <option value="4" class="country">Rwanda</option>
+       #     ...
+       #   </optgroup>
+-      #   <optgroup label="Asia">
+-      #     <option value="3" selected="selected">China</option>
+-      #     <option value="12">India</option>
+-      #     <option value="5">Japan</option>
++      #   <optgroup label="Asia" class="continent">
++      #     <option value="3" selected="selected" class="country">China</option>
++      #     <option value="12" class="country">India</option>
++      #     <option value="5" class="country">Japan</option>
+       #     ...
+       #   </optgroup>
+       #
+       # <b>Note:</b> Only the <tt><optgroup></tt> and <tt><option></tt> tags are returned, so you still have to
+       # wrap the output in an appropriate <tt><select></tt> tag.
+-      def option_groups_from_collection_for_select(collection, group_method, group_label_method, option_key_method, option_value_method, selected_key = nil)
++      def option_groups_from_collection_for_select(collection, group_method, group_label_method, option_key_method, option_value_method, selected_key = nil, group_html_options = {}, option_html_options = {})
+         collection.inject("") do |options_for_select, group|
+           group_label_string = eval("group.#{group_label_method}")
+-          options_for_select += "<optgroup label=\"#{html_escape(group_label_string)}\">"
+-          options_for_select += options_from_collection_for_select(eval("group.#{group_method}"), option_key_method, option_value_method, selected_key)
+-          options_for_select += '</optgroup>'
++          html_options = to_html_options(group_html_options, group_label_string).merge(:label => html_escape(group_label_string))
++          options_for_select += content_tag('optgroup', options_from_collection_for_select(eval("group.#{group_method}"), option_key_method, option_value_method, selected_key, option_html_options), html_options)
+         end
+       end
+ 
+@@ -280,6 +298,10 @@ module ActionView
+       # The +selected+ parameter must be either +nil+, or a string that names
+       # a TimeZone.
+       #
++      # The +html_options+ parameter is used in the same way as in options_for_select,
++      # except for the separator between priority zones and other zones. The
++      # is not affected by +html_options+.
++      #
+       # By default, +model+ is the TimeZone constant (which can be obtained
+       # in Active Record as a value object). The only requirement is that the
+       # +model+ parameter be an object that responds to +all+, and returns
+@@ -287,7 +309,7 @@ module ActionView
+       #
+       # NOTE: Only the option tags are returned, you have to wrap this call in
+       # a regular HTML select tag.
+-      def time_zone_options_for_select(selected = nil, priority_zones = nil, model = ::ActiveSupport::TimeZone)
++      def time_zone_options_for_select(selected = nil, priority_zones = nil, html_options = {}, model = ::ActiveSupport::TimeZone)
+         zone_options = ""
+ 
+         zones = model.all
+@@ -297,13 +319,13 @@ module ActionView
+ 	        if priority_zones.is_a?(Regexp)
+             priority_zones = model.all.find_all {|z| z =~ priority_zones}
+ 	        end
+-          zone_options += options_for_select(convert_zones[priority_zones], selected)
++          zone_options += options_for_select(convert_zones[priority_zones], selected, html_options)
+           zone_options += "<option value=\"\" disabled=\"disabled\">-------------</option>\n"
+ 
+           zones = zones.reject { |z| priority_zones.include?( z ) }
+         end
+ 
+-        zone_options += options_for_select(convert_zones[zones], selected)
++        zone_options += options_for_select(convert_zones[zones], selected, html_options)
+         zone_options
+       end
+ 
+@@ -324,6 +346,14 @@ module ActionView
+             value == selected
+           end
+         end
++        
++        def to_html_options(html_options, text, value = nil, option_selected = nil)
++          case html_options
++            when Proc then html_options.call(text, value, option_selected)
++            when Hash then html_options.dup
++            else Hash.new
++          end
++        end
+ 
+         # All the countries included in the country_options output.
+         COUNTRIES = ActiveSupport::Deprecation::DeprecatedConstantProxy.new 'COUNTRIES', 'ActionView::Helpers::FormCountryHelper::COUNTRIES'
+diff --git a/actionpack/test/template/form_options_helper_test.rb b/actionpack/test/template/form_options_helper_test.rb
+index a33eb85..5884ca1 100644
+--- a/actionpack/test/template/form_options_helper_test.rb
++++ b/actionpack/test/template/form_options_helper_test.rb
+@@ -62,6 +62,32 @@ uses_mocha "FormOptionsHelperTest" do
+           options_from_collection_for_select(@posts, "author_name", "title", [ "Babe", "Cabe" ])
+         )
+     end
++    
++    def options_from_collection_for_select_with_html_options_hash
++      @posts = [
++        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
++        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
++        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
++      ]
++
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\" style=\"color: red;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" selected=\"selected\" style=\"color: red;\">Babe went home</option>\n<option value=\"Cabe\" selected=\"selected\" style=\"color: red;\">Cabe went home</option>",
++        options_from_collection_for_select(@posts, "author_name", "title", [ "Babe", "Cabe" ], :style => 'color: red;')
++      )
++    end
++    
++    def options_from_collection_for_select_with_html_options_proc
++      @posts = [
++        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
++        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
++        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
++      ]
++
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\" class=\"odd\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" selected=\"selected\" class=\"even\">Babe went home</option>\n<option value=\"Cabe\" selected=\"selected\" class=\"odd\">Cabe went home</option>",
++        options_from_collection_for_select(@posts, "author_name", "title", [ "Babe", "Cabe" ], lambda { {:class => cycle('odd', 'even')} })
++      )
++    end
+ 
+     def test_array_options_for_select
+       assert_dom_equal(
+@@ -101,16 +127,20 @@ uses_mocha "FormOptionsHelperTest" do
+ 
+     def test_hash_options_for_select
+       assert_dom_equal(
+-        "<option value=\"&lt;Kroner&gt;\">&lt;DKR&gt;</option>\n<option value=\"Dollar\">$</option>",
+-        options_for_select("$" => "Dollar", "<DKR>" => "<Kroner>").split("\n").sort.join("\n")
++        "<option value=\"Dollar\">$</option>\n<option value=\"&lt;Kroner&gt;\">&lt;DKR&gt;</option>",
++        options_for_select("$" => "Dollar", "<DKR>" => "<Kroner>")
+       )
+       assert_dom_equal(
+-        "<option value=\"&lt;Kroner&gt;\">&lt;DKR&gt;</option>\n<option value=\"Dollar\" selected=\"selected\">$</option>",
+-        options_for_select({ "$" => "Dollar", "<DKR>" => "<Kroner>" }, "Dollar").split("\n").sort.join("\n")
++        "<option value=\"Dollar\" selected=\"selected\">$</option>\n<option value=\"&lt;Kroner&gt;\">&lt;DKR&gt;</option>",
++        options_for_select({ "$" => "Dollar", "<DKR>" => "<Kroner>" }, "Dollar")
+       )
+       assert_dom_equal(
+-        "<option value=\"&lt;Kroner&gt;\" selected=\"selected\">&lt;DKR&gt;</option>\n<option value=\"Dollar\" selected=\"selected\">$</option>",
+-        options_for_select({ "$" => "Dollar", "<DKR>" => "<Kroner>" }, [ "Dollar", "<Kroner>" ]).split("\n").sort.join("\n")
++        "<option value=\"Dollar\" selected=\"selected\">$</option>\n<option value=\"&lt;Kroner&gt;\" selected=\"selected\">&lt;DKR&gt;</option>",
++        options_for_select({ "$" => "Dollar", "<DKR>" => "<Kroner>" }, [ "Dollar", "<Kroner>" ])
++      )
++      assert_dom_equal(
++        "<option value=\"alice\">Alice</option>\n<option value=\"bob\" selected=\"selected\">Bob</option>",
++        options_for_select({ "Bob" => "bob", "Alice" => "alice" }, "bob")
+       )
+     end
+ 
+@@ -129,6 +159,28 @@ uses_mocha "FormOptionsHelperTest" do
+         options_for_select([quack.new("<DKR>", "<Kroner>"), quack.new("$", "Dollar")], ["Dollar", "<Kroner>"])
+       )
+     end
++    
++    def test_options_for_select_with_html_options_hash
++      assert_dom_equal(
++        "<option value=\"Dollar\" class=\"currency\">$</option>\n<option value=\"&lt;Kroner&gt;\" class=\"currency\">&lt;DKR&gt;</option>",
++        options_for_select({"$" => "Dollar", "<DKR>" => "<Kroner>"}, nil, {:class => 'currency'})
++      )
++      assert_dom_equal(
++        %(<option value="$" style="color: blue;">Dollar</option>\n<option value="DKK" style="color: blue;">Kroner</option>\n<option value="SEK" style="color: blue;">Kronor</option>),
++        options_for_select({"Dollar" => "$", "Kroner" => "DKK", "Kronor" => "SEK"}, "Kronor", :style => 'color: blue;')
++      )
++    end
++    
++    def test_options_for_select_with_html_options_proc
++      assert_dom_equal(
++        "<option value=\"black\" style=\"color: black;\">Black</option>\n<option value=\"red\" style=\"color: red;\">Red</option>",
++        options_for_select({"Red" => "red", "Black" => "black"}, nil, lambda { |text, value, selected| {:style => "color: #{value};"} })
++      )
++      assert_dom_equal(
++        %(<option value="$" class="odd">Dollar</option>\n<option value="EUR" class="even">Euro</option>\n<option value="DKK" class="odd">Kroner</option>\n<option value="SEK" class="even">Kronor</option>),
++        options_for_select({"Dollar" => "$", "Kroner" => "DKK", "Kronor" => "SEK", "Euro" => "EUR"}, "Kronor", lambda { {:class => cycle("odd", "even")} })
++      )
++    end
+ 
+     def test_option_groups_from_collection_for_select
+       @continents = [
+@@ -141,6 +193,18 @@ uses_mocha "FormOptionsHelperTest" do
+         option_groups_from_collection_for_select(@continents, "countries", "continent_name", "country_id", "country_name", "dk")
+       )
+     end
++    
++    def test_option_groups_from_collection_for_select_with_html_options
++      @continents = [
++        Continent.new("<Africa>", [Country.new("<sa>", "<South Africa>"), Country.new("so", "Somalia")] ),
++        Continent.new("Europe", [Country.new("dk", "Denmark"), Country.new("ie", "Ireland")] )
++      ]
++
++      assert_dom_equal(
++        "<optgroup label=\"&lt;Africa&gt;\" class=\"continent\"><option value=\"&lt;sa&gt;\" class=\"odd\">&lt;South Africa&gt;</option>\n<option value=\"so\" class=\"even\">Somalia</option></optgroup><optgroup label=\"Europe\" class=\"continent\"><option value=\"dk\" selected=\"selected\" class=\"odd\">Denmark</option>\n<option value=\"ie\" class=\"even\">Ireland</option></optgroup>",
++        option_groups_from_collection_for_select(@continents, "countries", "continent_name", "country_id", "country_name", "dk", lambda { reset_cycle; {:class => 'continent'} }, lambda { {:class => cycle('odd', 'even') } })
++      )
++    end
+ 
+     def test_time_zone_options_no_parms
+       opts = time_zone_options_for_select
+@@ -207,6 +271,30 @@ uses_mocha "FormOptionsHelperTest" do
+                    "<option value=\"D\">D</option>",
+                    opts
+     end
++    
++    def test_time_zone_options_for_select_with_html_options_hash
++      zones = [ ActiveSupport::TimeZone.new( "B" ), ActiveSupport::TimeZone.new( "E" ) ]
++      opts = time_zone_options_for_select( "C", zones, :style => 'color: red;')
++      assert_dom_equal "<option value=\"B\" style=\"color: red;\">B</option>\n" +
++                   "<option value=\"E\" style=\"color: red;\">E</option>" +
++                   "<option value=\"\" disabled=\"disabled\">-------------</option>\n" +
++                   "<option value=\"A\" style=\"color: red;\">A</option>\n" +
++                   "<option value=\"C\" selected=\"selected\" style=\"color: red;\">C</option>\n" +
++                   "<option value=\"D\" style=\"color: red;\">D</option>",
++                   opts
++    end
++    
++    def test_time_zone_options_for_select_with_html_options_proc
++      zones = [ ActiveSupport::TimeZone.new( "B" ), ActiveSupport::TimeZone.new( "E" ) ]
++      opts = time_zone_options_for_select( "C", zones, lambda { {:class => cycle('odd', 'even') } } )
++      assert_dom_equal "<option value=\"B\" class=\"odd\">B</option>\n" +
++                   "<option value=\"E\" class=\"even\">E</option>" +
++                   "<option value=\"\" disabled=\"disabled\">-------------</option>\n" +
++                   "<option value=\"A\" class=\"odd\">A</option>\n" +
++                   "<option value=\"C\" selected=\"selected\" class=\"even\">C</option>\n" +
++                   "<option value=\"D\" class=\"odd\">D</option>",
++                   opts
++    end
+ 
+     def test_select
+       @post = Post.new
+-- 
+1.5.5.1
+
+
+From 9f296712a04474262162f0f74a4c300394d87bf8 Mon Sep 17 00:00:00 2001
+From: Arthur Carlsson <arthur@kiron.net>
+Date: Sat, 19 Jul 2008 13:01:39 +0200
+Subject: [PATCH] Small fix in the documentation comments
+
+---
+ .../lib/action_view/helpers/form_options_helper.rb |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_options_helper.rb b/actionpack/lib/action_view/helpers/form_options_helper.rb
+index 1f32132..830ec42 100644
+--- a/actionpack/lib/action_view/helpers/form_options_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_options_helper.rb
+@@ -193,7 +193,7 @@ module ActionView
+       #     <option value="$" style="color: blue;">Dollar</option>\n<option value="DKK" style="color: blue;">Kroner</option>\n<option value="SEK" style="color: blue;">Kronor</option>
+       #
+       #   options_for_select({"Dollar" => "$", "Kroner" => "DKK", "Kronor" => "SEK"}, "Kronor", lambda { |text, value, selected| {:class => cycle("odd", "even")} })
+-      #     <option value="$" class="odd">Dollar</option>\n<option value="DKK" class="odd">Kroner</option>\n<option value="SEK" class="even">Kronor</option>
++      #     <option value="$" class="odd">Dollar</option>\n<option value="DKK" class="even">Kroner</option>\n<option value="SEK" class="odd">Kronor</option>
+       #
+       # NOTE: Only the option tags are returned, you have to wrap this call in a regular HTML select tag.
+       def options_for_select(container, selected = nil, html_options = {})
+-- 
+1.5.5.1
+

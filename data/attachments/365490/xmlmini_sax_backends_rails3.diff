@@ -1,0 +1,782 @@
+From 21562884805f1dac03fa4efb8e345a6148f23aed Mon Sep 17 00:00:00 2001
+From: Willem van Bergen <willem@vanbergen.org>
+Date: Fri, 1 Jan 2010 12:08:48 +0100
+Subject: [PATCH 1/3] Added SAX-based parser for XmlMini, using Nokogiri.
+
+---
+ .../lib/active_support/xml_mini/nokogirisax.rb     |   82 ++++++++
+ .../test/xml_mini/nokogirisax_engine_test.rb       |  216 ++++++++++++++++++++
+ 2 files changed, 298 insertions(+), 0 deletions(-)
+ create mode 100644 activesupport/lib/active_support/xml_mini/nokogirisax.rb
+ create mode 100644 activesupport/test/xml_mini/nokogirisax_engine_test.rb
+
+diff --git a/activesupport/lib/active_support/xml_mini/nokogirisax.rb b/activesupport/lib/active_support/xml_mini/nokogirisax.rb
+new file mode 100644
+index 0000000..42a4489
+--- /dev/null
++++ b/activesupport/lib/active_support/xml_mini/nokogirisax.rb
+@@ -0,0 +1,82 @@
++require 'nokogiri'
++
++# = XmlMini Nokogiri implementation using a SAX-based parser
++module ActiveSupport
++  module XmlMini_NokogiriSAX
++    extend self
++
++    # Class that will build the hash while the XML document
++    # is being parsed using SAX events.
++    class HashBuilder < Nokogiri::XML::SAX::Document
++
++      CONTENT_KEY   = '__content__'.freeze
++      HASH_SIZE_KEY = '__hash_size__'.freeze
++
++      attr_reader :hash
++
++      def current_hash
++        @hash_stack.last
++      end
++
++      def start_document
++        @hash = {}
++        @hash_stack = [@hash]
++      end
++
++      def end_document
++        raise "Parse stack not empty!" if @hash_stack.size > 1
++      end
++
++      def error(error_message)
++        raise Nokogiri::XML::SyntaxError, error_message
++      end
++
++      def start_element(name, attrs = [])
++        new_hash = { CONTENT_KEY => '' }
++        new_hash[attrs.shift] = attrs.shift while attrs.length > 0
++        new_hash[HASH_SIZE_KEY] = new_hash.size + 1
++
++        case current_hash[name]
++          when Array then current_hash[name] << new_hash
++          when Hash  then current_hash[name] = [current_hash[name], new_hash]
++          when nil   then current_hash[name] = new_hash
++        end
++
++        @hash_stack.push(new_hash)
++      end
++
++      def end_element(name)
++        if current_hash.length > current_hash.delete(HASH_SIZE_KEY) && current_hash[CONTENT_KEY].blank? || current_hash[CONTENT_KEY] == ''
++          current_hash.delete(CONTENT_KEY)
++        end
++        @hash_stack.pop
++      end
++
++      def characters(string)
++        current_hash[CONTENT_KEY] << string
++      end
++
++      alias_method :cdata_block, :characters
++    end
++
++    attr_accessor :document_class
++    self.document_class = HashBuilder
++
++    def parse(data)
++      if !data.respond_to?(:read)
++        data = StringIO.new(data || '')
++      end
++
++      char = data.getc
++      if char.nil?
++        {}
++      else
++        data.ungetc(char)
++        document = self.document_class.new
++        parser = Nokogiri::XML::SAX::Parser.new(document)
++        parser.parse(data)
++        document.hash
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activesupport/test/xml_mini/nokogirisax_engine_test.rb b/activesupport/test/xml_mini/nokogirisax_engine_test.rb
+new file mode 100644
+index 0000000..43f1cda
+--- /dev/null
++++ b/activesupport/test/xml_mini/nokogirisax_engine_test.rb
+@@ -0,0 +1,216 @@
++require 'abstract_unit'
++require 'active_support/xml_mini'
++require 'active_support/core_ext/hash/conversions'
++
++begin
++  require 'nokogiri'
++rescue LoadError
++  # Skip nokogiri tests
++else
++
++class NokogiriEngineTest < Test::Unit::TestCase
++  include ActiveSupport
++
++  def setup
++    @default_backend = XmlMini.backend
++    XmlMini.backend = 'NokogiriSAX'
++  end
++
++  def teardown
++    XmlMini.backend = @default_backend
++  end
++
++  def test_file_from_xml
++    hash = Hash.from_xml(<<-eoxml)
++      <blog>
++        <logo type="file" name="logo.png" content_type="image/png">
++        </logo>
++      </blog>
++    eoxml
++    assert hash.has_key?('blog')
++    assert hash['blog'].has_key?('logo')
++
++    file = hash['blog']['logo']
++    assert_equal 'logo.png', file.original_filename
++    assert_equal 'image/png', file.content_type
++  end
++
++  def test_exception_thrown_on_expansion_attack
++    assert_raise Nokogiri::XML::SyntaxError do
++      attack_xml = <<-EOT
++      <?xml version="1.0" encoding="UTF-8"?>
++      <!DOCTYPE member [
++        <!ENTITY a "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
++        <!ENTITY b "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
++        <!ENTITY c "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">
++        <!ENTITY d "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;">
++        <!ENTITY e "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">
++        <!ENTITY f "&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;">
++        <!ENTITY g "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
++      ]>
++      <member>
++      &a;
++      </member>
++      EOT
++      Hash.from_xml(attack_xml)
++    end
++  end
++
++  def test_setting_nokogiri_as_backend
++    XmlMini.backend = 'Nokogiri'
++    assert_equal XmlMini_Nokogiri, XmlMini.backend
++  end
++
++  def test_blank_returns_empty_hash
++    assert_equal({}, XmlMini.parse(nil))
++    assert_equal({}, XmlMini.parse(''))
++  end
++
++  def test_array_type_makes_an_array
++    assert_equal_rexml(<<-eoxml)
++      <blog>
++        <posts type="array">
++          <post>a post</post>
++          <post>another post</post>
++        </posts>
++      </blog>
++    eoxml
++  end
++
++  def test_one_node_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products/>
++    eoxml
++  end
++
++  def test_one_node_with_attributes_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products foo="bar"/>
++    eoxml
++  end
++
++  def test_products_node_with_book_node_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++    </products>
++    eoxml
++  end
++
++  def test_products_node_with_two_book_nodes_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++      <book name="america" id="67890" />
++    </products>
++    eoxml
++  end
++
++  def test_single_node_with_content_as_hash
++    assert_equal_rexml(<<-eoxml)
++      <products>
++        hello world
++      </products>
++    eoxml
++  end
++
++  def test_children_with_children
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        <book name="america" id="67890" />
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello everyone
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_non_adjacent_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++  end
++
++  def test_parse_from_io
++    io = StringIO.new(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++    XmlMini.parse(io)
++  end
++
++  def test_children_with_simple_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++         <![CDATA[cdatablock]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_multiple_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++         <![CDATA[cdatablock1]]><![CDATA[cdatablock2]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_text_and_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello <![CDATA[cdatablock]]>
++        morning
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_blank_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>   </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_blank_text_and_attribute
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products type="file">   </products>
++    </root>
++    eoxml
++  end
++
++  private
++  def assert_equal_rexml(xml)
++    hash = XmlMini.with_backend('REXML') { XmlMini.parse(xml) }
++    assert_equal(hash, XmlMini.parse(xml))
++  end
++end
++
++end
+-- 
+1.6.5.1
+
+
+From f62a2be215fadf7658e824846a4499e2d263ab25 Mon Sep 17 00:00:00 2001
+From: Willem van Bergen <willem@vanbergen.org>
+Date: Fri, 1 Jan 2010 12:57:36 +0100
+Subject: [PATCH 2/3] Added SAX-based parser for XmlMini, using LibXML
+
+---
+ .../lib/active_support/xml_mini/libxmlsax.rb       |   84 +++++++++
+ .../test/xml_mini/libxmlsax_engine_test.rb         |  194 ++++++++++++++++++++
+ 2 files changed, 278 insertions(+), 0 deletions(-)
+ create mode 100644 activesupport/lib/active_support/xml_mini/libxmlsax.rb
+ create mode 100644 activesupport/test/xml_mini/libxmlsax_engine_test.rb
+
+diff --git a/activesupport/lib/active_support/xml_mini/libxmlsax.rb b/activesupport/lib/active_support/xml_mini/libxmlsax.rb
+new file mode 100644
+index 0000000..dba1f87
+--- /dev/null
++++ b/activesupport/lib/active_support/xml_mini/libxmlsax.rb
+@@ -0,0 +1,84 @@
++require 'libxml'
++
++# = XmlMini LibXML implementation using a SAX-based parser
++module ActiveSupport
++  module XmlMini_LibXMLSAX
++    extend self
++
++    # Class that will build the hash while the XML document
++    # is being parsed using SAX events.
++    class HashBuilder
++
++      include LibXML::XML::SaxParser::Callbacks
++
++      CONTENT_KEY   = '__content__'.freeze
++      HASH_SIZE_KEY = '__hash_size__'.freeze
++
++      attr_reader :hash
++
++      def current_hash
++        @hash_stack.last
++      end
++
++      def on_start_document
++        @hash = {}
++        @hash_stack = [@hash]
++      end
++
++      def on_end_document
++        raise "Parse stack not empty!" if @hash_stack.size > 1
++      end
++
++      def on_error(error_message)
++        raise LibXML::XML::Error, error_message
++      end
++
++      def on_start_element(name, attrs = {})
++        new_hash = { CONTENT_KEY => '' }.merge(attrs)
++        new_hash[HASH_SIZE_KEY] = new_hash.size + 1
++
++        case current_hash[name]
++          when Array then current_hash[name] << new_hash
++          when Hash  then current_hash[name] = [current_hash[name], new_hash]
++          when nil   then current_hash[name] = new_hash
++        end
++
++        @hash_stack.push(new_hash)
++      end
++
++      def on_end_element(name)
++        if current_hash.length > current_hash.delete(HASH_SIZE_KEY) && current_hash[CONTENT_KEY].blank? || current_hash[CONTENT_KEY] == ''
++          current_hash.delete(CONTENT_KEY)
++        end
++        @hash_stack.pop
++      end
++
++      def on_characters(string)
++        current_hash[CONTENT_KEY] << string
++      end
++
++      alias_method :on_cdata_block, :on_characters
++    end
++
++    attr_accessor :document_class
++    self.document_class = HashBuilder
++
++    def parse(data)
++      if !data.respond_to?(:read)
++        data = StringIO.new(data || '')
++      end
++
++      char = data.getc
++      if char.nil?
++        {}
++      else
++        data.ungetc(char)
++        document = self.document_class.new
++        parser = LibXML::XML::SaxParser.io(data)
++        parser.callbacks = document
++        parser.parse
++        document.hash
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activesupport/test/xml_mini/libxmlsax_engine_test.rb b/activesupport/test/xml_mini/libxmlsax_engine_test.rb
+new file mode 100644
+index 0000000..6d5b367
+--- /dev/null
++++ b/activesupport/test/xml_mini/libxmlsax_engine_test.rb
+@@ -0,0 +1,194 @@
++require 'abstract_unit'
++require 'active_support/xml_mini'
++require 'active_support/core_ext/hash/conversions'
++
++begin
++  require 'libxml'
++rescue LoadError
++  # Skip libxml tests
++else
++
++class LibXMLSAXEngineTest < Test::Unit::TestCase
++  include ActiveSupport
++
++  def setup
++    @default_backend = XmlMini.backend
++    XmlMini.backend = 'LibXMLSAX'
++
++    LibXML::XML::Error.set_handler(&lambda { |error| }) #silence libxml, exceptions will do
++  end
++
++  def teardown
++    XmlMini.backend = @default_backend
++  end
++
++  def test_exception_thrown_on_expansion_attack
++    assert_raise LibXML::XML::Error do
++      attack_xml = %{<?xml version="1.0" encoding="UTF-8"?>
++      <!DOCTYPE member [
++        <!ENTITY a "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
++        <!ENTITY b "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
++        <!ENTITY c "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">
++        <!ENTITY d "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;">
++        <!ENTITY e "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">
++        <!ENTITY f "&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;">
++        <!ENTITY g "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
++      ]>
++      <member>
++      &a;
++      </member>
++     }
++      Hash.from_xml(attack_xml)
++    end
++  end
++
++  def test_setting_libxml_as_backend
++    XmlMini.backend = 'LibXMLSAX'
++    assert_equal XmlMini_LibXMLSAX, XmlMini.backend
++  end
++
++  def test_blank_returns_empty_hash
++    assert_equal({}, XmlMini.parse(nil))
++    assert_equal({}, XmlMini.parse(''))
++  end
++
++  def test_array_type_makes_an_array
++    assert_equal_rexml(<<-eoxml)
++      <blog>
++        <posts type="array">
++          <post>a post</post>
++          <post>another post</post>
++        </posts>
++      </blog>
++    eoxml
++  end
++
++  def test_one_node_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products/>
++    eoxml
++  end
++
++  def test_one_node_with_attributes_document_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products foo="bar"/>
++    eoxml
++  end
++
++  def test_products_node_with_book_node_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++    </products>
++    eoxml
++  end
++
++  def test_products_node_with_two_book_nodes_as_hash
++    assert_equal_rexml(<<-eoxml)
++    <products>
++      <book name="awesome" id="12345" />
++      <book name="america" id="67890" />
++    </products>
++    eoxml
++  end
++
++  def test_single_node_with_content_as_hash
++    assert_equal_rexml(<<-eoxml)
++      <products>
++        hello world
++      </products>
++    eoxml
++  end
++
++  def test_children_with_children
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        <book name="america" id="67890" />
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello everyone
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_non_adjacent_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++  end
++
++  def test_parse_from_io
++    io = StringIO.new(<<-eoxml)
++    <root>
++      good
++      <products>
++        hello everyone
++      </products>
++      morning
++    </root>
++    eoxml
++    XmlMini.parse(io)
++  end
++
++  def test_children_with_simple_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++         <![CDATA[cdatablock]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_multiple_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++         <![CDATA[cdatablock1]]><![CDATA[cdatablock2]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_text_and_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello <![CDATA[cdatablock]]>
++        morning
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_blank_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>   </products>
++    </root>
++    eoxml
++  end
++
++  private
++  def assert_equal_rexml(xml)
++    hash = XmlMini.with_backend('REXML') { XmlMini.parse(xml) }
++    assert_equal(hash, XmlMini.parse(xml))
++  end
++end
++
++end
+-- 
+1.6.5.1
+
+
+From 5582c44c65bc1522ca971ccdc94d1e7bcc6daaf7 Mon Sep 17 00:00:00 2001
+From: Willem van Bergen <willem@vanbergen.org>
+Date: Fri, 1 Jan 2010 13:44:42 +0100
+Subject: [PATCH 3/3] Fixed some bugs and fixed some tests in new SAX-based XmlMini backends.
+
+---
+ .../lib/active_support/xml_mini/libxmlsax.rb       |   14 +++++++-------
+ .../lib/active_support/xml_mini/nokogirisax.rb     |    2 +-
+ activesupport/test/core_ext/hash_ext_test.rb       |    8 +++++---
+ .../test/xml_mini/libxmlsax_engine_test.rb         |    8 ++++----
+ .../test/xml_mini/nokogirisax_engine_test.rb       |    5 +++--
+ 5 files changed, 20 insertions(+), 17 deletions(-)
+
+diff --git a/activesupport/lib/active_support/xml_mini/libxmlsax.rb b/activesupport/lib/active_support/xml_mini/libxmlsax.rb
+index dba1f87..d7b2f4c 100644
+--- a/activesupport/lib/active_support/xml_mini/libxmlsax.rb
++++ b/activesupport/lib/active_support/xml_mini/libxmlsax.rb
+@@ -21,16 +21,13 @@ module ActiveSupport
+       end
+ 
+       def on_start_document
+-        @hash = {}
++        @hash = { CONTENT_KEY => '' }
+         @hash_stack = [@hash]
+       end
+ 
+       def on_end_document
+-        raise "Parse stack not empty!" if @hash_stack.size > 1
+-      end
+-
+-      def on_error(error_message)
+-        raise LibXML::XML::Error, error_message
++        @hash = @hash_stack.pop
++        @hash.delete(CONTENT_KEY)
+       end
+ 
+       def on_start_element(name, attrs = {})
+@@ -73,8 +70,11 @@ module ActiveSupport
+         {}
+       else
+         data.ungetc(char)
+-        document = self.document_class.new
++
++        LibXML::XML::Error.set_handler(&LibXML::XML::Error::QUIET_HANDLER)
+         parser = LibXML::XML::SaxParser.io(data)
++        document = self.document_class.new
++
+         parser.callbacks = document
+         parser.parse
+         document.hash
+diff --git a/activesupport/lib/active_support/xml_mini/nokogirisax.rb b/activesupport/lib/active_support/xml_mini/nokogirisax.rb
+index 42a4489..d538a91 100644
+--- a/activesupport/lib/active_support/xml_mini/nokogirisax.rb
++++ b/activesupport/lib/active_support/xml_mini/nokogirisax.rb
+@@ -28,7 +28,7 @@ module ActiveSupport
+       end
+ 
+       def error(error_message)
+-        raise Nokogiri::XML::SyntaxError, error_message
++        raise error_message
+       end
+ 
+       def start_element(name, attrs = [])
+diff --git a/activesupport/test/core_ext/hash_ext_test.rb b/activesupport/test/core_ext/hash_ext_test.rb
+index 4642bb1..5b1d53a 100644
+--- a/activesupport/test/core_ext/hash_ext_test.rb
++++ b/activesupport/test/core_ext/hash_ext_test.rb
+@@ -902,9 +902,11 @@ class HashToXmlTest < Test::Unit::TestCase
+ 
+   def test_expansion_count_is_limited
+     expected = {
+-      'ActiveSupport::XmlMini_REXML'    => 'RuntimeError',
+-      'ActiveSupport::XmlMini_Nokogiri' => 'Nokogiri::XML::SyntaxError',
+-      'ActiveSupport::XmlMini_LibXML'   => 'LibXML::XML::Error',
++      'ActiveSupport::XmlMini_REXML'       => 'RuntimeError',
++      'ActiveSupport::XmlMini_Nokogiri'    => 'Nokogiri::XML::SyntaxError',
++      'ActiveSupport::XmlMini_NokogiriSAX' => 'RuntimeError',
++      'ActiveSupport::XmlMini_LibXML'      => 'LibXML::XML::Error',
++      'ActiveSupport::XmlMini_LibXMLSAX'   => 'LibXML::XML::Error',
+     }[ActiveSupport::XmlMini.backend.name].constantize
+ 
+     assert_raise expected do
+diff --git a/activesupport/test/xml_mini/libxmlsax_engine_test.rb b/activesupport/test/xml_mini/libxmlsax_engine_test.rb
+index 6d5b367..8648100 100644
+--- a/activesupport/test/xml_mini/libxmlsax_engine_test.rb
++++ b/activesupport/test/xml_mini/libxmlsax_engine_test.rb
+@@ -14,8 +14,6 @@ class LibXMLSAXEngineTest < Test::Unit::TestCase
+   def setup
+     @default_backend = XmlMini.backend
+     XmlMini.backend = 'LibXMLSAX'
+-
+-    LibXML::XML::Error.set_handler(&lambda { |error| }) #silence libxml, exceptions will do
+   end
+ 
+   def teardown
+@@ -24,7 +22,8 @@ class LibXMLSAXEngineTest < Test::Unit::TestCase
+ 
+   def test_exception_thrown_on_expansion_attack
+     assert_raise LibXML::XML::Error do
+-      attack_xml = %{<?xml version="1.0" encoding="UTF-8"?>
++      attack_xml = <<-EOT
++      <?xml version="1.0" encoding="UTF-8"?>
+       <!DOCTYPE member [
+         <!ENTITY a "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
+         <!ENTITY b "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
+@@ -37,7 +36,8 @@ class LibXMLSAXEngineTest < Test::Unit::TestCase
+       <member>
+       &a;
+       </member>
+-     }
++      EOT
++
+       Hash.from_xml(attack_xml)
+     end
+   end
+diff --git a/activesupport/test/xml_mini/nokogirisax_engine_test.rb b/activesupport/test/xml_mini/nokogirisax_engine_test.rb
+index 43f1cda..1149d0f 100644
+--- a/activesupport/test/xml_mini/nokogirisax_engine_test.rb
++++ b/activesupport/test/xml_mini/nokogirisax_engine_test.rb
+@@ -8,7 +8,7 @@ rescue LoadError
+   # Skip nokogiri tests
+ else
+ 
+-class NokogiriEngineTest < Test::Unit::TestCase
++class NokogiriSAXEngineTest < Test::Unit::TestCase
+   include ActiveSupport
+ 
+   def setup
+@@ -36,7 +36,7 @@ class NokogiriEngineTest < Test::Unit::TestCase
+   end
+ 
+   def test_exception_thrown_on_expansion_attack
+-    assert_raise Nokogiri::XML::SyntaxError do
++    assert_raise RuntimeError do
+       attack_xml = <<-EOT
+       <?xml version="1.0" encoding="UTF-8"?>
+       <!DOCTYPE member [
+@@ -52,6 +52,7 @@ class NokogiriEngineTest < Test::Unit::TestCase
+       &a;
+       </member>
+       EOT
++
+       Hash.from_xml(attack_xml)
+     end
+   end
+-- 
+1.6.5.1
+

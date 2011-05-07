@@ -1,0 +1,147 @@
+From c4116b25e05bec181096eb9e5be2e41dcbb4fe50 Mon Sep 17 00:00:00 2001
+From: Lance Ivy <lance@cainlevy.net>
+Date: Tue, 8 Jul 2008 11:03:27 -0700
+Subject: [PATCH] add support for :load option to ActiveRecord::Base#find, which explicitely uses the preloading strategy on the named associations
+
+---
+ activerecord/lib/active_record/base.rb             |   13 +++++---
+ activerecord/test/cases/associations/eager_test.rb |   11 +++++--
+ activerecord/test/cases/method_scoping_test.rb     |   33 ++++++++++++++++++++
+ 3 files changed, 49 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 962c2b3..c613633 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1348,14 +1348,17 @@ module ActiveRecord #:nodoc:
+ 
+         def find_every(options)
+           include_associations = merge_includes(scope(:find, :include), options[:include])
++          load_associations = merge_includes(scope(:find, :load), options[:load])
+ 
+           if include_associations.any? && references_eager_loaded_tables?(options)
+             records = find_with_associations(options)
+           else
++            load_associations = merge_includes(load_associations, include_associations)
+             records = find_by_sql(construct_finder_sql(options))
+-            if include_associations.any?
+-              preload_associations(records, include_associations)
+-            end
++          end
++
++          if load_associations.any?
++            preload_associations(records, load_associations)
+           end
+ 
+           records.each { |record| record.readonly! } if options[:readonly]
+@@ -1830,7 +1833,7 @@ module ActiveRecord #:nodoc:
+                       merge = hash[method][key] && params[key] # merge if both scopes have the same key
+                       if key == :conditions && merge
+                         hash[method][key] = merge_conditions(params[key], hash[method][key])
+-                      elsif key == :include && merge
++                      elsif [:include, :load].include?(key) && merge
+                         hash[method][key] = merge_includes(hash[method][key], params[key]).uniq
+                       else
+                         hash[method][key] = hash[method][key] || params[key]
+@@ -2106,7 +2109,7 @@ module ActiveRecord #:nodoc:
+         end
+ 
+         VALID_FIND_OPTIONS = [ :conditions, :include, :joins, :limit, :offset,
+-                               :order, :select, :readonly, :group, :from, :lock ]
++                               :order, :select, :readonly, :group, :from, :lock, :load ]
+ 
+         def validate_find_options(options) #:nodoc:
+           options.assert_valid_keys(VALID_FIND_OPTIONS)
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index f65ada5..2d39c23 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -235,13 +235,13 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     subscriber =Subscriber.find(subscribers(:second).id, :include => :subscriptions)
+     assert_equal subscriptions, subscriber.subscriptions.sort_by(&:id)
+   end
+-  
++
+   def test_eager_load_has_many_through_with_string_keys
+     books = books(:awdr, :rfr)
+     subscriber = Subscriber.find(subscribers(:second).id, :include => :books)
+     assert_equal books, subscriber.books.sort_by(&:id)
+   end
+-  
++
+   def test_eager_load_belongs_to_with_string_keys
+     subscriber = subscribers(:second)
+     subscription = Subscription.find(subscriptions(:webster_awdr).id, :include => :subscriber)
+@@ -343,7 +343,7 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     author_posts_without_comments = author.posts.select { |post| post.comments.blank? }
+     assert_equal author_posts_without_comments.size, author.posts.count(:all, :include => :comments, :conditions => 'comments.id is null')
+   end
+-  
++
+   def test_eager_count_performed_on_a_has_many_through_association_with_multi_table_conditional
+     person = people(:michael)
+     person_posts_without_comments = person.posts.select { |post| post.comments.blank? }
+@@ -620,4 +620,9 @@ class EagerAssociationTest < ActiveRecord::TestCase
+   def test_order_on_join_table_with_include_and_limit
+     assert_equal 5, Developer.find(:all, :include => 'projects', :order => 'developers_projects.joined_on DESC', :limit => 5).size
+   end
++
++  def test_eager_loading_by_explicit_preloading
++    posts = Post.find(:first, :load => :comments)
++    assert posts.comments.loaded?
++  end
+ end
+diff --git a/activerecord/test/cases/method_scoping_test.rb b/activerecord/test/cases/method_scoping_test.rb
+index d6b3e34..c3058eb 100644
+--- a/activerecord/test/cases/method_scoping_test.rb
++++ b/activerecord/test/cases/method_scoping_test.rb
+@@ -87,6 +87,13 @@ class MethodScopingTest < ActiveRecord::TestCase
+     assert_equal 1, scoped_developers.size
+   end
+ 
++  def test_scoped_find_load
++    developers = Developer.with_scope(:find => { :load => :projects }) do
++      Developer.find(:all)
++    end
++    assert developers.all? { |developer| developer.projects.loaded? }
++  end
++
+   def test_scoped_find_joins
+     scoped_developers = Developer.with_scope(:find => { :joins => 'JOIN developers_projects ON id = developer_id' } ) do
+       Developer.find(:all, :conditions => 'developers_projects.project_id = 2')
+@@ -239,6 +246,32 @@ class NestedScopingTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_nested_scoped_find_merged_load
++    # :load's remain unique and don't "double up" when merging
++    Developer.with_scope(:find => { :load => :projects }) do
++      Developer.with_scope(:find => { :load => :projects }) do
++        assert_equal 1, Developer.instance_eval('current_scoped_methods')[:find][:load].length
++        assert Developer.find(:first).projects.loaded?
++      end
++    end
++
++    # the nested scope doesn't remove the first :load
++    Developer.with_scope(:find => { :load => :projects }) do
++      Developer.with_scope(:find => { :load => [] }) do
++        assert_equal 1, Developer.instance_eval('current_scoped_methods')[:find][:load].length
++        assert Developer.find(:first).projects.loaded?
++      end
++    end
++
++    # mixing array and symbol :load's will merge correctly
++    Developer.with_scope(:find => { :load => [:projects] }) do
++      Developer.with_scope(:find => { :load => :projects }) do
++        assert_equal 1, Developer.instance_eval('current_scoped_methods')[:find][:load].length
++        assert Developer.find(:first).projects.loaded?
++      end
++    end
++  end
++
+   def test_nested_scoped_find_replace_include
+     Developer.with_scope(:find => { :include => :projects }) do
+       Developer.with_exclusive_scope(:find => { :include => [] }) do
+-- 
+1.5.4.3
+

@@ -1,0 +1,102 @@
+From a5016a8f1d7db880a4f7024a34b72f8650467de5 Mon Sep 17 00:00:00 2001
+From: Will Bryant <will.bryant@gmail.com>
+Date: Wed, 24 Sep 2008 16:44:56 +1200
+Subject: [PATCH] wrote a test showing eager loading's misbehavior (sanitizing against the wrong table) when the association has a :conditions hash
+
+---
+ activerecord/test/cases/associations/eager_test.rb |    7 +++++++
+ 1 files changed, 7 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 956a289..3c8a3ec 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -115,6 +115,13 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     posts = authors(:david).posts.find(:all, :include => :comments, :order => "posts.id")
+     assert_equal 2, posts.first.comments.size
+   end
++  
++  def test_loading_from_an_association_that_has_a_hash_of_conditions
++    assert_nothing_raised do
++      Author.find(:all, :include => :hello_posts_with_hash_conditions)
++    end
++    assert !Author.find(authors(:david).id, :include => :hello_posts_with_hash_conditions).hello_posts.empty?
++  end
+ 
+   def test_loading_with_no_associations
+     assert_nil Post.find(posts(:authorless).id, :include => :author).author
+-- 
+1.5.5.1
+
+
+From 199f36248d77e695f343a262fdc60a4d7fe34c35 Mon Sep 17 00:00:00 2001
+From: Will Bryant <will.bryant@gmail.com>
+Date: Wed, 24 Sep 2008 17:00:35 +1200
+Subject: [PATCH] fix eager loading's :condition sanitizing expanding against the wrong table
+
+---
+ .../lib/active_record/association_preload.rb       |   10 +++++-----
+ activerecord/lib/active_record/reflection.rb       |    4 ++++
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index 4487275..418f92f 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -96,7 +96,7 @@ module ActiveRecord
+         options = reflection.options
+ 
+         conditions = "t0.#{reflection.primary_key_name} #{in_or_equals_for_ids(ids)}"
+-        conditions << append_conditions(options, preload_options)
++        conditions << append_conditions(reflection, preload_options)
+ 
+         associated_records = reflection.klass.find(:all, :conditions => [conditions, ids],
+         :include => options[:include],
+@@ -233,7 +233,7 @@ module ActiveRecord
+             end
+           end
+           conditions = "#{table_name}.#{connection.quote_column_name(primary_key)} #{in_or_equals_for_ids(ids)}"
+-          conditions << append_conditions(options, preload_options)
++          conditions << append_conditions(reflection, preload_options)
+           associated_records = klass.find(:all, :conditions => [conditions, ids],
+                                           :include => options[:include],
+                                           :select => options[:select],
+@@ -254,7 +254,7 @@ module ActiveRecord
+           conditions = "#{reflection.klass.quoted_table_name}.#{foreign_key} #{in_or_equals_for_ids(ids)}"
+         end
+ 
+-        conditions << append_conditions(options, preload_options)
++        conditions << append_conditions(reflection, preload_options)
+ 
+         reflection.klass.find(:all,
+                               :select => (preload_options[:select] || options[:select] || "#{table_name}.*"),
+@@ -270,9 +270,9 @@ module ActiveRecord
+         instance_eval("%@#{sql.gsub('@', '\@')}@")
+       end
+ 
+-      def append_conditions(options, preload_options)
++      def append_conditions(reflection, preload_options)
+         sql = ""
+-        sql << " AND (#{interpolate_sql_for_preload(sanitize_sql(options[:conditions]))})" if options[:conditions]
++        sql << " AND (#{interpolate_sql_for_preload(reflection.sanitized_conditions)})" if reflection.sanitized_conditions
+         sql << " AND (#{sanitize_sql preload_options[:conditions]})" if preload_options[:conditions]
+         sql
+       end
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 8614ef8..3f74c03 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -112,6 +112,10 @@ module ActiveRecord
+         name == other_aggregation.name && other_aggregation.options && active_record == other_aggregation.active_record
+       end
+ 
++      def sanitized_conditions #:nodoc:
++        @sanitized_conditions ||= klass.send(:sanitize_sql, options[:conditions]) if options[:conditions]
++      end
++
+       private
+         def derive_class_name
+           name.to_s.camelize
+-- 
+1.5.5.1
+

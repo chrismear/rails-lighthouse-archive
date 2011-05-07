@@ -1,0 +1,156 @@
+diff --git a/actionpack/lib/action_controller/routing/builder.rb b/actionpack/lib/action_controller/routing/builder.rb
+index 5704d9d..c0c11fd 100644
+--- a/actionpack/lib/action_controller/routing/builder.rb
++++ b/actionpack/lib/action_controller/routing/builder.rb
+@@ -26,11 +26,11 @@ module ActionController
+       # to be set separately, via the +assign_route_options+ method, and the
+       # <tt>optional?</tt> method for each segment will not be reliable until after
+       # +assign_route_options+ is called, as well.
+-      def segments_for_route_path(path)
++      def segments_for_route_path(path, options = {})
+         rest, segments = path, []
+ 
+         until rest.empty?
+-          segment, rest = segment_for rest
++          segment, rest = segment_for rest, options
+           segments << segment
+         end
+         segments
+@@ -38,12 +38,12 @@ module ActionController
+ 
+       # A factory method that returns a new segment instance appropriate for the
+       # format of the given string.
+-      def segment_for(string)
++      def segment_for(string, options = {})
+         segment = case string
+           when /\A:(\w+)/
+             key = $1.to_sym
+             case key
+-              when :controller then ControllerSegment.new(key)
++              when :controller then ControllerSegment.new(key, options)
+               else DynamicSegment.new key
+             end
+           when /\A\*(\w+)/ then PathSegment.new($1.to_sym, :optional => true)
+@@ -63,7 +63,7 @@ module ActionController
+         options = options.dup
+ 
+         if options[:namespace]
+-          options[:controller] = "#{options.delete(:namespace).sub(/\/$/, '')}/#{options[:controller]}"
++          options[:controller] = "#{options.delete(:namespace).sub(/\/$/, '')}/#{options[:controller]}" if options[:controller]
+           options.delete(:path_prefix)
+           options.delete(:name_prefix)
+         end
+@@ -168,7 +168,7 @@ module ActionController
+ 
+         path = "/#{options[:path_prefix].to_s.gsub(/^\//,'')}#{path}" if options[:path_prefix]
+ 
+-        segments = segments_for_route_path(path)
++        segments = segments_for_route_path(path, options)
+         defaults, requirements, conditions = divide_route_options(segments, options)
+         requirements = assign_route_options(segments, defaults, requirements)
+ 
+diff --git a/actionpack/lib/action_controller/routing/route.rb b/actionpack/lib/action_controller/routing/route.rb
+index 3b2cb28..151246a 100644
+--- a/actionpack/lib/action_controller/routing/route.rb
++++ b/actionpack/lib/action_controller/routing/route.rb
+@@ -187,7 +187,10 @@ module ActionController
+         # Write and compile a +recognize+ method for this Route.
+         def write_recognition!
+           # Create an if structure to extract the params from a match if it occurs.
+-          body = "params = parameter_shell.dup\n#{recognition_extraction * "\n"}\nparams"
++          body = "params = parameter_shell.dup\n#{recognition_extraction * "\n"}\n"
++          body << "params[:namespace] = '#{requirements[:namespace]}' if params[:controller]\n" if requirements[:namespace]
++          body << "params"
++
+           body = "if #{recognition_conditions.join(" && ")}\n#{body}\nend"
+ 
+           # Build the method declaration and compile it
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index ff44849..675d5a1 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -384,7 +384,12 @@ module ActionController
+       def recognize(request)
+         params = recognize_path(request.path, extract_request_environment(request))
+         request.path_parameters = params.with_indifferent_access
+-        "#{params[:controller].camelize}Controller".constantize
++      
++        controller = params[:controller]
++        if params[:namespace]
++          controller = params[:namespace] + controller unless controller.start_with? params[:namespace]
++        end
++        "#{controller.camelize}Controller".constantize
+       end
+ 
+       def recognize_path(path, environment={})
+diff --git a/actionpack/lib/action_controller/routing/segments.rb b/actionpack/lib/action_controller/routing/segments.rb
+index e5f174a..18421cb 100644
+--- a/actionpack/lib/action_controller/routing/segments.rb
++++ b/actionpack/lib/action_controller/routing/segments.rb
+@@ -114,7 +114,7 @@ module ActionController
+       attr_reader :key
+ 
+       # TODO: Convert these accessors to read only
+-      attr_accessor :default, :regexp
++      attr_accessor :default, :regexp, :namespace
+ 
+       def initialize(key = nil, options = {})
+         super()
+@@ -122,6 +122,7 @@ module ActionController
+         @default = options[:default] if options.key?(:default)
+         @regexp = options[:regexp] if options.key?(:regexp)
+         @is_optional = true if options[:optional] || options.key?(:default)
++        @namespace = options.key?(:namespace) ? options[:namespace] : nil
+       end
+ 
+       def to_s
+@@ -227,6 +228,17 @@ module ActionController
+     class ControllerSegment < DynamicSegment #:nodoc:
+       def regexp_chunk
+         possible_names = Routing.possible_controllers.collect { |name| Regexp.escape name }
++        
++        if namespace
++          namespaced_names = []
++          possible_names.each do |name|
++            if name.start_with? namespace
++              namespaced_names << name.gsub(/^#{namespace}[\/]?/, '') 
++            end 
++          end
++          possible_names = possible_names | namespaced_names
++        end
++
+         "(?i-:(#{(regexp || Regexp.union(*possible_names)).source}))"
+       end
+ 
+diff --git a/actionpack/test/controller/routing_test.rb b/actionpack/test/controller/routing_test.rb
+index 1eb26a7..24ed258 100644
+--- a/actionpack/test/controller/routing_test.rb
++++ b/actionpack/test/controller/routing_test.rb
+@@ -2089,6 +2089,27 @@ uses_mocha 'LegacyRouteSet, Route, RouteSet and RouteLoading' do
+     ensure
+       Object.send(:remove_const, :Api)
+     end
++    
++    def test_namespaced_defaults
++      Object.const_set(:Api, Module.new { |m| m.const_set(:ProductsController, Class.new) })
++      request.method = :get
++      
++      ActionController::Routing.with_controllers(['api/products']) do
++        set.draw do |map|
++          map.namespace 'api' do |api|
++            api.connect ':controller/:action/:id'
++          end
++        end
++      
++        request.path = "/api/products/index"
++        assert_nothing_raised { set.recognize(request) }
++        request.path = "/api/products/show/1"
++        assert_nothing_raised { set.recognize(request) }
++      end
++    ensure
++      Object.send(:remove_const, :Api)
++    end
++
+ 
+     def test_generate_finds_best_fit
+       set.draw do |map|

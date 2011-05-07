@@ -1,0 +1,185 @@
+From 04c5149e11249f914d229dd3a521660ec0f5708a Mon Sep 17 00:00:00 2001
+From: Robert Sosinski <rsosinski@slingmedia.com>
+Date: Fri, 26 Nov 2010 20:41:37 -0500
+Subject: [PATCH 1/2] Add tsvector datatype patch to postgresql adapter
+
+---
+ .../connection_adapters/postgresql_adapter.rb      |    6 +++++-
+ 1 files changed, 5 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index e2b9a5d..550ecdc 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -107,6 +107,9 @@ module ActiveRecord
+             # UUID type
+             when 'uuid'
+               :string
++            # TSVector type
++            when 'tsvector'
++              :tsvector
+             # Small and big integer types
+             when /^(?:small|big)int$/
+               :integer
+@@ -206,7 +209,8 @@ module ActiveRecord
+         :date        => { :name => "date" },
+         :binary      => { :name => "bytea" },
+         :boolean     => { :name => "boolean" },
+-        :xml         => { :name => "xml" }
++        :xml         => { :name => "xml" },
++        :tsvector    => { :name => "tsvector" }
+       }
+ 
+       # Returns 'PostgreSQL' as adapter name for identification purposes.
+-- 
+1.7.3.4
+
+
+From d693abda5efd8c7a01abb15e6113a59d01d9581a Mon Sep 17 00:00:00 2001
+From: Scott Lowe <scottwithtwotees@gmail.com>
+Date: Sat, 23 Apr 2011 12:46:50 +0100
+Subject: [PATCH 2/2] Add tests to support PostgreSQL tsvector data type and schema dumps.
+ Ticket #6073
+
+---
+ .../cases/adapters/postgresql/datatype_test.rb     |   24 +++++++++++++++++
+ activerecord/test/cases/schema_dumper_test.rb      |    9 ++++++-
+ .../test/schema/postgresql_specific_schema.rb      |   27 +++++++++++++++++---
+ 3 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/test/cases/adapters/postgresql/datatype_test.rb b/activerecord/test/cases/adapters/postgresql/datatype_test.rb
+index 5bb8fa2..9451160 100644
+--- a/activerecord/test/cases/adapters/postgresql/datatype_test.rb
++++ b/activerecord/test/cases/adapters/postgresql/datatype_test.rb
+@@ -21,6 +21,9 @@ end
+ class PostgresqlOid < ActiveRecord::Base
+ end
+ 
++class PostgresqlTsvector < ActiveRecord::Base
++end
++
+ class PostgresqlTimestampWithZone < ActiveRecord::Base
+ end
+ 
+@@ -55,6 +58,9 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     @first_oid = PostgresqlOid.find(1)
+ 
+     @connection.execute("INSERT INTO postgresql_timestamp_with_zones (time) VALUES ('2010-01-01 10:00:00-1')")
++
++    @connection.execute("INSERT INTO postgresql_tsvectors (text) VALUES ('Monkeys are our friends')")
++    @first_tsvector = PostgresqlTsvector.find(1)
+   end
+ 
+   def test_data_type_of_array_types
+@@ -75,6 +81,10 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     assert_equal :string, @first_time.column_for_attribute(:time_interval).type
+   end
+ 
++  def test_data_type_of_tsvector_types
++    assert_equal :tsvector, @first_tsvector.column_for_attribute(:tsv_text).type
++  end
++
+   def test_data_type_of_network_address_types
+     assert_equal :string, @first_network_address.column_for_attribute(:cidr_address).type
+     assert_equal :string, @first_network_address.column_for_attribute(:inet_address).type
+@@ -124,6 +134,11 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     assert_equal 1234, @first_oid.obj_id
+   end
+ 
++  def test_tsvector_values
++    assert_equal "Monkeys are our friends", @first_tsvector.text
++    assert_equal "'friend':4 'monkey':1", @first_tsvector.tsv_text
++  end
++
+   def test_update_integer_array
+     new_value = '{32800,95000,29350,17000}'
+     assert @first_array.commission_by_quarter = new_value
+@@ -207,6 +222,15 @@ class PostgresqlDataTypeTest < ActiveRecord::TestCase
+     assert_equal @first_oid.obj_id, new_value
+   end
+ 
++  def test_update_tsvector
++    new_text = "Monkeys are our friends friends"
++    assert @first_tsvector.text = new_text
++    assert @first_tsvector.save
++    assert @first_tsvector.reload
++    assert_equal @first_tsvector.text, new_text
++    assert_equal @first_tsvector.tsv_text, "'friend':4,5 'monkey':1"
++  end
++
+   def test_timestamp_with_zone_values_with_rails_time_zone_support
+     old_tz         = ActiveRecord::Base.time_zone_aware_attributes
+     old_default_tz = ActiveRecord::Base.default_timezone
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index 9b2c7c0..d61e6ea 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -45,7 +45,7 @@ class SchemaDumperTest < ActiveRecord::TestCase
+       next if column_set.empty?
+ 
+       lengths = column_set.map do |column|
+-        if match = column.match(/t\.(?:integer|decimal|float|datetime|timestamp|time|date|text|binary|string|boolean)\s+"/)
++        if match = column.match(/t\.(?:integer|tsvector|decimal|float|datetime|timestamp|time|date|text|binary|string|boolean)\s+"/)
+           match[0].length
+         end
+       end
+@@ -203,6 +203,13 @@ class SchemaDumperTest < ActiveRecord::TestCase
+         assert_match %r{t.xml "data"}, output
+       end
+     end
++
++    def test_schema_dump_includes_tsvector_definition
++      output = standard_dump
++      if %r{create_table "postgresql_tsvectors"} =~ output
++        assert_match %r{t.tsvector "tsv_text"}, output
++      end
++    end
+   end
+ 
+   def test_schema_dump_keeps_large_precision_integer_columns_as_decimal
+diff --git a/activerecord/test/schema/postgresql_specific_schema.rb b/activerecord/test/schema/postgresql_specific_schema.rb
+index f38f4f3..5ada5da 100644
+--- a/activerecord/test/schema/postgresql_specific_schema.rb
++++ b/activerecord/test/schema/postgresql_specific_schema.rb
+@@ -1,7 +1,8 @@
+ ActiveRecord::Schema.define do
+ 
+-  %w(postgresql_arrays postgresql_moneys postgresql_numbers postgresql_times postgresql_network_addresses postgresql_bit_strings
+-      postgresql_oids postgresql_xml_data_type defaults geometrics postgresql_timestamp_with_zones).each do |table_name|
++  %w(postgresql_arrays postgresql_moneys postgresql_numbers postgresql_times postgresql_network_addresses
++      postgresql_bit_strings postgresql_oids postgresql_xml_data_type postgresql_tsvectors defaults
++      geometrics postgresql_timestamp_with_zones).each do |table_name|
+     execute "DROP TABLE  IF EXISTS #{quote_table_name table_name}"
+   end
+ 
+@@ -115,7 +116,25 @@ _SQL
+     data xml
+     );
+ _SQL
+-rescue #This version of PostgreSQL either has no XML support or is was not compiled with XML support: skipping table
++  rescue # This version of PostgreSQL either has no XML support or is was not compiled with XML support: skipping table
+   end
+-end
+ 
++  begin
++    execute <<_SQL
++    CREATE TABLE postgresql_tsvectors (
++      id SERIAL PRIMARY KEY,
++      text TEXT,
++      tsv_text tsvector
++    );
++
++    CREATE TRIGGER postgresql_tsvectors_tsv_text_trigger
++      BEFORE INSERT OR UPDATE
++      ON postgresql_tsvectors
++      FOR EACH ROW
++      EXECUTE PROCEDURE
++        tsvector_update_trigger('tsv_text', 'pg_catalog.english', 'text');
++_SQL
++  rescue # This version of PostgreSQL has no tsvector type support for Full Text Searching: skipping table
++  end
++
++end
+-- 
+1.7.3.4
+

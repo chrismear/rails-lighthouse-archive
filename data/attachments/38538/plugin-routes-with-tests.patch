@@ -1,0 +1,375 @@
+From 302f807c5f1948b224b67ef490d4fc2e2f23cda8 Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <cavanaugh@fatjam.com>
+Date: Mon, 2 Jun 2008 07:36:04 -0400
+Subject: [PATCH] Add RouteSet#draw_for_plugin which takes a key and a block. The key is a symbol that simply identifies the plugin. The block should use the same syntax as the block in routes.rb. Add Mapper#plugin_routes which works as follows: map.plugin_routes map.plugin_routes :all # alias of the above call map.plugin_routes :hobo, :active_scaffold, :restful_authentication map.plugin_routes :except => [:hobo, :something] Mapper#plugin_routes should be called in routes.rb where ever you would like plugin routes to initialize.
+
+---
+ .../lib/action_controller/routing/route_set.rb     |   20 ++++++++++++++++++--
+ 1 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index 8dfc22f..fa7dc53 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -49,6 +49,18 @@ module ActionController
+             with_options({:path_prefix => name, :name_prefix => "#{name}_", :namespace => "#{name}/" }.merge(options), &block)
+           end
+         end
++        
++        def plugin_routes(*args)
++          options = args.extract_options!
++
++          route_plugins = (args.empty? || args.first.eql?(:all)) ? @set.plugin_blocks.keys : args
++
++          route_plugins.reject! {|name| options[:except].member? name } if options[:except]
++
++          route_plugins.each do |plugin_name|
++            @set.plugin_blocks[plugin_name].call(self)
++          end
++        end
+ 
+         def method_missing(route_name, *args, &proc) #:nodoc:
+           super unless args.length >= 1 && proc.nil?
+@@ -189,12 +201,12 @@ module ActionController
+           end
+       end
+ 
+-      attr_accessor :routes, :named_routes, :configuration_file
++      attr_accessor :routes, :named_routes, :configuration_file, :plugin_blocks
+ 
+       def initialize
+         self.routes = []
+         self.named_routes = NamedRouteCollection.new
+-
++        self.plugin_blocks = {}
+         write_recognize_optimized!
+       end
+ 
+@@ -210,6 +222,10 @@ module ActionController
+         install_helpers
+       end
+ 
++      def draw_for_plugin(plugin_name, &block)
++        self.plugin_blocks[plugin_name] = block
++      end
++
+       def clear!
+         routes.clear
+         named_routes.clear
+-- 
+1.5.4.5
+
+
+From 76d45a1875254364b6f75a7c7f5ecfb06fd4f7f8 Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <cavanaugh@fatjam.com>
+Date: Tue, 3 Jun 2008 21:14:19 -0400
+Subject: [PATCH] Added #draw_for to the config exposed to a plugin's init.rb. Exposed the currently loading plugin to the configuration for purposes of automatically setting the name to the currently loading plugin's name.
+
+---
+ .../lib/action_controller/routing/route_set.rb     |    2 +
+ railties/lib/initializer.rb                        |   27 ++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 0 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index fa7dc53..edb1b21 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -50,6 +50,8 @@ module ActionController
+           end
+         end
+         
++        # Enables registering plugin routes while maintaing complete
++        # control over order and what is registered.
+         def plugin_routes(*args)
+           options = args.extract_options!
+ 
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 6576cd3..7ae11dc 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -707,6 +707,33 @@ Run `rake gems:install` to install the missing gems.
+       @gems << Rails::GemDependency.new(name, options)
+     end
+ 
++    # When a plugin is loading currently_loading_plugin is the appropriate
++    # Rails::Plugin instance for the plugin currently being loaded by
++    # Rails::Plugin::Loader. currently_loading_plugin is nil when no plugin
++    # is in the process of being loaded.
++    attr_accessor :currently_loading_plugin
++
++    # Adds a block to be loaded later in config/routes.rb. This should
++    # be used by plugins to register routes for themselves. The parameter
++    # name should be a unique and descriptive name for the routes 
++    # being registered. If it is not set the plugin's name is used.
++    # 
++    #   # vendor/plugins/example_plugin/init.rb
++    # 
++    #   config.draw_for do |map|
++    #     map.connect '/', ...
++    #   end
++    # 
++    #   # or
++    # 
++    #   config.draw_for :example_plugin_admin do |map|
++    #     map.connect '/', ...
++    #   end
++    def draw_for(name=nil, &block)
++      name ||= currently_loading_plugin.name
++      ActionController::Routing::Routes.draw_for_plugin(name.to_sym, &block)
++    end
++
+     # Deprecated options:
+     def breakpoint_server(_ = nil)
+       $stderr.puts %(
+-- 
+1.5.4.5
+
+
+From 021af20d66a9cfa918e1a4319f611f92fd8a0b70 Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <cavanaugh@fatjam.com>
+Date: Wed, 4 Jun 2008 12:54:44 -0400
+Subject: [PATCH] cleanup the method naming a bit
+
+---
+ railties/lib/initializer.rb |   10 ++++++----
+ 1 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 7ae11dc..5b54234 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -720,20 +720,22 @@ Run `rake gems:install` to install the missing gems.
+     # 
+     #   # vendor/plugins/example_plugin/init.rb
+     # 
+-    #   config.draw_for do |map|
++    #   config.plugin_routes do |map|
+     #     map.connect '/', ...
+     #   end
+     # 
+-    #   # or
++    # The alias #draw_for is also provided for more natural pattern
++    # when passing a name for the route block.
+     # 
+     #   config.draw_for :example_plugin_admin do |map|
+     #     map.connect '/', ...
+     #   end
+-    def draw_for(name=nil, &block)
++    def plugin_routes(name=nil, &block)
+       name ||= currently_loading_plugin.name
+       ActionController::Routing::Routes.draw_for_plugin(name.to_sym, &block)
+     end
+-
++    alias_method :draw_for, :plugin_routes
++    
+     # Deprecated options:
+     def breakpoint_server(_ = nil)
+       $stderr.puts %(
+-- 
+1.5.4.5
+
+
+From 3f992b332caef8b38fdbc4b29f71e2435a3226e1 Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <rich@silverback.local>
+Date: Tue, 12 Aug 2008 03:15:41 -0400
+Subject: [PATCH] Exposed the currently loading plugin to the configuration for purposes of automatically setting the name to the currently loading plugin's name.
+
+---
+ railties/lib/rails/plugin.rb |    2 ++
+ 1 files changed, 2 insertions(+), 0 deletions(-)
+
+diff --git a/railties/lib/rails/plugin.rb b/railties/lib/rails/plugin.rb
+index b8b2b57..96a27d5 100644
+--- a/railties/lib/rails/plugin.rb
++++ b/railties/lib/rails/plugin.rb
+@@ -41,8 +41,10 @@ module Rails
+     def load(initializer)
+       return if loaded?
+       report_nonexistant_or_empty_plugin! unless valid?
++      initializer.configuration.currently_loading_plugin = self
+       evaluate_init_rb(initializer)
+       @loaded = true
++      initializer.configuration.currently_loading_plugin = nil
+     end
+     
+     def loaded?
+-- 
+1.5.4.5
+
+
+From 87c1357ac84e8313395f3cee48a46aa71a022aa5 Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <rich@silverback.local>
+Date: Tue, 12 Aug 2008 03:41:19 -0400
+Subject: [PATCH] add a plugin fixture for testing the plugin routes functionality in the initializer. add the tests using that fixture
+
+---
+ .../fixtures/plugins/default/with_routes/init.rb   |    7 ++++
+ railties/test/initializer_test.rb                  |   35 +++++++++++++++++--
+ 2 files changed, 38 insertions(+), 4 deletions(-)
+ create mode 100644 railties/test/fixtures/plugins/default/with_routes/init.rb
+
+diff --git a/railties/test/fixtures/plugins/default/with_routes/init.rb b/railties/test/fixtures/plugins/default/with_routes/init.rb
+new file mode 100644
+index 0000000..a22b6bf
+--- /dev/null
++++ b/railties/test/fixtures/plugins/default/with_routes/init.rb
+@@ -0,0 +1,7 @@
++config.plugin_routes do |map|
++  map.connect '/one', :controller => 'one', :action => 'test'
++end
++
++config.draw_for :one_admin do |map|
++  map.connect '/one-admin', :controller => 'admin/one', :action => 'test'
++end
+\ No newline at end of file
+diff --git a/railties/test/initializer_test.rb b/railties/test/initializer_test.rb
+index 07303a5..a1c1c3e 100644
+--- a/railties/test/initializer_test.rb
++++ b/railties/test/initializer_test.rb
+@@ -192,7 +192,7 @@ uses_mocha "Initializer plugin loading tests" do
+     def test_all_plugins_are_loaded_when_registered_plugin_list_is_untouched
+       failure_tip = "It's likely someone has added a new plugin fixture without updating this list"
+       load_plugins!
+-      assert_plugins [:a, :acts_as_chunky_bacon, :gemlike, :plugin_with_no_lib_dir, :stubby], @initializer.loaded_plugins, failure_tip
++      assert_plugins [:a, :acts_as_chunky_bacon, :gemlike, :plugin_with_no_lib_dir, :stubby, :with_routes], @initializer.loaded_plugins, failure_tip
+     end
+ 
+     def test_all_plugins_loaded_when_all_is_used
+@@ -200,7 +200,7 @@ uses_mocha "Initializer plugin loading tests" do
+       only_load_the_following_plugins! plugin_names
+       load_plugins!
+       failure_tip = "It's likely someone has added a new plugin fixture without updating this list"
+-      assert_plugins [:stubby, :acts_as_chunky_bacon, :a, :gemlike, :plugin_with_no_lib_dir], @initializer.loaded_plugins, failure_tip
++      assert_plugins [:stubby, :acts_as_chunky_bacon, :a, :gemlike, :plugin_with_no_lib_dir, :with_routes], @initializer.loaded_plugins, failure_tip
+     end
+ 
+     def test_all_plugins_loaded_after_all
+@@ -208,7 +208,7 @@ uses_mocha "Initializer plugin loading tests" do
+       only_load_the_following_plugins! plugin_names
+       load_plugins!
+       failure_tip = "It's likely someone has added a new plugin fixture without updating this list"
+-      assert_plugins [:stubby, :a, :gemlike, :plugin_with_no_lib_dir, :acts_as_chunky_bacon], @initializer.loaded_plugins, failure_tip
++      assert_plugins [:stubby, :a, :gemlike, :plugin_with_no_lib_dir, :with_routes, :acts_as_chunky_bacon], @initializer.loaded_plugins, failure_tip
+     end
+ 
+     def test_plugin_names_may_be_strings
+@@ -242,5 +242,32 @@ uses_mocha "Initializer plugin loading tests" do
+         @initializer.load_plugins
+       end
+   end
+-
+ end
++
++uses_mocha "Initializer plugin routing tests" do
++  require File.dirname(__FILE__) + '/plugin_test_helper'
++
++  class InitializerPluginRoutesTests < Test::Unit::TestCase
++    def setup
++      @configuration     = Rails::Configuration.new
++      @configuration.plugin_paths << plugin_fixture_root_path
++      @initializer       = Rails::Initializer.new(@configuration)
++    end
++    
++    def test_ensure_plugin_routes_is_called_on_the_configuration
++      @configuration.expects(:plugin_routes).once
++      load_plugins!
++    end
++    
++    def test_ensure_draw_for_is_called_on_the_configuration_with_a_name
++      @configuration.expects(:draw_for).with(:one_admin).once
++      load_plugins!
++    end
++    
++    private
++      def load_plugins!
++        @initializer.add_plugin_load_paths
++        @initializer.load_plugins
++      end
++  end
++end
+\ No newline at end of file
+-- 
+1.5.4.5
+
+
+From fb77dc9fe5ae0185ddbedeb20fe0c1ba3149765e Mon Sep 17 00:00:00 2001
+From: Rich Cavanaugh <rich@silverback.local>
+Date: Tue, 12 Aug 2008 04:03:07 -0400
+Subject: [PATCH] added tests for the plugin routes functionality
+
+---
+ actionpack/test/controller/routing_test.rb |   58 ++++++++++++++++++++++++++++
+ 1 files changed, 58 insertions(+), 0 deletions(-)
+
+diff --git a/actionpack/test/controller/routing_test.rb b/actionpack/test/controller/routing_test.rb
+index 6cf134c..e75aeb5 100644
+--- a/actionpack/test/controller/routing_test.rb
++++ b/actionpack/test/controller/routing_test.rb
+@@ -2308,6 +2308,64 @@ uses_mocha 'LegacyRouteSet, Route, RouteSet and RouteLoading' do
+       end
+       assert_equal({:controller => 'pages', :action => 'show', :name => 'JAMIS'}, set.recognize_path('/page/JAMIS'))
+     end
++    
++    def test_can_draw_all_plugin_routes
++      draw_plugin_routes!
++      set.draw do |map|
++        map.plugin_routes :all
++      end
++      assert_equal({:controller => 'one', :action => 'index'}, set.recognize_path('/one'))
++      assert_equal({:controller => 'two', :action => 'index'}, set.recognize_path('/two'))
++      assert_equal({:controller => 'three', :action => 'index'}, set.recognize_path('/three'))
++    end
++    
++    def test_can_draw_all_plugin_routes_with_exceptions
++      draw_plugin_routes!
++      set.draw do |map|
++        map.plugin_routes :all, :except => [:two]
++      end
++      assert_equal({:controller => 'one', :action => 'index'}, set.recognize_path('/one'))
++      assert_equal({:controller => 'three', :action => 'index'}, set.recognize_path('/three'))
++      assert_raises ActionController::RoutingError do
++        set.recognize_path('/two')
++      end
++    end
++    
++    def test_can_draw_specified_plugin_routes
++      draw_plugin_routes!
++      set.draw do |map|
++        map.plugin_routes :three
++      end
++      
++      assert_equal({:controller => 'three', :action => 'index'}, set.recognize_path('/three'))
++      assert_raises(ActionController::RoutingError) {set.recognize_path('/two')}
++      assert_raises(ActionController::RoutingError) {set.recognize_path('/one')}
++    end
++    
++    def test_can_override_parts_of_plugin_routes
++      draw_plugin_routes!
++      set.draw do |map|
++        map.connect '/three', :controller => 'new', :action => 'show'
++        map.plugin_routes :three
++      end
++      
++      assert_equal({:controller => 'new', :action => 'show'}, set.recognize_path('/three'))
++      assert_equal({:controller => 'admin/three', :action => 'index'}, set.recognize_path('/three-admin'))
++    end
++    
++    private
++      def draw_plugin_routes!
++        set.draw_for_plugin(:one) do |map|
++          map.connect '/one', :controller => 'one', :action => 'index'
++        end
++        set.draw_for_plugin(:two) do |map|
++          map.connect '/two', :controller => 'two', :action => 'index'
++        end
++        set.draw_for_plugin(:three) do |map|
++          map.connect '/three', :controller => 'three', :action => 'index'
++          map.connect '/three-admin', :controller => 'admin/three', :action => 'index'
++        end
++      end
+   end
+ 
+   class RouteLoadingTest < Test::Unit::TestCase
+-- 
+1.5.4.5
+

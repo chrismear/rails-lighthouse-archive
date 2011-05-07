@@ -1,0 +1,229 @@
+From e35a026430fb9e2886422ea2645c5d27964a1588 Mon Sep 17 00:00:00 2001
+From: Rob Anderton <rob.anderton@thewebfellas.com>
+Date: Wed, 27 Oct 2010 23:01:07 +0100
+Subject: [PATCH 1/3] Fix annoying parentheses warning in trace template
+
+---
+ .../action_controller/templates/rescues/_trace.erb |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/templates/rescues/_trace.erb b/actionpack/lib/action_controller/templates/rescues/_trace.erb
+index f8f6b42..9103d10 100644
+--- a/actionpack/lib/action_controller/templates/rescues/_trace.erb
++++ b/actionpack/lib/action_controller/templates/rescues/_trace.erb
+@@ -20,7 +20,7 @@
+ 
+   <% traces.each do |name, trace| %>
+     <div id="<%= name.gsub /\s/, '-' %>" style="display: <%= name == "Application Trace" ? 'block' : 'none' %>;">
+-      <pre><code><%=h trace.join "\n" %></code></pre>
++      <pre><code><%=h trace.join("\n") %></code></pre>
+     </div>
+   <% end %>
+ </div>
+-- 
+1.6.4.4
+
+
+From edf346e6c5ddb4edffa36ba621ee95a08d562c60 Mon Sep 17 00:00:00 2001
+From: Rob Anderton <rob.anderton@thewebfellas.com>
+Date: Wed, 27 Oct 2010 23:18:51 +0100
+Subject: [PATCH 2/3] Patch Rack 1.1.0 parameter parsing to correctly handle quotes
+
+---
+ actionpack/lib/action_controller/integration.rb    |    1 +
+ .../lib/action_controller/rack_utils_patch.rb      |   68 ++++++++++++++++++++
+ .../request/query_string_parsing_test.rb           |   21 ++++++
+ 3 files changed, 90 insertions(+), 0 deletions(-)
+ create mode 100644 actionpack/lib/action_controller/rack_utils_patch.rb
+
+diff --git a/actionpack/lib/action_controller/integration.rb b/actionpack/lib/action_controller/integration.rb
+index d9de6b8..4919a6d 100644
+--- a/actionpack/lib/action_controller/integration.rb
++++ b/actionpack/lib/action_controller/integration.rb
+@@ -2,6 +2,7 @@ require 'stringio'
+ require 'uri'
+ require 'active_support/test_case'
+ require 'action_controller/rack_lint_patch'
++require 'action_controller/rack_utils_patch'
+ 
+ module ActionController
+   module Integration #:nodoc:
+diff --git a/actionpack/lib/action_controller/rack_utils_patch.rb b/actionpack/lib/action_controller/rack_utils_patch.rb
+new file mode 100644
+index 0000000..05780bb
+--- /dev/null
++++ b/actionpack/lib/action_controller/rack_utils_patch.rb
+@@ -0,0 +1,68 @@
++# Rack 1.1.0 does not parse params containing quotes properly
++# This has been fixed in Rack >= 1.2 however that introduces a whole
++# new selection of problems such as broken multipart parsing and
++# Ruby 1.8.6 incompatibility, so for now it is safer to stick with
++# Rack 1.1.0 and patch the params parser
++# TODO : Remove this monkey patch when moving to Rack >= 1.3
++
++module RackUtilsPatch
++  module FixParamsParsing
++    def self.included(base)
++      base.send(:alias_method, :parse_query, :parse_query_with_hack)
++      base.send(:alias_method, :normalize_params, :normalize_params_with_hack)
++      base.send(:module_function, :parse_query, :normalize_params)
++    end
++
++    def parse_query_with_hack(qs, d = nil)
++      params = {}
++
++      (qs || '').split(d ? /[#{d}] */n : Rack::Utils::DEFAULT_SEP).each do |p|
++        k, v = p.split('=', 2).map { |x| unescape(x) }
++        if cur = params[k]
++          if cur.class == Array
++            params[k] << v
++          else
++            params[k] = [cur, v]
++          end
++        else
++          params[k] = v
++        end
++      end
++
++      return params
++    end
++
++    def normalize_params_with_hack(params, name, v = nil)
++      name =~ %r(\A[\[\]]*([^\[\]]+)\]*)
++      k = $1 || ''
++      after = $' || ''
++
++      return if k.empty?
++
++      if after == ""
++        params[k] = v
++      elsif after == "[]"
++        params[k] ||= []
++        raise TypeError, "expected Array (got #{params[k].class.name}) for param `#{k}'" unless params[k].is_a?(Array)
++        params[k] << v
++      elsif after =~ %r(^\[\]\[([^\[\]]+)\]$) || after =~ %r(^\[\](.+)$)
++        child_key = $1
++        params[k] ||= []
++        raise TypeError, "expected Array (got #{params[k].class.name}) for param `#{k}'" unless params[k].is_a?(Array)
++        if params[k].last.is_a?(Hash) && !params[k].last.key?(child_key)
++          normalize_params(params[k].last, child_key, v)
++        else
++          params[k] << normalize_params({}, child_key, v)
++        end
++      else
++        params[k] ||= {}
++        raise TypeError, "expected Hash (got #{params[k].class.name}) for param `#{k}'" unless params[k].is_a?(Hash)
++        params[k] = normalize_params(params[k], after, v)
++      end
++
++      return params
++    end
++  end
++
++  Rack::Utils.send(:include, FixParamsParsing) if Rack.release == "1.1"
++end
+\ No newline at end of file
+diff --git a/actionpack/test/controller/request/query_string_parsing_test.rb b/actionpack/test/controller/request/query_string_parsing_test.rb
+index a31e326..6284be3 100644
+--- a/actionpack/test/controller/request/query_string_parsing_test.rb
++++ b/actionpack/test/controller/request/query_string_parsing_test.rb
+@@ -105,6 +105,27 @@ class QueryStringParsingTest < ActionController::IntegrationTest
+     )
+   end
+ 
++  test "query string with single quotes" do
++    assert_parses(
++      { "search" => "'keyword'" },
++      "search='keyword'"
++    )
++  end
++
++  test "query string with double quotes" do
++    assert_parses(
++      { "search" => "\"keyword\"" },
++      "search=\"keyword\""
++    )
++  end
++
++  test "query string with many quotes" do
++    assert_parses(
++      { "quote" => "\"And stop saying 'okay' all the time. Okay?\"\n\"Okay.\"\n\"Good.\"" },
++      "quote=\"And%20stop%20saying%20'okay'%20all%20the%20time.%20Okay?\"\n\"Okay.\"\n\"Good.\""
++    )
++  end
++
+   private
+     def assert_parses(expected, actual)
+       with_routing do |set|
+-- 
+1.6.4.4
+
+
+From 8109610127c8dedb2eeecd9f249fbd27c4b54b5a Mon Sep 17 00:00:00 2001
+From: Rob Anderton <rob.anderton@thewebfellas.com>
+Date: Wed, 27 Oct 2010 23:22:01 +0100
+Subject: [PATCH 3/3] Remove Rack::Lint patch as it is no longer needed
+
+---
+ actionpack/lib/action_controller/integration.rb    |    1 -
+ .../lib/action_controller/rack_lint_patch.rb       |   36 --------------------
+ 2 files changed, 0 insertions(+), 37 deletions(-)
+ delete mode 100644 actionpack/lib/action_controller/rack_lint_patch.rb
+
+diff --git a/actionpack/lib/action_controller/integration.rb b/actionpack/lib/action_controller/integration.rb
+index 4919a6d..fe13c80 100644
+--- a/actionpack/lib/action_controller/integration.rb
++++ b/actionpack/lib/action_controller/integration.rb
+@@ -1,7 +1,6 @@
+ require 'stringio'
+ require 'uri'
+ require 'active_support/test_case'
+-require 'action_controller/rack_lint_patch'
+ require 'action_controller/rack_utils_patch'
+ 
+ module ActionController
+diff --git a/actionpack/lib/action_controller/rack_lint_patch.rb b/actionpack/lib/action_controller/rack_lint_patch.rb
+deleted file mode 100644
+index da9f168..0000000
+--- a/actionpack/lib/action_controller/rack_lint_patch.rb
++++ /dev/null
+@@ -1,36 +0,0 @@
+-# Rack 1.0 does not allow string subclass body. This does not play well with our ActiveSupport::SafeBuffer.
+-# The next release of Rack will be allowing string subclass body - http://github.com/rack/rack/commit/de668df02802a0335376a81ba709270e43ba9d55
+-# TODO : Remove this monkey patch after the next release of Rack
+-
+-module RackLintPatch
+-  module AllowStringSubclass
+-    def self.included(base)
+-      base.send :alias_method, :each, :each_with_hack
+-    end
+-
+-    def each_with_hack
+-      @closed = false
+-
+-      @body.each { |part|
+-        assert("Body yielded non-string value #{part.inspect}") {
+-          part.kind_of?(String)
+-        }
+-        yield part
+-      }
+-
+-      if @body.respond_to?(:to_path)
+-        assert("The file identified by body.to_path does not exist") {
+-          ::File.exist? @body.to_path
+-        }
+-      end
+-    end
+-  end
+-
+-  begin
+-    app = proc {|env| [200, {"Content-Type" => "text/plain", "Content-Length" => "12"}, [Class.new(String).new("Hello World!")]] }
+-    response = Rack::MockRequest.new(Rack::Lint.new(app)).get('/')
+-  rescue Rack::Lint::LintError => e
+-    raise(e) unless e.message =~ /Body yielded non-string value/
+-    Rack::Lint.send :include, AllowStringSubclass
+-  end
+-end
+-- 
+1.6.4.4
+

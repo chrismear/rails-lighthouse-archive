@@ -1,0 +1,98 @@
+From 443c1db71060b0bf8ab543bff4129c433abac06c Mon Sep 17 00:00:00 2001
+From: Brian Durand <brian@embellishedvisions.com>
+Date: Fri, 18 Jun 2010 16:59:33 -0500
+Subject: [PATCH] Fix bug with rolling back frozen attributes.
+
+---
+ .../abstract/database_statements.rb                |    4 ++--
+ activerecord/lib/active_record/transactions.rb     |    1 +
+ .../test/cases/autosave_association_test.rb        |    1 -
+ .../test/cases/transaction_callbacks_test.rb       |   16 ++++++++++++----
+ 4 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+index b9fb452..25432e9 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+@@ -304,7 +304,7 @@ module ActiveRecord
+               begin
+                 record.rolledback!(rollback)
+               rescue Exception => e
+-                record.logger.error(e) if record.respond_to?(:logger)
++                record.logger.error(e) if record.respond_to?(:logger) && record.logger
+               end
+             end
+           end
+@@ -319,7 +319,7 @@ module ActiveRecord
+               begin
+                 record.committed!
+               rescue Exception => e
+-                record.logger.error(e) if record.respond_to?(:logger)
++                record.logger.error(e) if record.respond_to?(:logger) && record.logger
+               end
+             end
+           end
+diff --git a/activerecord/lib/active_record/transactions.rb b/activerecord/lib/active_record/transactions.rb
+index 620758f..775d9f0 100644
+--- a/activerecord/lib/active_record/transactions.rb
++++ b/activerecord/lib/active_record/transactions.rb
+@@ -320,6 +320,7 @@ module ActiveRecord
+         if @_start_transaction_state[:level] < 1
+           restore_state = remove_instance_variable(:@_start_transaction_state)
+           if restore_state
++            @attributes = @attributes.dup if @attributes.frozen?
+             @new_record = restore_state[:new_record]
+             @destroyed = restore_state[:destroyed]
+             if restore_state[:id]
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 4e4f9c3..3b89c12 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -712,7 +712,6 @@ class TestDestroyAsPartOfAutosaveAssociation < ActiveRecord::TestCase
+       end
+ 
+       assert_raise(RuntimeError) { assert !@pirate.save }
+-      assert before.first.frozen? # the first child was indeed destroyed
+       assert_equal before, @pirate.reload.send(association_name)
+     end
+ 
+diff --git a/activerecord/test/cases/transaction_callbacks_test.rb b/activerecord/test/cases/transaction_callbacks_test.rb
+index ebc1665..4af65df 100644
+--- a/activerecord/test/cases/transaction_callbacks_test.rb
++++ b/activerecord/test/cases/transaction_callbacks_test.rb
+@@ -221,20 +221,28 @@ class TransactionCallbacksTest < ActiveRecord::TestCase
+     assert_equal 2, @first.rollbacks
+   end
+ 
+-  def test_after_transaction_callbacks_should_not_raise_errors
++  def test_after_transaction_callbacks_should_prevent_callbacks_from_being_called
+     def @first.last_after_transaction_error=(e); @last_transaction_error = e; end
+     def @first.last_after_transaction_error; @last_transaction_error; end
+     @first.after_commit_block{|r| r.last_after_transaction_error = :commit; raise "fail!";}
+     @first.after_rollback_block{|r| r.last_after_transaction_error = :rollback; raise "fail!";}
+-
+-    @first.save!
++    @second.after_commit_block{|r| r.history << :after_commit}
++    @second.after_rollback_block{|r| r.history << :after_rollback}
++    
++    Topic.transaction do
++      @first.save!
++      @second.save!
++    end
+     assert_equal :commit, @first.last_after_transaction_error
++    assert_equal [:after_commit], @second.history
+ 
++    @second.history.clear
+     Topic.transaction do
+       @first.save!
++      @second.save!
+       raise ActiveRecord::Rollback
+     end
+-
+     assert_equal :rollback, @first.last_after_transaction_error
++    assert_equal [:after_rollback], @second.history
+   end
+ end
+-- 
+1.6.4.1
+

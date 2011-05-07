@@ -1,0 +1,750 @@
+From cc8feef90d94d5ca840c62be604b6ae5789f16ae Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Thu, 10 Jun 2010 18:31:28 +0100
+Subject: [PATCH] Add shallow routing option to new router
+
+---
+ actionpack/lib/action_dispatch/routing/mapper.rb |  404 +++++++++++++---------
+ actionpack/test/dispatch/routing_test.rb         |  125 +++++++
+ 2 files changed, 373 insertions(+), 156 deletions(-)
+
+diff --git a/actionpack/lib/action_dispatch/routing/mapper.rb b/actionpack/lib/action_dispatch/routing/mapper.rb
+index 7b79b6b..46304b0 100644
+--- a/actionpack/lib/action_dispatch/routing/mapper.rb
++++ b/actionpack/lib/action_dispatch/routing/mapper.rb
+@@ -33,7 +33,7 @@ module ActionDispatch
+       end
+ 
+       class Mapping #:nodoc:
+-        IGNORE_OPTIONS = [:to, :as, :controller, :action, :via, :on, :constraints, :defaults, :only, :except, :anchor]
++        IGNORE_OPTIONS = [:to, :as, :controller, :action, :via, :on, :constraints, :defaults, :only, :except, :anchor, :shallow]
+ 
+         def initialize(set, scope, args)
+           @set, @scope    = set, scope
+@@ -409,11 +409,13 @@ module ActionDispatch
+           def merge_options_scope(parent, child)
+             (parent || {}).merge(child)
+           end
++
++          def merge_shallow_scope(parent, child)
++            child ? true : false
++          end
+       end
+ 
+       module Resources
+-        CRUD_ACTIONS = [:index, :show, :create, :update, :destroy] #:nodoc:
+-
+         class Resource #:nodoc:
+           def self.default_actions
+             [:index, :create, :new, :show, :update, :destroy, :edit]
+@@ -442,15 +444,6 @@ module ActionDispatch
+             end
+           end
+ 
+-          def action_type(action)
+-            case action
+-            when :index, :create
+-              :collection
+-            when :show, :update, :destroy
+-              :member
+-            end
+-          end
+-
+           def name
+             options[:as] || @name
+           end
+@@ -463,34 +456,19 @@ module ActionDispatch
+             name.to_s.singularize
+           end
+ 
+-          def member_prefix
+-            ':id'
+-          end
+-
+           def member_name
+             singular
+           end
+ 
++          alias_method :nested_name, :member_name
++
+           # Checks for uncountable plurals, and appends "_index" if they're.
+           def collection_name
+-            uncountable? ? "#{plural}_index" : plural
+-          end
+-
+-          def uncountable?
+-            singular == plural
+-          end
+-
+-          def name_for_action(action)
+-            case action_type(action)
+-            when :collection
+-              collection_name
+-            when :member
+-              member_name
+-            end
++            singular == plural ? "#{plural}_index" : plural
+           end
+ 
+-          def id_segment
+-            ":#{singular}_id"
++          def shallow?
++            options[:shallow] ? true : false
+           end
+ 
+           def constraints
+@@ -506,21 +484,43 @@ module ActionDispatch
+           end
+ 
+           def collection_options
+-            (options || {}).dup.tap do |options|
+-              options.delete(:id)
+-              options[:constraints] = options[:constraints].dup if options[:constraints]
+-              options[:constraints].delete(:id) if options[:constraints].is_a?(Hash)
++            (options || {}).dup.tap do |opts|
++              opts.delete(:id)
++              opts[:constraints] = options[:constraints].dup if options[:constraints]
++              opts[:constraints].delete(:id) if options[:constraints].is_a?(Hash)
+             end
+           end
+ 
+-          def nested_prefix
+-            id_segment
++          def nested_path
++            "#{path}/:#{singular}_id"
+           end
+ 
+           def nested_options
+-            options = { :name_prefix => member_name }
+-            options["#{singular}_id".to_sym] = id_constraint if id_constraint?
+-            options
++            {}.tap do |opts|
++              opts[:name_prefix] = member_name
++              opts["#{singular}_id".to_sym] = id_constraint if id_constraint?
++              opts[:options] = { :shallow => shallow? } unless options[:shallow].nil?
++            end
++          end
++
++          def resource_scope
++            [{ :controller => controller }]
++          end
++
++          def collection_scope
++            [path, collection_options]
++          end
++
++          def member_scope
++            ["#{path}/:id", options]
++          end
++
++          def new_scope
++            [path]
++          end
++
++          def nested_scope
++            [nested_path, nested_options]
+           end
+         end
+ 
+@@ -533,27 +533,27 @@ module ActionDispatch
+             super
+           end
+ 
+-          def action_type(action)
+-            case action
+-            when :show, :create, :update, :destroy
+-              :member
+-            end
++          def member_name
++            name
+           end
+ 
+-          def member_prefix
+-            ''
++          def nested_path
++            path
+           end
+ 
+-          def member_name
+-            name
++          def nested_options
++            {}.tap do |opts|
++              opts[:name_prefix] = member_name
++              opts[:options] = { :shallow => shallow? } unless @options[:shallow].nil?
++            end
+           end
+ 
+-          def nested_prefix
+-            ''
++          def shallow?
++            false
+           end
+ 
+-          def nested_options
+-            { :name_prefix => member_name }
++          def member_scope
++            [path, options]
+           end
+         end
+ 
+@@ -565,28 +565,25 @@ module ActionDispatch
+         def resource(*resources, &block)
+           options = resources.extract_options!
+           options = (@scope[:options] || {}).merge(options)
++          options[:shallow] = true if @scope[:shallow] && !options.has_key?(:shallow)
+ 
+           if apply_common_behavior_for(:resource, resources, options, &block)
+             return self
+           end
+ 
+-          resource = SingletonResource.new(resources.pop, options)
+-
+-          scope(:path => resource.path, :controller => resource.controller) do
+-            with_scope_level(:resource, resource) do
++          resource_scope(SingletonResource.new(resources.pop, options)) do
++            yield if block_given?
+ 
+-              yield if block_given?
++            collection_scope do
++              post :create if parent_resource.actions.include?(:create)
++              get  :new if parent_resource.actions.include?(:new)
++            end
+ 
+-              with_scope_level(:member) do
+-                scope(resource.options) do
+-                  get    :show if resource.actions.include?(:show)
+-                  post   :create if resource.actions.include?(:create)
+-                  put    :update if resource.actions.include?(:update)
+-                  delete :destroy if resource.actions.include?(:destroy)
+-                  get    :new, :as => resource.name if resource.actions.include?(:new)
+-                  get    :edit, :as => resource.name if resource.actions.include?(:edit)
+-                end
+-              end
++            member_scope  do
++              get    :show if parent_resource.actions.include?(:show)
++              put    :update if parent_resource.actions.include?(:update)
++              delete :destroy if parent_resource.actions.include?(:destroy)
++              get    :edit if parent_resource.actions.include?(:edit)
+             end
+           end
+ 
+@@ -596,35 +593,26 @@ module ActionDispatch
+         def resources(*resources, &block)
+           options = resources.extract_options!
+           options = (@scope[:options] || {}).merge(options)
++          options[:shallow] = true if @scope[:shallow] && !options.has_key?(:shallow)
+ 
+           if apply_common_behavior_for(:resources, resources, options, &block)
+             return self
+           end
+ 
+-          resource = Resource.new(resources.pop, options)
+-
+-          scope(:path => resource.path, :controller => resource.controller) do
+-            with_scope_level(:resources, resource) do
+-              yield if block_given?
++          resource_scope(Resource.new(resources.pop, options)) do
++            yield if block_given?
+ 
+-              with_scope_level(:collection) do
+-                scope(resource.collection_options) do
+-                  get  :index if resource.actions.include?(:index)
+-                  post :create if resource.actions.include?(:create)
+-                  get  :new, :as => resource.singular if resource.actions.include?(:new)
+-                end
+-              end
++            collection_scope do
++              get  :index if parent_resource.actions.include?(:index)
++              post :create if parent_resource.actions.include?(:create)
++              get  :new if parent_resource.actions.include?(:new)
++            end
+ 
+-              with_scope_level(:member) do
+-                scope(':id') do
+-                  scope(resource.options) do
+-                    get    :show if resource.actions.include?(:show)
+-                    put    :update if resource.actions.include?(:update)
+-                    delete :destroy if resource.actions.include?(:destroy)
+-                    get    :edit, :as => resource.singular if resource.actions.include?(:edit)
+-                  end
+-                end
+-              end
++            member_scope  do
++              get    :show if parent_resource.actions.include?(:show)
++              put    :update if parent_resource.actions.include?(:update)
++              delete :destroy if parent_resource.actions.include?(:destroy)
++              get    :edit if parent_resource.actions.include?(:edit)
+             end
+           end
+ 
+@@ -636,10 +624,8 @@ module ActionDispatch
+             raise ArgumentError, "can't use collection outside resources scope"
+           end
+ 
+-          with_scope_level(:collection) do
+-            scope(:name_prefix => parent_resource.collection_name, :as => "") do
+-              yield
+-            end
++          collection_scope do
++            yield
+           end
+         end
+ 
+@@ -648,10 +634,8 @@ module ActionDispatch
+             raise ArgumentError, "can't use member outside resource(s) scope"
+           end
+ 
+-          with_scope_level(:member) do
+-            scope(parent_resource.member_prefix, :name_prefix => parent_resource.member_name, :as => "") do
+-              yield
+-            end
++          member_scope do
++            yield
+           end
+         end
+ 
+@@ -659,9 +643,9 @@ module ActionDispatch
+           unless resource_scope?
+             raise ArgumentError, "can't use new outside resource(s) scope"
+           end
+-          
++
+           with_scope_level(:new) do
+-            scope(new_scope_prefix, :name_prefix => parent_resource.member_name, :as => "") do
++            scope(*parent_resource.new_scope) do
+               yield
+             end
+           end
+@@ -673,8 +657,18 @@ module ActionDispatch
+           end
+ 
+           with_scope_level(:nested) do
+-            scope(parent_resource.nested_prefix, parent_resource.nested_options) do
+-              yield
++            if parent_resource.shallow?
++              with_exclusive_scope do
++                if @scope[:module].blank?
++                  scope(*parent_resource.nested_scope) { yield }
++                else
++                  scope(@scope[:module], :name_prefix => @scope[:module].tr('/', '_')) do
++                    scope(*parent_resource.nested_scope) { yield }
++                  end
++                end
++              end
++            else
++              scope(*parent_resource.nested_scope) { yield }
+             end
+           end
+         end
+@@ -687,63 +681,69 @@ module ActionDispatch
+           end
+         end
+ 
++        def shallow
++          scope(:shallow => true) do
++            yield
++          end
++        end
++
+         def match(*args)
+           options = args.extract_options!
+ 
+           options[:anchor] = true unless options.key?(:anchor)
+ 
+           if args.length > 1
+-            args.each { |path| match(path, options) }
++            args.each { |path| match(path, options.dup) }
+             return self
+           end
+ 
+-          path_names = options.delete(:path_names)
++          if [:collection, :member, :new].include?(options[:on])
++            args.push(options)
+ 
+-          if args.first.is_a?(Symbol)
+-            action = args.first
+-            if CRUD_ACTIONS.include?(action)
+-              begin
+-                old_path = @scope[:path]
+-                @scope[:path] = "#{@scope[:path]}(.:format)"
+-                return match(options.reverse_merge(
+-                  :to => action,
+-                  :as => parent_resource.name_for_action(action)
+-                ))
+-              ensure
+-                @scope[:path] = old_path
+-              end
+-            else
+-              with_exclusive_name_prefix(action_name_prefix(action, options)) do
+-                return match("#{action_path(action, path_names)}(.:format)", options.reverse_merge(:to => action))
+-              end
++            case options.delete(:on)
++            when :collection
++              return collection { match(*args) }
++            when :member
++              return member { match(*args) }
++            when :new
++              return new { match(*args) }
+             end
+           end
+ 
+-          args.push(options)
+-
+-          case options.delete(:on)
+-          when :collection
+-            return collection { match(*args) }
+-          when :member
++          if @scope[:scope_level] == :resource
++            args.push(options)
+             return member { match(*args) }
+-          when :new
+-            return new { match(*args) }
+           end
+ 
+-          if @scope[:scope_level] == :resource
+-            return member { match(*args) }
++          path_names = options.delete(:path_names)
++
++          if args.first.is_a?(Symbol)
++            path = path_for_action(args.first, path_names)
++            options = options_for_action(args.first, options)
++
++            with_exclusive_scope do
++              return match(path, options)
++            end
+           end
+ 
+           if resource_scope?
+             raise ArgumentError, "can't define route directly in resource(s) scope"
+           end
+ 
++          args.push(options)
+           super
+         end
+ 
+         def root(options={})
+-          options[:on] ||= :collection if @scope[:scope_level] == :resources
+-          super(options)
++          if @scope[:scope_level] == :resources
++            with_scope_level(:collection) do
++              scope(parent_resource.path, :name_prefix => parent_resource.collection_name) do
++                super(options)
++              end
++            end
++          else
++            super(options)
++          end
+         end
+ 
+         protected
+@@ -752,15 +752,6 @@ module ActionDispatch
+           end
+ 
+         private
+-          def action_path(name, path_names = nil)
+-            path_names ||= @scope[:path_names]
+-            path_names[name.to_sym] || name.to_s
+-          end
+-
+-          def action_name_prefix(action, options = {})
+-            (options[:on] == :new || @scope[:scope_level] == :new) ? "#{action}_new" : action
+-          end
+-
+           def apply_common_behavior_for(method, resources, options, &block)
+             if resources.length > 1
+               resources.each { |r| send(method, r, options, &block) }
+@@ -784,27 +775,18 @@ module ActionDispatch
+             false
+           end
+ 
+-          def new_scope_prefix
+-            @scope[:path_names][:new] || 'new'
+-          end
+-
+           def resource_scope?
+             [:resource, :resources].include?(@scope[:scope_level])
+           end
+ 
+-          def with_exclusive_name_prefix(prefix)
++          def with_exclusive_scope
+             begin
+-              old_name_prefix = @scope[:name_prefix]
+-
+-              if !old_name_prefix.blank?
+-                @scope[:name_prefix] = "#{prefix}_#{@scope[:name_prefix]}"
+-              else
+-                @scope[:name_prefix] = prefix.to_s
+-              end
++              old_name_prefix, old_path = @scope[:name_prefix], @scope[:path]
++              @scope[:name_prefix], @scope[:path] = nil, nil
+ 
+               yield
+             ensure
+-              @scope[:name_prefix] = old_name_prefix
++              @scope[:name_prefix], @scope[:path] = old_name_prefix, old_path
+             end
+           end
+ 
+@@ -816,6 +798,116 @@ module ActionDispatch
+             @scope[:scope_level] = old
+             @scope[:scope_level_resource] = old_resource
+           end
++
++          def resource_scope(resource)
++            with_scope_level(resource.is_a?(SingletonResource) ? :resource : :resources, resource) do
++              scope(*parent_resource.resource_scope) do
++                yield
++              end
++            end
++          end
++
++          def collection_scope
++            with_scope_level(:collection) do
++              scope(*parent_resource.collection_scope) do
++                yield
++              end
++            end
++          end
++
++          def member_scope
++            with_scope_level(:member) do
++              scope(*parent_resource.member_scope) do
++                yield
++              end
++            end
++          end
++
++          def path_for_action(action, path_names)
++            case action
++            when :index, :create
++              "#{@scope[:path]}(.:format)"
++            when :show, :update, :destroy
++              if parent_resource.shallow?
++                "#{@scope[:module]}/#{parent_resource.path}/:id(.:format)"
++              else
++                "#{@scope[:path]}(.:format)"
++              end
++            when :new
++              "#{@scope[:path]}/#{action_path(:new)}(.:format)"
++            when :edit
++              if parent_resource.shallow?
++                "#{@scope[:module]}/#{parent_resource.path}/:id/#{action_path(:edit)}(.:format)"
++              else
++                "#{@scope[:path]}/#{action_path(:edit)}(.:format)"
++              end
++            else
++              case @scope[:scope_level]
++              when :collection
++                "#{@scope[:path]}/#{action_path(action)}(.:format)"
++              when :new
++                "#{@scope[:path]}/#{action_path(:new)}/#{action_path(action)}(.:format)"
++              else
++                if parent_resource.shallow?
++                  "#{@scope[:module]}/#{parent_resource.path}/:id/#{action_path(action)}(.:format)"
++                else
++                  "#{@scope[:path]}/#{action_path(action)}(.:format)"
++                end
++              end
++            end
++          end
++
++          def action_path(name, path_names = nil)
++            path_names ||= @scope[:path_names]
++            path_names[name.to_sym] || name.to_s
++          end
++
++          def options_for_action(action, options)
++            options.reverse_merge(
++              :to => action,
++              :as => name_for_action(action)
++            )
++          end
++
++          def name_for_action(action)
++            name_prefix = @scope[:name_prefix].blank? ? "" : "#{@scope[:name_prefix]}_"
++            shallow_prefix = @scope[:module].blank? ? "" : "#{@scope[:module].tr('/', '_')}_"
++
++            case action
++            when :index
++              "#{name_prefix}#{parent_resource.collection_name}"
++            when :show
++              if parent_resource.shallow?
++                "#{shallow_prefix}#{parent_resource.member_name}"
++              else
++                "#{name_prefix}#{parent_resource.member_name}"
++              end
++            when :edit
++              if parent_resource.shallow?
++                "edit_#{shallow_prefix}#{parent_resource.member_name}"
++              else
++                "edit_#{name_prefix}#{parent_resource.member_name}"
++              end
++            when :new
++              "new_#{name_prefix}#{parent_resource.member_name}"
++            when :update, :create, :destroy
++              nil
++            else
++              case @scope[:scope_level]
++              when :collection
++                "#{action}_#{name_prefix}#{parent_resource.collection_name}"
++              when :new
++                "#{action}_new_#{name_prefix}#{parent_resource.member_name}"
++              else
++                if parent_resource.shallow?
++                  "#{action}_#{shallow_prefix}#{parent_resource.member_name}"
++                else
++                  "#{action}_#{name_prefix}#{parent_resource.member_name}"
++                end
++              end
++            end
++          end
++
+       end
+ 
+       include Base
+diff --git a/actionpack/test/dispatch/routing_test.rb b/actionpack/test/dispatch/routing_test.rb
+index e13960e..e294703 100644
+--- a/actionpack/test/dispatch/routing_test.rb
++++ b/actionpack/test/dispatch/routing_test.rb
+@@ -142,6 +142,26 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+         resources :comments, :except => :destroy
+       end
+ 
++      shallow do
++        namespace :api do
++          resources :teams do
++            resources :players
++            resource :captain
++          end
++        end
++      end
++
++      resources :threads, :shallow => true do
++        resource :owner
++        resources :messages do
++          resources :comments do
++            member do
++              post :preview
++            end
++          end
++        end
++      end
++
+       resources :sheep
+ 
+       resources :clients do
+@@ -1132,6 +1152,111 @@ class TestRoutingMapper < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  def test_shallow_nested_resources
++    with_test_routes do
++
++      get '/api/teams'
++      assert_equal 'api/teams#index', @response.body
++      assert_equal '/api/teams', api_teams_path
++
++      get '/api/teams/new'
++      assert_equal 'api/teams#new', @response.body
++      assert_equal '/api/teams/new', new_api_team_path
++
++      get '/api/teams/1'
++      assert_equal 'api/teams#show', @response.body
++      assert_equal '/api/teams/1', api_team_path(:id => '1')
++
++      get '/api/teams/1/edit'
++      assert_equal 'api/teams#edit', @response.body
++      assert_equal '/api/teams/1/edit', edit_api_team_path(:id => '1')
++
++      get '/api/teams/1/players'
++      assert_equal 'api/players#index', @response.body
++      assert_equal '/api/teams/1/players', api_team_players_path(:team_id => '1')
++
++      get '/api/teams/1/players/new'
++      assert_equal 'api/players#new', @response.body
++      assert_equal '/api/teams/1/players/new', new_api_team_player_path(:team_id => '1')
++
++      get '/api/players/2'
++      assert_equal 'api/players#show', @response.body
++      assert_equal '/api/players/2', api_player_path(:id => '2')
++
++      get '/api/players/2/edit'
++      assert_equal 'api/players#edit', @response.body
++      assert_equal '/api/players/2/edit', edit_api_player_path(:id => '2')
++
++      get '/api/teams/1/captain'
++      assert_equal 'api/captains#show', @response.body
++      assert_equal '/api/teams/1/captain', api_team_captain_path(:team_id => '1')
++
++      get '/api/teams/1/captain/new'
++      assert_equal 'api/captains#new', @response.body
++      assert_equal '/api/teams/1/captain/new', new_api_team_captain_path(:team_id => '1')
++
++      get '/api/teams/1/captain/edit'
++      assert_equal 'api/captains#edit', @response.body
++      assert_equal '/api/teams/1/captain/edit', edit_api_team_captain_path(:team_id => '1')
++
++      get '/threads'
++      assert_equal 'threads#index', @response.body
++      assert_equal '/threads', threads_path
++
++      get '/threads/new'
++      assert_equal 'threads#new', @response.body
++      assert_equal '/threads/new', new_thread_path
++
++      get '/threads/1'
++      assert_equal 'threads#show', @response.body
++      assert_equal '/threads/1', thread_path(:id => '1')
++
++      get '/threads/1/edit'
++      assert_equal 'threads#edit', @response.body
++      assert_equal '/threads/1/edit', edit_thread_path(:id => '1')
++
++      get '/threads/1/owner'
++      assert_equal 'owners#show', @response.body
++      assert_equal '/threads/1/owner', thread_owner_path(:thread_id => '1')
++
++      get '/threads/1/messages'
++      assert_equal 'messages#index', @response.body
++      assert_equal '/threads/1/messages', thread_messages_path(:thread_id => '1')
++
++      get '/threads/1/messages/new'
++      assert_equal 'messages#new', @response.body
++      assert_equal '/threads/1/messages/new', new_thread_message_path(:thread_id => '1')
++
++      get '/messages/2'
++      assert_equal 'messages#show', @response.body
++      assert_equal '/messages/2', message_path(:id => '2')
++
++      get '/messages/2/edit'
++      assert_equal 'messages#edit', @response.body
++      assert_equal '/messages/2/edit', edit_message_path(:id => '2')
++
++      get '/messages/2/comments'
++      assert_equal 'comments#index', @response.body
++      assert_equal '/messages/2/comments', message_comments_path(:message_id => '2')
++
++      get '/messages/2/comments/new'
++      assert_equal 'comments#new', @response.body
++      assert_equal '/messages/2/comments/new', new_message_comment_path(:message_id => '2')
++
++      get '/comments/3'
++      assert_equal 'comments#show', @response.body
++      assert_equal '/comments/3', comment_path(:id => '3')
++
++      get '/comments/3/edit'
++      assert_equal 'comments#edit', @response.body
++      assert_equal '/comments/3/edit', edit_comment_path(:id => '3')
++
++      post '/comments/3/preview'
++      assert_equal 'comments#preview', @response.body
++      assert_equal '/comments/3/preview', preview_comment_path(:id => '3')
++    end
++  end
++
+   private
+     def with_test_routes
+       yield
+-- 
+1.7.1
+

@@ -1,0 +1,144 @@
+From 1efc6dbba6f368d2bb0d52bf1e29ca69c3d58ffc Mon Sep 17 00:00:00 2001
+From: Adam Milligan <adam@theophrastus.local>
+Date: Sun, 21 Sep 2008 01:03:09 -0700
+Subject: [PATCH] Changed ActiveRecord attributes to respect access control.
+
+---
+ .../lib/active_record/attribute_methods.rb         |   12 ++++-
+ activerecord/test/cases/attribute_methods_test.rb  |   51 ++++++++++++++++++--
+ 2 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/attribute_methods.rb b/activerecord/lib/active_record/attribute_methods.rb
+index 020da01..c2a8aee 100644
+--- a/activerecord/lib/active_record/attribute_methods.rb
++++ b/activerecord/lib/active_record/attribute_methods.rb
+@@ -232,6 +232,8 @@ module ActiveRecord
+     def method_missing(method_id, *args, &block)
+       method_name = method_id.to_s
+ 
++      protect_if_private(method_name, args)
++
+       # If we haven't generated any methods yet, generate them, then
+       # see if we've created the method we're looking for.
+       if !self.class.generated_methods?
+@@ -334,10 +336,12 @@ module ActiveRecord
+     # <tt>person.respond_to?(:name=)</tt>, and <tt>person.respond_to?(:name?)</tt>
+     # which will all return +true+.
+     alias :respond_to_without_attributes? :respond_to?
+-    def respond_to?(method, include_priv = false)
++    def respond_to?(method, include_private_methods = false)
+       method_name = method.to_s
+       if super
+         return true
++      elsif self.private_methods.include?(method_name) && !include_private_methods
++        return false
+       elsif !self.class.generated_methods?
+         self.class.define_attribute_methods
+         if self.class.generated_methods.include?(method_name)
+@@ -356,6 +360,12 @@ module ActiveRecord
+     end
+ 
+     private
++
++      def protect_if_private(method_name, args)
++        if self.private_methods.include?(method_name)
++          raise NoMethodError("Attempt to call private method", method_name, args)
++        end
++      end
+     
+       def missing_attribute(attr_name, stack)
+         raise ActiveRecord::MissingAttributeError, "missing attribute: #{attr_name}", stack
+diff --git a/activerecord/test/cases/attribute_methods_test.rb b/activerecord/test/cases/attribute_methods_test.rb
+index ce293a4..975a694 100644
+--- a/activerecord/test/cases/attribute_methods_test.rb
++++ b/activerecord/test/cases/attribute_methods_test.rb
+@@ -58,19 +58,19 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+ 
+   def test_kernel_methods_not_implemented_in_activerecord
+     %w(test name display y).each do |method|
+-      assert_equal false, ActiveRecord::Base.instance_method_already_implemented?(method), "##{method} is defined"
++      assert !ActiveRecord::Base.instance_method_already_implemented?(method), "##{method} is defined"
+     end
+   end
+ 
+   def test_primary_key_implemented
+-    assert_equal true, Class.new(ActiveRecord::Base).instance_method_already_implemented?('id')
++    assert Class.new(ActiveRecord::Base).instance_method_already_implemented?('id')
+   end
+ 
+   def test_defined_kernel_methods_implemented_in_model
+     %w(test name display y).each do |method|
+       klass = Class.new ActiveRecord::Base
+       klass.class_eval "def #{method}() 'defined #{method}' end"
+-      assert_equal true, klass.instance_method_already_implemented?(method), "##{method} is not defined"
++      assert klass.instance_method_already_implemented?(method), "##{method} is not defined"
+     end
+   end
+ 
+@@ -80,7 +80,7 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+       abstract.class_eval "def #{method}() 'defined #{method}' end"
+       abstract.abstract_class = true
+       klass = Class.new abstract
+-      assert_equal true, klass.instance_method_already_implemented?(method), "##{method} is not defined"
++      assert klass.instance_method_already_implemented?(method), "##{method} is not defined"
+     end
+   end
+ 
+@@ -227,6 +227,40 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     assert_equal [:field_a], Topic.skip_time_zone_conversion_for_attributes 
+     assert_equal [:field_b], Minimalistic.skip_time_zone_conversion_for_attributes 
+   end
++  
++  def test_read_attributes_respect_access_control
++    privatize("title")
++    
++    topic = @target.new(:title => "The pros and cons of programming naked.")
++    assert !topic.respond_to?(:title)
++    assert_raise(NoMethodError) { topic.title }
++    topic.send(:title)
++  end
++  
++  def test_write_attributes_respect_access_control
++    privatize("title=(value)")
++    
++    topic = @target.new
++    assert !topic.respond_to?(:title=)
++    assert_raise(NoMethodError) { topic.title = "Pants"}
++    topic.send(:title=, "Very large pants")
++  end
++  
++  def test_question_attributes_respect_access_control
++    privatize("title?")
++    
++    topic = @target.new(:title => "Isaac Newton's pants")
++    assert !topic.respond_to?(:title?)
++    assert_raise(NoMethodError) { topic.title? }
++    assert topic.send(:title?)
++  end
++  
++  def test_bulk_update_respects_access_control
++    privatize("title=(value)")
++    
++    assert_raise(ActiveRecord::UnknownAttributeError) { topic = @target.new(:title => "Rants about pants") }
++    assert_raise(ActiveRecord::UnknownAttributeError) { @target.new.attributes = { :title => "Ants in pants" } }
++  end
+ 
+   private
+   def time_related_columns_on_topic
+@@ -244,4 +278,13 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     Time.zone = old_zone
+     ActiveRecord::Base.time_zone_aware_attributes = old_tz
+   end
++  
++  def privatize(method_signature)
++    @target.class_eval <<-private_method 
++      private 
++      def #{method_signature}
++        "I'm private"
++      end
++    private_method
++  end
+ end
+-- 
+1.6.0
+

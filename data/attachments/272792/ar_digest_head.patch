@@ -1,0 +1,508 @@
+diff --git a/activeresource/lib/active_resource.rb b/activeresource/lib/active_resource.rb
+index fd4c199..9597d45 100644
+--- a/activeresource/lib/active_resource.rb
++++ b/activeresource/lib/active_resource.rb
+@@ -31,6 +31,7 @@ require 'active_model'
+ 
+ module ActiveResource
+   autoload :Base, 'active_resource/base'
++  autoload :Digest, 'active_resource/digest'
+   autoload :Connection, 'active_resource/connection'
+   autoload :CustomMethods, 'active_resource/custom_methods'
+   autoload :Formats, 'active_resource/formats'
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index bc82139..35bcbea 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -289,6 +289,42 @@ module ActiveResource
+         @password = password
+       end
+ 
++      # Returns the Basic authentication availability.  Defaults to +true+.
++      def use_basic_authentication
++        # Not using superclass_delegating_reader. See +site+ for explanation
++        if defined?(@use_basic_authentication)
++          @use_basic_authentication
++        elsif superclass != Object && superclass.use_basic_authentication
++          superclass.use_basic_authentication.freeze
++        else
++          true
++        end
++      end
++
++      # Denies / allows using the Basic authentication method.
++      # +true+ by default.
++      def use_basic_authentication=(use_basic_authentication)
++        @connection = nil
++        @use_basic_authentication = use_basic_authentication
++      end
++
++      # Returns the Digest authentication availability.  Defaults to +false+.
++      def use_digest_authentication
++        # Not using superclass_delegating_reader. See +site+ for explanation
++        if defined?(@use_digest_authentication)
++          @use_digest_authentication
++        elsif superclass != Object && superclass.use_digest_authentication
++          superclass.use_digest_authentication.freeze
++        end
++      end
++
++      # Denies / allows using the Digest authentication method.
++      # +false+ by default.
++      def use_digest_authentication=(use_digest_authentication)
++        @connection = nil
++        @use_digest_authentication = use_digest_authentication
++      end
++
+       # Sets the format that attributes are sent and received in from a mime type reference:
+       #
+       #   Person.format = :json
+@@ -335,6 +371,8 @@ module ActiveResource
+           @connection.user = user if user
+           @connection.password = password if password
+           @connection.timeout = timeout if timeout
++          @connection.use_basic_authentication = use_basic_authentication
++          @connection.use_digest_authentication = use_digest_authentication
+           @connection
+         else
+           superclass.connection
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index fb3fde5..88149ea 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -17,7 +17,7 @@ module ActiveResource
+     }
+ 
+     attr_reader :site, :user, :password, :timeout
+-    attr_accessor :format
++    attr_accessor :format, :use_basic_authentication, :use_digest_authentication
+ 
+     class << self
+       def requests
+@@ -32,6 +32,8 @@ module ActiveResource
+       @user = @password = nil
+       self.site = site
+       self.format = format
++      self.use_basic_authentication = true
++      self.use_digest_authentication = true
+     end
+ 
+     # Set URI for remote service.
+@@ -58,32 +60,47 @@ module ActiveResource
+ 
+     # Executes a GET request.
+     # Used to get (find) resources.
+-    def get(path, headers = {})
+-      format.decode(request(:get, path, build_request_headers(headers, :get)).body)
++    def get(path, headers = {}, authz_headers = {}, retried = false)
++      format.decode(request(:get, path, build_request_headers(headers, :get, self.site.merge(path), authz_headers)).body)
++    rescue UnauthorizedAccess => e
++      retried, authz_headers = handle_authentication_failure(retried, e.response)
++      retry
+     end
+ 
+     # Executes a DELETE request (see HTTP protocol documentation if unfamiliar).
+     # Used to delete resources.
+-    def delete(path, headers = {})
+-      request(:delete, path, build_request_headers(headers, :delete))
++    def delete(path, headers = {}, authz_headers = {}, retried = false)
++      request(:delete, path, build_request_headers(headers, :delete, self.site.merge(path), authz_headers))
++    rescue UnauthorizedAccess => e
++      retried, authz_headers = handle_authentication_failure(retried, e.response)
++      retry
+     end
+ 
+     # Executes a PUT request (see HTTP protocol documentation if unfamiliar).
+     # Used to update resources.
+-    def put(path, body = '', headers = {})
+-      request(:put, path, body.to_s, build_request_headers(headers, :put))
++    def put(path, body = '', headers = {}, authz_headers = {}, retried = false)
++      request(:put, path, body.to_s, build_request_headers(headers, :put, self.site.merge(path), authz_headers))
++    rescue UnauthorizedAccess => e
++      retried, authz_headers = handle_authentication_failure(retried, e.response)
++      retry
+     end
+ 
+     # Executes a POST request.
+     # Used to create new resources.
+-    def post(path, body = '', headers = {})
+-      request(:post, path, body.to_s, build_request_headers(headers, :post))
++    def post(path, body = '', headers = {}, authz_headers = {}, retried = false)
++      request(:post, path, body.to_s, build_request_headers(headers, :post, self.site.merge(path), authz_headers))
++    rescue UnauthorizedAccess => e
++      retried, authz_headers = handle_authentication_failure(retried, e.response)
++      retry
+     end
+ 
+     # Executes a HEAD request.
+     # Used to obtain meta-information about resources, such as whether they exist and their size (via response headers).
+-    def head(path, headers = {})
+-      request(:head, path, build_request_headers(headers))
++    def head(path, headers = {}, authz_headers = {}, retried = false)
++      request(:head, path, build_request_headers(headers, :head, self.site.merge(path), authz_headers))
++    rescue UnauthorizedAccess => e
++      retried, authz_headers = handle_authentication_failure(retried, e.response)
++      retry
+     end
+ 
+ 
+@@ -91,9 +108,13 @@ module ActiveResource
+       # Makes a request to the remote service.
+       def request(method, path, *arguments)
+         logger.info "#{method.to_s.upcase} #{site.scheme}://#{site.host}:#{site.port}#{path}" if logger
++        if logger && logger.debug? && arguments.first && arguments.first.respond_to?(:length) && arguments.first.length < 1024 then
++          logger.debug { arguments.inspect }
++        end
+         result = nil
+         ms = Benchmark.ms { result = http.send(method, path, *arguments) }
+         logger.info "--> %d %s (%d %.0fms)" % [result.code, result.message, result.body ? result.body.length : 0, ms] if logger
++        logger.debug result.body if logger && logger.debug? && result.body
+         handle_response(result)
+       rescue Timeout::Error => e
+         raise TimeoutError.new(e.message)
+@@ -101,6 +122,10 @@ module ActiveResource
+ 
+       # Handles response and error codes from the remote service.
+       def handle_response(response)
++        if logger && logger.debug? && response.body && response.body.length < 1024 && response["Content-Type"] =~ /text|xml/ then
++          logger.debug { response.body }
++        end
++
+         case response.code.to_i
+           when 301,302
+             raise(Redirection.new(response))
+@@ -129,12 +154,20 @@ module ActiveResource
+         end
+       end
+ 
++      def handle_authentication_failure(retried, response)
++        raise if retried
++        raise unless response["WWW-Authenticate"]
++
++        logger.debug {"Retrying failed 401 request with #{response["WWW-Authenticate"].inspect}"} if logger
++        retried, authz_headers = true, response
++      end
++
+       # Creates new Net::HTTP instance for communication with the
+       # remote service and resources.
+       def http
+         http             = Net::HTTP.new(@site.host, @site.port)
+         http.use_ssl     = @site.is_a?(URI::HTTPS)
+-        http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl
++        http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl?
+         http.read_timeout = @timeout if @timeout # If timeout is not set, the default Net::HTTP timeout (60s) is used.
+         http
+       end
+@@ -144,13 +177,19 @@ module ActiveResource
+       end
+ 
+       # Builds headers for request to remote service.
+-      def build_request_headers(headers, http_method=nil)
+-        authorization_header.update(default_header).update(http_format_header(http_method)).update(headers)
++      def build_request_headers(headers, http_method, uri, response_headers)
++        authorization_header(uri, http_method, response_headers).update(default_header).update(http_format_header(http_method)).update(headers)
+       end
+ 
+       # Sets authorization header
+-      def authorization_header
+-        (@user || @password ? { 'Authorization' => 'Basic ' + ["#{@user}:#{ @password}"].pack('m').delete("\r\n") } : {})
++      def authorization_header(uri=nil, http_method=nil, response_headers={})
++        if self.use_digest_authentication && uri && response_headers["WWW-Authenticate"].to_s =~ /Digest/ then
++          {"Authorization" => ActiveResource::Digest.authenticate(uri, @user, @password, response_headers["WWW-Authenticate"], http_method)}
++        elsif self.use_basic_authentication then
++          (@user || @password ? { 'Authorization' => 'Basic ' + ["#{@user}:#{ @password}"].pack('m').delete("\r\n") } : {})
++        else
++          {}
++        end
+       end
+ 
+       def http_format_header(http_method)
+diff --git a/activeresource/lib/active_resource/digest.rb b/activeresource/lib/active_resource/digest.rb
+new file mode 100644
+index 0000000..526d698
+--- /dev/null
++++ b/activeresource/lib/active_resource/digest.rb
+@@ -0,0 +1,53 @@
++require "digest/md5"
++
++module ActiveResource
++  # Written by Eric Hodel <drbrain@segment7.net>
++  # Copied and adapted from http://segment7.net/projects/ruby/snippets/digest_auth.rb
++  #
++  #  HTTP Digest Authentication
++  module Digest
++    @@nonce_count = -1
++
++    CNONCE = ::Digest::MD5.hexdigest("%x" % (Time.now.to_i + rand(65535)))
++    # CNONCE = ActiveSupport::SecureRandom.hex(32)
++
++    def self.authenticate(uri, user, password, auth_header, method = :get, is_IIS = false)
++      uri = URI.parse(uri) unless uri.kind_of?(URI)
++      @@nonce_count += 1
++
++      auth_header =~ /^(\w+) (.*)/
++      raise ArgumentError, "Authentication method must be 'Digest', found #{$1}" unless $1 == "Digest"
++
++      params = {}
++      $2.gsub(/(\w+)="(.*?)"/) { params[$1] = $2 }
++
++      a_1 = "#{user}:#{params['realm']}:#{password}"
++      a_2 = "#{method.to_s.upcase}:#{uri.path}"
++      a_2 << "?#{uri.query}" unless uri.query.blank?
++      request_digest = ''
++      request_digest << ::Digest::MD5.hexdigest(a_1)
++      request_digest << ':' << params["nonce"]
++      request_digest << ':' << ("%08x" % @@nonce_count)
++      request_digest << ':' << CNONCE
++      request_digest << ':' << params["qop"]
++      request_digest << ':' << ::Digest::MD5.hexdigest(a_2)
++
++      header = ''
++      header << "Digest username=\"#{user}\", "
++      header << "realm=\"#{params["realm"]}\", "
++      if is_IIS then
++        header << "qop=\"#{params["qop"]}\", "
++      else
++        header << "qop=#{params["qop"]}, "
++      end
++      header << "uri=\"#{uri.path}\", "
++      header << "nonce=\"#{params["nonce"]}\", "
++      header << "nc=#{"%08x" % @@nonce_count}, "
++      header << "cnonce=\"#{CNONCE}\", "
++      header << "opaque=\"#{params["opaque"]}\", "
++      header << "response=\"#{::Digest::MD5.hexdigest(request_digest)}\""
++
++      return header
++    end
++  end
++end
+diff --git a/activeresource/test/authorization_test.rb b/activeresource/test/authorization_test.rb
+index ca25f43..2bdd5cc 100644
+--- a/activeresource/test/authorization_test.rb
++++ b/activeresource/test/authorization_test.rb
+@@ -18,6 +18,27 @@ class AuthorizationTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_authorization_header_not_added_when_explicitely_turn_off_basic_authentication
++    @authenticated_conn.use_basic_authentication = false
++
++    authorization_header = @authenticated_conn.__send__(:authorization_header)
++    assert_equal Hash.new, authorization_header
++  end
++
++  def test_authorization_header_when_previous_www_authenticate_header_available_and_specifies_digest_authentication_accepted
++    @authenticated_conn.use_digest_authentication = true
++    @authenticated_conn.use_basic_authentication  = false
++
++    # Because ActiveResource::Digest depends on Time.now, we reassign a known cnonce to allow canned values to be used
++    silence_warnings do
++      ActiveResource::Digest.const_set("CNONCE", ::Digest::MD5.hexdigest("%x" % 0))
++    end
++
++    authorization_header = @authenticated_conn.__send__(:authorization_header, "/people", :get, "WWW-Authenticate" => %(Digest realm="AdGear API", qop="auth", algorithm=MD5, nonce="MTI0OTQxMTQzNzplOTEwNzM1ZThiMmU3NzdiMGE4NmU2ODQ2MjI2ZjQzMA==", opaque="a21e6002d2bd70e6dbeaca094ded4f93"))
++
++    assert_equal %(Digest username="david", realm="AdGear API", qop=auth, uri="/people", nonce="MTI0OTQxMTQzNzplOTEwNzM1ZThiMmU3NzdiMGE4NmU2ODQ2MjI2ZjQzMA==", nc=00000000, cnonce="cfcd208495d565ef66e7dff9f98764da", opaque="a21e6002d2bd70e6dbeaca094ded4f93", response="878fe453f5e15622a0d8f3b618ed8989"), authorization_header["Authorization"]
++  end
++
+   def test_authorization_header
+     authorization_header = @authenticated_conn.__send__(:authorization_header)
+     assert_equal @authorization_request_header['Authorization'], authorization_header['Authorization']
+diff --git a/activeresource/test/base_test.rb b/activeresource/test/base_test.rb
+index 82d3b2a..0a87b5d 100644
+--- a/activeresource/test/base_test.rb
++++ b/activeresource/test/base_test.rb
+@@ -180,6 +180,27 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal("123", actor.password)
+   end
+ 
++	def test_can_turn_off_basic_authentication
++		assert_nothing_raised do
++			Person.use_basic_authentication = false
++		end
++	end
++
++	def test_basic_authentication_true_by_default
++		actor = Class.new(ActiveResource::Base)
++		assert actor.use_basic_authentication
++	end
++
++	def test_digest_authentication_false_by_default
++		actor = Class.new(ActiveResource::Base)
++		assert !actor.use_digest_authentication
++	end
++
++	def test_base_subclass_without_basic_authentication_turns_off_basic_authentication_of_underlying_connection
++		Person.use_basic_authentication = false
++		assert_equal false, Person.connection.use_basic_authentication
++	end
++
+   def test_site_reader_uses_superclass_site_until_written
+     # Superclass is Object so returns nil.
+     assert_nil ActiveResource::Base.site
+diff --git a/activeresource/test/connection_test.rb b/activeresource/test/connection_test.rb
+index 831fbc4..6b7ef33 100644
+--- a/activeresource/test/connection_test.rb
++++ b/activeresource/test/connection_test.rb
+@@ -1,4 +1,5 @@
+ require 'abstract_unit'
++require 'mocha'
+ 
+ class ConnectionTest < Test::Unit::TestCase
+   ResponseCodeStub = Struct.new(:code)
+@@ -183,6 +184,113 @@ class ConnectionTest < Test::Unit::TestCase
+     assert_nothing_raised(Mocha::ExpectationError) { @conn.get(path, {'Accept' => 'application/xhtml+xml'}) }
+   end
+ 
++  def test_head_retries_when_unauthorized_a_first_time
++    @http = mock('new Net::HTTP')
++    @conn.stubs(:http).returns(@http)
++    @conn.user = "david"
++    @conn.password = "test123"
++    @conn.use_basic_authentication = false
++    @conn.use_digest_authentication = true
++
++    @resp_unauthorized = stub_everything("HTTP Unauthorized Response", :code => "401")
++    @resp_unauthorized.stubs(:[]).with("WWW-Authenticate").returns(%(Digest realm="AdGear API", qop="auth", algorithm=MD5, nonce="MTI0OTQxMTQzNzplOTEwNzM1ZThiMmU3NzdiMGE4NmU2ODQ2MjI2ZjQzMA==", opaque="a21e6002d2bd70e6dbeaca094ded4f93"))
++    @resp_ok = stub_everything("HTTP OK", :code => "200")
++
++    path = "/people/2.xml"
++    @http.expects(:head).with(path, any_parameters).returns(@resp_unauthorized)
++    @http.expects(:head).with(path, has_entry("Authorization", regexp_matches(/Digest/))).returns(@resp_ok)
++
++    assert_nothing_raised do
++      @conn.head(path)
++    end
++  end
++
++  def test_get_retries_when_unauthorized_a_first_time
++    @http = mock('new Net::HTTP')
++    @conn.stubs(:http).returns(@http)
++    @conn.user = "david"
++    @conn.password = "test123"
++    @conn.use_basic_authentication = false
++    @conn.use_digest_authentication = true
++
++    @resp_unauthorized = stub_everything("HTTP Unauthorized Response", :code => "401")
++    @resp_unauthorized.stubs(:[]).with("WWW-Authenticate").returns(%(Digest realm="AdGear API", qop="auth", algorithm=MD5, nonce="MTI0OTQxMTQzNzplOTEwNzM1ZThiMmU3NzdiMGE4NmU2ODQ2MjI2ZjQzMA==", opaque="a21e6002d2bd70e6dbeaca094ded4f93"))
++    @resp_ok = stub_everything("HTTP OK", :code => "200")
++
++    path = "/people/2.xml"
++    @http.expects(:get).with(path, any_parameters).returns(@resp_unauthorized)
++    @http.expects(:get).with(path, has_entry("Authorization", regexp_matches(/Digest/))).returns(@resp_ok)
++
++    assert_nothing_raised do
++      @conn.get(path)
++    end
++  end
++
++  def test_post_retries_when_unauthorized_and_response_has_www_authenticate_header_present_with_digest
++    @http = mock('new Net::HTTP')
++    @conn.stubs(:http).returns(@http)
++    @conn.user = "david"
++    @conn.password = "test123"
++    @conn.use_basic_authentication = false
++    @conn.use_digest_authentication = true
++
++    @resp_unauthorized = stub_everything("HTTP Unauthorized Response", :code => "401")
++    @resp_unauthorized.stubs(:[]).with("WWW-Authenticate").returns(%(Digest realm="AdGear API", qop="auth", algorithm=MD5, nonce="MTI0OTQxMTQzNzplOTEwNzM1ZThiMmU3NzdiMGE4NmU2ODQ2MjI2ZjQzMA==", opaque="a21e6002d2bd70e6dbeaca094ded4f93"))
++    @resp_ok = stub_everything("HTTP OK", :code => "200")
++
++    path = "/people/2.xml"
++    data = "<?xml?><person><name>David</name></person>"
++    @http.expects(:post).with(path, data, any_parameters).returns(@resp_unauthorized)
++    @http.expects(:post).with(path, data, has_entry("Authorization", regexp_matches(/Digest/))).returns(@resp_ok)
++
++    assert_nothing_raised do
++      @conn.post(path, data)
++    end
++  end
++
++  def test_put_retries_when_unauthorized_and_response_has_www_authenticate_header_present_with_digest
++    @http = mock('new Net::HTTP')
++    @conn.stubs(:http).returns(@http)
++    @conn.user = "david"
++    @conn.password = "test123"
++    @conn.use_basic_authentication = false
++    @conn.use_digest_authentication = true
++
++    @resp_unauthorized = stub_everything("HTTP Unauthorized Response", :code => "401")
++    @resp_unauthorized.stubs(:[]).with("WWW-Authenticate").returns(%(Digest realm="AdGear API", qop="auth", algorithm=MD5, nonce="MTI0OTQxMTQzNzplOTEwNzM1ZThiMmU3NzdiMGE4NmU2ODQ2MjI2ZjQzMA==", opaque="a21e6002d2bd70e6dbeaca094ded4f93"))
++    @resp_ok = stub_everything("HTTP OK", :code => "200")
++
++    path = "/people/2.xml"
++    data = "<?xml?><person><name>David</name></person>"
++    @http.expects(:put).with(path, data, any_parameters).returns(@resp_unauthorized)
++    @http.expects(:put).with(path, data, has_entry("Authorization", regexp_matches(/Digest/))).returns(@resp_ok)
++
++    assert_nothing_raised do
++      @conn.put(path, data)
++    end
++  end
++
++  def test_delete_retries_when_unauthorized_and_response_has_www_authenticate_header_present_with_digest
++    @http = mock('new Net::HTTP')
++    @conn.stubs(:http).returns(@http)
++    @conn.user = "david"
++    @conn.password = "test123"
++    @conn.use_basic_authentication = false
++    @conn.use_digest_authentication = true
++
++    @resp_unauthorized = stub_everything("HTTP Unauthorized Response", :code => "401")
++    @resp_unauthorized.stubs(:[]).with("WWW-Authenticate").returns(%(Digest realm="AdGear API", qop="auth", algorithm=MD5, nonce="MTI0OTQxMTQzNzplOTEwNzM1ZThiMmU3NzdiMGE4NmU2ODQ2MjI2ZjQzMA==", opaque="a21e6002d2bd70e6dbeaca094ded4f93"))
++    @resp_ok = stub_everything("HTTP OK", :code => "200")
++
++    path = "/people/2.xml"
++    @http.expects(:delete).with(path, any_parameters).returns(@resp_unauthorized)
++    @http.expects(:delete).with(path, has_entry("Authorization", regexp_matches(/Digest/))).returns(@resp_ok)
++
++    assert_nothing_raised do
++      @conn.delete(path)
++    end
++  end
++
+   protected
+     def assert_response_raises(klass, code)
+       assert_raise(klass, "Expected response code #{code} to raise #{klass}") do
+diff --git a/activeresource/test/digest_test.rb b/activeresource/test/digest_test.rb
+new file mode 100644
+index 0000000..288d81f
+--- /dev/null
++++ b/activeresource/test/digest_test.rb
+@@ -0,0 +1,36 @@
++require 'abstract_unit'
++require 'mocha'
++
++class DigestTest < Test::Unit::TestCase
++  DEFAULT_WWW_AUTHENTICATE_HEADER = %(Digest realm="AdGear API", qop="auth", algorithm=MD5, nonce="MTI0OTQxNzM2NDo5ZjM3MzhmMzhlZTM4ODNlZmFjM2FhNjNjMTgxZmIxNQ==", opaque="a21e6002d2bd70e6dbeaca094ded4f93")
++
++  def test_returns_opaque_unchanged
++    value = ActiveResource::Digest.authenticate("http://site.com/api/people", "user", "pass", DEFAULT_WWW_AUTHENTICATE_HEADER)
++    assert_match /opaque="a21e6002d2bd70e6dbeaca094ded4f93"/, value
++  end
++
++  def test_returns_nonce_unchanged
++    value = ActiveResource::Digest.authenticate("http://site.com/api/people", "user", "pass", DEFAULT_WWW_AUTHENTICATE_HEADER)
++    assert_match /nonce="MTI0OTQxNzM2NDo5ZjM3MzhmMzhlZTM4ODNlZmFjM2FhNjNjMTgxZmIxNQ=="/, value
++  end
++
++  def test_returns_path_of_uri
++    value = ActiveResource::Digest.authenticate("http://site.com/api/people", "user", "pass", DEFAULT_WWW_AUTHENTICATE_HEADER)
++    assert_match /uri="\/api\/people"/, value
++  end
++
++  def test_returns_realm_unchanged
++    value = ActiveResource::Digest.authenticate("http://site.com/api/people", "user", "pass", DEFAULT_WWW_AUTHENTICATE_HEADER)
++    assert_match /realm="AdGear API"/, value
++  end
++
++  def test_uses_request_method_to_calculate_digest
++    value = ActiveResource::Digest.authenticate("http://site.com/api/people", "user", "pass", DEFAULT_WWW_AUTHENTICATE_HEADER, :get)
++    assert_match /response="6830a9204e6b7c611879db0076587bdb"/, value, "Did the implementation use the request method to calculate the digest?"
++  end
++
++  def test_uses_request_method_to_calculate_digest
++    value = ActiveResource::Digest.authenticate("http://site.com/api/people", "user", "pass", DEFAULT_WWW_AUTHENTICATE_HEADER, :post)
++    assert_match /response="2c745576ed636753b68311db8ab12f5b"/, value, "Did the implementation use the request method to calculate the digest?"
++  end
++end

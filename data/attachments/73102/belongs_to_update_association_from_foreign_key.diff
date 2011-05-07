@@ -1,0 +1,158 @@
+From cd60db17bf7f9a21fc1454e129a6da804b88f3d6 Mon Sep 17 00:00:00 2001
+From: Jon Leighton <j@jonathanleighton.com>
+Date: Sun, 7 Sep 2008 14:42:33 +0100
+Subject: [PATCH] Support for updating a belongs to association from the foreign key (without saving and reloading the record)
+
+---
+ activerecord/lib/active_record/associations.rb     |    9 ++++++++-
+ .../associations/belongs_to_associations_test.rb   |   13 +++++++++++++
+ activerecord/test/cases/associations_test.rb       |   12 ++++++++++++
+ 3 files changed, 33 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 07bc50c..cc20d23 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1250,7 +1250,7 @@ module ActiveRecord
+ 
+             association = instance_variable_get(ivar) if instance_variable_defined?(ivar)
+ 
+-            if association.nil? || force_reload
++            if association.nil? || !association.loaded? || force_reload
+               association = association_proxy_class.new(self, reflection)
+               retval = association.reload
+               if retval.nil? and association_proxy_class == BelongsToAssociation
+@@ -1283,6 +1283,13 @@ module ActiveRecord
+               instance_variable_set(ivar, new_value.nil? ? nil : association)
+             end
+           end
++          
++          if association_proxy_class == BelongsToAssociation
++            define_method("#{reflection.primary_key_name}=") do |target_id|
++              instance_variable_get(ivar).reset if instance_variable_defined?(ivar)
++              write_attribute(reflection.primary_key_name, target_id)
++            end
++          end
+ 
+           define_method("set_#{reflection.name}_target") do |target|
+             return if target.nil? and association_proxy_class == BelongsToAssociation
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 40a8503..223afc3 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -46,6 +46,19 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     citibank.firm = apple
+     assert_equal apple.id, citibank.firm_id
+   end
++  
++  def test_foreign_key_assignment
++    # Test using an existing record
++    signals37 = accounts(:signals37)
++    assert_equal companies(:first_firm), signals37.firm
++    signals37.firm_id = companies(:another_firm).id
++    assert_equal companies(:another_firm), signals37.firm
++    
++    # Test using a new record
++    account = Account.new
++    account.firm_id = companies(:another_firm).id
++    assert_equal companies(:another_firm), account.firm
++  end
+ 
+   def test_no_unexpected_aliasing
+     first_firm = companies(:first_firm)
+diff --git a/activerecord/test/cases/associations_test.rb b/activerecord/test/cases/associations_test.rb
+index 056a294..a6b94ce 100644
+--- a/activerecord/test/cases/associations_test.rb
++++ b/activerecord/test/cases/associations_test.rb
+@@ -181,6 +181,18 @@ class AssociationProxyTest < ActiveRecord::TestCase
+     p = setup_dangling_association
+     assert_nil p.author.reset
+   end
++  
++  def test_reset_loads_association_next_time
++    welcome = posts(:welcome)
++    david = authors(:david)
++    author_assoc = welcome.author
++    
++    assert_equal david, welcome.author # So we can be sure the test works correctly
++    author_assoc.reset
++    assert !author_assoc.loaded?
++    assert_nil author_assoc.target
++    assert_equal david, welcome.author
++  end
+ 
+   def test_reload_returns_assocition
+     david = developers(:david)
+-- 
+1.5.6.3
+
+
+From 544b88798d6c8a296f70710b414e7f5742398442 Mon Sep 17 00:00:00 2001
+From: Jon Leighton <j@jonathanleighton.com>
+Date: Sat, 20 Dec 2008 22:57:30 +0000
+Subject: [PATCH] Assigning to the foreign key of a belongs to association should reset *all* associations with that foreign key
+
+---
+ activerecord/lib/active_record/associations.rb     |   10 +++++++++-
+ .../associations/belongs_to_associations_test.rb   |    4 ++++
+ activerecord/test/models/company.rb                |    1 +
+ 3 files changed, 14 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index cc20d23..1c19e7c 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1286,7 +1286,15 @@ module ActiveRecord
+           
+           if association_proxy_class == BelongsToAssociation
+             define_method("#{reflection.primary_key_name}=") do |target_id|
+-              instance_variable_get(ivar).reset if instance_variable_defined?(ivar)
++              # Find all associations which use the same primary key and reset them
++              self.class.reflect_on_all_associations(:belongs_to).each do |assoc|
++                if reflection.primary_key_name.to_s == assoc.primary_key_name.to_s
++                  proxy = instance_variable_get("@#{assoc.name}")
++                  proxy.reset unless proxy.nil?
++                end
++              end
++              
++              # Write the new foreign key value
+               write_attribute(reflection.primary_key_name, target_id)
+             end
+           end
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 223afc3..b86da17 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -51,13 +51,17 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     # Test using an existing record
+     signals37 = accounts(:signals37)
+     assert_equal companies(:first_firm), signals37.firm
++    assert_equal companies(:first_firm), signals37.firm2
++    
+     signals37.firm_id = companies(:another_firm).id
+     assert_equal companies(:another_firm), signals37.firm
++    assert_equal companies(:another_firm), signals37.firm2
+     
+     # Test using a new record
+     account = Account.new
+     account.firm_id = companies(:another_firm).id
+     assert_equal companies(:another_firm), account.firm
++    assert_equal companies(:another_firm), account.firm2
+   end
+ 
+   def test_no_unexpected_aliasing
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index 0e3fafa..02dcd20 100644
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -131,6 +131,7 @@ end
+ 
+ class Account < ActiveRecord::Base
+   belongs_to :firm
++  belongs_to :firm2, :foreign_key => :firm_id, :class_name => "Firm"
+ 
+   def self.destroyed_account_ids
+     @destroyed_account_ids ||= Hash.new { |h,k| h[k] = [] }
+-- 
+1.5.6.3
+

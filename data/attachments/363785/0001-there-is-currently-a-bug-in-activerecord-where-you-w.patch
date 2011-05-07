@@ -1,0 +1,108 @@
+From 3fd30861ef48ececc07ea94e9884b42fdb1e5eeb Mon Sep 17 00:00:00 2001
+From: Aubrey Holland <aubrey@patch.com>
+Date: Mon, 28 Dec 2009 15:53:45 -0500
+Subject: [PATCH] There is currently a bug in ActiveRecord where you will get an infinite
+ loop if you try to use a has_many :through association with a nonstandard
+ primary key. This happens because the association calls owner_quoted_id in
+ construct_quoted_owner_attributes, and owner_quoted_id calls
+ quote_value. The problem is that quote_value is not defined on the
+ association itself and needs to be called through method_missing. The
+ method_missing implementation in association_collection tries to send
+ the method through to the reflection's class, but only after calling
+ construct_scope, and that method ends up calling owner_quoted_id again,
+ creating an infinite loop. This patch implements the quote_value method
+ on AssociationCollection to send the call directly to the reflection's
+ class without going through method_missing.
+
+---
+ .../associations/association_collection.rb         |    4 ++++
+ .../has_many_through_associations_test.rb          |    6 +++++-
+ activerecord/test/fixtures/contracts.yml           |    3 +++
+ activerecord/test/models/company.rb                |    9 +++++++++
+ activerecord/test/schema/schema.rb                 |    1 +
+ 5 files changed, 22 insertions(+), 1 deletions(-)
+ create mode 100644 activerecord/test/fixtures/contracts.yml
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index f5c6aa4..80e7da0 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -340,6 +340,10 @@ module ActiveRecord
+         super || @reflection.klass.respond_to?(method, include_private)
+       end
+ 
++      def quote_value(value, column=nil)
++        @reflection.klass.quote_value(value, column)
++      end
++
+       protected
+         def construct_find_options!(options)
+         end
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index a5afd21..992a3bb 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -17,7 +17,7 @@ require 'models/developer'
+ 
+ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+   fixtures :posts, :readers, :people, :comments, :authors, :owners, :pets, :toys,
+-           :companies
++           :companies, :developers, :contracts
+ 
+   def test_associate_existing
+     assert_queries(2) { posts(:thinking);people(:david) }
+@@ -327,6 +327,10 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     assert_equal 1, owners(:blackbeard).toys.count
+   end
+ 
++  def test_has_many_through_with_nonstandard_keys_on_the_association
++    assert_equal [developers(:david)], companies(:first_client).developers_with_nonstandard_keys
++  end
++
+   def test_find_on_has_many_association_collection_with_include_and_conditions
+     post_with_no_comments = people(:michael).posts_with_no_comments.first
+     assert_equal post_with_no_comments, posts(:authorless)
+diff --git a/activerecord/test/fixtures/contracts.yml b/activerecord/test/fixtures/contracts.yml
+new file mode 100644
+index 0000000..51c0e65
+--- /dev/null
++++ b/activerecord/test/fixtures/contracts.yml
+@@ -0,0 +1,3 @@
++david_summit:
++  company_name: Summit
++  developer_id: 1
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index de1a1cc..080c1ca 100644
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -12,6 +12,15 @@ class Company < AbstractCompany
+   has_many :contracts
+   has_many :developers, :through => :contracts
+ 
++  has_many :contracts_with_nonstandard_keys, 
++           :primary_key => :name, :foreign_key => :company_name,
++           :class_name => 'Contract'
++  has_many :developers_with_nonstandard_keys, 
++           :through => :contracts_with_nonstandard_keys, 
++           :source => :developer,
++           :primary_key => :name, :foreign_key => :company_name,
++           :class_name => 'Developer'
++
+   def arbitrary_method
+     "I am Jack's profound disappointment"
+   end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index b046104..daf1b24 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -129,6 +129,7 @@ ActiveRecord::Schema.define do
+   create_table :contracts, :force => true do |t|
+     t.integer :developer_id
+     t.integer :company_id
++    t.string :company_name
+   end
+ 
+   create_table :customers, :force => true do |t|
+-- 
+1.6.4.1
+

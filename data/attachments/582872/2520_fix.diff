@@ -1,0 +1,193 @@
+From c899a5840242998e0a01a96076d8c50cd6cba589 Mon Sep 17 00:00:00 2001
+From: Neeraj Singh <neerajdotname@gmail.com>
+Date: Wed, 30 Jun 2010 07:14:09 -0400
+Subject: [PATCH] With this patch update_attribute
+
+- will only save the attribute it has been asked to save and
+  not all dirty attributes
+
+- does not invoke callbacks anymore
+
+- doest not update updated_at/updated_on
+---
+ activerecord/lib/active_record/persistence.rb     |   11 ++++---
+ activerecord/test/cases/base_test.rb              |   31 +++++++++++++++++++++
+ activerecord/test/cases/dirty_test.rb             |    7 ++---
+ activerecord/test/cases/nested_attributes_test.rb |   18 ++++++------
+ 4 files changed, 49 insertions(+), 18 deletions(-)
+
+diff --git a/activerecord/lib/active_record/persistence.rb b/activerecord/lib/active_record/persistence.rb
+index 50166c4..34303a2 100644
+--- a/activerecord/lib/active_record/persistence.rb
++++ b/activerecord/lib/active_record/persistence.rb
+@@ -102,12 +102,13 @@ module ActiveRecord
+       became
+     end
+ 
+-    # Updates a single attribute and saves the record without going through the normal validation procedure.
+-    # This is especially useful for boolean flags on existing records. The regular +update_attribute+ method
+-    # in Base is replaced with this when the validations module is mixed in, which it is by default.
++    # Updates a single attribute and saves the record without going through the normal validation procedure
++    # or callbacks. This is especially useful for boolean flags on existing records.
+     def update_attribute(name, value)
+       send("#{name}=", value)
+-      save(:validate => false)
++      @changed_attributes.delete(name.to_s)
++      primary_key = self.class.primary_key
++      self.class.update_all({ name => value }, {primary_key => self[primary_key]}) == 1
+     end
+ 
+     # Updates all the attributes from the passed-in Hash and saves the record. 
+@@ -234,4 +235,4 @@ module ActiveRecord
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index ba7db83..cf926e9 100644
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -918,6 +918,37 @@ class BasicsTest < ActiveRecord::TestCase
+     assert !Topic.find(1).approved?
+   end
+ 
++  def test_update_attribute_with_one_changed_and_one_updated
++    t = Topic.order('id').limit(1).first
++    title, author_name = t.title, t.author_name
++    t.author_name = 'John'
++    t.update_attribute(:title, 'super_title')
++    assert_equal 'John', t.author_name
++    assert_equal 'super_title', t.title
++    assert t.changed?, "topic should have changed"
++    assert t.author_name_changed?, "author_name should have changed"
++    assert !t.title_changed?, "title should not have changed"
++    assert_nil t.title_change, 'title change should be nil'
++    assert_equal ['author_name'], t.changed
++
++    t.reload
++    assert_equal 'David', t.author_name
++    assert_equal 'super_title', t.title
++  end
++
++  def test_update_attribute_with_one_updated
++    t = Topic.first
++    title = t.title
++    t.update_attribute(:title, 'super_title')
++    assert_equal 'super_title', t.title
++    assert !t.changed?, "topic should not have changed"
++    assert !t.title_changed?, "title should not have changed"
++    assert_nil t.title_change, 'title change should be nil'
++
++    t.reload
++    assert_equal 'super_title', t.title
++  end
++
+   def test_update_attributes
+     topic = Topic.find(1)
+     assert !topic.approved?
+diff --git a/activerecord/test/cases/dirty_test.rb b/activerecord/test/cases/dirty_test.rb
+index 75f7453..837386e 100644
+--- a/activerecord/test/cases/dirty_test.rb
++++ b/activerecord/test/cases/dirty_test.rb
+@@ -475,10 +475,9 @@ class DirtyTest < ActiveRecord::TestCase
+     pirate = Pirate.find_by_catchphrase("Ahoy!")
+     pirate.update_attribute(:catchphrase, "Ninjas suck!")
+ 
+-    assert_equal 2, pirate.previous_changes.size
+-    assert_equal ["Ahoy!", "Ninjas suck!"], pirate.previous_changes['catchphrase']
+-    assert_not_nil pirate.previous_changes['updated_on'][0]
+-    assert_not_nil pirate.previous_changes['updated_on'][1]
++    assert_equal 0, pirate.previous_changes.size
++    assert_nil pirate.previous_changes['catchphrase']
++    assert_nil pirate.previous_changes['updated_on']
+     assert !pirate.previous_changes.key?('parrot_id')
+     assert !pirate.previous_changes.key?('created_on')    
+   end
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index 3c79707..9c366fc 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -195,7 +195,7 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+     [1, '1', true, 'true'].each do |truth|
+       @pirate.reload.create_ship(:name => 'Mister Pablo')
+       assert_difference('Ship.count', -1) do
+-        @pirate.update_attribute(:ship_attributes, { :id => @pirate.ship.id, :_destroy => truth })
++        @pirate.update_attributes(:ship_attributes => { :id => @pirate.ship.id, :_destroy => truth })
+       end
+     end
+   end
+@@ -203,7 +203,7 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_not_destroy_an_existing_record_if_destroy_is_not_truthy
+     [nil, '0', 0, 'false', false].each do |not_truth|
+       assert_no_difference('Ship.count') do
+-        @pirate.update_attribute(:ship_attributes, { :id => @pirate.ship.id, :_destroy => not_truth })
++        @pirate.update_attributes(:ship_attributes => { :id => @pirate.ship.id, :_destroy => not_truth })
+       end
+     end
+   end
+@@ -212,7 +212,7 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+     Pirate.accepts_nested_attributes_for :ship, :allow_destroy => false, :reject_if => proc { |attributes| attributes.empty? }
+ 
+     assert_no_difference('Ship.count') do
+-      @pirate.update_attribute(:ship_attributes, { :id => @pirate.ship.id, :_destroy => '1' })
++      @pirate.update_attributes(:ship_attributes => { :id => @pirate.ship.id, :_destroy => '1' })
+     end
+ 
+     Pirate.accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+@@ -247,13 +247,13 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+   end
+ 
+   def test_should_accept_update_only_option
+-    @pirate.update_attribute(:update_only_ship_attributes, { :id => @pirate.ship.id, :name => 'Mayflower' })
++    @pirate.update_attributes(:update_only_ship_attributes => { :id => @pirate.ship.id, :name => 'Mayflower' })
+   end
+ 
+   def test_should_create_new_model_when_nothing_is_there_and_update_only_is_true
+     @ship.delete
+     assert_difference('Ship.count', 1) do
+-      @pirate.reload.update_attribute(:update_only_ship_attributes, { :name => 'Mayflower' })
++      @pirate.reload.update_attributes(:update_only_ship_attributes => { :name => 'Mayflower' })
+     end
+   end
+ 
+@@ -353,7 +353,7 @@ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+     [1, '1', true, 'true'].each do |truth|
+       @ship.reload.create_pirate(:catchphrase => 'Arr')
+       assert_difference('Pirate.count', -1) do
+-        @ship.update_attribute(:pirate_attributes, { :id => @ship.pirate.id, :_destroy => truth })
++        @ship.update_attributes(:pirate_attributes => { :id => @ship.pirate.id, :_destroy => truth })
+       end
+     end
+   end
+@@ -361,7 +361,7 @@ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+   def test_should_not_destroy_an_existing_record_if_destroy_is_not_truthy
+     [nil, '0', 0, 'false', false].each do |not_truth|
+       assert_no_difference('Pirate.count') do
+-        @ship.update_attribute(:pirate_attributes, { :id => @ship.pirate.id, :_destroy => not_truth })
++        @ship.update_attributes(:pirate_attributes => { :id => @ship.pirate.id, :_destroy => not_truth })
+       end
+     end
+   end
+@@ -370,7 +370,7 @@ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+     Ship.accepts_nested_attributes_for :pirate, :allow_destroy => false, :reject_if => proc { |attributes| attributes.empty? }
+ 
+     assert_no_difference('Pirate.count') do
+-      @ship.update_attribute(:pirate_attributes, { :id => @ship.pirate.id, :_destroy => '1' })
++      @ship.update_attributes(:pirate_attributes => { :id => @ship.pirate.id, :_destroy => '1' })
+     end
+ 
+     Ship.accepts_nested_attributes_for :pirate, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+@@ -398,7 +398,7 @@ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+   def test_should_create_new_model_when_nothing_is_there_and_update_only_is_true
+     @pirate.delete
+     assert_difference('Pirate.count', 1) do
+-      @ship.reload.update_attribute(:update_only_pirate_attributes, { :catchphrase => 'Arr' })
++      @ship.reload.update_attributes(:update_only_pirate_attributes => { :catchphrase => 'Arr' })
+     end
+   end
+ 
+-- 
+1.6.5.2
+

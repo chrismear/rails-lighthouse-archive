@@ -1,0 +1,289 @@
+From d34809ef9607edd81a4079953a9bab2146537fba Mon Sep 17 00:00:00 2001
+From: Tom Lea <norman@sysdevmac-01.office.zen.co.uk>
+Date: Thu, 7 Aug 2008 17:44:17 +0100
+Subject: [PATCH] Callbacks attachable on instance
+
+---
+ activesupport/lib/active_support/callbacks.rb |   42 +++++++++-
+ activesupport/test/callbacks_test.rb          |  118 ++++++++++++++++++++-----
+ 2 files changed, 136 insertions(+), 24 deletions(-)
+
+diff --git a/activesupport/lib/active_support/callbacks.rb b/activesupport/lib/active_support/callbacks.rb
+index 9c59b7a..79db933 100644
+--- a/activesupport/lib/active_support/callbacks.rb
++++ b/activesupport/lib/active_support/callbacks.rb
+@@ -36,6 +36,31 @@ module ActiveSupport
+   #   - save
+   #   saved
+   #
++  # Callbacks can be hooked up for a single instance too.
++  #
++  # Example:
++  #   class SomeStorage < Storage
++  #   end
++  #   
++  #   store = SomeStorage.new
++  #   store.before_save do |object|
++  #     puts "saving..."
++  #   end
++  #   
++  #   store.save
++  # 
++  #   puts "... another store ..."
++  #   
++  #   another_store = SomeStorage.new
++  #   another_store.save
++  #
++  # Output:
++  #   saving...
++  #   - save
++  #   saved
++  #   ... another store ...
++  #   - save
++  #
+   # Callbacks from parent classes are inherited.
+   #
+   # Example:
+@@ -210,6 +235,11 @@ module ActiveSupport
+               (@#{callback}_callbacks ||= CallbackChain.new).concat callbacks
+             end
+ 
++            def #{callback}(*methods, &block)
++              callbacks = CallbackChain.build(:#{callback}, *methods, &block)
++              (@#{callback}_callbacks ||= CallbackChain.new).concat callbacks
++            end
++
+             def self.#{callback}_callback_chain
+               @#{callback}_callbacks ||= CallbackChain.new
+ 
+@@ -219,6 +249,16 @@ module ActiveSupport
+                 @#{callback}_callbacks
+               end
+             end
++            
++            def #{callback}_callback_chain
++              @#{callback}_callbacks ||= CallbackChain.new
++
++              if self.class.respond_to?(:#{callback}_callback_chain)
++                CallbackChain.new(self.class.#{callback}_callback_chain + @#{callback}_callbacks)
++              else
++                @#{callback}_callbacks
++              end
++            end
+           end_eval
+         end
+       end
+@@ -269,7 +309,7 @@ module ActiveSupport
+     #   pass
+     #   stop
+     def run_callbacks(kind, options = {}, &block)
+-      self.class.send("#{kind}_callback_chain").run(self, options, &block)
++      send("#{kind}_callback_chain").run(self, options, &block)
+     end
+   end
+ end
+diff --git a/activesupport/test/callbacks_test.rb b/activesupport/test/callbacks_test.rb
+index 7f71ca2..ee86a4a 100644
+--- a/activesupport/test/callbacks_test.rb
++++ b/activesupport/test/callbacks_test.rb
+@@ -1,35 +1,38 @@
+ require 'abstract_unit'
+ 
+-class Record
+-  include ActiveSupport::Callbacks
+-
+-  define_callbacks :before_save, :after_save
+-
+-  class << self
+-    def callback_symbol(callback_method)
+-      returning("#{callback_method}_method") do |method_name|
+-        define_method(method_name) do
+-          history << [callback_method, :symbol]
+-        end
++module CallbackTestHelpers
++  def callback_symbol(callback_method)
++    returning("#{callback_method}_method") do |method_name|
++      define_method(method_name) do
++        history << [callback_method, :symbol]
+       end
+     end
++  end
+ 
+-    def callback_string(callback_method)
+-      "history << [#{callback_method.to_sym.inspect}, :string]"
+-    end
++  def callback_string(callback_method)
++    "history << [#{callback_method.to_sym.inspect}, :string]"
++  end
+ 
+-    def callback_proc(callback_method)
+-      Proc.new { |model| model.history << [callback_method, :proc] }
+-    end
++  def callback_proc(callback_method)
++    Proc.new { |model| model.history << [callback_method, :proc] }
++  end
+ 
+-    def callback_object(callback_method)
+-      klass = Class.new
+-      klass.send(:define_method, callback_method) do |model|
+-        model.history << [callback_method, :object]
+-      end
+-      klass.new
++  def callback_object(callback_method, name = nil)
++    name ||= callback_method
++    klass = Class.new
++    klass.send(:define_method, name) do |model|
++      model.history << [callback_method, :object]
+     end
++    klass.new
+   end
++end
++
++class Record
++  include ActiveSupport::Callbacks
++  extend CallbackTestHelpers
++
++  define_callbacks :before_save, :after_save
++
+ 
+   def history
+     @history ||= []
+@@ -52,6 +55,22 @@ class Person < Record
+   end
+ end
+ 
++
++module RecordExtension
++  extend CallbackTestHelpers
++  
++  def self.extended(other)
++    [:before_save, :after_save].each do |callback_method|
++      callback_method_history_sym = "#{callback_method}_extension".to_sym
++      other.send(callback_method, callback_symbol(callback_method_history_sym))
++      other.send(callback_method, callback_string(callback_method_history_sym))
++      other.send(callback_method, callback_proc(callback_method_history_sym))
++      other.send(callback_method, callback_object(callback_method_history_sym, callback_method))
++      other.send(callback_method) { |model| model.history << [callback_method_history_sym, :block] }
++    end
++  end
++end
++
+ class ConditionalPerson < Record
+   before_save Proc.new { |r| r.history << [:before_save, :proc] }, :if => Proc.new { |r| true }
+   before_save Proc.new { |r| r.history << "b00m" }, :if => Proc.new { |r| false }
+@@ -84,6 +103,59 @@ class CallbacksTest < Test::Unit::TestCase
+   end
+ end
+ 
++class InstanceCallbacksTest < Test::Unit::TestCase
++  def test_save_person
++    person = Person.new
++    person.extend RecordExtension
++    assert_equal [], person.history
++    person.save
++    assert_equal [
++      [:before_save, :symbol],
++      [:before_save, :string],
++      [:before_save, :proc],
++      [:before_save, :object],
++      [:before_save, :block],
++      [:before_save_extension, :symbol],
++      [:before_save_extension, :string],
++      [:before_save_extension, :proc],
++      [:before_save_extension, :object],
++      [:before_save_extension, :block],
++      [:after_save, :symbol],
++      [:after_save, :string],
++      [:after_save, :proc],
++      [:after_save, :object],
++      [:after_save, :block],
++      [:after_save_extension, :symbol],
++      [:after_save_extension, :string],
++      [:after_save_extension, :proc],
++      [:after_save_extension, :object],
++      [:after_save_extension, :block]
++    ], person.history
++  end
++  
++  def test_save_unextended_person
++    person = Person.new
++    person.extend RecordExtension
++    person.save
++    
++    another_person = Person.new
++    assert_equal [], another_person.history
++    another_person.save
++    assert_equal [
++      [:before_save, :symbol],
++      [:before_save, :string],
++      [:before_save, :proc],
++      [:before_save, :object],
++      [:before_save, :block],
++      [:after_save, :symbol],
++      [:after_save, :string],
++      [:after_save, :proc],
++      [:after_save, :object],
++      [:after_save, :block]
++    ], another_person.history
++  end
++end
++
+ class ConditionalCallbackTest < Test::Unit::TestCase
+   def test_save_conditional_person
+     person = ConditionalPerson.new
+-- 
+1.5.2.4
+
+
+From 1382797980a3a85f3cdfc25f711e480a88392a78 Mon Sep 17 00:00:00 2001
+From: Tom Lea <norman@sysdevmac-01.office.zen.co.uk>
+Date: Thu, 7 Aug 2008 18:08:28 +0100
+Subject: [PATCH] Documentation change to Per-Instance Callbacks
+
+---
+ activesupport/lib/active_support/callbacks.rb |   16 +++++++++-------
+ 1 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/activesupport/lib/active_support/callbacks.rb b/activesupport/lib/active_support/callbacks.rb
+index 79db933..79f9cef 100644
+--- a/activesupport/lib/active_support/callbacks.rb
++++ b/activesupport/lib/active_support/callbacks.rb
+@@ -40,6 +40,11 @@ module ActiveSupport
+   #
+   # Example:
+   #   class SomeStorage < Storage
++  #     def save
++  #       run_callbacks(:before_save)
++  #       puts "- save"
++  #       run_callbacks(:after_save)
++  #     end
+   #   end
+   #   
+   #   store = SomeStorage.new
+@@ -47,19 +52,16 @@ module ActiveSupport
+   #     puts "saving..."
+   #   end
+   #   
++  #   store.after_save do |object|
++  #     puts "saved."
++  #   end
++  #
+   #   store.save
+-  # 
+-  #   puts "... another store ..."
+-  #   
+-  #   another_store = SomeStorage.new
+-  #   another_store.save
+   #
+   # Output:
+   #   saving...
+   #   - save
+   #   saved
+-  #   ... another store ...
+-  #   - save
+   #
+   # Callbacks from parent classes are inherited.
+   #
+-- 
+1.5.2.4
+

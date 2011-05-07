@@ -1,0 +1,366 @@
+From 2376e67caf3ec3f3fa3e60c7148e99c8306616da Mon Sep 17 00:00:00 2001
+From: S. Brent Faulkner <brentf@unwwwired.net>
+Date: Sat, 30 Aug 2008 00:12:17 -0400
+Subject: [PATCH] add support for shallow nesting of routes (and deep route specifications with has_many and a hash)
+
+---
+ actionpack/lib/action_controller/resources.rb |   73 ++++++++++++---
+ actionpack/test/controller/resources_test.rb  |  126 ++++++++++++++++++++----
+ 2 files changed, 166 insertions(+), 33 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/resources.rb b/actionpack/lib/action_controller/resources.rb
+index b4ac0db..31710ca 100644
+--- a/actionpack/lib/action_controller/resources.rb
++++ b/actionpack/lib/action_controller/resources.rb
+@@ -85,16 +85,24 @@ module ActionController
+         @new_path  ||= "#{path}/#{new_action}"
+       end
+ 
++      def shallow_path_prefix
++        @shallow_path_prefix ||= "#{path_prefix unless @options[:shallow]}"
++      end
++
+       def member_path
+-        @member_path ||= "#{path}/:id"
++        @member_path ||= "#{shallow_path_prefix}/#{path_segment}/:id"
+       end
+ 
+       def nesting_path_prefix
+-        @nesting_path_prefix ||= "#{path}/:#{singular}_id"
++        @nesting_path_prefix ||= "#{shallow_path_prefix}/#{path_segment}/:#{singular}_id"
++      end
++
++      def shallow_name_prefix
++        @shallow_name_prefix ||= "#{name_prefix unless @options[:shallow]}"
+       end
+ 
+       def nesting_name_prefix
+-        "#{name_prefix}#{singular}_"
++        "#{shallow_name_prefix}#{singular}_"
+       end
+ 
+       def action_separator
+@@ -141,6 +149,8 @@ module ActionController
+         super
+       end
+ 
++      alias_method :shallow_path_prefix, :path_prefix
++      alias_method :shallow_name_prefix, :name_prefix
+       alias_method :member_path,         :path
+       alias_method :nesting_path_prefix, :path
+     end
+@@ -318,6 +328,31 @@ module ActionController
+     #   comments_url(@article)
+     #   comment_url(@article, @comment)
+     #
++    # * <tt>:shallow</tt> - If true, paths for nested resources which reference a specific member
++    #   (ie. those with an :id parameter) will not use the parent path prefix or name prefix.
++    #
++    # The <tt>:shallow</tt> option is inherited by any nested resource(s).
++    #
++    # For example, 'users', 'posts' and 'comments' all use shallow paths with the following nested resources:
++    #
++    #   map.resources :users, :shallow => true do |user|
++    #     user.resources :posts do |post|
++    #       post.resources :comments
++    #     end
++    #   end
++    #   # --> GET /users/1/posts (maps to the PostsController#index action as usual)
++    #   #     also adds the usual named route called "user_posts"
++    #   # --> GET /posts/2 (maps to the PostsController#show action as if it were not nested)
++    #   #     also adds the named route called "post"
++    #   # --> GET /posts/2/comments (maps to the CommentsController#index action)
++    #   #     also adds the named route called "post_comments"
++    #   # --> GET /comments/2 (maps to the CommentsController#show action as if it were not nested)
++    #   #     also adds the named route called "comment"
++    #
++    # You may also use <tt>:shallow</tt> in combination with the +has_one+ and +has_many+ shorthand notations like:
++    #
++    #   map.resources :users, :has_many => { :posts => :comments }, :shallow => true
++    #
+     # If <tt>map.resources</tt> is called with multiple resources, they all get the same options applied.
+     #
+     # Examples:
+@@ -443,7 +478,7 @@ module ActionController
+           map_associations(resource, options)
+ 
+           if block_given?
+-            with_options(:path_prefix => resource.nesting_path_prefix, :name_prefix => resource.nesting_name_prefix, :namespace => options[:namespace], &block)
++            with_options(:path_prefix => resource.nesting_path_prefix, :name_prefix => resource.nesting_name_prefix, :namespace => options[:namespace], :shallow => options[:shallow], &block)
+           end
+         end
+       end
+@@ -460,21 +495,35 @@ module ActionController
+           map_associations(resource, options)
+ 
+           if block_given?
+-            with_options(:path_prefix => resource.nesting_path_prefix, :name_prefix => resource.nesting_name_prefix, :namespace => options[:namespace], &block)
++            with_options(:path_prefix => resource.nesting_path_prefix, :name_prefix => resource.nesting_name_prefix, :namespace => options[:namespace], :shallow => options[:shallow], &block)
+           end
+         end
+       end
+ 
+       def map_associations(resource, options)
++        map_has_many_associations(resource, options.delete(:has_many), options) if options[:has_many]
++
+         path_prefix = "#{options.delete(:path_prefix)}#{resource.nesting_path_prefix}"
+         name_prefix = "#{options.delete(:name_prefix)}#{resource.nesting_name_prefix}"
+ 
+-        Array(options[:has_many]).each do |association|
+-          resources(association, :path_prefix => path_prefix, :name_prefix => name_prefix, :namespace => options[:namespace])
++        Array(options[:has_one]).each do |association|
++          resource(association, :path_prefix => path_prefix, :name_prefix => name_prefix, :namespace => options[:namespace], :shallow => options[:shallow])
+         end
++      end
+ 
+-        Array(options[:has_one]).each do |association|
+-          resource(association, :path_prefix => path_prefix, :name_prefix => name_prefix, :namespace => options[:namespace])
++      def map_has_many_associations(resource, associations, options)
++        case associations
++        when Hash
++          associations.each do |association,has_many|
++            map_has_many_associations(resource, association, options.merge(:has_many => has_many))
++          end
++        when Array
++          associations.each do |association|
++            map_has_many_associations(resource, association, options)
++          end
++        when Symbol, String
++          resources(associations, :path_prefix => resource.nesting_path_prefix, :name_prefix => resource.nesting_name_prefix, :namespace => options[:namespace], :shallow => options[:shallow], :has_many => options[:has_many])
++        else
+         end
+       end
+ 
+@@ -530,13 +579,13 @@ module ActionController
+               action_path = resource.options[:path_names][action] if resource.options[:path_names].is_a?(Hash)
+               action_path ||= Base.resources_path_names[action] || action
+ 
+-              map_named_routes(map, "#{action}_#{resource.name_prefix}#{resource.singular}", "#{resource.member_path}#{resource.action_separator}#{action_path}", action_options)
++              map_named_routes(map, "#{action}_#{resource.shallow_name_prefix}#{resource.singular}", "#{resource.member_path}#{resource.action_separator}#{action_path}", action_options)
+             end
+           end
+         end
+ 
+         show_action_options = action_options_for("show", resource)
+-        map_named_routes(map, "#{resource.name_prefix}#{resource.singular}", resource.member_path, show_action_options)
++        map_named_routes(map, "#{resource.shallow_name_prefix}#{resource.singular}", resource.member_path, show_action_options)
+ 
+         update_action_options = action_options_for("update", resource)
+         map_unnamed_routes(map, resource.member_path, update_action_options)
+@@ -579,4 +628,4 @@ end
+ 
+ class ActionController::Routing::RouteSet::Mapper
+   include ActionController::Resources
+-end
+\ No newline at end of file
++end
+diff --git a/actionpack/test/controller/resources_test.rb b/actionpack/test/controller/resources_test.rb
+index 7830767..691e147 100644
+--- a/actionpack/test/controller/resources_test.rb
++++ b/actionpack/test/controller/resources_test.rb
+@@ -379,6 +379,31 @@ class ResourcesTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_shallow_nested_restful_routes
++    with_routing do |set|
++      set.draw do |map|
++        map.resources :threads, :shallow => true do |map|
++          map.resources :messages do |map|
++            map.resources :comments
++          end
++        end
++      end
++
++      assert_simply_restful_for :threads,
++        :shallow => true
++      assert_simply_restful_for :messages,
++        :name_prefix => 'thread_',
++        :path_prefix => 'threads/1/',
++        :shallow => true,
++        :options => { :thread_id => '1' }
++      assert_simply_restful_for :comments,
++        :name_prefix => 'message_',
++        :path_prefix => 'messages/2/',
++        :shallow => true,
++        :options => { :message_id => '2' }
++    end
++  end
++
+   def test_restful_routes_dont_generate_duplicates
+     with_restful_routing :messages do
+       routes = ActionController::Routing::Routes.routes
+@@ -429,6 +454,32 @@ class ResourcesTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_resources_has_many_hash_should_become_nested_resources
++    with_routing do |set|
++      set.draw do |map|
++        map.resources :threads, :has_many => { :messages => [ :comments, { :authors => :threads } ] }
++      end
++
++      assert_simply_restful_for :threads
++      assert_simply_restful_for :messages, :name_prefix => "thread_", :path_prefix => 'threads/1/', :options => { :thread_id => '1' }
++      assert_simply_restful_for :comments, :name_prefix => "thread_message_", :path_prefix => 'threads/1/messages/1/', :options => { :thread_id => '1', :message_id => '1' }
++      assert_simply_restful_for :authors,  :name_prefix => "thread_message_", :path_prefix => 'threads/1/messages/1/', :options => { :thread_id => '1', :message_id => '1' }
++      assert_simply_restful_for :threads,  :name_prefix => "thread_message_author_", :path_prefix => 'threads/1/messages/1/authors/1/', :options => { :thread_id => '1', :message_id => '1', :author_id => '1' }
++    end
++  end
++
++  def test_shallow_resource_has_many_should_become_shallow_nested_resources
++    with_routing do |set|
++      set.draw do |map|
++        map.resources :messages, :has_many => [ :comments, :authors ], :shallow => true
++      end
++
++      assert_simply_restful_for :messages, :shallow => true
++      assert_simply_restful_for :comments, :name_prefix => "message_", :path_prefix => 'messages/1/', :shallow => true, :options => { :message_id => '1' }
++      assert_simply_restful_for :authors,  :name_prefix => "message_", :path_prefix => 'messages/1/', :shallow => true, :options => { :message_id => '1' }
++    end
++  end
++
+   def test_resource_has_one_should_become_nested_resources
+     with_routing do |set|
+       set.draw do |map|
+@@ -440,6 +491,17 @@ class ResourcesTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_shallow_resource_has_one_should_become_shallow_nested_resources
++    with_routing do |set|
++      set.draw do |map|
++        map.resources :messages, :has_one => :logo, :shallow => true
++      end
++
++      assert_simply_restful_for :messages, :shallow => true
++      assert_singleton_restful_for :logo, :name_prefix => 'message_', :path_prefix => 'messages/1/', :shallow => true, :options => { :message_id => '1' }
++    end
++  end
++
+   def test_singleton_resource_with_member_action
+     [:put, :post].each do |method|
+       with_singleton_resources :account, :member => { :reset => method } do
+@@ -744,6 +806,13 @@ class ResourcesTest < Test::Unit::TestCase
+       options[:options] ||= {}
+       options[:options][:controller] = options[:controller] || controller_name.to_s
+ 
++      if options[:shallow]
++        options[:shallow_options] ||= {}
++        options[:shallow_options][:controller] = options[:options][:controller]
++      else
++        options[:shallow_options] = options[:options]
++      end
++
+       new_action    = ActionController::Base.resources_path_names[:new] || "new"
+       edit_action   = ActionController::Base.resources_path_names[:edit] || "edit"
+       if options[:path_names]
+@@ -751,8 +820,10 @@ class ResourcesTest < Test::Unit::TestCase
+         edit_action = options[:path_names][:edit] if options[:path_names][:edit]
+       end
+ 
+-      collection_path            = "/#{options[:path_prefix]}#{options[:as] || controller_name}"
+-      member_path                = "#{collection_path}/1"
++      path                       = "#{options[:as] || controller_name}"
++      collection_path            = "/#{options[:path_prefix]}#{path}"
++      shallow_path               = "/#{options[:path_prefix] unless options[:shallow]}#{path}"
++      member_path                = "#{shallow_path}/1"
+       new_path                   = "#{collection_path}/#{new_action}"
+       edit_member_path           = "#{member_path}/#{edit_action}"
+       formatted_edit_member_path = "#{member_path}/#{edit_action}.xml"
+@@ -760,10 +831,13 @@ class ResourcesTest < Test::Unit::TestCase
+       with_options(options[:options]) do |controller|
+         controller.assert_routing collection_path,            :action => 'index'
+         controller.assert_routing new_path,                   :action => 'new'
+-        controller.assert_routing member_path,                :action => 'show', :id => '1'
+-        controller.assert_routing edit_member_path,           :action => 'edit', :id => '1'
+         controller.assert_routing "#{collection_path}.xml",   :action => 'index',            :format => 'xml'
+         controller.assert_routing "#{new_path}.xml",          :action => 'new',              :format => 'xml'
++      end
++
++      with_options(options[:shallow_options]) do |controller|
++        controller.assert_routing member_path,                :action => 'show', :id => '1'
++        controller.assert_routing edit_member_path,           :action => 'edit', :id => '1'
+         controller.assert_routing "#{member_path}.xml",       :action => 'show', :id => '1', :format => 'xml'
+         controller.assert_routing formatted_edit_member_path, :action => 'edit', :id => '1', :format => 'xml'
+       end
+@@ -771,18 +845,18 @@ class ResourcesTest < Test::Unit::TestCase
+       assert_recognizes(options[:options].merge(:action => 'index'),               :path => collection_path,  :method => :get)
+       assert_recognizes(options[:options].merge(:action => 'new'),                 :path => new_path,         :method => :get)
+       assert_recognizes(options[:options].merge(:action => 'create'),              :path => collection_path,  :method => :post)
+-      assert_recognizes(options[:options].merge(:action => 'show',    :id => '1'), :path => member_path,      :method => :get)
+-      assert_recognizes(options[:options].merge(:action => 'edit',    :id => '1'), :path => edit_member_path, :method => :get)
+-      assert_recognizes(options[:options].merge(:action => 'update',  :id => '1'), :path => member_path,      :method => :put)
+-      assert_recognizes(options[:options].merge(:action => 'destroy', :id => '1'), :path => member_path,      :method => :delete)
++      assert_recognizes(options[:shallow_options].merge(:action => 'show',    :id => '1'), :path => member_path,      :method => :get)
++      assert_recognizes(options[:shallow_options].merge(:action => 'edit',    :id => '1'), :path => edit_member_path, :method => :get)
++      assert_recognizes(options[:shallow_options].merge(:action => 'update',  :id => '1'), :path => member_path,      :method => :put)
++      assert_recognizes(options[:shallow_options].merge(:action => 'destroy', :id => '1'), :path => member_path,      :method => :delete)
+ 
+       assert_recognizes(options[:options].merge(:action => 'index',               :format => 'xml'), :path => "#{collection_path}.xml",   :method => :get)
+       assert_recognizes(options[:options].merge(:action => 'new',                 :format => 'xml'), :path => "#{new_path}.xml",          :method => :get)
+       assert_recognizes(options[:options].merge(:action => 'create',              :format => 'xml'), :path => "#{collection_path}.xml",   :method => :post)
+-      assert_recognizes(options[:options].merge(:action => 'show',    :id => '1', :format => 'xml'), :path => "#{member_path}.xml",       :method => :get)
+-      assert_recognizes(options[:options].merge(:action => 'edit',    :id => '1', :format => 'xml'), :path => formatted_edit_member_path, :method => :get)
+-      assert_recognizes(options[:options].merge(:action => 'update',  :id => '1', :format => 'xml'), :path => "#{member_path}.xml",       :method => :put)
+-      assert_recognizes(options[:options].merge(:action => 'destroy', :id => '1', :format => 'xml'), :path => "#{member_path}.xml",       :method => :delete)
++      assert_recognizes(options[:shallow_options].merge(:action => 'show',    :id => '1', :format => 'xml'), :path => "#{member_path}.xml",       :method => :get)
++      assert_recognizes(options[:shallow_options].merge(:action => 'edit',    :id => '1', :format => 'xml'), :path => formatted_edit_member_path, :method => :get)
++      assert_recognizes(options[:shallow_options].merge(:action => 'update',  :id => '1', :format => 'xml'), :path => "#{member_path}.xml",       :method => :put)
++      assert_recognizes(options[:shallow_options].merge(:action => 'destroy', :id => '1', :format => 'xml'), :path => "#{member_path}.xml",       :method => :delete)
+ 
+       yield options[:options] if block_given?
+     end
+@@ -798,14 +872,24 @@ class ResourcesTest < Test::Unit::TestCase
+       options[:options] ||= {}
+       options[:options][:controller] = options[:controller] || controller_name.to_s
+ 
++      if options[:shallow]
++        options[:shallow_options] ||= {}
++        options[:shallow_options][:controller] = options[:options][:controller]
++      else
++        options[:shallow_options] = options[:options]
++      end
++
+       @controller = "#{options[:options][:controller].camelize}Controller".constantize.new
+       @request    = ActionController::TestRequest.new
+       @response   = ActionController::TestResponse.new
+       get :index, options[:options]
+       options[:options].delete :action
+ 
+-      full_prefix = "/#{options[:path_prefix]}#{options[:as] || controller_name}"
++      path = "#{options[:as] || controller_name}"
++      shallow_path = "/#{options[:path_prefix] unless options[:shallow]}#{path}"
++      full_path = "/#{options[:path_prefix]}#{path}"
+       name_prefix = options[:name_prefix]
++      shallow_prefix = "#{options[:name_prefix] unless options[:shallow]}"
+ 
+       new_action  = "new"
+       edit_action = "edit"
+@@ -814,15 +898,15 @@ class ResourcesTest < Test::Unit::TestCase
+         edit_action = options[:path_names][:edit] || "edit"
+       end
+ 
+-      assert_named_route "#{full_prefix}",            "#{name_prefix}#{controller_name}_path",              options[:options]
+-      assert_named_route "#{full_prefix}.xml",        "formatted_#{name_prefix}#{controller_name}_path",    options[:options].merge(            :format => 'xml')
+-      assert_named_route "#{full_prefix}/1",          "#{name_prefix}#{singular_name}_path",                options[:options].merge(:id => '1')
+-      assert_named_route "#{full_prefix}/1.xml",      "formatted_#{name_prefix}#{singular_name}_path",      options[:options].merge(:id => '1', :format => 'xml')
++      assert_named_route "#{full_path}",            "#{name_prefix}#{controller_name}_path",              options[:options]
++      assert_named_route "#{full_path}.xml",        "formatted_#{name_prefix}#{controller_name}_path",    options[:options].merge(            :format => 'xml')
++      assert_named_route "#{shallow_path}/1",          "#{shallow_prefix}#{singular_name}_path",                options[:shallow_options].merge(:id => '1')
++      assert_named_route "#{shallow_path}/1.xml",      "formatted_#{shallow_prefix}#{singular_name}_path",      options[:shallow_options].merge(:id => '1', :format => 'xml')
+ 
+-      assert_named_route "#{full_prefix}/#{new_action}",        "new_#{name_prefix}#{singular_name}_path",            options[:options]
+-      assert_named_route "#{full_prefix}/#{new_action}.xml",    "formatted_new_#{name_prefix}#{singular_name}_path",  options[:options].merge(            :format => 'xml')
+-      assert_named_route "#{full_prefix}/1/#{edit_action}",     "edit_#{name_prefix}#{singular_name}_path",           options[:options].merge(:id => '1')
+-      assert_named_route "#{full_prefix}/1/#{edit_action}.xml", "formatted_edit_#{name_prefix}#{singular_name}_path", options[:options].merge(:id => '1', :format => 'xml')
++      assert_named_route "#{full_path}/#{new_action}",        "new_#{name_prefix}#{singular_name}_path",            options[:options]
++      assert_named_route "#{full_path}/#{new_action}.xml",    "formatted_new_#{name_prefix}#{singular_name}_path",  options[:options].merge(            :format => 'xml')
++      assert_named_route "#{shallow_path}/1/#{edit_action}",     "edit_#{shallow_prefix}#{singular_name}_path",           options[:shallow_options].merge(:id => '1')
++      assert_named_route "#{shallow_path}/1/#{edit_action}.xml", "formatted_edit_#{shallow_prefix}#{singular_name}_path", options[:shallow_options].merge(:id => '1', :format => 'xml')
+ 
+       yield options[:options] if block_given?
+     end
+-- 
+1.5.5.1
+

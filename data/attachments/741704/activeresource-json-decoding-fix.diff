@@ -1,0 +1,156 @@
+From 5d49c0ba2e459e0547856314b3fea342320302be Mon Sep 17 00:00:00 2001
+From: Denis Odorcic <denis.odorcic@gmail.com>
+Date: Wed, 27 Oct 2010 22:57:11 -0400
+Subject: [PATCH] Fix ActiveResource JSON not handling resources with root and incorrect format tests for both JSON and XML [#5867 state:resolved]
+
+---
+ .../lib/active_resource/formats/json_format.rb     |   16 +++++++++-
+ activeresource/test/cases/base_test.rb             |   10 ++---
+ activeresource/test/cases/format_test.rb           |   33 +++++++++++++++-----
+ 3 files changed, 44 insertions(+), 15 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/formats/json_format.rb b/activeresource/lib/active_resource/formats/json_format.rb
+index 9980634..6a06483 100644
+--- a/activeresource/lib/active_resource/formats/json_format.rb
++++ b/activeresource/lib/active_resource/formats/json_format.rb
+@@ -18,8 +18,22 @@ module ActiveResource
+       end
+ 
+       def decode(json)
+-        ActiveSupport::JSON.decode(json)
++        decoded_json = ActiveSupport::JSON.decode(json)
++        if decoded_json.is_a?(Array)
++          decoded_json.map! { |e| from_json_data(e) }
++        else
++          from_json_data(decoded_json)
++        end
+       end
++
++      private
++        def from_json_data(data)
++          if data.is_a?(Hash) && data.keys.size == 1
++            data.values.first
++          else
++            data
++          end
++        end
+     end
+   end
+ end
+diff --git a/activeresource/test/cases/base_test.rb b/activeresource/test/cases/base_test.rb
+index abf4259..55753bf 100644
+--- a/activeresource/test/cases/base_test.rb
++++ b/activeresource/test/cases/base_test.rb
+@@ -980,7 +980,6 @@ class BaseTest < Test::Unit::TestCase
+   end
+ 
+   def test_to_json
+-    Person.include_root_in_json = true
+     Person.format = :json
+     joe = Person.find(6)
+     encode = joe.encode
+@@ -988,15 +987,14 @@ class BaseTest < Test::Unit::TestCase
+     Person.format = :xml
+ 
+     assert_equal encode, json
+-    assert_match %r{^\{"person":\{"person":\{}, json
++    assert_match %r{^\{"person":\{}, json
+     assert_match %r{"id":6}, json
+     assert_match %r{"name":"Joe"}, json
+-    assert_match %r{\}\}\}$}, json
++    assert_match %r{\}\}$}, json
+   end
+ 
+   def test_to_json_with_element_name
+     old_elem_name = Person.element_name
+-    Person.include_root_in_json = true
+     Person.format = :json
+     joe = Person.find(6)
+     Person.element_name = 'ruby_creator'
+@@ -1005,10 +1003,10 @@ class BaseTest < Test::Unit::TestCase
+     Person.format = :xml
+ 
+     assert_equal encode, json
+-    assert_match %r{^\{"ruby_creator":\{"person":\{}, json
++    assert_match %r{^\{"ruby_creator":\{}, json
+     assert_match %r{"id":6}, json
+     assert_match %r{"name":"Joe"}, json
+-    assert_match %r{\}\}\}$}, json
++    assert_match %r{\}\}$}, json
+   ensure
+     Person.element_name = old_elem_name
+   end
+diff --git a/activeresource/test/cases/format_test.rb b/activeresource/test/cases/format_test.rb
+index fc1a7b8..b8b15e3 100644
+--- a/activeresource/test/cases/format_test.rb
++++ b/activeresource/test/cases/format_test.rb
+@@ -2,10 +2,27 @@ require 'abstract_unit'
+ require "fixtures/person"
+ require "fixtures/street_address"
+ 
++# Used in setup and needed to properly properly encode
++# the class in the correct format
++class PersonWithFormatSerializers
++  include ActiveModel::Serializers::JSON
++  include ActiveModel::Serializers::Xml
++  attr_accessor :id, :name
++
++  def initialize(options={})
++    @id = options[:id]
++    @name = options[:name]
++  end
++
++  def attributes
++    @attributes ||= {'id' => id, 'name' => name}
++  end
++end
++
+ class FormatTest < Test::Unit::TestCase
+   def setup
+-    @matz  = { :id => 1, :name => 'Matz' }
+-    @david = { :id => 2, :name => 'David' }
++    @matz  = PersonWithFormatSerializers.new(:id => 1, :name => 'Matz')
++    @david  = PersonWithFormatSerializers.new(:id => 2, :name => 'David')
+ 
+     @programmers = [ @matz, @david ]
+   end
+@@ -22,7 +39,7 @@ class FormatTest < Test::Unit::TestCase
+     for format in [ :json, :xml ]
+       using_format(Person, format) do
+         ActiveResource::HttpMock.respond_to.get "/people/1.#{format}", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode(@david)
+-        assert_equal @david[:name], Person.find(1).name
++        assert_equal @david.name, Person.find(1).name
+       end
+     end
+   end
+@@ -44,8 +61,8 @@ class FormatTest < Test::Unit::TestCase
+         ActiveResource::HttpMock.respond_to.get "/people/retrieve.#{format}?name=David", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode([@david])
+         remote_programmers = Person.get(:retrieve, :name => 'David')
+         assert_equal 1, remote_programmers.size
+-        assert_equal @david[:id], remote_programmers[0]['id']
+-        assert_equal @david[:name], remote_programmers[0]['name']
++        assert_equal @david.id, remote_programmers[0]['id']
++        assert_equal @david.name, remote_programmers[0]['name']
+       end
+     end
+   end
+@@ -58,13 +75,13 @@ class FormatTest < Test::Unit::TestCase
+           mock.get "/people/2/shallow.#{format}", {'Accept' => ActiveResource::Formats[format].mime_type}, ActiveResource::Formats[format].encode(@david)
+         end
+         remote_programmer = Person.find(2).get(:shallow)
+-        assert_equal @david[:id], remote_programmer['id']
+-        assert_equal @david[:name], remote_programmer['name']
++        assert_equal @david.id, remote_programmer['id']
++        assert_equal @david.name, remote_programmer['name']
+       end
+     end
+ 
+     for format in [ :json, :xml ]
+-      ryan = ActiveResource::Formats[format].encode({ :name => 'Ryan' })
++      ryan = ActiveResource::Formats[format].encode(PersonWithFormatSerializers.new(:name => 'Ryan' ))
+       using_format(Person, format) do
+         remote_ryan = Person.new(:name => 'Ryan')
+         ActiveResource::HttpMock.respond_to.post "/people.#{format}", {'Content-Type' => ActiveResource::Formats[format].mime_type}, ryan, 201, {'Location' => "/people/5.#{format}"}
+-- 
+1.6.0.6
+

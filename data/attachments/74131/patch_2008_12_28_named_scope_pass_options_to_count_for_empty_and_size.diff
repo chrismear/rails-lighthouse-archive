@@ -1,0 +1,109 @@
+From 0da022b85086ab9c8789c4fb50a1e821045885c4 Mon Sep 17 00:00:00 2001
+From: Wolfram Arnold <wolfram@wtaconsulting.net>
+Date: Sun, 28 Dec 2008 23:29:57 +0100
+Subject: [PATCH] #1652 fixed - pass all options except :order and :select to the .count method invoked for .size and .empty? if the data has not been loaded yet.
+
+---
+ activerecord/lib/active_record/named_scope.rb |   21 +++++++++++++++++++--
+ activerecord/test/cases/named_scope_test.rb   |   22 ++++++++++++++++++++++
+ activerecord/test/models/post.rb              |    9 +++++++++
+ 3 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 83043c2..12701f3 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -69,6 +69,13 @@ module ActiveRecord
+       #     end
+       #   end
+       #
++      # Note that most options available with the +find+ method apply here too.  Calling +size+ or +empty+ will resolve
++      # to a <tt>SELECT COUNT(*)...</tt> and ignore an explicit :select or :order option, if given.  The :group option and others will
++      # be processed, however.
++      #
++      # Note also that the +size+ and +length+ methods are not equivalent when the data has not yet been loaded.  In that
++      # case, +size+ will also invoke a <tt>SELECT COUNT(*)</tt> query while +length+ will run the full query.  If the data has been
++      # loaded, the behavior of the two methods is equivalent.  This behavior is analogous to ActiveRecord Association collections. 
+       #
+       # For testing complex named \scopes, you can examine the scoping options using the
+       # <tt>proxy_options</tt> method on the proxy itself.
+@@ -137,11 +144,21 @@ module ActiveRecord
+       end
+ 
+       def size
+-        @found ? @found.length : count
++        if @found
++          @found.length
++        else
++          ct = count(@proxy_options.except(:select, :order))
++          ct.is_a?(Numeric) ? ct : ct.length
++        end
+       end
+ 
+       def empty?
+-        @found ? @found.empty? : count.zero?
++        if @found
++          @found.empty?
++        else
++          ct = count(@proxy_options.except(:select, :order))
++          ct.is_a?(Numeric) ? ct.zero? : ct.empty?
++        end
+       end
+ 
+       def respond_to?(method, include_private = false)
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index 64e8997..776933d 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -272,6 +272,28 @@ class NamedScopeTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_custom_select_works
++    expected_posts = posts(:sti_comments, :welcome, :sti_post_and_comments)
++    assert_queries(1) do
++      assert_sql(/SELECT posts\.\*, COUNT\(\*\) AS comment_count/i) do
++        most_commented_posts = Post.most_commented(3,0)
++        assert_equal expected_posts, most_commented_posts
++      end
++    end
++  end
++
++  def test_empty_should_use_count_and_honor_group_option
++    assert_queries(1) do
++      assert_sql(/SELECT COUNT\(\*\) AS count_all.*GROUP BY posts\.id/i) { assert !Post.most_commented(3,0).empty? }
++    end
++  end
++
++  def test_size_should_use_count_and_honor_group_option
++    assert_queries(1) do
++      assert_sql(/SELECT COUNT\(\*\) AS count_all.*GROUP BY posts\.id/i) { assert_equal 3, Post.most_commented(3,0).size }
++    end
++  end
++
+   def test_chaining_with_duplicate_joins
+     join = "INNER JOIN comments ON comments.post_id = posts.id"
+     post = Post.find(1)
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index e0d8be6..21abacb 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -5,6 +5,15 @@ class Post < ActiveRecord::Base
+       :joins => 'JOIN authors ON authors.id = posts.author_id'
+     }
+   }
++  
++  named_scope :most_commented,
++              Proc.new { |limit, offset| { :select => 'posts.*, COUNT(*) AS comment_count',
++                                           :joins => :comments, 
++                                           :limit => limit,
++                                           :group => 'posts.id',
++                                           :order => 'comment_count DESC, comments.id ASC',
++                                           :offset => offset
++                                         } }
+ 
+   belongs_to :author do
+     def greeting
+-- 
+1.5.6.3
+

@@ -1,0 +1,453 @@
+From bedb4cb30a61a2b21deb80a1a20ad402f26d20cc Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Sun, 2 May 2010 19:17:21 +1000
+Subject: [PATCH] Ability to link and unlink records with :autosave => true on has_many and habtm associations.
+
+---
+ .../associations/association_collection.rb         |   97 ++++++++++---
+ .../has_and_belongs_to_many_association.rb         |    9 +-
+ .../lib/active_record/autosave_association.rb      |    2 +
+ .../lib/active_record/nested_attributes.rb         |    2 +-
+ .../test/cases/autosave_association_test.rb        |  160 +++++++++++++++++++-
+ 5 files changed, 247 insertions(+), 23 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0dfd966..d4e6342 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -108,6 +108,7 @@ module ActiveRecord
+         reset_target!
+         reset_named_scopes_cache!
+         @loaded = false
++        reset_pending_links
+       end
+ 
+       def build(attributes = {}, &block)
+@@ -131,7 +132,7 @@ module ActiveRecord
+           flatten_deeper(records).each do |record|
+             raise_on_type_mismatch(record)
+             add_record_to_target_with_callbacks(record) do |r|
+-              result &&= insert_record(record) unless @owner.new_record?
++              result &&= insert_record(record) unless @owner.new_record? || autosave?
+             end
+           end
+         end
+@@ -166,7 +167,7 @@ module ActiveRecord
+         reset_target!
+         reset_named_scopes_cache!
+       end
+-      
++
+       # Calculate sum using SQL, not Enumerable
+       def sum(*args)
+         if block_given?
+@@ -214,8 +215,15 @@ module ActiveRecord
+       # +delete_records+. They are in any case removed from the collection.
+       def delete(*records)
+         remove_records(records) do |records, old_records|
+-          delete_records(old_records) if old_records.any?
+-          records.each { |record| @target.delete(record) }
++          if autosave?
++            old_records.each { |record| pending_link_deletions << record unless @owner.new_record? }
++          else
++            delete_records(old_records) if old_records.any?
++          end
++          records.each do |record|
++            @target.delete(record)
++            pending_link_creations.delete(record) if autosave?
++          end
+         end
+       end
+ 
+@@ -227,22 +235,22 @@ module ActiveRecord
+       def destroy(*records)
+         records = find(records) if records.any? {|record| record.kind_of?(Fixnum) || record.kind_of?(String)}
+         remove_records(records) do |records, old_records|
+-          old_records.each { |record| record.destroy }
++          old_records.each do |record|
++            record.destroy
++            @target.delete(record)
++          end
+         end
+-
+-        load_target
+       end
+ 
+       # Removes all records from this association.  Returns +self+ so method calls may be chained.
+       def clear
+-        return self if length.zero? # forces load_target if it hasn't happened already
+-
+-        if @reflection.options[:dependent] && @reflection.options[:dependent] == :destroy
+-          destroy_all
+-        else          
+-          delete_all
++        unless load_target.size.zero?
++          if !autosave? && @reflection.options[:dependent] && @reflection.options[:dependent] == :destroy
++            destroy_all
++          else
++            delete_all
++          end
+         end
+-
+         self
+       end
+ 
+@@ -287,7 +295,7 @@ module ActiveRecord
+       def size
+         if @owner.new_record? || (loaded? && !@reflection.options[:uniq])
+           @target.size
+-        elsif !loaded? && @reflection.options[:group]
++        elsif autosave? || (!loaded? && @reflection.options[:group])
+           load_target.size
+         elsif !loaded? && !@reflection.options[:uniq] && @target.is_a?(Array)
+           unsaved_records = @target.select { |r| r.new_record? }
+@@ -367,6 +375,35 @@ module ActiveRecord
+         super || @reflection.klass.respond_to?(method, include_private)
+       end
+ 
++      def pending_link_creations
++        @pending_link_creations ||= []
++      end
++
++      def pending_link_deletions
++        @pending_link_deletions ||= []
++      end
++
++      # Saves the pending changes to the datastore.
++      def save
++        return unless autosave?
++        return if pending_link_creations.empty? && pending_link_deletions.empty?
++        transaction do
++          unless pending_link_creations.empty?
++            pending_link_creations.dup.each do |record|
++              callback(:before_create, record)
++              insert_record(record, false, false)
++              callback(:after_create, record)
++            end
++          end
++          unless pending_link_deletions.empty?
++            pending_link_deletions.each { |record| callback(:before_destroy, record) }
++            delete_records(pending_link_deletions)
++            pending_link_deletions.each { |record| callback(:after_destroy, record) }
++          end
++        end
++        reset_pending_links
++      end
++
+       protected
+         def construct_find_options!(options)
+         end
+@@ -392,6 +429,10 @@ module ActiveRecord
+                 else
+                   @target = find_target
+                 end
++                if autosave?
++                  pending_link_creations.each { |record| @target.push(record) unless @target.include?(record) }
++                  pending_link_deletions.each { |record| @target.delete(record) }
++                end
+               end
+             rescue ActiveRecord::RecordNotFound
+               reset
+@@ -451,17 +492,35 @@ module ActiveRecord
+           records
+         end
+ 
++        def add_record_to_target(record)
++          @target ||= [] unless loaded?
++          @target << record unless @reflection.options[:uniq] && @target.include?(record)
++          set_inverse_instance(record, @owner)
++        end
++
+         def add_record_to_target_with_callbacks(record)
+           callback(:before_add, record)
+           yield(record) if block_given?
+-          @target ||= [] unless loaded?
+-          @target << record unless @reflection.options[:uniq] && @target.include?(record)
++          add_record_to_target(record)
++          if autosave?
++            unless @reflection.options[:uniq] && @target.include?(record)
++              pending_link_creations << record
++              pending_link_deletions.delete(record) unless @owner.new_record?
++            end
++          end
+           callback(:after_add, record)
+-          set_inverse_instance(record, @owner)
+           record
+         end
+ 
++        def autosave?
++          @reflection.options[:autosave]
++        end
++
+       private
++        def reset_pending_links
++          @pending_link_creations = @pending_link_deletions = nil
++        end
++
+         def create_record(attrs)
+           attrs.update(@reflection.options[:conditions]) if @reflection.options[:conditions].is_a?(Hash)
+           ensure_owner_is_not_new
+@@ -473,6 +532,8 @@ module ActiveRecord
+           else
+             add_record_to_target_with_callbacks(record)
+           end
++          pending_link_creations.delete(record) if autosave?
++          record
+         end
+ 
+         def build_record(attrs)
+diff --git a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+index 7f39a18..44b44b1 100644
+--- a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+@@ -59,8 +59,9 @@ module ActiveRecord
+               end
+               attrs
+             end
+-
+-            relation.insert(attributes)
++            success = relation.insert(attributes)
++            pending_link_creations.delete(record) if success && autosave?
++            success
+           end
+ 
+           return true
+@@ -113,7 +114,9 @@ module ActiveRecord
+           if attributes.is_a?(Array)
+             attributes.collect { |attr| create(attr) }
+           else
+-            build_record(attributes, &block)
++            record = build_record(attributes, &block)
++            pending_link_creations.delete(record) if autosave?
++            record
+           end
+         end
+     end
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 325a8aa..950bcdd 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -309,6 +309,8 @@ module ActiveRecord
+           end
+         end
+ 
++        association.save if autosave
++
+         # reconstruct the SQL queries now that we know the owner's id
+         association.send(:construct_sql) if association.respond_to?(:construct_sql)
+       end
+diff --git a/activerecord/lib/active_record/nested_attributes.rb b/activerecord/lib/active_record/nested_attributes.rb
+index 6718b4a..523473e 100644
+--- a/activerecord/lib/active_record/nested_attributes.rb
++++ b/activerecord/lib/active_record/nested_attributes.rb
+@@ -366,7 +366,7 @@ module ActiveRecord
+             association.build(attributes.except(*UNASSIGNABLE_KEYS))
+           end
+         elsif existing_record = existing_records.detect { |record| record.id.to_s == attributes['id'].to_s }
+-          association.send(:add_record_to_target_with_callbacks, existing_record) unless association.loaded?
++          association.send(:add_record_to_target, existing_record) unless association.loaded?
+           assign_to_or_mark_for_destruction(existing_record, attributes, options[:allow_destroy])
+         else
+           raise_nested_attributes_record_not_found(association_name, attributes['id'])
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index 2995cc6..7ba2735 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -1118,6 +1118,153 @@ module AutosaveAssociationOnACollectionAssociationTests
+       @pirate.save!
+     end
+   end
++
++end
++
++module AutosaveAssociationOnCollectionAssociationLinkUnlinkTests
++
++  def test_should_not_have_pending_link_creations_or_deletions
++    assert @pirate.send(@association_name).pending_link_creations.empty?
++    assert @pirate.send(@association_name).pending_link_deletions.empty?
++  end
++
++  def test_should_have_pending_link_creations
++    @pirate.send(@association_name) << [@new_child_1, @new_child_2]
++    assert_equal [@new_child_1, @new_child_2], @pirate.send(@association_name).pending_link_creations
++    assert_equal 2, @pirate.send(@association_name).count
++  end
++
++  def test_should_have_pending_link_deletions
++    @pirate.send(@association_name).clear
++    assert_equal [@child_1, @child_2], @pirate.send(@association_name).pending_link_deletions
++    assert_equal 2, @pirate.send(@association_name).count
++  end
++
++  def test_should_delay_adding_and_deleting_with_new_record
++    @pirate = Pirate.new(:catchphrase => "Copa Grrommats Ferevah!")
++    association = @pirate.send(@association_name)
++    association << [@new_child_1, @new_child_2, @new_child_3]
++    association.delete(@new_child_2)
++    assert_equal [@new_child_1, @new_child_3], association.target
++    assert_equal [@new_child_1, @new_child_3], association.pending_link_creations
++    assert_equal [], association.pending_link_deletions
++    assert_equal 2, @pirate.send(@association_name).length
++    @pirate.save!
++    @pirate.reload
++    assert_equal 2, @pirate.send(@association_name).length
++    assert_equal 2, association.length
++    assert association.pending_link_creations.empty?
++    assert association.pending_link_deletions.empty?
++  end
++
++  [false, true].each do |reloaded|
++    [false, true].each do |loaded|
++      define_method("test_should_delay_adding_and_deleting_with_existing_record_and_reloaded_is_#{reloaded}_and_loaded_is_#{loaded}") do
++        @pirate.reload if reloaded
++        @pirate.send(@association_name).size if loaded # loads the target
++
++        association = @pirate.send(@association_name)
++        assert_equal loaded, association.loaded?
++
++        association << [@new_child_1, @new_child_2]
++        association.delete(@child_1)
++        assert_equal (reloaded&&!loaded ? [@new_child_1, @new_child_2] : [@child_2, @new_child_1, @new_child_2]), association.target
++        assert_equal [@new_child_1, @new_child_2], association.pending_link_creations
++        assert_equal [@child_1], association.pending_link_deletions
++        assert_equal 2, Pirate.find(@pirate.id).send(@association_name).length # nothing changed in db yet
++
++        @pirate.save!
++        @pirate.reload
++
++        assert_equal 3, Pirate.find(@pirate.id).send(@association_name).length
++        assert_equal 3, @pirate.send(@association_name).length
++        assert_equal 3, association.length
++        assert association.pending_link_creations.empty?
++        assert association.pending_link_deletions.empty?
++      end
++    end
++  end
++
++  def test_should_replace
++    @pirate.send("#{@association_name}=", [@child_2, @new_child_2])
++    assert_equal [@new_child_2], @pirate.send(@association_name).pending_link_creations
++    assert_equal [@child_1], @pirate.send(@association_name).pending_link_deletions
++    assert_equal 2, Pirate.find(@pirate.id).send(@association_name).length
++    @pirate.save!
++    @pirate.reload
++    assert_equal [@child_2, @new_child_2], @pirate.send(@association_name)
++    assert @pirate.send(@association_name).pending_link_creations.empty?
++    assert @pirate.send(@association_name).pending_link_deletions.empty?
++  end
++
++  def test_should_replace_ids
++    @pirate.send("#{@association_name.to_s.singularize}_ids=", [@child_2.id, @new_child_2.id])
++    assert_equal [@new_child_2], @pirate.send(@association_name).pending_link_creations
++    assert_equal [@child_1], @pirate.send(@association_name).pending_link_deletions
++    assert_equal 2, Pirate.find(@pirate.id).send(@association_name).length
++    @pirate.save!
++    @pirate.reload
++    assert_equal [@child_2, @new_child_2], @pirate.send(@association_name)
++    assert @pirate.send(@association_name).pending_link_creations.empty?
++    assert @pirate.send(@association_name).pending_link_deletions.empty?
++  end
++
++  def test_should_return_ids
++    @pirate.send("#{@association_name}=", [@child_2, @new_child_2, @new_child_3])
++    assert_equal [@child_2.id, @new_child_2.id, @new_child_3.id], @pirate.send("#{@association_name.to_s.singularize}_ids")
++    assert_equal [@child_1.id, @child_2.id], Pirate.find(@pirate.id).send("#{@association_name.to_s.singularize}_ids")
++    @pirate.save!
++    assert_equal [@child_2.id, @new_child_2.id, @new_child_3.id], Pirate.find(@pirate.id).send("#{@association_name.to_s.singularize}_ids")
++  end
++
++  def test_should_find_without_loading_collection
++    @pirate.reload
++    association = @pirate.send(@association_name)
++    assert !association.loaded?
++    assert_equal @child_1, association.first
++    assert_equal @child_2, association.last
++    assert_equal @child_1, association.find(@child_1.id)
++    assert !association.loaded?
++  end
++
++  def test_should_call_the_callbacks
++    association_name_with_callbacks = "#{@association_name}_with_method_callbacks"
++    @pirate.send("#{association_name_with_callbacks}=", [@child_1, @new_child_2])
++    expected_log = ["before_removing_method_#{@singular_name}_#{@child_2.id}",
++                    "after_removing_method_#{@singular_name}_#{@child_2.id}",
++                    "before_adding_method_#{@singular_name}_#{@new_child_2.id}",
++                    "after_adding_method_#{@singular_name}_#{@new_child_2.id}"]
++    assert_equal expected_log, @pirate.ship_log
++  end
++
++  def test_should_build_a_new_child
++    association_name_with_callbacks = "#{@association_name}_with_method_callbacks"
++    @pirate = Pirate.create!(:catchphrase => "Copa Grrommats Ferevah!")
++    @pirate.send(association_name_with_callbacks).build(:name => 'Kitty')
++    expected_log = ["before_adding_method_#{@singular_name}_<new>", "after_adding_method_#{@singular_name}_<new>"]
++    assert_equal expected_log, @pirate.ship_log
++    assert @pirate.send(association_name_with_callbacks).first.new_record?
++  end
++
++  def test_should_create_and_link_a_new_child_immediately
++    association_name_with_callbacks = "#{@association_name}_with_method_callbacks"
++    @pirate = Pirate.create!(:catchphrase => "Copa Grrommats Ferevah!")
++    new_child = @pirate.send(association_name_with_callbacks).create!(:name => 'Kitty')
++    expected_log = ["before_adding_method_#{@singular_name}_<new>", "after_adding_method_#{@singular_name}_#{new_child.id}"]
++    assert_equal expected_log, @pirate.ship_log
++    child = @pirate.send(association_name_with_callbacks).first
++    assert_equal 'Kitty', child.name
++    assert !child.new_record?
++    assert_equal [new_child], Pirate.find(@pirate.id).send(association_name_with_callbacks)
++  end
++
++  def test_should_delay_delete_all
++    @pirate.send(@association_name).delete_all
++    assert @pirate.send(@association_name).empty?
++    assert_equal 2, Pirate.find(@pirate.id).send(@association_name).size
++    @pirate.save!
++    assert_equal 0, Pirate.find(@pirate.id).send(@association_name).size
++  end
+ end
+ 
+ class TestAutosaveAssociationOnAHasManyAssociation < ActiveRecord::TestCase
+@@ -1125,13 +1272,19 @@ class TestAutosaveAssociationOnAHasManyAssociation < ActiveRecord::TestCase
+ 
+   def setup
+     @association_name = :birds
++    @singular_name = @association_name.to_s.singularize
+ 
+     @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
+     @child_1 = @pirate.birds.create(:name => 'Posideons Killer')
+     @child_2 = @pirate.birds.create(:name => 'Killer bandita Dionne')
++
++    @new_child_1 = Bird.create(:name => 'Copa')
++    @new_child_2 = Bird.create(:name => 'Cabana')
++    @new_child_3 = Bird.create(:name => 'Brotha!')
+   end
+ 
+   include AutosaveAssociationOnACollectionAssociationTests
++  include AutosaveAssociationOnCollectionAssociationLinkUnlinkTests
+ end
+ 
+ class TestAutosaveAssociationOnAHasAndBelongsToManyAssociation < ActiveRecord::TestCase
+@@ -1139,14 +1292,19 @@ class TestAutosaveAssociationOnAHasAndBelongsToManyAssociation < ActiveRecord::T
+ 
+   def setup
+     @association_name = :parrots
+-    @habtm = true
++    @singular_name = @association_name.to_s.singularize
+ 
+     @pirate = Pirate.create(:catchphrase => "Don' botharrr talkin' like one, savvy?")
+     @child_1 = @pirate.parrots.create(:name => 'Posideons Killer')
+     @child_2 = @pirate.parrots.create(:name => 'Killer bandita Dionne')
++
++    @new_child_1 = Parrot.create(:name => 'Copa')
++    @new_child_2 = Parrot.create(:name => 'Cabana')
++    @new_child_3 = Parrot.create(:name => 'Brotha!')
+   end
+ 
+   include AutosaveAssociationOnACollectionAssociationTests
++  include AutosaveAssociationOnCollectionAssociationLinkUnlinkTests
+ end
+ 
+ class TestAutosaveAssociationValidationsOnAHasManyAssocication < ActiveRecord::TestCase
+-- 
+1.7.0
+

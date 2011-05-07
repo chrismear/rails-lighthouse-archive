@@ -1,0 +1,106 @@
+From 0fa460ca931aae5151896dc8644d3abe2ab472ee Mon Sep 17 00:00:00 2001
+From: Mark Catley <mark@nexx.co.nz>
+Date: Sat, 21 Jun 2008 23:41:30 +1200
+Subject: [PATCH] Fixing bug which occurs when you use a named_scope with a :joins.
+ If the model you are doing the named_scope on has a column name in common with the model you are joining to you will get the field values from the joined table.
+
+---
+ activerecord/lib/active_record/base.rb         |    2 +-
+ activerecord/test/cases/method_scoping_test.rb |   10 ++++++++++
+ activerecord/test/cases/named_scope_test.rb    |   21 ++++++++++++++++++++-
+ activerecord/test/models/post.rb               |    7 ++++++-
+ 4 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 8fca34e..913b0e3 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1479,7 +1479,7 @@ module ActiveRecord #:nodoc:
+ 
+         def construct_finder_sql(options)
+           scope = scope(:find)
+-          sql  = "SELECT #{options[:select] || (scope && scope[:select]) || (options[:joins] && quoted_table_name + '.*') || '*'} "
++          sql  = "SELECT #{options[:select] || (scope && scope[:select]) || ((options[:joins] || (scope && scope[:joins])) && quoted_table_name + '.*') || '*'} "
+           sql << "FROM #{(scope && scope[:from]) || options[:from] || quoted_table_name} "
+ 
+           add_joins!(sql, options, scope)
+diff --git a/activerecord/test/cases/method_scoping_test.rb b/activerecord/test/cases/method_scoping_test.rb
+index 1a9a875..d6b3e34 100644
+--- a/activerecord/test/cases/method_scoping_test.rb
++++ b/activerecord/test/cases/method_scoping_test.rb
+@@ -87,6 +87,16 @@ class MethodScopingTest < ActiveRecord::TestCase
+     assert_equal 1, scoped_developers.size
+   end
+ 
++  def test_scoped_find_joins
++    scoped_developers = Developer.with_scope(:find => { :joins => 'JOIN developers_projects ON id = developer_id' } ) do
++      Developer.find(:all, :conditions => 'developers_projects.project_id = 2')
++    end
++    assert scoped_developers.include?(developers(:david))
++    assert !scoped_developers.include?(developers(:jamis))
++    assert_equal 1, scoped_developers.size
++    assert_equal developers(:david).attributes, scoped_developers.first.attributes
++  end
++
+   def test_scoped_count_include
+     # with the include, will retrieve only developers for the given project
+     Developer.with_scope(:find => { :include => :projects }) do
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index d890cf7..ffcc944 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -6,7 +6,7 @@ require 'models/reply'
+ require 'models/author'
+ 
+ class NamedScopeTest < ActiveRecord::TestCase
+-  fixtures :posts, :authors, :topics, :comments
++  fixtures :posts, :authors, :topics, :comments, :author_addresses
+ 
+   def test_implements_enumerable
+     assert !Topic.find(:all).empty?
+@@ -77,6 +77,25 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert_equal topics_written_before_the_second, Topic.written_before(topics(:second).written_on)
+   end
+ 
++  def test_scopes_with_joins
++    address = author_addresses(:david_address)
++    posts_with_authors_at_address = Post.find(
++      :all, :joins => 'JOIN authors ON authors.id = posts.author_id',
++      :conditions => [ 'authors.author_address_id = ?', address.id ]
++    )
++    assert_equal posts_with_authors_at_address, Post.with_authors_at_address(address)
++  end
++
++  def test_scopes_with_joins_respects_custom_select
++    address = author_addresses(:david_address)
++    posts_with_authors_at_address_titles = Post.find(:all,
++      :select => 'title',
++      :joins => 'JOIN authors ON authors.id = posts.author_id',
++      :conditions => [ 'authors.author_address_id = ?', address.id ]
++    )
++    assert_equal posts_with_authors_at_address_titles, Post.with_authors_at_address(address).find(:all, :select => 'title')
++  end
++
+   def test_extensions
+     assert_equal 1, Topic.anonymous_extension.one
+     assert_equal 2, Topic.named_extension.two
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index d910170..3adbc0c 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -1,6 +1,11 @@
+ class Post < ActiveRecord::Base
+   named_scope :containing_the_letter_a, :conditions => "body LIKE '%a%'"
+-  
++  named_scope :with_authors_at_address, lambda { |address| {
++      :conditions => [ 'authors.author_address_id = ?', address.id ],
++      :joins => 'JOIN authors ON authors.id = posts.author_id'
++    }
++  }
++
+   belongs_to :author do
+     def greeting
+       "hello"
+-- 
+1.5.5.1
+

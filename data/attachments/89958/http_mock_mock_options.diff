@@ -1,0 +1,158 @@
+From 659628756b9832cd2e17b4170b6153a03749a624 Mon Sep 17 00:00:00 2001
+From: Michael Kintzer <michael.kintzer@zerk.com>
+Date: Tue, 17 Feb 2009 17:23:51 -0800
+Subject: [PATCH] Allow for specifying match_options in respond_to to control strictness of request matching
+
+---
+ activeresource/lib/active_resource/http_mock.rb    |   25 ++++++-
+ .../test/http_mock/match_options_test.rb           |   75 ++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 4 deletions(-)
+ create mode 100644 activeresource/test/http_mock/match_options_test.rb
+
+diff --git a/activeresource/lib/active_resource/http_mock.rb b/activeresource/lib/active_resource/http_mock.rb
+index 7d7e378..0111fe0 100644
+--- a/activeresource/lib/active_resource/http_mock.rb
++++ b/activeresource/lib/active_resource/http_mock.rb
+@@ -29,7 +29,8 @@ module ActiveResource
+   #
+   # In order for a mock to deliver its content, the incoming request must match by the <tt>http_method</tt>,
+   # +path+ and <tt>request_headers</tt>.  If no match is found an InvalidRequestError exception
+-  # will be raised letting you know you need to create a new mock for that request.
++  # will be raised letting you know you need to create a new mock for that request.   See HttpMock.respond_to for
++  # a description of options that allows you to modify the strictness of the request matching algorithm.
+   #
+   # ==== Example
+   #   def setup
+@@ -99,9 +100,17 @@ module ActiveResource
+ 
+       # Accepts a block which declares a set of requests and responses for the HttpMock to respond to. See the main
+       # ActiveResource::HttpMock description for a more detailed explanation.
+-      def respond_to(pairs = {}) #:yields: mock
++      #
++      # * <tt>pairs</tt>
++      # * <tt>match_options</tt> - can be used to adjust the how strictly the incoming request is evaluated for a match.
++      # Valid match_options are:
++      # * <tt>lax_path</tt> - when set, this option will ignore the query_string portion of the request URI
++      #   while evaluating a match.
++      # * <tt>ignore_headers</tt> - when set, this option will ignore differences in request headers.
++      def respond_to(pairs = {}, match_options = {}) #:yields: mock
+         reset!
+         responses.concat pairs.to_a
++        @@match_options = match_options || {}
+         if block_given?
+           yield Responder.new(responses)
+         else
+@@ -109,10 +118,16 @@ module ActiveResource
+         end
+       end
+ 
+-      # Deletes all logged requests and responses.
++      # Deletes all logged requests, responses, and match_options.
+       def reset!
+         requests.clear
+         responses.clear
++        match_options.clear
++      end
++
++      # returns current match_options
++      def match_options
++        @@match_options ||= {}
+       end
+     end
+ 
+@@ -148,7 +163,9 @@ module ActiveResource
+     end
+ 
+     def ==(req)
+-      path == req.path && method == req.method && headers == req.headers
++      HttpMock.match_options[:lax_path] ? matched_path = path.split("?")[0] == req.path.split("?")[0] : matched_path = path == req.path
++      HttpMock.match_options[:ignore_headers] ? matched_headers = true : matched_headers = headers == req.headers
++      matched_path && method == req.method && matched_headers
+     end
+ 
+     def to_s
+diff --git a/activeresource/test/http_mock/match_options_test.rb b/activeresource/test/http_mock/match_options_test.rb
+new file mode 100644
+index 0000000..2cb2cd5
+--- /dev/null
++++ b/activeresource/test/http_mock/match_options_test.rb
+@@ -0,0 +1,75 @@
++require 'abstract_unit'
++require 'fixtures/person'
++
++class MatchOptionsTest < Test::Unit::TestCase
++
++ def setup
++    @matz_array = [{ :id => 1, :name => 'Matz' }].to_xml(:root => 'people')
++
++    @req_path1 = ActiveResource::Request.new(:get, "/people.xml", nil, {})
++    @req_path2 = ActiveResource::Request.new(:get, "/people.xml?query_string=val1", nil, {})
++    @req_path3 = ActiveResource::Request.new(:get, "/people.xml?query_string=val2", nil, {})
++
++    @req_header1 = ActiveResource::Request.new(:get, "/people.xml", nil, {"Content-Type" => "application/xml"})
++    @req_header2 = ActiveResource::Request.new(:get, "/people.xml", nil, {"Content-Type" => "text/javascript"})
++  end
++
++  def test_match_options
++    lax_path
++    assert_equal ActiveResource::HttpMock.match_options, {:lax_path=>true}
++    ignore_headers
++    assert_equal ActiveResource::HttpMock.match_options, {:ignore_headers=>true}
++  end
++
++  def test_reset_clears_match_options
++    lax_path
++    ActiveResource::HttpMock.reset!
++    assert_equal ActiveResource::HttpMock.match_options, {}
++  end
++
++  def test_lax_path
++    no_options
++    assert_not_equal @req_path1, @req_path2
++    assert_not_equal @req_path2, @req_path3
++    lax_path
++    assert_equal @req_path1, @req_path2
++    assert_equal @req_path2, @req_path3
++  end
++
++  def test_ignore_headers
++    no_options
++    assert_not_equal @req_header1, @req_header2
++    ignore_headers
++    assert_equal @req_header1, @req_header2
++  end
++
++ def test_lax_path_end_to_end
++   no_options
++   assert_raise ActiveResource::InvalidRequestError do
++     Person.get(:retrieve, :name => 'Bogus')
++   end
++   lax_path
++   assert_equal([{ "id" => 1, "name" => 'Matz' }], Person.get(:retrieve, :name => 'Bogus'))
++ end
++
++  private
++
++  def no_options
++    ActiveResource::HttpMock.respond_to do |mock|
++      mock.get    "/people/retrieve.xml", {}, @matz_array, 200
++    end
++  end
++
++  def lax_path
++    ActiveResource::HttpMock.respond_to({}, {:lax_path=>true}) do |mock|
++      mock.get    "/people/retrieve.xml", {}, @matz_array, 200
++    end
++  end
++
++  def ignore_headers
++    ActiveResource::HttpMock.respond_to({}, {:ignore_headers=>true}) do |mock|
++      mock.get    "/people/retrieve.xml", {"bogus" => "header"}, @matz_array, 200
++    end
++  end
++
++end
+\ No newline at end of file
+-- 
+1.6.0.2
+

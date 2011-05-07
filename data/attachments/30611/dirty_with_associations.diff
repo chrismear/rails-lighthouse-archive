@@ -1,0 +1,88 @@
+diff --git a/activerecord/lib/active_record/dirty.rb b/activerecord/lib/active_record/dirty.rb
+index a7d7674..e0ce6e9 100644
+--- a/activerecord/lib/active_record/dirty.rb
++++ b/activerecord/lib/active_record/dirty.rb
+@@ -121,7 +121,7 @@ module ActiveRecord
+       # Wrap write_attribute to remember original attribute value.
+       def write_attribute_with_dirty(attr, value)
+         attr = attr.to_s
+-
++        
+         # The attribute already has an unsaved change.
+         unless changed_attributes.include?(attr)
+           old = clone_attribute_value(:read_attribute, attr)
+@@ -130,6 +130,23 @@ module ActiveRecord
+ 
+         # Carry on.
+         write_attribute_without_dirty(attr, value)
++        
++        # try to find an association based on reflection that includes the attribute that's changed
++        found_association = self.class.reflections.find do |k,v| 
++          v.is_a?(ActiveRecord::Reflection::AssociationReflection) && v.macro.to_s == "belongs_to" && v.primary_key_name.to_s == attr
++        end
++        
++        if (association_attr = found_association.first.to_s if found_association)
++          # The attribute already has an unsaved change.
++          unless changed_attributes.include?(association_attr)
++            # grab the old version that's been eager-loaded; only attempt if 'old' attr was set
++            old = self.send(association_attr.to_sym) unless self.send("#{attr}_was").nil?
++            changed_attributes[association_attr] = old if field_changed?(association_attr, old, value)
++          end
++
++          # Carry on.
++          write_attribute_without_dirty(association_attr, value)
++        end
+       end
+ 
+       def update_with_dirty
+diff --git a/activerecord/test/cases/associations/has_one_associations_test.rb b/activerecord/test/cases/associations/has_one_associations_test.rb
+index d3ca0ca..1e1e722 100755
+--- a/activerecord/test/cases/associations/has_one_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_associations_test.rb
+@@ -315,7 +315,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+ 
+     firm = Firm.find(:first).clone
+     firm.account = Account.find(:first).clone
+-    assert_queries(2) { firm.save! }
++    assert_queries(3) { firm.save! }
+   end
+ 
+   def test_save_still_works_after_accessing_nil_has_one
+diff --git a/activerecord/test/cases/dirty_test.rb b/activerecord/test/cases/dirty_test.rb
+index e5e0220..94abf92 100644
+--- a/activerecord/test/cases/dirty_test.rb
++++ b/activerecord/test/cases/dirty_test.rb
+@@ -115,13 +115,21 @@ class DirtyTest < ActiveRecord::TestCase
+     assert_equal ['arr matey', 'arr matey!'], pirate.catchphrase_change
+   end
+ 
+-  def test_association_assignment_changes_foreign_key
++  # def test_association_assignment_changes_foreign_key
++  #   pirate = Pirate.create!(:catchphrase => 'jarl')
++  #   pirate.parrot = Parrot.create!
++  #   assert pirate.changed?
++  #   assert_equal %w(parrot_id), pirate.changed
++  # end
++  
++  def test_association_assignment_changes_foreign_key_and_association
+     pirate = Pirate.create!(:catchphrase => 'jarl')
+     pirate.parrot = Parrot.create!
+     assert pirate.changed?
+-    assert_equal %w(parrot_id), pirate.changed
++    assert_equal %w(parrot parrot_id), pirate.changed
++    assert_equal({"parrot" => [nil, pirate.parrot], "parrot_id" => [nil, pirate.parrot.id]}, pirate.changes)
+   end
+-
++  
+   def test_attribute_should_be_compared_with_type_cast
+     topic = Topic.new
+     assert topic.approved?
+@@ -203,7 +211,7 @@ class DirtyTest < ActiveRecord::TestCase
+     def check_pirate_after_save_failure(pirate)
+       assert pirate.changed?
+       assert pirate.parrot_id_changed?
+-      assert_equal %w(parrot_id), pirate.changed
++      assert_equal %w(parrot parrot_id), pirate.changed
+       assert_nil pirate.parrot_id_was
+     end
+ end

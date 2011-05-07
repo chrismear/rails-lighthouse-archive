@@ -1,0 +1,1063 @@
+From c91912700d31f1f3b54192beefc6f5496804a396 Mon Sep 17 00:00:00 2001
+From: Joshua Peek <josh@joshpeek.com>
+Date: Tue, 24 Mar 2009 10:34:30 -0500
+Subject: [PATCH] just kill brittle test
+
+---
+ .../test/controller/session/cookie_store_test.rb   |   21 --------------------
+ 1 files changed, 0 insertions(+), 21 deletions(-)
+
+diff --git a/actionpack/test/controller/session/cookie_store_test.rb b/actionpack/test/controller/session/cookie_store_test.rb
+index 48a961c..40fcd56 100644
+--- a/actionpack/test/controller/session/cookie_store_test.rb
++++ b/actionpack/test/controller/session/cookie_store_test.rb
+@@ -193,27 +193,6 @@ class CookieStoreTest < ActionController::IntegrationTest
+     end
+   end
+ 
+-  def test_session_store_with_expire_after
+-    app = ActionController::Session::CookieStore.new(DispatcherApp, :key => SessionKey, :secret => SessionSecret, :expire_after => 5.hours)
+-    @integration_session = open_session(app)
+-
+-    with_test_route_set do
+-      # First request accesses the session
+-      cookies[SessionKey] = SignedBar
+-
+-      get '/set_session_value'
+-      assert_response :success
+-      cookie = headers['Set-Cookie']
+-
+-      # Second request does not access the session so the
+-      # expires header should not be changed
+-      get '/no_session_access'
+-      assert_response :success
+-      assert_equal cookie, headers['Set-Cookie'],
+-        "#{unmarshal_session(cookie).inspect} expected but was #{unmarshal_session(headers['Set-Cookie']).inspect}"
+-    end
+-  end
+-
+   private
+     def with_test_route_set
+       with_routing do |set|
+-- 
+1.6.0.4
+
+
+From daffa5cbddace5a68ce09808a827805ef81ddb84 Mon Sep 17 00:00:00 2001
+From: Peter Marklund <peter_marklund@fastmail.fm>
+Date: Tue, 24 Mar 2009 10:37:57 -0500
+Subject: [PATCH] Reset request_parameters in TestRequest#recycle! to avoid multiple posts clobbering each other [#2271 state:resolved]
+
+Signed-off-by: Joshua Peek <josh@joshpeek.com>
+---
+ actionpack/lib/action_controller/test_process.rb |    1 +
+ actionpack/test/controller/test_test.rb          |    8 ++++++++
+ 2 files changed, 9 insertions(+), 0 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/test_process.rb b/actionpack/lib/action_controller/test_process.rb
+index dbaec00..c5081a2 100644
+--- a/actionpack/lib/action_controller/test_process.rb
++++ b/actionpack/lib/action_controller/test_process.rb
+@@ -110,6 +110,7 @@ module ActionController #:nodoc:
+     end
+ 
+     def recycle!
++      @env["action_controller.request.request_parameters"] = {}
+       self.query_parameters   = {}
+       self.path_parameters    = {}
+       @headers, @request_method, @accepts, @content_type = nil, nil, nil, nil
+diff --git a/actionpack/test/controller/test_test.rb b/actionpack/test/controller/test_test.rb
+index 65c894c..3924b28 100644
+--- a/actionpack/test/controller/test_test.rb
++++ b/actionpack/test/controller/test_test.rb
+@@ -515,6 +515,14 @@ XML
+     assert_nil @request.instance_variable_get("@request_method")
+   end
+ 
++  def test_params_reset_after_post_request
++    post :no_op, :foo => "bar"
++    assert_equal "bar", @request.params[:foo]
++    @request.recycle!
++    post :no_op
++    assert @request.params[:foo].blank?
++  end
++
+   %w(controller response request).each do |variable|
+     %w(get post put delete head process).each do |method|
+       define_method("test_#{variable}_missing_for_#{method}_raises_error") do
+-- 
+1.6.0.4
+
+
+From dace54b2e9bcdb49ffa43b204c3a8959c55f1276 Mon Sep 17 00:00:00 2001
+From: David Dollar <ddollar@gmail.com>
+Date: Tue, 24 Mar 2009 10:41:45 -0500
+Subject: [PATCH] Updates tests to cause the tests for the Request class not to proxy through a fake TestRequest object [#2278 state:resolved]
+
+Signed-off-by: Joshua Peek <josh@joshpeek.com>
+---
+ actionpack/test/controller/request_test.rb |  448 ++++++++++++++--------------
+ 1 files changed, 218 insertions(+), 230 deletions(-)
+
+diff --git a/actionpack/test/controller/request_test.rb b/actionpack/test/controller/request_test.rb
+index c72f885..c4cc63e 100644
+--- a/actionpack/test/controller/request_test.rb
++++ b/actionpack/test/controller/request_test.rb
+@@ -3,7 +3,6 @@ require 'abstract_unit'
+ class RequestTest < ActiveSupport::TestCase
+   def setup
+     ActionController::Base.relative_url_root = nil
+-    @request = ActionController::TestRequest.new
+   end
+ 
+   def teardown
+@@ -11,60 +10,52 @@ class RequestTest < ActiveSupport::TestCase
+   end
+ 
+   def test_remote_ip
+-    assert_equal '0.0.0.0', @request.remote_ip
++    request = stub_request 'REMOTE_ADDR' => '1.2.3.4'
++    assert_equal '1.2.3.4', request.remote_ip
+ 
+-    @request.remote_addr = '1.2.3.4'
+-    assert_equal '1.2.3.4', @request.remote_ip
++    request = stub_request 'REMOTE_ADDR' => '1.2.3.4,3.4.5.6'
++    assert_equal '1.2.3.4', request.remote_ip
+ 
+-    @request.remote_addr = '1.2.3.4,3.4.5.6'
+-    assert_equal '1.2.3.4', @request.remote_ip
++    request = stub_request 'REMOTE_ADDR' => '1.2.3.4',
++      'HTTP_X_FORWARDED_FOR' => '3.4.5.6'
++    assert_equal '1.2.3.4', request.remote_ip
+ 
+-    @request.env['HTTP_CLIENT_IP'] = '2.3.4.5'
+-    assert_equal '1.2.3.4', @request.remote_ip
++    request = stub_request 'REMOTE_ADDR' => '127.0.0.1',
++      'HTTP_X_FORWARDED_FOR' => '3.4.5.6'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.remote_addr = '192.168.0.1'
+-    assert_equal '2.3.4.5', @request.remote_ip
+-    @request.env.delete 'HTTP_CLIENT_IP'
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => 'unknown,3.4.5.6'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.remote_addr = '1.2.3.4'
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '3.4.5.6'
+-    assert_equal '1.2.3.4', @request.remote_ip
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '172.16.0.1,3.4.5.6'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.remote_addr = '127.0.0.1'
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '3.4.5.6'
+-    assert_equal '3.4.5.6', @request.remote_ip
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '192.168.0.1,3.4.5.6'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.env['HTTP_X_FORWARDED_FOR'] = 'unknown,3.4.5.6'
+-    assert_equal '3.4.5.6', @request.remote_ip
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '10.0.0.1,3.4.5.6'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '172.16.0.1,3.4.5.6'
+-    assert_equal '3.4.5.6', @request.remote_ip
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '10.0.0.1, 10.0.0.1, 3.4.5.6'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '192.168.0.1,3.4.5.6'
+-    assert_equal '3.4.5.6', @request.remote_ip
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '127.0.0.1,3.4.5.6'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '10.0.0.1,3.4.5.6'
+-    assert_equal '3.4.5.6', @request.remote_ip
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => 'unknown,192.168.0.1'
++    assert_equal 'unknown', request.remote_ip
+ 
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '10.0.0.1, 10.0.0.1, 3.4.5.6'
+-    assert_equal '3.4.5.6', @request.remote_ip
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '9.9.9.9, 3.4.5.6, 10.0.0.1, 172.31.4.4'
++    assert_equal '3.4.5.6', request.remote_ip
+ 
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '127.0.0.1,3.4.5.6'
+-    assert_equal '3.4.5.6', @request.remote_ip
+-
+-    @request.env['HTTP_X_FORWARDED_FOR'] = 'unknown,192.168.0.1'
+-    assert_equal 'unknown', @request.remote_ip
+-
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '9.9.9.9, 3.4.5.6, 10.0.0.1, 172.31.4.4'
+-    assert_equal '3.4.5.6', @request.remote_ip
+-
+-    @request.env['HTTP_CLIENT_IP'] = '8.8.8.8'
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '1.1.1.1',
++                           'HTTP_CLIENT_IP'       => '2.2.2.2'
+     e = assert_raise(ActionController::ActionControllerError) {
+-      @request.remote_ip
++      request.remote_ip
+     }
+     assert_match /IP spoofing attack/, e.message
+-    assert_match /HTTP_X_FORWARDED_FOR="9.9.9.9, 3.4.5.6, 10.0.0.1, 172.31.4.4"/, e.message
+-    assert_match /HTTP_CLIENT_IP="8.8.8.8"/, e.message
++    assert_match /HTTP_X_FORWARDED_FOR="1.1.1.1"/, e.message
++    assert_match /HTTP_CLIENT_IP="2.2.2.2"/, e.message
+ 
+     # turn IP Spoofing detection off.
+     # This is useful for sites that are aimed at non-IP clients.  The typical
+@@ -72,336 +63,333 @@ class RequestTest < ActiveSupport::TestCase
+     # leap of faith to assume that their proxies are ever going to set the
+     # HTTP_CLIENT_IP/HTTP_X_FORWARDED_FOR headers properly.
+     ActionController::Base.ip_spoofing_check = false
+-    assert_equal('8.8.8.8', @request.remote_ip)
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '1.1.1.1',
++                           'HTTP_CLIENT_IP'       => '2.2.2.2'
++    assert_equal '2.2.2.2', request.remote_ip
+     ActionController::Base.ip_spoofing_check = true
+ 
+-    @request.env['HTTP_X_FORWARDED_FOR'] = '8.8.8.8, 9.9.9.9'
+-    assert_equal '8.8.8.8', @request.remote_ip
+-
+-    @request.env.delete 'HTTP_CLIENT_IP'
+-    @request.env.delete 'HTTP_X_FORWARDED_FOR'
++    request = stub_request 'HTTP_X_FORWARDED_FOR' => '8.8.8.8, 9.9.9.9'
++    assert_equal '9.9.9.9', request.remote_ip
+   end
+ 
+   def test_domains
+-    @request.host = "www.rubyonrails.org"
+-    assert_equal "rubyonrails.org", @request.domain
+-
+-    @request.host = "www.rubyonrails.co.uk"
+-    assert_equal "rubyonrails.co.uk", @request.domain(2)
++    request = stub_request 'HTTP_HOST' => 'www.rubyonrails.org'
++    assert_equal "rubyonrails.org", request.domain
+ 
+-    @request.host = "192.168.1.200"
+-    assert_nil @request.domain
++    request = stub_request 'HTTP_HOST' => "www.rubyonrails.co.uk"
++    assert_equal "rubyonrails.co.uk", request.domain(2)
+ 
+-    @request.host = "foo.192.168.1.200"
+-    assert_nil @request.domain
++    request = stub_request 'HTTP_HOST' => "192.168.1.200"
++    assert_nil request.domain
+ 
+-    @request.host = "192.168.1.200.com"
+-    assert_equal "200.com", @request.domain
++    request = stub_request 'HTTP_HOST' => "foo.192.168.1.200"
++    assert_nil request.domain
+ 
+-    @request.host = nil
+-    assert_nil @request.domain
++    request = stub_request 'HTTP_HOST' => "192.168.1.200.com"
++    assert_equal "200.com", request.domain
+   end
+ 
+   def test_subdomains
+-    @request.host = "www.rubyonrails.org"
+-    assert_equal %w( www ), @request.subdomains
++    request = stub_request 'HTTP_HOST' => "www.rubyonrails.org"
++    assert_equal %w( www ), request.subdomains
+ 
+-    @request.host = "www.rubyonrails.co.uk"
+-    assert_equal %w( www ), @request.subdomains(2)
++    request = stub_request 'HTTP_HOST' => "www.rubyonrails.co.uk"
++    assert_equal %w( www ), request.subdomains(2)
+ 
+-    @request.host = "dev.www.rubyonrails.co.uk"
+-    assert_equal %w( dev www ), @request.subdomains(2)
++    request = stub_request 'HTTP_HOST' => "dev.www.rubyonrails.co.uk"
++    assert_equal %w( dev www ), request.subdomains(2)
+ 
+-    @request.host = "foobar.foobar.com"
+-    assert_equal %w( foobar ), @request.subdomains
++    request = stub_request 'HTTP_HOST' => "foobar.foobar.com"
++    assert_equal %w( foobar ), request.subdomains
+ 
+-    @request.host = "192.168.1.200"
+-    assert_equal [], @request.subdomains
++    request = stub_request 'HTTP_HOST' => "192.168.1.200"
++    assert_equal [], request.subdomains
+ 
+-    @request.host = "foo.192.168.1.200"
+-    assert_equal [], @request.subdomains
++    request = stub_request 'HTTP_HOST' => "foo.192.168.1.200"
++    assert_equal [], request.subdomains
+ 
+-    @request.host = "192.168.1.200.com"
+-    assert_equal %w( 192 168 1 ), @request.subdomains
++    request = stub_request 'HTTP_HOST' => "192.168.1.200.com"
++    assert_equal %w( 192 168 1 ), request.subdomains
+ 
+-    @request.host = nil
+-    assert_equal [], @request.subdomains
++    request = stub_request 'HTTP_HOST' => nil
++    assert_equal [], request.subdomains
+   end
+ 
+   def test_port_string
+-    @request.port = 80
+-    assert_equal "", @request.port_string
++    request = stub_request 'HTTP_HOST' => 'www.example.org:80'
++    assert_equal "", request.port_string
+ 
+-    @request.port = 8080
+-    assert_equal ":8080", @request.port_string
++    request = stub_request 'HTTP_HOST' => 'www.example.org:8080'
++    assert_equal ":8080", request.port_string
+   end
+ 
+   def test_request_uri
+-    @request.env['SERVER_SOFTWARE'] = 'Apache 42.342.3432'
++    request = stub_request 'REQUEST_URI' => "http://www.rubyonrails.org/path/of/some/uri?mapped=1"
++    assert_equal "/path/of/some/uri?mapped=1", request.request_uri
++    assert_equal "/path/of/some/uri",          request.path
+ 
+-    @request.set_REQUEST_URI "http://www.rubyonrails.org/path/of/some/uri?mapped=1"
+-    assert_equal "/path/of/some/uri?mapped=1", @request.request_uri
+-    assert_equal "/path/of/some/uri", @request.path
++    request = stub_request 'REQUEST_URI' => "http://www.rubyonrails.org/path/of/some/uri"
++    assert_equal "/path/of/some/uri", request.request_uri
++    assert_equal "/path/of/some/uri", request.path
+ 
+-    @request.set_REQUEST_URI "http://www.rubyonrails.org/path/of/some/uri"
+-    assert_equal "/path/of/some/uri", @request.request_uri
+-    assert_equal "/path/of/some/uri", @request.path
++    request = stub_request 'REQUEST_URI' => "/path/of/some/uri"
++    assert_equal "/path/of/some/uri", request.request_uri
++    assert_equal "/path/of/some/uri", request.path
+ 
+-    @request.set_REQUEST_URI "/path/of/some/uri"
+-    assert_equal "/path/of/some/uri", @request.request_uri
+-    assert_equal "/path/of/some/uri", @request.path
++    request = stub_request 'REQUEST_URI' => "/"
++    assert_equal "/", request.request_uri
++    assert_equal "/", request.path
+ 
+-    @request.set_REQUEST_URI "/"
+-    assert_equal "/", @request.request_uri
+-    assert_equal "/", @request.path
++    request = stub_request 'REQUEST_URI' => "/?m=b"
++    assert_equal "/?m=b", request.request_uri
++    assert_equal "/",     request.path
+ 
+-    @request.set_REQUEST_URI "/?m=b"
+-    assert_equal "/?m=b", @request.request_uri
+-    assert_equal "/", @request.path
+-
+-    @request.set_REQUEST_URI "/"
+-    @request.env['SCRIPT_NAME'] = "/dispatch.cgi"
+-    assert_equal "/", @request.request_uri
+-    assert_equal "/", @request.path
++    request = stub_request 'REQUEST_URI' => "/", 'SCRIPT_NAME' => '/dispatch.cgi'
++    assert_equal "/", request.request_uri
++    assert_equal "/", request.path
+ 
+     ActionController::Base.relative_url_root = "/hieraki"
+-    @request.set_REQUEST_URI "/hieraki/"
+-    @request.env['SCRIPT_NAME'] = "/hieraki/dispatch.cgi"
+-    assert_equal "/hieraki/", @request.request_uri
+-    assert_equal "/", @request.path
++    request = stub_request 'REQUEST_URI' => "/hieraki/", 'SCRIPT_NAME' => "/hieraki/dispatch.cgi"
++    assert_equal "/hieraki/", request.request_uri
++    assert_equal "/",         request.path
+     ActionController::Base.relative_url_root = nil
+ 
+     ActionController::Base.relative_url_root = "/collaboration/hieraki"
+-    @request.set_REQUEST_URI "/collaboration/hieraki/books/edit/2"
+-    @request.env['SCRIPT_NAME'] = "/collaboration/hieraki/dispatch.cgi"
+-    assert_equal "/collaboration/hieraki/books/edit/2", @request.request_uri
+-    assert_equal "/books/edit/2", @request.path
++    request = stub_request 'REQUEST_URI' => "/collaboration/hieraki/books/edit/2",
++      'SCRIPT_NAME' => "/collaboration/hieraki/dispatch.cgi"
++    assert_equal "/collaboration/hieraki/books/edit/2", request.request_uri
++    assert_equal "/books/edit/2",                       request.path
+     ActionController::Base.relative_url_root = nil
+ 
+     # The following tests are for when REQUEST_URI is not supplied (as in IIS)
+-    @request.env['PATH_INFO'] = "/path/of/some/uri?mapped=1"
+-    @request.env['SCRIPT_NAME'] = nil #"/path/dispatch.rb"
+-    @request.set_REQUEST_URI nil
+-    assert_equal "/path/of/some/uri?mapped=1", @request.request_uri
+-    assert_equal "/path/of/some/uri", @request.path
++    request = stub_request 'PATH_INFO'   => "/path/of/some/uri?mapped=1",
++                           'SCRIPT_NAME' => nil,
++                           'REQUEST_URI' => nil
++    assert_equal "/path/of/some/uri?mapped=1", request.request_uri
++    assert_equal "/path/of/some/uri",          request.path
+ 
+     ActionController::Base.relative_url_root = '/path'
+-    @request.env['PATH_INFO'] = "/path/of/some/uri?mapped=1"
+-    @request.env['SCRIPT_NAME'] = "/path/dispatch.rb"
+-    @request.set_REQUEST_URI nil
+-    assert_equal "/path/of/some/uri?mapped=1", @request.request_uri
+-    assert_equal "/of/some/uri", @request.path
++    request = stub_request 'PATH_INFO'   => "/path/of/some/uri?mapped=1",
++                           'SCRIPT_NAME' => "/path/dispatch.rb",
++                           'REQUEST_URI' => nil
++    assert_equal "/path/of/some/uri?mapped=1", request.request_uri
++    assert_equal "/of/some/uri",               request.path
+     ActionController::Base.relative_url_root = nil
+ 
+-    @request.env['PATH_INFO'] = "/path/of/some/uri"
+-    @request.env['SCRIPT_NAME'] = nil
+-    @request.set_REQUEST_URI nil
+-    assert_equal "/path/of/some/uri", @request.request_uri
+-    assert_equal "/path/of/some/uri", @request.path
++    request = stub_request 'PATH_INFO'   => "/path/of/some/uri",
++                           'SCRIPT_NAME' => nil,
++                           'REQUEST_URI' => nil
++    assert_equal "/path/of/some/uri", request.request_uri
++    assert_equal "/path/of/some/uri", request.path
+ 
+-    @request.env['PATH_INFO'] = "/"
+-    @request.set_REQUEST_URI nil
+-    assert_equal "/", @request.request_uri
+-    assert_equal "/", @request.path
++    request = stub_request 'PATH_INFO' => '/', 'REQUEST_URI' => nil
++    assert_equal "/", request.request_uri
++    assert_equal "/", request.path
+ 
+-    @request.env['PATH_INFO'] = "/?m=b"
+-    @request.set_REQUEST_URI nil
+-    assert_equal "/?m=b", @request.request_uri
+-    assert_equal "/", @request.path
++    request = stub_request 'PATH_INFO' => '/?m=b', 'REQUEST_URI' => nil
++    assert_equal "/?m=b", request.request_uri
++    assert_equal "/",     request.path
+ 
+-    @request.env['PATH_INFO'] = "/"
+-    @request.env['SCRIPT_NAME'] = "/dispatch.cgi"
+-    @request.set_REQUEST_URI nil
+-    assert_equal "/", @request.request_uri
+-    assert_equal "/", @request.path
++    request = stub_request 'PATH_INFO'   => "/",
++                           'SCRIPT_NAME' => "/dispatch.cgi",
++                           'REQUEST_URI' => nil
++    assert_equal "/", request.request_uri
++    assert_equal "/", request.path
+ 
+     ActionController::Base.relative_url_root = '/hieraki'
+-    @request.env['PATH_INFO'] = "/hieraki/"
+-    @request.env['SCRIPT_NAME'] = "/hieraki/dispatch.cgi"
+-    @request.set_REQUEST_URI nil
+-    assert_equal "/hieraki/", @request.request_uri
+-    assert_equal "/", @request.path
++    request = stub_request 'PATH_INFO'   => "/hieraki/",
++                           'SCRIPT_NAME' => "/hieraki/dispatch.cgi",
++                           'REQUEST_URI' => nil
++    assert_equal "/hieraki/", request.request_uri
++    assert_equal "/",         request.path
+     ActionController::Base.relative_url_root = nil
+ 
+-    @request.set_REQUEST_URI '/hieraki/dispatch.cgi'
++    request = stub_request 'REQUEST_URI' => '/hieraki/dispatch.cgi'
+     ActionController::Base.relative_url_root = '/hieraki'
+-    assert_equal "/dispatch.cgi", @request.path
++    assert_equal "/dispatch.cgi", request.path
+     ActionController::Base.relative_url_root = nil
+ 
+-    @request.set_REQUEST_URI '/hieraki/dispatch.cgi'
++    request = stub_request 'REQUEST_URI' => '/hieraki/dispatch.cgi'
+     ActionController::Base.relative_url_root = '/foo'
+-    assert_equal "/hieraki/dispatch.cgi", @request.path
++    assert_equal "/hieraki/dispatch.cgi", request.path
+     ActionController::Base.relative_url_root = nil
+ 
+     # This test ensures that Rails uses REQUEST_URI over PATH_INFO
+     ActionController::Base.relative_url_root = nil
+-    @request.env['REQUEST_URI'] = "/some/path"
+-    @request.env['PATH_INFO'] = "/another/path"
+-    @request.env['SCRIPT_NAME'] = "/dispatch.cgi"
+-    assert_equal "/some/path", @request.request_uri
+-    assert_equal "/some/path", @request.path
++    request = stub_request 'REQUEST_URI' => "/some/path",
++                           'PATH_INFO'   => "/another/path",
++                           'SCRIPT_NAME' => "/dispatch.cgi"
++    assert_equal "/some/path", request.request_uri
++    assert_equal "/some/path", request.path
+   end
+ 
+   def test_host_with_default_port
+-    @request.host = "rubyonrails.org"
+-    @request.port = 80
+-    assert_equal "rubyonrails.org", @request.host_with_port
++    request = stub_request 'HTTP_HOST' => 'rubyonrails.org:80'
++    assert_equal "rubyonrails.org", request.host_with_port
+   end
+ 
+   def test_host_with_non_default_port
+-    @request.host = "rubyonrails.org"
+-    @request.port = 81
+-    assert_equal "rubyonrails.org:81", @request.host_with_port
++    request = stub_request 'HTTP_HOST' => 'rubyonrails.org:81'
++    assert_equal "rubyonrails.org:81", request.host_with_port
+   end
+ 
+   def test_server_software
+-    assert_equal nil, @request.server_software
++    request = stub_request
++    assert_equal nil, request.server_software
+ 
+-    @request.env['SERVER_SOFTWARE'] = 'Apache3.422'
+-    assert_equal 'apache', @request.server_software
++    request = stub_request 'SERVER_SOFTWARE' => 'Apache3.422'
++    assert_equal 'apache', request.server_software
+ 
+-    @request.env['SERVER_SOFTWARE'] = 'lighttpd(1.1.4)'
+-    assert_equal 'lighttpd', @request.server_software
++    request = stub_request 'SERVER_SOFTWARE' => 'lighttpd(1.1.4)'
++    assert_equal 'lighttpd', request.server_software
+   end
+ 
+   def test_xml_http_request
+-    assert !@request.xml_http_request?
+-    assert !@request.xhr?
++    request = stub_request
++
++    assert !request.xml_http_request?
++    assert !request.xhr?
+ 
+-    @request.env['HTTP_X_REQUESTED_WITH'] = "DefinitelyNotAjax1.0"
+-    assert !@request.xml_http_request?
+-    assert !@request.xhr?
++    request = stub_request 'HTTP_X_REQUESTED_WITH' => 'DefinitelyNotAjax1.0'
++    assert !request.xml_http_request?
++    assert !request.xhr?
+ 
+-    @request.env['HTTP_X_REQUESTED_WITH'] = "XMLHttpRequest"
+-    assert @request.xml_http_request?
+-    assert @request.xhr?
++    request = stub_request 'HTTP_X_REQUESTED_WITH' => 'XMLHttpRequest'
++    assert request.xml_http_request?
++    assert request.xhr?
+   end
+ 
+   def test_reports_ssl
+-    assert !@request.ssl?
+-    @request.env['HTTPS'] = 'on'
+-    assert @request.ssl?
++    request = stub_request
++    assert !request.ssl?
++
++    request = stub_request 'HTTPS' => 'on'
++    assert request.ssl?
+   end
+ 
+   def test_reports_ssl_when_proxied_via_lighttpd
+-    assert !@request.ssl?
+-    @request.env['HTTP_X_FORWARDED_PROTO'] = 'https'
+-    assert @request.ssl?
++    request = stub_request
++    assert !request.ssl?
++
++    request = stub_request 'HTTP_X_FORWARDED_PROTO' => 'https'
++    assert request.ssl?
+   end
+ 
+   def test_symbolized_request_methods
+     [:get, :post, :put, :delete].each do |method|
+-      self.request_method = method
+-      assert_equal method, @request.method
++      request = stub_request 'REQUEST_METHOD' => method.to_s.upcase
++      assert_equal method, request.method
+     end
+   end
+ 
+   def test_invalid_http_method_raises_exception
+     assert_raise(ActionController::UnknownHttpMethod) do
+-      self.request_method = :random_method
+-      @request.request_method
++      request = stub_request 'REQUEST_METHOD' => 'RANDOM_METHOD'
++      request.request_method
+     end
+   end
+ 
+   def test_allow_method_hacking_on_post
+     [:get, :head, :options, :put, :post, :delete].each do |method|
+-      self.request_method = method
+-      assert_equal(method == :head ? :get : method, @request.method)
+-    end
+-  end
+-
+-  def test_invalid_method_hacking_on_post_raises_exception
+-    assert_raise(ActionController::UnknownHttpMethod) do
+-      self.request_method = :_random_method
+-      @request.request_method
++      request = stub_request 'REQUEST_METHOD' => method.to_s.upcase
++      assert_equal(method == :head ? :get : method, request.method)
+     end
+   end
+ 
+   def test_restrict_method_hacking
+-    @request.instance_eval { @parameters = { :_method => 'put' } }
+     [:get, :put, :delete].each do |method|
+-      self.request_method = method
+-      assert_equal method, @request.method
++      request = stub_request 'REQUEST_METHOD' => method.to_s.upcase,
++        'action_controller.request.request_parameters' => { :_method => 'put' }
++      assert_equal method, request.method
+     end
+   end
+ 
+   def test_head_masquerading_as_get
+-    self.request_method = :head
+-    assert_equal :get, @request.method
+-    assert @request.get?
+-    assert @request.head?
++    request = stub_request 'REQUEST_METHOD' => 'HEAD'
++    assert_equal :get, request.method
++    assert request.get?
++    assert request.head?
+   end
+ 
+   def test_xml_format
+-    @request.instance_eval { @parameters = { :format => 'xml' } }
+-    assert_equal Mime::XML, @request.format
++    request = stub_request
++    request.expects(:parameters).at_least_once.returns({ :format => 'xml' })
++    assert_equal Mime::XML, request.format
+   end
+ 
+   def test_xhtml_format
+-    @request.instance_eval { @parameters = { :format => 'xhtml' } }
+-    assert_equal Mime::HTML, @request.format
++    request = stub_request
++    request.expects(:parameters).at_least_once.returns({ :format => 'xhtml' })
++    assert_equal Mime::HTML, request.format
+   end
+ 
+   def test_txt_format
+-    @request.instance_eval { @parameters = { :format => 'txt' } }
+-    assert_equal Mime::TEXT, @request.format
++    request = stub_request
++    request.expects(:parameters).at_least_once.returns({ :format => 'txt' })
++    assert_equal Mime::TEXT, request.format
+   end
+ 
+-  def test_nil_format
++  def test_xml_http_request
+     ActionController::Base.use_accept_header, old =
+       false, ActionController::Base.use_accept_header
+ 
+-    @request.instance_eval { @parameters = {} }
+-    @request.env["HTTP_X_REQUESTED_WITH"] = "XMLHttpRequest"
+-    assert @request.xhr?
+-    assert_equal Mime::JS, @request.format
+-
++    request = stub_request 'HTTP_X_REQUESTED_WITH' => 'XMLHttpRequest'
++    request.expects(:parameters).at_least_once.returns({})
++    assert request.xhr?
++    assert_equal Mime::JS, request.format
+   ensure
+     ActionController::Base.use_accept_header = old
+   end
+ 
+   def test_content_type
+-    @request.env["CONTENT_TYPE"] = "text/html"
+-    assert_equal Mime::HTML, @request.content_type
++    request = stub_request 'CONTENT_TYPE' => 'text/html'
++    assert_equal Mime::HTML, request.content_type
+   end
+ 
+-  def test_format_assignment_should_set_format
+-    @request.instance_eval { self.format = :txt }
+-    assert !@request.format.xml?
+-    @request.instance_eval { self.format = :xml }
+-    assert @request.format.xml?
++  def test_can_override_format_with_parameter
++    request = stub_request
++    request.expects(:parameters).at_least_once.returns({ :format => :txt })
++    assert !request.format.xml?
++
++    request = stub_request
++    request.expects(:parameters).at_least_once.returns({ :format => :xml })
++    assert request.format.xml?
+   end
+ 
+   def test_content_no_type
+-    assert_equal nil, @request.content_type
++    request = stub_request
++    assert_equal nil, request.content_type
+   end
+ 
+   def test_content_type_xml
+-    @request.env["CONTENT_TYPE"] = "application/xml"
+-    assert_equal Mime::XML, @request.content_type
++    request = stub_request 'CONTENT_TYPE' => 'application/xml'
++    assert_equal Mime::XML, request.content_type
+   end
+ 
+   def test_content_type_with_charset
+-    @request.env["CONTENT_TYPE"] = "application/xml; charset=UTF-8"
+-    assert_equal Mime::XML, @request.content_type
++    request = stub_request 'CONTENT_TYPE' => 'application/xml; charset=UTF-8'
++    assert_equal Mime::XML, request.content_type
+   end
+ 
+   def test_user_agent
+-    assert_not_nil @request.user_agent
++    request = stub_request 'HTTP_USER_AGENT' => 'TestAgent'
++    assert_equal 'TestAgent', request.user_agent
+   end
+ 
+   def test_parameters
+-    @request.stubs(:request_parameters).returns({ "foo" => 1 })
+-    @request.stubs(:query_parameters).returns({ "bar" => 2 })
++    request = stub_request
++    request.stubs(:request_parameters).returns({ "foo" => 1 })
++    request.stubs(:query_parameters).returns({ "bar" => 2 })
+ 
+-    assert_equal({"foo" => 1, "bar" => 2}, @request.parameters)
+-    assert_equal({"foo" => 1}, @request.request_parameters)
+-    assert_equal({"bar" => 2}, @request.query_parameters)
++    assert_equal({"foo" => 1, "bar" => 2}, request.parameters)
++    assert_equal({"foo" => 1}, request.request_parameters)
++    assert_equal({"bar" => 2}, request.query_parameters)
++  end
++
++protected
++
++  def stub_request(env={})
++    ActionController::Request.new(env)
+   end
+ 
+-  protected
+-    def request_method=(method)
+-      @request.env['REQUEST_METHOD'] = method.to_s.upcase
+-      @request.request_method = nil # Reset the ivar cache
+-    end
+ end
+-- 
+1.6.0.4
+
+
+From d2e6a0fbc30d3fd03e7945306d18ed8ced8b20cf Mon Sep 17 00:00:00 2001
+From: thedarkone <thedarkone2@gmail.com>
+Date: Tue, 24 Mar 2009 10:44:54 -0500
+Subject: [PATCH] Simplify handling of absolute path templates. [#2276 state:resolved]
+
+Signed-off-by: Joshua Peek <josh@joshpeek.com>
+---
+ actionpack/lib/action_view/paths.rb    |    2 +-
+ actionpack/lib/action_view/template.rb |   11 ++++++++---
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/actionpack/lib/action_view/paths.rb b/actionpack/lib/action_view/paths.rb
+index 8cc3fe2..a0a2f96 100644
+--- a/actionpack/lib/action_view/paths.rb
++++ b/actionpack/lib/action_view/paths.rb
+@@ -61,7 +61,7 @@ module ActionView #:nodoc:
+         end
+       end
+ 
+-      return Template.new(original_template_path, original_template_path.to_s =~ /\A\// ? "" : ".") if File.file?(original_template_path)
++      return Template.new(original_template_path) if File.file?(original_template_path)
+ 
+       raise MissingTemplate.new(self, original_template_path, format)
+     end
+diff --git a/actionpack/lib/action_view/template.rb b/actionpack/lib/action_view/template.rb
+index c339c8a..4497c4a 100644
+--- a/actionpack/lib/action_view/template.rb
++++ b/actionpack/lib/action_view/template.rb
+@@ -107,9 +107,8 @@ module ActionView #:nodoc:
+     attr_accessor :locale, :name, :format, :extension
+     delegate :to_s, :to => :path
+ 
+-    def initialize(template_path, load_path)
+-      @template_path = template_path.dup
+-      @load_path, @filename = load_path, File.join(load_path, template_path)
++    def initialize(template_path, load_path = nil)
++      @template_path, @load_path = template_path.dup, load_path
+       @base_path, @name, @locale, @format, @extension = split(template_path)
+       @base_path.to_s.gsub!(/\/$/, '') # Push to split method
+ 
+@@ -180,6 +179,12 @@ module ActionView #:nodoc:
+       @@exempt_from_layout.any? { |exempted| path =~ exempted }
+     end
+ 
++    def filename
++      # no load_path means this is an "absolute pathed" template
++      load_path ? File.join(load_path, template_path) : template_path
++    end
++    memoize :filename
++
+     def source
+       File.read(filename)
+     end
+-- 
+1.6.0.4
+
+
+From 6a1267a0b12560a752ebfb443194de1a0ab3bef5 Mon Sep 17 00:00:00 2001
+From: thedarkone <thedarkone2@gmail.com>
+Date: Tue, 24 Mar 2009 10:48:47 -0500
+Subject: [PATCH] Fix template extension parsing. [#2315 state:resolved] [#2284 state:resolved]
+
+Signed-off-by: Joshua Peek <josh@joshpeek.com>
+---
+ actionpack/lib/action_view/template.rb    |   44 +++++++++-------------------
+ actionpack/test/template/template_test.rb |   32 +++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 30 deletions(-)
+ create mode 100644 actionpack/test/template/template_test.rb
+
+diff --git a/actionpack/lib/action_view/template.rb b/actionpack/lib/action_view/template.rb
+index 4497c4a..a974f26 100644
+--- a/actionpack/lib/action_view/template.rb
++++ b/actionpack/lib/action_view/template.rb
+@@ -217,46 +217,30 @@ module ActionView #:nodoc:
+       end
+ 
+       def valid_locale?(locale)
+-        I18n.available_locales.include?(locale.to_sym)
++        locale && I18n.available_locales.include?(locale.to_sym)
+       end
+ 
+       # Returns file split into an array
+       #   [base_path, name, locale, format, extension]
+       def split(file)
+         if m = file.to_s.match(/^(.*\/)?([^\.]+)\.(.*)$/)
+-          base_path = m[1]
+-          name = m[2]
+-          extensions = m[3]
+-        else
+-          return
++          [m[1], m[2], *parse_extensions(m[3])]
+         end
++      end
+ 
+-        locale = nil
+-        format = nil
+-        extension = nil
+-
+-        if m = extensions.split(".")
+-          if valid_locale?(m[0]) && m[1] && valid_extension?(m[2]) # All three
+-            locale = m[0]
+-            format = m[1]
+-            extension = m[2]
+-          elsif m[0] && m[1] && valid_extension?(m[2]) # Multipart formats
+-            format = "#{m[0]}.#{m[1]}"
+-            extension = m[2]
+-          elsif valid_locale?(m[0]) && valid_extension?(m[1]) # locale and extension
+-            locale = m[0]
+-            extension = m[1]
+-          elsif valid_extension?(m[1]) # format and extension
+-            format = m[0]
+-            extension = m[1]
+-          elsif valid_extension?(m[0]) # Just extension
+-            extension = m[0]
+-          else # No extension
+-            format = m[0]
+-          end
++      # returns parsed extensions as an array
++      #   [locale, format, extension]
++      def parse_extensions(extensions)
++        exts = extensions.split(".")
++
++        if extension = valid_extension?(exts.last) && exts.pop || nil
++          locale = valid_locale?(exts.first) && exts.shift || nil
++          format = exts.join('.') if exts.any? # join('.') is needed for multipart templates
++        else # no extension, just format
++          format = exts.last
+         end
+ 
+-        [base_path, name, locale, format, extension]
++        [locale, format, extension]
+       end
+   end
+ end
+diff --git a/actionpack/test/template/template_test.rb b/actionpack/test/template/template_test.rb
+new file mode 100644
+index 0000000..7caec7a
+--- /dev/null
++++ b/actionpack/test/template/template_test.rb
+@@ -0,0 +1,32 @@
++require 'abstract_unit'
++
++class TemplateTest < Test::Unit::TestCase
++  def test_template_path_parsing
++    with_options :base_path => nil, :name => 'abc', :locale => nil, :format => 'html', :extension => 'erb' do |t|
++      t.assert_parses_template_path 'abc.en.html.erb',        :locale => 'en'
++      t.assert_parses_template_path 'abc.en.plain.html.erb',  :locale => 'en', :format => 'plain.html'
++      t.assert_parses_template_path 'abc.html.erb'
++      t.assert_parses_template_path 'abc.plain.html.erb',     :format => 'plain.html'
++      t.assert_parses_template_path 'abc.erb',                :format => nil
++      t.assert_parses_template_path 'abc.html',               :extension => nil
++      
++      t.assert_parses_template_path '_abc.html.erb',          :name => '_abc'
++      
++      t.assert_parses_template_path 'test/abc.html.erb',      :base_path => 'test'
++      t.assert_parses_template_path './test/abc.html.erb',    :base_path => './test'
++      t.assert_parses_template_path '../test/abc.html.erb',   :base_path => '../test'
++      
++      t.assert_parses_template_path 'abc',                    :extension => nil, :format => nil, :name => nil
++      t.assert_parses_template_path 'abc.xxx',                :extension => nil, :format => 'xxx', :name => 'abc'
++      t.assert_parses_template_path 'abc.html.xxx',           :extension => nil, :format => 'xxx', :name => 'abc'
++    end
++  end
++
++  private
++  def assert_parses_template_path(path, parse_results)
++    template = ActionView::Template.new(path, '')
++    parse_results.each_pair do |k, v|
++      assert_block(%Q{Expected template to parse #{k.inspect} from "#{path}" as #{v.inspect}, but got #{template.send(k).inspect}}) { v == template.send(k) }
++    end
++  end
++end
+-- 
+1.6.0.4
+
+
+From 651611999df3e57de6f36486b51abd3bf5d66cea Mon Sep 17 00:00:00 2001
+From: Ryan Angilly <ryan@angilly.com>
+Date: Tue, 24 Mar 2009 10:51:45 -0500
+Subject: [PATCH] adding session_options initialization and test [#2303 state:resolved]
+
+Signed-off-by: Joshua Peek <josh@joshpeek.com>
+---
+ actionpack/lib/action_controller/test_process.rb |    1 +
+ actionpack/test/controller/test_test.rb          |    4 ++++
+ 2 files changed, 5 insertions(+), 0 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/test_process.rb b/actionpack/lib/action_controller/test_process.rb
+index c5081a2..03c4d4f 100644
+--- a/actionpack/lib/action_controller/test_process.rb
++++ b/actionpack/lib/action_controller/test_process.rb
+@@ -13,6 +13,7 @@ module ActionController #:nodoc:
+ 
+       @query_parameters   = {}
+       @session            = TestSession.new
++      @session_options    ||= {}
+ 
+       initialize_default_values
+       initialize_containers
+diff --git a/actionpack/test/controller/test_test.rb b/actionpack/test/controller/test_test.rb
+index 3924b28..6bf8a10 100644
+--- a/actionpack/test/controller/test_test.rb
++++ b/actionpack/test/controller/test_test.rb
+@@ -130,6 +130,10 @@ XML
+     ActionController::Routing::Routes.reload
+   end
+ 
++  def test_test_request_has_session_options_initialized
++    assert @request.session_options
++  end
++
+   def test_raw_post_handling
+     params = {:page => {:name => 'page name'}, 'some key' => 123}
+     post :render_raw_post, params.dup
+-- 
+1.6.0.4
+
+
+From f921811eab31888858c0467591a0a685fd188a97 Mon Sep 17 00:00:00 2001
+From: David Dollar <ddollar@gmail.com>
+Date: Fri, 27 Mar 2009 14:53:01 -0400
+Subject: [PATCH] Attempt to deal with more cases of gems with native components
+
+This commit adds a rudimentary check for 'unbuilt' gems, so that we can abort
+the application load if there are any gems that have native components that
+have not yet been built.
+
+The rake task gems:build has now only builds 'unbuilt' gems as a result.
+
+The rake task gems:build:force has been added to deal with cases of incomplete
+builds, or any case where you need to force the build of all of your gems.
+---
+ railties/lib/initializer.rb          |   21 +++++++++++++++++++++
+ railties/lib/rails/gem_dependency.rb |   12 ++++++++----
+ railties/lib/tasks/gems.rake         |    9 +++++++++
+ 3 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index a04405a..6b01b6b 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -159,6 +159,8 @@ module Rails
+ 
+       add_support_load_paths
+ 
++      check_for_unbuilt_gems
++
+       load_gems
+       load_plugins
+ 
+@@ -306,6 +308,25 @@ module Rails
+       end
+     end
+ 
++    def check_for_unbuilt_gems
++      unbuilt_gems = @configuration.gems.reject { |g| g.built? }
++      if unbuilt_gems.size > 0
++        # don't print if the gems:build rake tasks are being run
++        unless $gems_build_rake_task
++          abort <<-end_error
++The following gems have native components that need to be built
++  #{unbuilt_gems.map { |gem| "#{gem.name}  #{gem.requirement}" } * "\n  "}
++
++You're running:
++  ruby #{Gem.ruby_version} at #{Gem.ruby}
++  rubygems #{Gem::RubyGemsVersion} at #{Gem.path * ', '}
++
++Run `rake gems:build` to build the unbuilt gems.
++          end_error
++        end
++      end
++    end
++
+     def check_gem_dependencies
+       unloaded_gems = @configuration.gems.reject { |g| g.loaded? }
+       if unloaded_gems.size > 0
+diff --git a/railties/lib/rails/gem_dependency.rb b/railties/lib/rails/gem_dependency.rb
+index 3062a77..ed63b0a 100644
+--- a/railties/lib/rails/gem_dependency.rb
++++ b/railties/lib/rails/gem_dependency.rb
+@@ -101,8 +101,12 @@ module Rails
+     end
+ 
+     def built?
+-      # TODO: If Rubygems ever gives us a way to detect this, we should use it
+-      false
++      return false unless frozen?
++      specification.extensions.each do |ext|
++        makefile = File.join(unpacked_gem_directory, File.dirname(ext), 'Makefile')
++        return false unless File.exists?(makefile)
++      end
++      true
+     end
+ 
+     def framework_gem?
+@@ -155,9 +159,9 @@ module Rails
+       specification && File.exists?(unpacked_gem_directory)
+     end
+ 
+-    def build
++    def build(options={})
+       require 'rails/gem_builder'
+-      unless built?
++      if options[:force] || !built?
+         return unless File.exists?(unpacked_specification_filename)
+         spec = YAML::load_file(unpacked_specification_filename)
+         Rails::GemBuilder.new(spec, unpacked_gem_directory).build_extensions
+diff --git a/railties/lib/tasks/gems.rake b/railties/lib/tasks/gems.rake
+index ed07bf2..5eb8992 100644
+--- a/railties/lib/tasks/gems.rake
++++ b/railties/lib/tasks/gems.rake
+@@ -24,6 +24,15 @@ namespace :gems do
+     current_gems.each &:build
+   end
+ 
++  namespace :build do
++    desc "Force the build of all gems"
++    task :force do
++      $gems_build_rake_task = true
++      Rake::Task['gems:unpack'].invoke
++      current_gems.each { |gem| gem.build(:force => true) }
++    end
++  end
++
+   desc "Installs all required gems."
+   task :install => :base do
+     current_gems.each &:install
+-- 
+1.6.0.4
+

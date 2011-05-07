@@ -1,0 +1,173 @@
+From 3c39a0a3692e0733b975477431601750cc355a29 Mon Sep 17 00:00:00 2001
+From: Timur Vafin <timur.vafin@flatsoft.com>
+Date: Wed, 22 Oct 2008 16:44:32 +0400
+Subject: [PATCH] Implement splitted cache on abstract level for all cache stores
+
+---
+ activesupport/lib/active_support/cache.rb |   77 +++++++++++++++++++++++++++++
+ activesupport/test/caching_test.rb        |   46 +++++++++++++++++
+ 2 files changed, 123 insertions(+), 0 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache.rb b/activesupport/lib/active_support/cache.rb
+index 51a6309..5162d82 100644
+--- a/activesupport/lib/active_support/cache.rb
++++ b/activesupport/lib/active_support/cache.rb
+@@ -68,14 +68,86 @@ module ActiveSupport
+         end
+       end
+ 
++      # Same as fetch, but splits long arrays to the chunks. It's usefull for memcache, because memecache does not support objects larger 1Mb
++      # * <tt>:force => true</tt> to force a cache miss.
++      # * <tt>:split => 3000</tt> to split array to chunks with 3000 pieces in each, by default 1000.
++      #
++      #   fetch_splitted('key') do
++      #     User.all
++      #   end # => [user1, user2]
++      #
++      #   fetch_splitted('key') do
++      #     'string'
++      #   end # => ['string']
++      #
++      def fetch_splitted(key, options ={})
++        @logger_off = true
++        if !options[:force] && value = read_splitted(key, options)
++          @logger_off = false
++          log("splitted hit ", key, options)
++          value
++        elsif block_given?
++          @logger_off = false
++          log("splitted miss", key, options)
++
++          value = nil
++          seconds = Benchmark.realtime { value = yield }
++
++          @logger_off = true
++          write_splitted(key, value, options)
++          @logger_off = false
++
++          log("write splitted (will save #{'%.2f' % (seconds * 1000)}ms)", key, nil)
++
++          value
++        end
++      end
++
+       def read(key, options = nil)
+         log("read", key, options)
+       end
+ 
++      def read_splitted(key, options = {})
++        split, chunk_size_key, chunk_key_fmt = default_options_for_splitted(key, options)
++
++        log("write splitted", key, options)
++
++        chunks_size = read(chunk_size_key, options)
++        unless chunks_size.nil?
++          value = []
++          chunks_size.times do |i|
++            chunk = read(chunk_key_fmt % i, options)
++            if chunk.nil?
++              log("read broken chunk", key, options)
++              write(chunk_size_key, nil, options)
++              return nil
++            else
++              value = value + chunk
++            end
++          end
++          value
++        else
++          nil
++        end
++      end
++
+       def write(key, value, options = nil)
+         log("write", key, options)
+       end
+ 
++      def write_splitted(key, value, options = {})
++        value = [value] unless value.is_a?(Array)
++        split, chunk_size_key, chunk_key_fmt = default_options_for_splitted(key, options)
++
++        log("write splitted", key, options)
++
++        chunks = value.in_groups_of(split, false)
++        write(chunk_size_key, chunks.size, options)
++        chunks.each_with_index { |c,i| write(chunk_key_fmt % i, c, options) }
++
++        value
++      end
++
+       def delete(key, options = nil)
+         log("delete", key, options)
+       end
+@@ -110,6 +182,11 @@ module ActiveSupport
+         def log(operation, key, options)
+           logger.debug("Cache #{operation}: #{key}#{options ? " (#{options.inspect})" : ""}") if logger && !@silence && !@logger_off
+         end
++
++        def default_options_for_splitted(key, options = {})
++          split = options[:split] || 1000
++          return split, "#{key}_#{split}_chunk_size", "#{key}_#{split}_chunk_%s"
++        end
+     end
+   end
+ end
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index cc371b3..f655830 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -68,6 +68,52 @@ uses_mocha 'high-level cache store tests' do
+       @cache.expects(:write).with('foo', 'bar', :force => true)
+       @cache.fetch('foo', :force => true) { 'bar' }
+     end
++
++    def test_write_splitted
++      @cache.expects(:write).with('bar_1_chunk_size', 2, :split => 1)
++      @cache.expects(:write).with('bar_1_chunk_0', ['chunk1'], :split => 1)
++      @cache.expects(:write).with('bar_1_chunk_1', ['chunk2'], :split => 1)
++
++      assert_equal ['chunk1', 'chunk2'], @cache.write_splitted('bar', ['chunk1', 'chunk2'], :split => 1)
++    end
++
++    def test_write_splitted_without_array_value
++      @cache.expects(:write).with('bar_1_chunk_size', 1, :split => 1)
++      @cache.expects(:write).with('bar_1_chunk_0', ['baz'], :split => 1)
++
++      assert_equal ['baz'], @cache.write_splitted('bar', 'baz', :split => 1)
++    end
++
++    def test_read_splitted_without_broken_chunk
++      @cache.stubs(:read).with('bar_1_chunk_size', :split => 1).returns(2)
++      @cache.stubs(:read).with('bar_1_chunk_0', :split => 1).returns(['chunk1'])
++      @cache.stubs(:read).with('bar_1_chunk_1', :split => 1).returns(['chunk2'])
++
++      assert_equal ['chunk1', 'chunk2'], @cache.read_splitted('bar', :split => 1)
++    end
++
++    def test_read_splitted_with_broken_chunk
++      @cache.stubs(:read).with('bar_1_chunk_size', :split => 1).returns(2)
++      @cache.stubs(:read).with('bar_1_chunk_0', :split => 1).returns(nil)
++      @cache.stubs(:read).with('bar_1_chunk_1', :split => 1).returns('chunk2')
++      @cache.expects(:write).with('bar_1_chunk_size', nil, :split => 1)
++
++      assert_equal nil, @cache.read_splitted('bar', :split => 1)
++    end
++
++    def test_fetch_splitted_without_cache_miss
++      @cache.stubs(:read_splitted).with('bar', :split => 1).returns(['chunk1', 'chunk2'])
++      @cache.expects(:write_splitted).never
++
++      assert_equal ['chunk1', 'chunk2'], @cache.fetch_splitted('bar', :split => 1) { ['chunk1', 'chunk2'] }
++    end
++
++    def test_fetch_splitted_with_cache_miss
++      @cache.stubs(:read_splitted).with('bar', :split => 1).returns(nil)
++      @cache.expects(:write_splitted).with('bar', ['chunk1', 'chunk2'], :split => 1)
++
++      assert_equal ['chunk1', 'chunk2'], @cache.fetch_splitted('bar', :split => 1) { ['chunk1', 'chunk2'] }
++    end
+   end
+ end
+ 
+-- 
+1.6.0.2
+

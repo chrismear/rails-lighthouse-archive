@@ -1,0 +1,287 @@
+From 1114d74787c3e289c2f25b8279ed5cd09d22a4a3 Mon Sep 17 00:00:00 2001
+From: Neeraj Singh <neerajdotname@gmail.com>
+Date: Wed, 16 Jun 2010 11:30:37 -0400
+Subject: [PATCH] moving before_validation and after_validation functionality
+ from ActiveRecord to ActiveModel
+
+[#4653 state:resolved]
+---
+ activemodel/lib/active_model/validations.rb        |   14 +---
+ .../lib/active_model/validations/callbacks.rb      |   64 ++++++++++++++++
+ .../test/cases/validations/callbacks_test.rb       |   76 ++++++++++++++++++++
+ activerecord/lib/active_record/base.rb             |    1 +
+ activerecord/lib/active_record/callbacks.rb        |   23 +-----
+ activerecord/lib/active_record/validations.rb      |    4 +-
+ 6 files changed, 148 insertions(+), 34 deletions(-)
+ create mode 100644 activemodel/lib/active_model/validations/callbacks.rb
+ create mode 100644 activemodel/test/cases/validations/callbacks_test.rb
+
+diff --git a/activemodel/lib/active_model/validations.rb b/activemodel/lib/active_model/validations.rb
+index 57487cf..31516dc 100644
+--- a/activemodel/lib/active_model/validations.rb
++++ b/activemodel/lib/active_model/validations.rb
+@@ -3,6 +3,7 @@ require 'active_support/core_ext/array/wrap'
+ require 'active_support/core_ext/class/attribute'
+ require 'active_support/core_ext/hash/keys'
+ require 'active_model/errors'
++require 'active_model/validations/callbacks'
+ 
+ module ActiveModel
+ 
+@@ -45,6 +46,7 @@ module ActiveModel
+   module Validations
+     extend ActiveSupport::Concern
+     include ActiveSupport::Callbacks
++    include ActiveModel::Validations::Callbacks
+ 
+     included do
+       extend ActiveModel::Translation
+@@ -158,18 +160,6 @@ module ActiveModel
+       @errors ||= Errors.new(self)
+     end
+ 
+-    # Runs all the specified validations and returns true if no errors were added
+-    # otherwise false. Context can optionally be supplied to define which callbacks
+-    # to test against (the context is defined on the validations using :on).
+-    def valid?(context = nil)
+-      current_context, self.validation_context = validation_context, context
+-      errors.clear
+-      _run_validate_callbacks
+-      errors.empty?
+-    ensure
+-      self.validation_context = current_context
+-    end
+-
+     # Performs the opposite of <tt>valid?</tt>. Returns true if errors were added, 
+     # false otherwise.
+     def invalid?(context = nil)
+diff --git a/activemodel/lib/active_model/validations/callbacks.rb b/activemodel/lib/active_model/validations/callbacks.rb
+new file mode 100644
+index 0000000..2c8798b
+--- /dev/null
++++ b/activemodel/lib/active_model/validations/callbacks.rb
+@@ -0,0 +1,64 @@
++require 'active_support/callbacks'
++
++module ActiveModel
++  module Validations
++    module Callbacks
++      # == Active Model Validation callbacks
++      #
++      # Provides an interface for any class to have <tt>before_validation</tt> and
++      # <tt>after_validation</tt> callbacks.
++      #
++      # First, extend ActiveModel::Callbacks from the class you are creating:
++      #
++      #   class MyModel
++      #     include ActiveModel::Validations::Callbacks
++      #
++      #     before_validation :do_stuff_before_validation
++      #     after_validation  :do_tuff_after_validation
++      #   end
++      #
++      #   Like other before_* callbacks if <tt>before_validation</tt> returns false
++      #   then <tt>valid?</tt> will not be called.
++      extend ActiveSupport::Concern
++
++      included do
++        include ActiveSupport::Callbacks
++        define_callbacks :validation, :terminator => "result == false", :scope => [:kind, :name]
++      end
++
++      module ClassMethods
++        def before_validation(*args, &block)
++          options = args.last
++          if options.is_a?(Hash) && options[:on]
++            options[:if] = Array.wrap(options[:if])
++            options[:if] << "self.validation_context == :#{options[:on]}"
++          end
++          set_callback(:validation, :before, *args, &block)
++        end
++
++        def after_validation(*args, &block)
++          options = args.extract_options!
++          options[:prepend] = true
++          options[:if] = Array.wrap(options[:if])
++          options[:if] << "!halted && value != false"
++          options[:if] << "self.validation_context == :#{options[:on]}" if options[:on]
++          set_callback(:validation, :after, *(args << options), &block)
++        end
++      end
++
++      # Runs all the specified validations and returns true if no errors were added
++      # otherwise false. Context can optionally be supplied to define which callbacks
++      # to test against (the context is defined on the validations using :on).
++      def valid?(context = nil)
++        current_context, self.validation_context = validation_context, context
++        errors.clear
++        @validate_callback_result = nil
++        validation_callback_result = _run_validation_callbacks { @validate_callback_result = _run_validate_callbacks }
++        (validation_callback_result && @validate_callback_result) ? errors.empty? : false
++      ensure
++        self.validation_context = current_context
++      end
++
++    end
++  end
++end
+diff --git a/activemodel/test/cases/validations/callbacks_test.rb b/activemodel/test/cases/validations/callbacks_test.rb
+new file mode 100644
+index 0000000..08dcf25
+--- /dev/null
++++ b/activemodel/test/cases/validations/callbacks_test.rb
+@@ -0,0 +1,76 @@
++# encoding: utf-8
++require 'cases/helper'
++
++class Dog
++  include ActiveModel::Validations
++
++  attr_accessor :name, :history
++
++  def history
++    @history ||= []
++  end
++end
++
++class DogWithMethodCallbacks < Dog
++  before_validation :set_before_validation_marker
++  after_validation :set_after_validation_marker
++
++  def set_before_validation_marker; self.history << 'before_validation_marker'; end
++  def set_after_validation_marker;  self.history << 'after_validation_marker' ; end
++end
++
++class DogValidtorsAreProc < Dog
++  before_validation { self.history << 'before_validation_marker' }
++  after_validation  { self.history << 'after_validation_marker' }
++end
++
++class DogWithTwoValidators < Dog
++  before_validation { self.history << 'before_validation_marker1' }
++  before_validation { self.history << 'before_validation_marker2' }
++end
++
++class DogValidatorReturningFalse < Dog
++  before_validation { false }
++  before_validation { self.history << 'before_validation_marker2' }
++end
++
++class DogWithMissingName < Dog
++  before_validation { self.history << 'before_validation_marker' }
++  validates_presence_of :name
++end
++
++class CallbacksWithMethodNamesShouldBeCalled < ActiveModel::TestCase
++
++  def test_before_validation_and_after_validation_callbacks_should_be_called
++    d = DogWithMethodCallbacks.new
++    d.valid?
++    assert_equal ['before_validation_marker', 'after_validation_marker'], d.history
++  end
++
++  def test_before_validation_and_after_validation_callbacks_should_be_called_with_proc
++    d = DogValidtorsAreProc.new
++    d.valid?
++    assert_equal ['before_validation_marker', 'after_validation_marker'], d.history
++  end
++
++  def test_before_validation_and_after_validation_callbacks_should_be_called_in_declared_order
++    d = DogWithTwoValidators.new
++    d.valid?
++    assert_equal ['before_validation_marker1', 'before_validation_marker2'], d.history
++  end
++
++  def test_further_callbacks_should_not_be_called_if_before_validation_returns_false
++    d = DogValidatorReturningFalse.new
++    output = d.valid?
++    assert_equal [], d.history
++    assert_equal false, output
++  end
++
++  def test_validation_test_should_be_done
++    d = DogWithMissingName.new
++    output = d.valid?
++    assert_equal ['before_validation_marker'], d.history
++    assert_equal false, output
++  end
++
++end
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 3b6ffa4..3a22a69 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1902,6 +1902,7 @@ module ActiveRecord #:nodoc:
+     extend ActiveSupport::Benchmarkable
+ 
+     include ActiveModel::Conversion
++    include ActiveModel::Validations::Callbacks
+     include Validations
+     extend CounterCache
+     include Locking::Optimistic, Locking::Pessimistic
+diff --git a/activerecord/lib/active_record/callbacks.rb b/activerecord/lib/active_record/callbacks.rb
+index 44fee12..42b56a3 100644
+--- a/activerecord/lib/active_record/callbacks.rb
++++ b/activerecord/lib/active_record/callbacks.rb
+@@ -235,7 +235,7 @@ module ActiveRecord
+     included do
+       extend ActiveModel::Callbacks
+ 
+-      define_callbacks :validation, :terminator => "result == false", :scope => [:kind, :name]
++      attr_accessor :validation_context
+ 
+       define_model_callbacks :initialize, :find, :only => :after
+       define_model_callbacks :save, :create, :update, :destroy
+@@ -250,28 +250,11 @@ module ActiveRecord
+         end
+       end
+ 
+-      def before_validation(*args, &block)
+-        options = args.last
+-        if options.is_a?(Hash) && options[:on]
+-          options[:if] = Array.wrap(options[:if])
+-          options[:if] << "@_on_validate == :#{options[:on]}"
+-        end
+-        set_callback(:validation, :before, *args, &block)
+-      end
+-
+-      def after_validation(*args, &block)
+-        options = args.extract_options!
+-        options[:prepend] = true
+-        options[:if] = Array.wrap(options[:if])
+-        options[:if] << "!halted && value != false"
+-        options[:if] << "@_on_validate == :#{options[:on]}" if options[:on]
+-        set_callback(:validation, :after, *(args << options), &block)
+-      end
+     end
+ 
+     def valid?(*) #:nodoc:
+-      @_on_validate = new_record? ? :create : :update
+-      _run_validation_callbacks { super }
++      self.validation_context = new_record? ? :create : :update
++      super 
+     end
+ 
+     def destroy #:nodoc:
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index be64e00..6ef9382 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -49,12 +49,12 @@ module ActiveRecord
+     # Runs all the specified validations and returns true if no errors were added otherwise false.
+     def valid?(context = nil)
+       context ||= (new_record? ? :create : :update)
+-      super(context)
++      output = super(context)
+ 
+       deprecated_callback_method(:validate)
+       deprecated_callback_method(:"validate_on_#{context}")
+ 
+-      errors.empty?
++      errors.empty? && output
+     end
+ 
+   protected
+-- 
+1.6.5.2
+

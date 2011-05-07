@@ -1,0 +1,213 @@
+From 056f1084c447e4dc9c9112a9de3c5269d07dd34f Mon Sep 17 00:00:00 2001
+From: Sven Fuchs <svenfuchs@artweb-design.de>
+Date: Fri, 16 Apr 2010 22:16:21 +0200
+Subject: [PATCH] Add a config.i18n.fallbacks setting and test cases for the I18n::Railtie, enable fallbacks by default in environment/production.rb
+
+Allows to configure locale fallbacks through config.i18n.fallbacks. The default setting config.i18n.fallbacks = true in production.rb will make I18n.t lookup fall back to the I18n.default_locale if a translation could not be found for the current or given locale.
+
+# USAGE
+
+# do nothing in config (i.e. remove the line in environment/production.rb)
+# => local fallbacks won't be used
+
+# set to true
+config.fallbacks = true
+# => uses I18n::Fallbacks.new
+# always falls back to the I18n.default_locale
+
+# use the OrderedOptions
+config.fallbacks.map = { :ca => :es }
+config.fallbacks.defaults = [:'es-ES', :es]
+# => uses I18n::Fallbacks.new(:'es-ES', :es, :ca => :es), see below
+
+# SHORTCUTS
+
+# set to an Array of defaults
+config.fallbacks = [:'es-ES', :es]
+# => uses I18n::Fallbacks.new(:'es-ES', :es)
+# always finally falls back to the I18n.default_locale, additionally always falls back through es-ES and es
+
+# set to a Hash of mappings
+config.fallbacks = { :ca => :es }
+# => uses I18n::Fallbacks.new(:'es-ES', :es)
+# always finally falls back to the I18n.default_locale, additionally falls back from cs to es
+
+# default Array and mappings Hash can be mixed
+config.fallbacks = [:'es-ES', :es, { :ca => :es }]
+# => uses I18n::Fallbacks.new(:'es-ES', :es, :ca => :es)
+---
+ activesupport/lib/active_support/railtie.rb        |   35 ++++++++
+ .../templates/config/environments/production.rb.tt |    4 +
+ railties/test/railties/i18n_railtie_test.rb        |   86 ++++++++++++++++++++
+ 3 files changed, 125 insertions(+), 0 deletions(-)
+ create mode 100644 railties/test/railties/i18n_railtie_test.rb
+
+diff --git a/activesupport/lib/active_support/railtie.rb b/activesupport/lib/active_support/railtie.rb
+index b8d54ff..0243157 100644
+--- a/activesupport/lib/active_support/railtie.rb
++++ b/activesupport/lib/active_support/railtie.rb
+@@ -33,6 +33,7 @@ module I18n
+     config.i18n = ActiveSupport::OrderedOptions.new
+     config.i18n.railties_load_path = []
+     config.i18n.load_path = []
++    config.i18n.fallbacks = ActiveSupport::OrderedOptions.new
+ 
+     initializer "i18n.initialize" do
+       ActiveSupport.on_load(:i18n) do
+@@ -53,6 +54,8 @@ module I18n
+           app.config.i18n.load_path.unshift(*value)
+         when :load_path
+           I18n.load_path += value
++        when :fallbacks
++          init_fallbacks(value) if value && validate_fallbacks(value)
+         else
+           I18n.send("#{setting}=", value)
+         end
+@@ -60,5 +63,37 @@ module I18n
+ 
+       I18n.reload!
+     end
++
++    class << self
++      protected
++
++        def init_fallbacks(fallbacks)
++          include_fallbacks_module
++          args = case fallbacks
++          when ActiveSupport::OrderedOptions
++            [*(fallbacks[:defaults] || []) << fallbacks[:map]].compact
++          when Hash, Array
++            Array.wrap(fallbacks)
++          else # TrueClass
++            []
++          end
++          I18n.fallbacks = I18n::Locale::Fallbacks.new(*args)
++        end
++
++        def include_fallbacks_module
++          I18n.backend.class.send(:include, I18n::Backend::Fallbacks)
++        end
++      
++        def validate_fallbacks(fallbacks)
++          case fallbacks
++          when ActiveSupport::OrderedOptions
++            !fallbacks.empty?
++          when TrueClass, Array, Hash
++            true
++          else
++            raise "Unexpected fallback type #{fallbacks.inspect}"
++          end
++        end
++    end
+   end
+ end
+\ No newline at end of file
+diff --git a/railties/lib/rails/generators/rails/app/templates/config/environments/production.rb.tt b/railties/lib/rails/generators/rails/app/templates/config/environments/production.rb.tt
+index f902120..b9fb13b 100644
+--- a/railties/lib/rails/generators/rails/app/templates/config/environments/production.rb.tt
++++ b/railties/lib/rails/generators/rails/app/templates/config/environments/production.rb.tt
+@@ -39,4 +39,8 @@
+ 
+   # Enable threaded mode
+   # config.threadsafe!
++
++  # Enable locale fallbacks for I18n (makes lookups for any locale fall back to
++  # the I18n.default_locale when a translation can not be found)
++  config.i18n.fallbacks = true
+ end
+diff --git a/railties/test/railties/i18n_railtie_test.rb b/railties/test/railties/i18n_railtie_test.rb
+new file mode 100644
+index 0000000..51684aa
+--- /dev/null
++++ b/railties/test/railties/i18n_railtie_test.rb
+@@ -0,0 +1,86 @@
++require "isolation/abstract_unit"
++
++module RailtiesTest
++  class I18nRailtieTest < Test::Unit::TestCase
++    include ActiveSupport::Testing::Isolation
++
++    def setup
++      build_app
++      boot_rails
++      FileUtils.rm_rf("#{app_path}/config/environments")
++      require "rails/all"
++      @old_path = I18n.load_path
++    end
++
++    def teardown
++      I18n.load_path = @old_path || []
++      I18n.backend = nil
++    end
++
++    def load_app
++      require "#{app_path}/config/environment"
++    end
++
++    def assert_fallbacks(fallbacks)
++      fallbacks.each do |locale, expected|
++        actual = I18n.fallbacks[locale]
++        assert_equal expected, actual, "expected fallbacks for #{locale.inspect} to be #{expected.inspect}, but were #{actual.inspect}"
++      end
++    end
++
++    def assert_no_fallbacks
++      assert !I18n.backend.class.included_modules.include?(I18n::Backend::Fallbacks)
++    end
++
++    test "config.i18n.load_path gets added to I18n.load_path" do
++      I18n.load_path = ['existing/path/to/locales']
++      I18n::Railtie.config.i18n.load_path = ['new/path/to/locales']
++      load_app
++
++      assert I18n.load_path.include?('existing/path/to/locales')
++      assert I18n.load_path.include?('new/path/to/locales')
++    end
++
++    test "not using config.i18n.fallbacks does not initialize I18n.fallbacks" do
++      I18n.backend = Class.new { include I18n::Backend::Base }.new # can't uninclude modules, so use a tmp backend class
++      load_app
++      assert_no_fallbacks
++    end
++
++    test "config.i18n.fallbacks = true initializes I18n.fallbacks with default settings" do
++      I18n::Railtie.config.i18n.fallbacks = true
++      load_app
++      assert_fallbacks :de => [:de, :en]
++    end
++
++    test "config.i18n.fallbacks.defaults = [:'en-US'] initializes fallbacks with en-US as a fallback default" do
++      I18n::Railtie.config.i18n.fallbacks.defaults = [:'en-US']
++      load_app
++      assert_fallbacks :de => [:de, :'en-US', :en]
++    end
++
++    test "config.i18n.fallbacks.map = { :ca => :'es-ES' } initializes fallbacks with a mapping ca => es-ES" do
++      I18n::Railtie.config.i18n.fallbacks.map = { :ca => :'es-ES' }
++      load_app
++      assert_fallbacks :ca => [:ca, :"es-ES", :es, :en]
++    end
++
++    test "[shortcut] config.i18n.fallbacks = [:'en-US'] initializes fallbacks with en-US as a fallback default" do
++      I18n::Railtie.config.i18n.fallbacks = [:'en-US']
++      load_app
++      assert_fallbacks :de => [:de, :'en-US', :en]
++    end
++
++    test "[shortcut] config.i18n.fallbacks = [{ :ca => :'es-ES' }] initializes fallbacks with a mapping de-AT => de-DE" do
++      I18n::Railtie.config.i18n.fallbacks.map = { :ca => :'es-ES' }
++      load_app
++      assert_fallbacks :ca => [:ca, :"es-ES", :es, :en]
++    end
++
++    test "[shortcut] config.i18n.fallbacks = [:'en-US', { :ca => :'es-ES' }] initializes fallbacks with the given arguments" do
++      I18n::Railtie.config.i18n.fallbacks = [:'en-US', { :ca => :'es-ES' }]
++      load_app
++      assert_fallbacks :ca => [:ca, :"es-ES", :es, :'en-US', :en]
++    end
++  end
++end
+\ No newline at end of file
+-- 
+1.6.5.5
+

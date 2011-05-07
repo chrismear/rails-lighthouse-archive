@@ -1,0 +1,89 @@
+From b8d0ca6f75137abfffce61a7ee402ceda34b86e3 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Mon, 10 Aug 2009 21:48:16 +0200
+Subject: [PATCH] Correctly unlock the reloader lock if the underlying app raises an exception.
+
+---
+ actionpack/lib/action_controller/reloader.rb |   33 +++++++++++++++-----------
+ actionpack/test/controller/reloader_test.rb  |   14 ++++++++++-
+ 2 files changed, 32 insertions(+), 15 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/reloader.rb b/actionpack/lib/action_controller/reloader.rb
+index cfc6bfc..e47d5ce 100644
+--- a/actionpack/lib/action_controller/reloader.rb
++++ b/actionpack/lib/action_controller/reloader.rb
+@@ -34,20 +34,25 @@ module ActionController
+     def call(env)
+       @lock.lock
+       Dispatcher.reload_application
+-      status, headers, body = @app.call(env)
+-      # We do not want to call 'cleanup_application' in an ensure block
+-      # because the returned Rack response body may lazily generate its data. This
+-      # is for example the case if one calls
+-      #
+-      #   render :text => lambda { ... code here which refers to application models ... }
+-      #
+-      # in an ActionController.
+-      #
+-      # Instead, we will want to cleanup the application code after the request is
+-      # completely finished. So we wrap the body in a BodyWrapper class so that
+-      # when the Rack handler calls #close during the end of the request, we get to
+-      # run our cleanup code.
+-      [status, headers, BodyWrapper.new(body, @lock)]
++      begin
++        status, headers, body = @app.call(env)
++        # We do not want to call 'cleanup_application' in an ensure block
++        # because the returned Rack response body may lazily generate its data. This
++        # is for example the case if one calls
++        #
++        #   render :text => lambda { ... code here which refers to application models ... }
++        #
++        # in an ActionController.
++        #
++        # Instead, we will want to cleanup the application code after the request is
++        # completely finished. So we wrap the body in a BodyWrapper class so that
++        # when the Rack handler calls #close during the end of the request, we get to
++        # run our cleanup code.
++        [status, headers, BodyWrapper.new(body, @lock)]
++      rescue Exception
++        @lock.unlock
++        raise
++      end
+     end
+   end
+ end
+diff --git a/actionpack/test/controller/reloader_test.rb b/actionpack/test/controller/reloader_test.rb
+index 5aa5678..9eab9e1 100644
+--- a/actionpack/test/controller/reloader_test.rb
++++ b/actionpack/test/controller/reloader_test.rb
+@@ -66,7 +66,7 @@ class ReloaderTests < ActiveSupport::TestCase
+     assert lock.locked?
+   end
+ 
+-  def it_unlocks_upon_calling_close_on_body
++  def test_it_unlocks_upon_calling_close_on_body
+     lock = MyLock.new
+     Dispatcher.expects(:reload_application)
+     reloader = Reloader.new(lambda { |env|
+@@ -77,6 +77,18 @@ class ReloaderTests < ActiveSupport::TestCase
+     assert !lock.locked?
+   end
+ 
++  def test_it_unlocks_if_app_object_raises_exception
++    lock = MyLock.new
++    Dispatcher.expects(:reload_application)
++    reloader = Reloader.new(lambda { |env|
++      raise "oh no!"
++    }, lock)
++    assert_raise(RuntimeError) do
++      reloader.call({ })
++    end
++    assert !lock.locked?
++  end
++
+   def test_returned_body_object_always_responds_to_close
+     body = setup_and_return_body(lambda { |env|
+       [200, { "Content-Type" => "text/html" }, [""]]
+-- 
+1.6.0.5
+

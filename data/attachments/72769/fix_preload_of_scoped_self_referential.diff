@@ -1,0 +1,200 @@
+From 2fe3a68bacdf40a5307a6b4dbd825379e5974f11 Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Fri, 19 Dec 2008 01:02:21 +0000
+Subject: [PATCH] Preload uses exclusive scope
+
+With self referential associations, the scope for the the top level should not affect fetching of associations, for example
+when doing
+
+Person.male.find :all, :include => :friends
+
+we should load all of the friends for each male, not just the male friends.
+---
+ .../lib/active_record/association_preload.rb       |   31 +++++++++++--------
+ activerecord/test/cases/associations/eager_test.rb |   15 +++++++++
+ activerecord/test/fixtures/people.yml              |   11 ++++++-
+ activerecord/test/models/person.rb                 |    6 ++++
+ activerecord/test/schema/schema.rb                 |    6 ++-
+ 5 files changed, 53 insertions(+), 16 deletions(-)
+
+diff --git a/activerecord/lib/active_record/association_preload.rb b/activerecord/lib/active_record/association_preload.rb
+index 7b1b2d9..d90cd95 100644
+--- a/activerecord/lib/active_record/association_preload.rb
++++ b/activerecord/lib/active_record/association_preload.rb
+@@ -43,7 +43,7 @@ module ActiveRecord
+     # loading in a more high-level (application developer-friendly) manner.
+     module ClassMethods
+       protected
+-      
++
+       # Eager loads the named associations for the given ActiveRecord record(s).
+       #
+       # In this description, 'association name' shall refer to the name passed
+@@ -113,7 +113,7 @@ module ActiveRecord
+         # unnecessarily
+         records.group_by {|record| class_to_reflection[record.class] ||= record.class.reflections[association]}.each do |reflection, records|
+           raise ConfigurationError, "Association named '#{ association }' was not found; perhaps you misspelled it?" unless reflection
+-          
++
+           # 'reflection.macro' can return 'belongs_to', 'has_many', etc. Thus,
+           # the following could call 'preload_belongs_to_association',
+           # 'preload_has_many_association', etc.
+@@ -128,7 +128,7 @@ module ActiveRecord
+           association_proxy.target.push(*[associated_record].flatten)
+         end
+       end
+-      
++
+       def add_preloaded_record_to_collection(parent_records, reflection_name, associated_record)
+         parent_records.each do |parent_record|
+           parent_record.send("set_#{reflection_name}_target", associated_record)
+@@ -183,18 +183,19 @@ module ActiveRecord
+         conditions = "t0.#{reflection.primary_key_name} #{in_or_equals_for_ids(ids)}"
+         conditions << append_conditions(reflection, preload_options)
+ 
+-        associated_records = reflection.klass.find(:all, :conditions => [conditions, ids],
+-        :include => options[:include],
+-        :joins => "INNER JOIN #{connection.quote_table_name options[:join_table]} t0 ON #{reflection.klass.quoted_table_name}.#{reflection.klass.primary_key} = t0.#{reflection.association_foreign_key}",
+-        :select => "#{options[:select] || table_name+'.*'}, t0.#{reflection.primary_key_name} as the_parent_record_id",
+-        :order => options[:order])
+-
++        associated_records = reflection.klass.with_exclusive_scope do
++          reflection.klass.find(:all, :conditions => [conditions, ids],
++            :include => options[:include],
++            :joins => "INNER JOIN #{connection.quote_table_name options[:join_table]} t0 ON #{reflection.klass.quoted_table_name}.#{reflection.klass.primary_key} = t0.#{reflection.association_foreign_key}",
++            :select => "#{options[:select] || table_name+'.*'}, t0.#{reflection.primary_key_name} as the_parent_record_id",
++            :order => options[:order])
++        end
+         set_association_collection_records(id_to_record_map, reflection.name, associated_records, 'the_parent_record_id')
+       end
+ 
+       def preload_has_one_association(records, reflection, preload_options={})
+         return if records.first.send("loaded_#{reflection.name}?")
+-        id_to_record_map, ids = construct_id_map(records)        
++        id_to_record_map, ids = construct_id_map(records)
+         options = reflection.options
+         records.each {|record| record.send("set_#{reflection.name}_target", nil)}
+         if options[:through]
+@@ -248,7 +249,7 @@ module ActiveRecord
+                                              reflection.primary_key_name)
+         end
+       end
+-      
++
+       def preload_through_records(records, reflection, through_association)
+         through_reflection = reflections[through_association]
+         through_primary_key = through_reflection.primary_key_name
+@@ -333,11 +334,13 @@ module ActiveRecord
+           end
+           conditions = "#{table_name}.#{connection.quote_column_name(primary_key)} #{in_or_equals_for_ids(ids)}"
+           conditions << append_conditions(reflection, preload_options)
+-          associated_records = klass.find(:all, :conditions => [conditions, ids],
++          associated_records = klass.with_exclusive_scope do
++            klass.find(:all, :conditions => [conditions, ids],
+                                           :include => options[:include],
+                                           :select => options[:select],
+                                           :joins => options[:joins],
+                                           :order => options[:order])
++          end
+           set_association_single_records(id_map, reflection.name, associated_records, primary_key)
+         end
+       end
+@@ -355,13 +358,15 @@ module ActiveRecord
+ 
+         conditions << append_conditions(reflection, preload_options)
+ 
+-        reflection.klass.find(:all,
++        reflection.klass.with_exclusive_scope do
++          reflection.klass.find(:all,
+                               :select => (preload_options[:select] || options[:select] || "#{table_name}.*"),
+                               :include => preload_options[:include] || options[:include],
+                               :conditions => [conditions, ids],
+                               :joins => options[:joins],
+                               :group => preload_options[:group] || options[:group],
+                               :order => preload_options[:order] || options[:order])
++        end
+       end
+ 
+ 
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 42063d1..dab065a 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -771,4 +771,19 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_equal author_addresses(:david_address), authors[0].author_address
+   end
+ 
++  def test_preload_belongs_to_uses_exclusive_scope
++    people = Person.males.find(:all, :include => :primary_contact)
++    assert_not_equal people.length, 0
++    people.each do |person|
++      assert_no_queries {assert_not_nil person.primary_contact}
++      assert_equal Person.find(person.id).primary_contact, person.primary_contact
++    end
++  end
++
++  def test_preload_has_many_uses_exclusive_scope
++    people = Person.males.find :all, :include => :agents
++    people.each do |person|
++      assert_equal Person.find(person.id).agents, person.agents
++    end
++  end
+ end
+diff --git a/activerecord/test/fixtures/people.yml b/activerecord/test/fixtures/people.yml
+index d5a69e5..3babb1f 100644
+--- a/activerecord/test/fixtures/people.yml
++++ b/activerecord/test/fixtures/people.yml
+@@ -1,6 +1,15 @@
+ michael:
+   id: 1
+   first_name: Michael
++  primary_contact_id: 2
++  gender: M
+ david:
+   id: 2
+-  first_name: David
+\ No newline at end of file
++  first_name: David
++  primary_contact_id: 3
++  gender: M
++susan:
++  id: 3
++  first_name: Susan
++  primary_contact_id: 2
++  gender: F
+\ No newline at end of file
+diff --git a/activerecord/test/models/person.rb b/activerecord/test/models/person.rb
+index 430d0b3..ec2f684 100644
+--- a/activerecord/test/models/person.rb
++++ b/activerecord/test/models/person.rb
+@@ -7,4 +7,10 @@ class Person < ActiveRecord::Base
+   has_many :jobs, :through => :references
+   has_one :favourite_reference, :class_name => 'Reference', :conditions => ['favourite=?', true]
+   has_many :posts_with_comments_sorted_by_comment_id, :through => :readers, :source => :post, :include => :comments, :order => 'comments.id'
++
++  belongs_to :primary_contact, :class_name => 'Person'
++  has_many :agents, :class_name => 'Person', :foreign_key => 'primary_contact_id'
++
++  named_scope :males, :conditions => { :gender => 'M' }
++  named_scope :females, :conditions => { :gender => 'F' }
+ end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index fbacc69..8199cb8 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -298,8 +298,10 @@ ActiveRecord::Schema.define do
+   end
+ 
+   create_table :people, :force => true do |t|
+-    t.string  :first_name, :null => false
+-    t.integer :lock_version, :null => false, :default => 0
++    t.string     :first_name, :null => false
++    t.references :primary_contact
++    t.string     :gender, :limit => 1
++    t.integer    :lock_version, :null => false, :default => 0
+   end
+ 
+   create_table :pets, :primary_key => :pet_id ,:force => true do |t|
+-- 
+1.6.0.1
+

@@ -1,0 +1,161 @@
+reset_session doesn't work properly when using ActiveRecordStore, or probably other derivatives of ActionController::Session::AbstractStore.
+
+After a reset_session, when ActionController::Session::AbstractStore generates a new session ID and tries to set the session cookie, it creates an invalid header instead.
+
+Here are the relevant extracts from a debugging session with rails 2.3.8 and rack 1.1.0, although the problem was not fixed by upgrading rack to 1.2.1.
+
+ [127, 136] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    130        	puts "abstract_store env session before call = #{env[ENV_SESSION_KEY]}"
+    131          response = @app.call(env)
+ => 132        	puts "abstract_store env session after call = #{env[ENV_SESSION_KEY]}"
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:132
+ puts "abstract_store env session after call = #{env[ENV_SESSION_KEY]}"
+ 
+ (rdb:1) p env['rack.session.options']
+ {:path=>"/", :httponly=>true, :domain=>nil, :expire_after=>nil, :cookie_only=>true, :key=>"_session_id", :secret=>"35be19722d70e3549c1707b87baf40f341585c32bd2c9c63cfb19902675647d6b94f07fdcc2b1dc77a5a62a03851bb1e2ccdff7722e6718b367a064a034ade01", :secure=>false}
+
+There is no saved session ID in `rack.session.options` at this point...
+
+ [135, 144] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    135          options = env[ENV_SESSION_OPTIONS_KEY]
+    136  
+    137          if !session_data.is_a?(AbstractStore::SessionHash) || session_data.send(:loaded?) || options[:expire_after]
+    138            session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) && !session_data.send(:loaded?)
+    139  
+ => 140            sid = options[:id] || generate_sid
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:140
+ sid = options[:id] || generate_sid
+ 
+ (rdb:1) p options[:id]
+ nil
+
+So we generate a new session ID here, and save it in the database, then generate a new cookie:
+
+ [141, 150] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    141  
+    142            unless set_session(env, sid, session_data.to_hash)
+    143              return response
+    144            end
+    145  
+ => 146            cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+    147            cookie << "; domain=#{options[:domain]}" if options[:domain]
+    148            cookie << "; path=#{options[:path]}" if options[:path]
+    149            if options[:expire_after]
+    150              expiry = Time.now + options[:expire_after]
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:146 
+ cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+ 
+ (rdb:1) p @key
+ "_session_id"
+ 
+ (rdb:1) p sid
+ "fca9862ce0015820072e85ae40262159"
+
+Stepped through the rest of the cookie creation to the header setting:
+
+ [153, 162] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    153            cookie << "; Secure" if options[:secure]
+    154            cookie << "; HttpOnly" if options[:httponly]
+    155  
+    156            headers = response[1]
+    157            unless headers[SET_COOKIE].blank?
+ => 158              headers[SET_COOKIE] << "\n#{cookie}"
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:158
+ headers[SET_COOKIE] << "\n#{cookie}"
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ ["auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT"]
+ 
+Whoops, it's an Array, not a String, but we're about to append a new element:
+ 
+ [159, 168] in /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb
+    159            else
+    160              headers[SET_COOKIE] = cookie
+    161            end
+    162          end
+    163  
+ => 164          response
+    165        end
+    166  
+    167        private
+    168          def generate_sid
+ /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164
+ response
+ 
+ (rdb:1) p headers[SET_COOKIE]
+ ["auth_token=; path=/; expires=Thu, 01-Jan-1970 00:00:00 GMT", "\n_session_id=fca9862ce0015820072e85ae40262159; path=/; HttpOnly"]
+ 
+Boom, this is not a good cookie. Note the newline before _session_id, which will prevent it being used as the actual session ID, so the next request resumes the old session rather than starting a new one, meaning that reset_session had no effect.
+
+We are now here:
+ 
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb:164:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/query_cache.rb:34:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:9:in `cache'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/query_cache.rb:28:in `call'
+ - /home/chris/project/minetoo/vendor/rails/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb:361:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/failsafe.rb:26:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `synchronize'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lock.rb:11:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/dispatcher.rb:110:in `call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:47:in `_call'
+ - /home/chris/project/minetoo/vendor/gems/rack-1.1.0/lib/rack/lint.rb:35:in `call'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:316:in `process'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:197:in `get'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:503:in `get'
+ - test/functional/about_controller_test.rb:329:in `test_about_page'
+ - test/functional/about_controller_test.rb:284:in `each'
+ - test/functional/about_controller_test.rb:284:in `test_about_page'
+ - test/functional/about_controller_test.rb:281:in `each'
+ - test/functional/about_controller_test.rb:281:in `test_about_page'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `__send__'
+ - /home/chris/project/minetoo/vendor/rails/activesupport/lib/active_support/testing/setup_and_teardown.rb:62:in `run'
+ - /home/chris/project/minetoo/vendor/rails/actionpack/lib/action_controller/integration.rb:661:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:34:in `run'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `each'
+ - /usr/lib/ruby/1.8/test/unit/testsuite.rb:33:in `run'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnermediator.rb:46:in `run_suite'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:67:in `start_mediator'
+ - /usr/lib/ruby/1.8/test/unit/ui/console/testrunner.rb:41:in `start'
+ - /usr/lib/ruby/1.8/test/unit/ui/testrunnerutilities.rb:29:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:216:in `run'
+ - /usr/lib/ruby/1.8/test/unit/autorunner.rb:12:in `run'
+ - /usr/lib/ruby/1.8/test/unit.rb:278
+ - test/functional/about_controller_test.rb:280
+
+I think this is the same problem as #4743, but was not resolved along with #4743 because AbstractStore contains a (still broken) copy of the old header code that CookieStore used to have, which assumed that headers were Strings. It seems from #4743 that Rack recently changed headers to be Arrays instead of Strings, and all the duplicated copies of this header handling code in Rails need to be updated.
+
+I think you could demonstrate this bug by applying the same tests written for #4743 (from [85b6d79d8a17fdef667770e31b44ac6647f8b584]) with an ActiveRecordStore session store instead of CookieStore, but I don't know how to run these tests or how to switch session store on the fly.
+
+I was able to resolve the problem with the following patch:
+
+ --- /usr/lib/ruby/gems/1.8/gems/actionpack-2.3.8/lib/action_controller/session/abstract_store.rb	2010-07-11 15:55:36.000000000 +0200
+ +++ vendor/rails/actionpack/lib/action_controller/session/abstract_store.rb	2010-07-11 16:04:43.000000000 +0200
+ @@ -150,11 +154,8 @@
+            cookie << "; HttpOnly" if options[:httponly]
+  
+            headers = response[1]
+ -          unless headers[SET_COOKIE].blank?
+ -            headers[SET_COOKIE] << "\n#{cookie}"
+ -          else
+ -            headers[SET_COOKIE] = cookie
+ -          end
+ +					headers[SET_COOKIE] = [] if headers[SET_COOKIE].blank?
+ +					headers[SET_COOKIE] << cookie
+          end
+  
+          response
+

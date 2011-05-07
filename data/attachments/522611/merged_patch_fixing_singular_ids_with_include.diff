@@ -1,0 +1,193 @@
+From 8f86b67b4b27853c24025a29102c5b4ebbebcf17 Mon Sep 17 00:00:00 2001
+From: Diego Algorta <diego@oboxodo.com>
+Date: Mon, 10 May 2010 02:31:15 -0300
+Subject: [PATCH] Fix bug for singular_ids when relationship uses :include. Includes test.
+
+---
+ activerecord/lib/active_record/associations.rb     |    4 +++-
+ activerecord/lib/active_record/relation.rb         |   14 +++++++++++++-
+ .../associations/has_many_associations_test.rb     |    6 +++++-
+ activerecord/test/cases/reflection_test.rb         |    4 ++--
+ activerecord/test/fixtures/companies.yml           |    2 ++
+ activerecord/test/fixtures/states.yml              |    3 +++
+ activerecord/test/models/company.rb                |    6 ++++++
+ activerecord/test/schema/schema.rb                 |    5 +++++
+ 8 files changed, 39 insertions(+), 5 deletions(-)
+ create mode 100644 activerecord/test/fixtures/states.yml
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 0a3c7c6..7353c03 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1398,7 +1398,9 @@ module ActiveRecord
+                 primary_key = reflection.source_reflection.primary_key_name
+                 send(through.name).select("DISTINCT #{through.quoted_table_name}.#{primary_key}").map!(&:"#{primary_key}")
+               else
+-                send(reflection.name).select("#{reflection.quoted_table_name}.#{reflection.klass.primary_key}").map!(&:id)
++                send(reflection.name).select("#{reflection.quoted_table_name}.#{reflection.klass.primary_key}").ignoring_includes do |relation|
++                  relation.map!(&:id)
++                end
+               end
+             end
+           end
+diff --git a/activerecord/lib/active_record/relation.rb b/activerecord/lib/active_record/relation.rb
+index 4e62187..2a0886e 100644
+--- a/activerecord/lib/active_record/relation.rb
++++ b/activerecord/lib/active_record/relation.rb
+@@ -20,6 +20,7 @@ module ActiveRecord
+ 
+       @implicit_readonly = nil
+       @loaded            = nil
++      @ignore_includes   = false
+ 
+       SINGLE_VALUE_METHODS.each {|v| instance_variable_set(:"@#{v}_value", nil)}
+       (ASSOCIATION_METHODS + MULTI_VALUE_METHODS).each {|v| instance_variable_set(:"@#{v}_values", [])}
+@@ -64,7 +65,7 @@ module ActiveRecord
+       @records = eager_loading? ? find_with_associations : @klass.find_by_sql(arel.to_sql)
+ 
+       preload = @preload_values
+-      preload +=  @includes_values unless eager_loading?
++      preload +=  @includes_values unless eager_loading? || should_ignore_includes?
+       preload.each {|associations| @klass.send(:preload_associations, @records, associations) }
+ 
+       # @readonly_value is true only if set explicity. @implicit_readonly is true if there are JOINS and no explicit SELECT.
+@@ -311,6 +312,17 @@ module ActiveRecord
+       @should_eager_load ||= (@eager_load_values.any? || (@includes_values.any? && references_eager_loaded_tables?))
+     end
+ 
++    def should_ignore_includes?
++      @ignore_includes
++    end
++
++    def ignoring_includes
++      @ignore_includes = true
++      yield self
++    ensure
++      @ignore_includes = false
++    end
++
+     def ==(other)
+       case other
+       when Relation
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index b55b08b..4a06102 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -15,7 +15,7 @@ require 'models/tagging'
+ class HasManyAssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :categories, :companies, :developers, :projects,
+            :developers_projects, :topics, :authors, :comments,
+-           :people, :posts, :readers, :taggings
++           :people, :posts, :readers, :taggings, :states
+ 
+   def setup
+     Client.destroyed_client_ids.clear
+@@ -900,6 +900,10 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert !company.clients.loaded?
+   end
+ 
++  def test_get_ids_ignores_include_option
++    assert_equal [companies(:first_client).id, companies(:second_client).id], companies(:first_firm).clients_with_eager_loaded_state_ids
++  end
++
+   def test_get_ids_for_unloaded_finder_sql_associations_loads_them
+     company = companies(:first_firm)
+     assert !company.clients_using_sql.loaded?
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 6781862..f437680 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -177,8 +177,8 @@ class ReflectionTest < ActiveRecord::TestCase
+ 
+   def test_reflection_of_all_associations
+     # FIXME these assertions bust a lot
+-    assert_equal 37, Firm.reflect_on_all_associations.size
+-    assert_equal 27, Firm.reflect_on_all_associations(:has_many).size
++    assert_equal 38, Firm.reflect_on_all_associations.size
++    assert_equal 28, Firm.reflect_on_all_associations(:has_many).size
+     assert_equal 10, Firm.reflect_on_all_associations(:has_one).size
+     assert_equal 0, Firm.reflect_on_all_associations(:belongs_to).size
+   end
+diff --git a/activerecord/test/fixtures/companies.yml b/activerecord/test/fixtures/companies.yml
+index 9ad68fb..91ec88e 100644
+--- a/activerecord/test/fixtures/companies.yml
++++ b/activerecord/test/fixtures/companies.yml
+@@ -6,6 +6,7 @@ first_client:
+   name: Summit
+   ruby_type: Client
+   firm_name: 37signals
++  state_id: 1
+ 
+ first_firm:
+   id: 1
+@@ -20,6 +21,7 @@ second_client:
+   client_of: 1
+   name: Microsoft
+   ruby_type: Client
++  state_id: 1
+ 
+ another_firm:
+   id: 4
+diff --git a/activerecord/test/fixtures/states.yml b/activerecord/test/fixtures/states.yml
+new file mode 100644
+index 0000000..f2aaf22
+--- /dev/null
++++ b/activerecord/test/fixtures/states.yml
+@@ -0,0 +1,3 @@
++washington:
++  id: 1
++  name: Washington
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index be6dd71..bf2fffe 100644
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -72,6 +72,7 @@ class Firm < Company
+            :primary_key => 'name', :foreign_key => 'firm_name', :dependent => :delete_all
+   has_many :clients_grouped_by_firm_id, :class_name => "Client", :group => "firm_id", :select => "firm_id"
+   has_many :clients_grouped_by_name, :class_name => "Client", :group => "name", :select => "name"
++  has_many :clients_with_eager_loaded_state, :class_name => "Client", :include => :state
+ 
+   has_one :account, :foreign_key => "firm_id", :dependent => :destroy, :validate => true
+   has_one :unvalidated_account, :foreign_key => "firm_id", :class_name => 'Account', :validate => false
+@@ -108,6 +109,7 @@ class Client < Company
+   belongs_to :firm_with_condition, :class_name => "Firm", :foreign_key => "client_of", :conditions => ["1 = ?", 1]
+   belongs_to :firm_with_primary_key, :class_name => "Firm", :primary_key => "name", :foreign_key => "firm_name"
+   belongs_to :readonly_firm, :class_name => "Firm", :foreign_key => "firm_id", :readonly => true
++  belongs_to :state
+ 
+   # Record destruction so we can test whether firm.clients.clear has
+   # is calling client.destroy, deleting from the database, or setting
+@@ -188,3 +190,7 @@ class Account < ActiveRecord::Base
+     "Sir, yes sir!"
+   end
+ end
++
++class State < ActiveRecord::Base
++  has_many :clients
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index f5fba2f..6a4e51d 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -136,6 +136,7 @@ ActiveRecord::Schema.define do
+     t.string  :name
+     t.integer :client_of
+     t.integer :rating, :default => 1
++    t.integer :state_id
+   end
+ 
+   add_index :companies, [:firm_id, :type, :rating, :ruby_type], :name => "company_index"
+@@ -450,6 +451,10 @@ ActiveRecord::Schema.define do
+     t.string :sponsorable_type
+   end
+ 
++  create_table :states, :force => true do |t|
++    t.string :name
++  end
++
+   create_table :subscribers, :force => true, :id => false do |t|
+     t.string :nick, :null => false
+     t.string :name
+-- 
+1.6.3.3
+

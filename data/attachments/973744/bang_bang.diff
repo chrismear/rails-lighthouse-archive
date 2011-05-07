@@ -1,0 +1,205 @@
+From eb86eb36551619f43249a3c77baef74c36f0f7f7 Mon Sep 17 00:00:00 2001
+From: Juan Maiz <juanmaiz@gmail.com>
+Date: Wed, 23 Mar 2011 10:53:25 -0300
+Subject: [PATCH] I'm tired of writing update_attribute. So I propose having a bang method in attributes, like ||@foo.bar! 'baz'|| wich updates bar to baz. Hope it's not just me.
+
+---
+ activerecord/lib/active_record.rb                  |    1 +
+ .../lib/active_record/attribute_methods/update.rb  |   31 +++++++++++++++
+ activerecord/lib/active_record/base.rb             |    2 +-
+ activerecord/test/cases/attribute_methods_test.rb  |   30 ++++++++++++++
+ activerecord/test/cases/persistence_test.rb        |   41 ++++++++++++++++++++
+ 5 files changed, 104 insertions(+), 1 deletions(-)
+ create mode 100644 activerecord/lib/active_record/attribute_methods/update.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 59cf42a..30a704a 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -95,6 +95,7 @@ module ActiveRecord
+       autoload :Query
+       autoload :Read
+       autoload :TimeZoneConversion
++      autoload :Update
+       autoload :Write
+     end
+   end
+diff --git a/activerecord/lib/active_record/attribute_methods/update.rb b/activerecord/lib/active_record/attribute_methods/update.rb
+new file mode 100644
+index 0000000..6d270d9
+--- /dev/null
++++ b/activerecord/lib/active_record/attribute_methods/update.rb
+@@ -0,0 +1,31 @@
++module ActiveRecord
++  module AttributeMethods
++    module Update
++      extend ActiveSupport::Concern
++
++      included do
++        attribute_method_suffix "!"
++      end
++
++      module ClassMethods
++        protected
++          def define_method_attribute!(attr_name)
++            if attr_name =~ /^[a-zA-Z_]\w*[!?=]?$/
++              generated_attribute_methods.module_eval("def #{attr_name}!(new_value); update_attribute('#{attr_name}', new_value); end", __FILE__, __LINE__)
++            else
++              generated_attribute_methods.send(:define_method, "#{attr_name}!") do |new_value|
++                update_attribute(attr_name, new_value)
++              end
++            end
++          end
++      end
++
++
++      private
++        # Handle *! for method_missing.
++        def attribute!(attribute_name, value)
++          update_attribute(attribute_name, value)
++        end
++    end
++  end
++end
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index b778b0c..398e1aa 100644
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1944,7 +1944,7 @@ MSG
+     extend CounterCache
+     include Locking::Optimistic, Locking::Pessimistic
+     include AttributeMethods
+-    include AttributeMethods::Read, AttributeMethods::Write, AttributeMethods::BeforeTypeCast, AttributeMethods::Query
++    include AttributeMethods::Read, AttributeMethods::Write, AttributeMethods::Update, AttributeMethods::BeforeTypeCast, AttributeMethods::Query
+     include AttributeMethods::PrimaryKey
+     include AttributeMethods::TimeZoneConversion
+     include AttributeMethods::Dirty
+diff --git a/activerecord/test/cases/attribute_methods_test.rb b/activerecord/test/cases/attribute_methods_test.rb
+index dfacf58..d541931 100644
+--- a/activerecord/test/cases/attribute_methods_test.rb
++++ b/activerecord/test/cases/attribute_methods_test.rb
+@@ -247,6 +247,18 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     # puts ""
+   end
+ 
++  def test_read_update_boolean_attribute
++    topic = Topic.new
++    topic.approved! "false"
++    assert !topic.approved?, "approved should be false"
++    topic.approved! "false"
++    assert !topic.approved?, "approved should be false"
++    topic.approved! "true"
++    assert topic.approved?, "approved should be true"
++    topic.approved! "true"
++    assert topic.approved?, "approved should be true"
++  end
++
+   def test_read_overridden_attribute
+     topic = Topic.new(:title => 'a')
+     def topic.title() 'b' end
+@@ -469,6 +481,14 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_update_nil_to_time_attributes
++    in_time_zone "Pacific Time (US & Canada)" do
++      record = @target.new
++      record.written_on! nil
++      assert_nil record.written_on
++    end
++  end
++
+   def test_time_attributes_are_retrieved_in_current_time_zone
+     in_time_zone "Pacific Time (US & Canada)" do
+       utc_time = Time.utc(2008, 1, 1)
+@@ -578,6 +598,16 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+     topic.send(:title=, "Very large pants")
+   end
+ 
++  def test_update_attributes_respect_access_control
++    privatize("title!(value)")
++
++    topic = @target.new
++    assert !topic.respond_to?(:title!)
++    exception = assert_raise(NoMethodError) { topic.title! "Pants"}
++    assert_match %r(^Attempt to call private method), exception.message
++    topic.send(:title!, "Very large pants")
++  end
++
+   def test_question_attributes_respect_access_control
+     privatize("title?")
+ 
+diff --git a/activerecord/test/cases/persistence_test.rb b/activerecord/test/cases/persistence_test.rb
+index 8ca9d62..3ec8149 100644
+--- a/activerecord/test/cases/persistence_test.rb
++++ b/activerecord/test/cases/persistence_test.rb
+@@ -336,11 +336,25 @@ class PersistencesTest < ActiveRecord::TestCase
+     assert !Topic.find(1).approved?
+   end
+ 
++  def test_update_attribute_with_bang_method
++    assert !Topic.find(1).approved?
++    Topic.find(1).approved! true
++    assert Topic.find(1).approved?
++
++    Topic.find(1).approved! false
++    assert !Topic.find(1).approved?
++  end
++
+   def test_update_attribute_for_readonly_attribute
+     minivan = Minivan.find('m1')
+     assert_raises(ActiveRecord::ActiveRecordError) { minivan.update_attribute(:color, 'black') }
+   end
+ 
++  def test_update_attribute_with_bang_method_for_readonly_attribute
++    minivan = Minivan.find('m1')
++    assert_raises(ActiveRecord::ActiveRecordError) { minivan.color! 'black' }
++  end
++
+   # This test is correct, but it is hard to fix it since
+   # update_attribute trigger simply call save! that triggers
+   # all callbacks.
+@@ -375,6 +389,19 @@ class PersistencesTest < ActiveRecord::TestCase
+     assert_equal 'super_title', t.title
+   end
+ 
++  def test_update_attribute_with_bang_method_with_one_updated
++    t = Topic.first
++    title = t.title
++    t.title! 'super_title'
++    assert_equal 'super_title', t.title
++    assert !t.changed?, "topic should not have changed"
++    assert !t.title_changed?, "title should not have changed"
++    assert_nil t.title_change, 'title change should be nil'
++
++    t.reload
++    assert_equal 'super_title', t.title
++  end
++
+   def test_update_attribute_for_updated_at_on
+     developer = Developer.find(1)
+     prev_month = Time.now.prev_month
+@@ -389,6 +416,20 @@ class PersistencesTest < ActiveRecord::TestCase
+     assert_not_equal prev_month, developer.updated_at
+   end
+ 
++  def test_update_attribute_with_bang_method_for_updated_at_on
++    developer = Developer.find(1)
++    prev_month = Time.now.prev_month
++
++    developer.updated_at! prev_month
++    assert_equal prev_month, developer.updated_at
++
++    developer.salary! 80001
++    assert_not_equal prev_month, developer.updated_at
++
++    developer.reload
++    assert_not_equal prev_month, developer.updated_at
++  end
++
+   def test_update_attributes
+     topic = Topic.find(1)
+     assert !topic.approved?
+-- 
+1.7.2.1
+

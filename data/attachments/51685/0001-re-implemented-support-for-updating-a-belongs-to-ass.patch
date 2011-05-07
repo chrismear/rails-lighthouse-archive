@@ -1,0 +1,218 @@
+From 27b62e305840791df032912b93c271c88481bbba Mon Sep 17 00:00:00 2001
+From: Aliaksey Kandratsenka <alk@tut.by>
+Date: Mon, 6 Oct 2008 17:34:59 +0300
+Subject: [PATCH] re-implemented support for updating a belongs to association from the foreign key
+
+Old implementation was inherently buggy. The bugs where:
+- calling #reset on association, because association proxy instance could be used outside as a replacement for it's old value
+- several associations (e.g. #author & #author_with_posts) for one foreign key were not supported
+- it was plain wrong when foreign key name equals association name
+- updates of foreign key via #write_attribute and thus overriding of foreign key setter were not supported
+---
+ activerecord/lib/active_record/associations.rb     |   25 +++++-----
+ .../associations/association_proxy.rb              |    8 +++-
+ .../associations/belongs_to_association.rb         |   14 +++++-
+ .../associations/has_one_association.rb            |    2 +
+ .../associations/belongs_to_associations_test.rb   |   52 ++++++++++++++++++++
+ 5 files changed, 87 insertions(+), 14 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index d1a0b2f..739dab1 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1009,6 +1009,11 @@ module ActiveRecord
+             association = instance_variable_get(ivar) if instance_variable_defined?(ivar)
+ 
+             if !association.nil?
++              unless association.proxy_compatible_with_owner_state?
++                # if association's state is stale, don't do anything
++                next
++              end
++
+               if association.new_record?
+                 association.save(true)
+               end
+@@ -1235,7 +1240,7 @@ module ActiveRecord
+ 
+             association = instance_variable_get(ivar) if instance_variable_defined?(ivar)
+ 
+-            if association.nil? || !association.loaded? || force_reload
++            if association.nil? || force_reload
+               association = association_proxy_class.new(self, reflection)
+               retval = association.reload
+               if retval.nil? and association_proxy_class == BelongsToAssociation
+@@ -1243,6 +1248,13 @@ module ActiveRecord
+                 return nil
+               end
+               instance_variable_set(ivar, association)
++            elsif !association.proxy_compatible_with_owner_state?
++              # if association asks for reload, do that
++              return self.send(reflection.name, true)
++            end
++
++            if !association.loaded?
++              association.reload
+             end
+ 
+             association.target.nil? ? nil : association
+@@ -1264,17 +1276,6 @@ module ActiveRecord
+             end
+           end
+ 
+-          if association_proxy_class == BelongsToAssociation
+-            define_method("#{reflection.primary_key_name}=") do |target_id|
+-              if instance_variable_defined?(ivar)
+-                if association = instance_variable_get(ivar)
+-                  association.reset
+-                end
+-              end
+-              write_attribute(reflection.primary_key_name, target_id)
+-            end
+-          end
+-
+           define_method("set_#{reflection.name}_target") do |target|
+             return if target.nil? and association_proxy_class == BelongsToAssociation
+             association = association_proxy_class.new(self, reflection)
+diff --git a/activerecord/lib/active_record/associations/association_proxy.rb b/activerecord/lib/active_record/associations/association_proxy.rb
+index b617147..1d62e1c 100644
+--- a/activerecord/lib/active_record/associations/association_proxy.rb
++++ b/activerecord/lib/active_record/associations/association_proxy.rb
+@@ -51,6 +51,12 @@ module ActiveRecord
+       delegate :to_param, :to => :proxy_target
+       instance_methods.each { |m| undef_method m unless m =~ /(^__|^nil\?$|^send$|proxy_|^object_id$)/ }
+ 
++      # Checks if current state of given proxy is compatible with current state of owner.
++      # Used to catch foreign key changes on owner for belongs_to associations.
++      def proxy_compatible_with_owner_state?
++        true
++      end
++
+       def initialize(owner, reflection)
+         @owner, @reflection = owner, reflection
+         Array(reflection.options[:extend]).each { |ext| proxy_extend(ext) }
+@@ -222,7 +228,7 @@ module ActiveRecord
+             @target = find_target
+           end
+ 
+-          @loaded = true
++          loaded
+           @target
+         rescue ActiveRecord::RecordNotFound
+           reset
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index f05c6be..dabbc85 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -1,6 +1,13 @@
+ module ActiveRecord
+   module Associations
+     class BelongsToAssociation < AssociationProxy #:nodoc:
++
++      # Checks if current state of given proxy is compatible with current state of owner.
++      # This implementation checks for foreign key change on owner.
++      def proxy_compatible_with_owner_state?
++        !@loaded || @recorded_target_id == @owner[@reflection.primary_key_name]
++      end
++
+       def create(attributes = {})
+         replace(@reflection.create_association(attributes))
+       end
+@@ -27,13 +34,18 @@ module ActiveRecord
+           end
+ 
+           @target = (AssociationProxy === record ? record.target : record)
+-          @owner[@reflection.primary_key_name] = record.id unless record.new_record?
++          @owner[@reflection.primary_key_name] = record.id
+           @updated = true
+         end
+ 
+         loaded
+         record
+       end
++
++      def loaded
++        super
++        @recorded_target_id = @target && @target.id
++      end
+       
+       def updated?
+         @updated
+diff --git a/activerecord/lib/active_record/associations/has_one_association.rb b/activerecord/lib/active_record/associations/has_one_association.rb
+index c92ef5c..fc52128 100644
+--- a/activerecord/lib/active_record/associations/has_one_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_association.rb
+@@ -1,6 +1,8 @@
+ module ActiveRecord
+   module Associations
+     class HasOneAssociation < BelongsToAssociation #:nodoc:
++      def proxy_compatible_with_owner_state?; true; end
++
+       def initialize(owner, reflection)
+         super
+         construct_sql
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 37b6836..222dd99 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -60,6 +60,58 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal companies(:another_firm), account.firm
+   end
+ 
++  def test_foreign_key_assignment_via_write_attribute
++    # Test using an existing record
++    signals37 = accounts(:signals37)
++    assert_equal companies(:first_firm), signals37.firm
++    signals37.write_attribute(:firm_id, companies(:another_firm).id)
++    assert_equal companies(:another_firm), signals37.firm
++
++    # Test using a new record
++    account = Account.new
++    account.write_attribute(:firm_id, companies(:another_firm).id)
++    assert_equal companies(:another_firm), account.firm
++  end
++
++  def check_using_assoc_proxy_after_clearing_foreign_key(assoc)
++    welcome = posts(:welcome)
++    author = welcome.send(assoc)
++    real_author = author.proxy_target
++    welcome.author_id = nil
++    assert_equal real_author.id, author.id
++    assert_equal real_author, author
++  end
++
++  def test_using_assoc_proxy_after_clearing_foreign_key_1
++    check_using_assoc_proxy_after_clearing_foreign_key(:author)
++  end
++
++  def test_using_assoc_proxy_after_clearing_foreign_key_2
++    check_using_assoc_proxy_after_clearing_foreign_key(:author_with_posts)
++  end
++
++  def test_assoc_assignment_when_foreign_key_name_equals_assoc_name
++    comp = computers(:workstation)
++    assert_equal developers(:david), comp.developer
++    alk = comp.developer = Developer.new(:name => 'alk', :salary => 50000)
++    comp.save!
++    comp = Computer.find(comp)
++    assert_equal alk, comp.developer
++  end
++
++  def test_foreign_key_assignment_for_multiple_associations
++    welcome = posts(:welcome)
++    david = authors(:david)
++    mary = authors(:mary)
++    assert_equal david, welcome.author
++    assert_equal david, welcome.author_with_posts
++
++    welcome.author_id = mary.id
++
++    assert_equal mary, welcome.author
++    assert_equal mary, welcome.author_with_posts
++  end
++
+   def test_no_unexpected_aliasing
+     first_firm = companies(:first_firm)
+     another_firm = companies(:another_firm)
+-- 
+1.5.6.5
+

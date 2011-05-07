@@ -1,0 +1,264 @@
+From 30316e8d6eebcbbce7332f98249563dd8ec6e5da Mon Sep 17 00:00:00 2001
+From: Tom Lea <commit@tomlea.co.uk>
+Date: Wed, 15 Apr 2009 22:20:34 +0100
+Subject: [PATCH 1/2] Allow find in ActiveRecord::Base.find_each and family to apply limits.
+
+---
+ activerecord/lib/active_record/batches.rb |   22 ++++++++++----------
+ activerecord/test/cases/batches_test.rb   |   32 +++++++++++++++++++++-------
+ 2 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/activerecord/lib/active_record/batches.rb b/activerecord/lib/active_record/batches.rb
+index 5a6cecd..1156e03 100644
+--- a/activerecord/lib/active_record/batches.rb
++++ b/activerecord/lib/active_record/batches.rb
+@@ -43,8 +43,7 @@ module ActiveRecord
+       # It's not possible to set the order. That is automatically set to
+       # ascending on the primary key ("id ASC") to make the batch ordering
+       # work. This also mean that this method only works with integer-based
+-      # primary keys. You can't set the limit either, that's used to control
+-      # the the batch sizes.
++      # primary keys.
+       #
+       # Example:
+       #
+@@ -54,28 +53,29 @@ module ActiveRecord
+       #   end
+       def find_in_batches(options = {})
+         raise "You can't specify an order, it's forced to be #{batch_order}" if options[:order]
+-        raise "You can't specify a limit, it's forced to be the batch_size"  if options[:limit]
++        limit = options.delete(:limit).to_i if options.has_key?(:limit)
+ 
+         start = options.delete(:start).to_i
+         batch_size = options.delete(:batch_size) || 1000
+ 
+-        with_scope(:find => options.merge(:order => batch_order, :limit => batch_size)) do
+-          records = find(:all, :conditions => [ "#{table_name}.#{primary_key} >= ?", start ])
++        with_scope(:find => options.merge(:order => batch_order)) do
++          records = find(:all, :conditions => [ "#{table_name}.#{primary_key} >= ?", start ], :limit => [ batch_size, limit ].compact.min)
+ 
+-          while records.any?
++          while records.any? and (limit.nil? or limit > 0)
+             yield records
+ 
+-            break if records.size < batch_size
+-            records = find(:all, :conditions => [ "#{table_name}.#{primary_key} > ?", records.last.id ])
++            limit -= records.size if limit
++            break if records.size < batch_size or (limit and limit < 1)
++            records = find(:all, :conditions => [ "#{table_name}.#{primary_key} > ?", records.last.id ], :limit => [ batch_size, limit ].compact.min)
+           end
+         end
+       end
+-      
+-      
++
++
+       private
+         def batch_order
+           "#{table_name}.#{primary_key} ASC"
+         end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/cases/batches_test.rb b/activerecord/test/cases/batches_test.rb
+index 5009a90..7359bac 100644
+--- a/activerecord/test/cases/batches_test.rb
++++ b/activerecord/test/cases/batches_test.rb
+@@ -8,7 +8,7 @@ class EachTest < ActiveRecord::TestCase
+     @posts = Post.all(:order => "id asc")
+     @total = Post.count
+   end
+-  
++
+   def test_each_should_excecute_one_query_per_batch
+     assert_queries(Post.count + 1) do
+       Post.find_each(:batch_size => 1) do |post|
+@@ -17,18 +17,34 @@ class EachTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  def test_each_should_raise_if_the_order_is_set
+-    assert_raise(RuntimeError) do
+-      Post.find_each(:order => "title") { |post| post }
++  def test_should_apply_user_provided_limit_if_set
++    returned_count = 0
++    assert_queries(2) do
++      Post.find_each(:batch_size => 1, :limit => 2) do |post|
++        assert_kind_of Post, post
++        returned_count += 1
++      end
++    end
++    assert_equal 2, returned_count
++  end
++
++  def test_should_apply_user_provided_within_a_batch
++    returned_count = 0
++    assert_queries(2) do
++      Post.find_each(:batch_size => 2, :limit => 3) do |post|
++        assert_kind_of Post, post
++        returned_count += 1
++      end
+     end
++    assert_equal 3, returned_count
+   end
+ 
+-  def test_each_should_raise_if_the_limit_is_set
++  def test_each_should_raise_if_the_order_is_set
+     assert_raise(RuntimeError) do
+-      Post.find_each(:limit => 1) { |post| post }
++      Post.find_each(:order => "title") { |post| post }
+     end
+   end
+-  
++
+   def test_find_in_batches_should_return_batches
+     assert_queries(Post.count + 1) do
+       Post.find_in_batches(:batch_size => 1) do |batch|
+@@ -58,4 +74,4 @@ class EachTest < ActiveRecord::TestCase
+       Post.find_in_batches(:batch_size => post_count + 1) {|batch| assert_kind_of Array, batch }
+     end
+   end
+-end
+\ No newline at end of file
++end
+-- 
+1.6.1.3
+
+
+From ee0856e1e5d90330ad05b67779de23d3a594ff86 Mon Sep 17 00:00:00 2001
+From: Tom Lea <commit@tomlea.co.uk>
+Date: Wed, 15 Apr 2009 22:50:47 +0100
+Subject: [PATCH 2/2] Find in batches should allow us to start with the most recent records.
+ Use case: Searching for the 100 most recent items matching some function.
+
+---
+ activerecord/lib/active_record/batches.rb |   38 ++++++++++++++++++----------
+ activerecord/test/cases/batches_test.rb   |   33 ++++++++++++++++++++----
+ 2 files changed, 51 insertions(+), 20 deletions(-)
+
+diff --git a/activerecord/lib/active_record/batches.rb b/activerecord/lib/active_record/batches.rb
+index 1156e03..db0b90e 100644
+--- a/activerecord/lib/active_record/batches.rb
++++ b/activerecord/lib/active_record/batches.rb
+@@ -40,10 +40,10 @@ module ActiveRecord
+       # worker 2 handle from 10,000 and beyond (by setting the <tt>:start</tt>
+       # option on that worker).
+       #
+-      # It's not possible to set the order. That is automatically set to
+-      # ascending on the primary key ("id ASC") to make the batch ordering
+-      # work. This also mean that this method only works with integer-based
+-      # primary keys.
++      # It's not possible to set the order by anything but the primary key.
++      # You may set :order to :desc to start with the highest id.
++      #
++      # This this method only works with integer-based primary keys.
+       #
+       # Example:
+       #
+@@ -52,30 +52,40 @@ module ActiveRecord
+       #     group.each { |person| person.party_all_night! }
+       #   end
+       def find_in_batches(options = {})
+-        raise "You can't specify an order, it's forced to be #{batch_order}" if options[:order]
++        order = options.delete(:order) || :asc
++        raise "You may only order :asc or :desc, and only on primary key" unless [:desc, :asc].include?(order)
+         limit = options.delete(:limit).to_i if options.has_key?(:limit)
+ 
+-        start = options.delete(:start).to_i
+         batch_size = options.delete(:batch_size) || 1000
+ 
++        if order == :asc
++          batch_order = "#{table_name}.#{primary_key} ASC"
++          first_condition = ["#{table_name}.#{primary_key} >= ?", options.delete(:start).to_i]
++          further_conditions = "#{table_name}.#{primary_key} > ?"
++          start = start.to_i
++        else
++          if options.has_key?(:start)
++            first_condition = ["#{table_name}.#{primary_key} <= ?", options.delete(:start).to_i]
++          else
++            first_condition = nil
++          end
++          further_conditions = "#{table_name}.#{primary_key} < ?"
++          batch_order = "#{table_name}.#{primary_key} DESC"
++        end
++
+         with_scope(:find => options.merge(:order => batch_order)) do
+-          records = find(:all, :conditions => [ "#{table_name}.#{primary_key} >= ?", start ], :limit => [ batch_size, limit ].compact.min)
++          records = find(:all, :conditions => first_condition, :limit => [ batch_size, limit ].compact.min)
+ 
+           while records.any? and (limit.nil? or limit > 0)
+             yield records
+ 
+             limit -= records.size if limit
+-            break if records.size < batch_size or (limit and limit < 1)
+-            records = find(:all, :conditions => [ "#{table_name}.#{primary_key} > ?", records.last.id ], :limit => [ batch_size, limit ].compact.min)
++            break if records.size < batch_size or (limit and limit < 1) or (order == :desc and records.last.id <= 1)
++            records = find(:all, :conditions => [ further_conditions, records.last.id ], :limit => [ batch_size, limit ].compact.min)
+           end
+         end
+       end
+ 
+-
+-      private
+-        def batch_order
+-          "#{table_name}.#{primary_key} ASC"
+-        end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/batches_test.rb b/activerecord/test/cases/batches_test.rb
+index 7359bac..c181db3 100644
+--- a/activerecord/test/cases/batches_test.rb
++++ b/activerecord/test/cases/batches_test.rb
+@@ -39,12 +39,6 @@ class EachTest < ActiveRecord::TestCase
+     assert_equal 3, returned_count
+   end
+ 
+-  def test_each_should_raise_if_the_order_is_set
+-    assert_raise(RuntimeError) do
+-      Post.find_each(:order => "title") { |post| post }
+-    end
+-  end
+-
+   def test_find_in_batches_should_return_batches
+     assert_queries(Post.count + 1) do
+       Post.find_in_batches(:batch_size => 1) do |batch|
+@@ -63,6 +57,33 @@ class EachTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_find_in_batches_should_sort_descending_order
++    last_batch = nil
++    assert_queries(Post.count) do
++      Post.find_in_batches(:batch_size => 1, :order => :desc) do |batch|
++        assert_kind_of Array, batch
++        assert_kind_of Post, batch.first
++        last_batch = batch
++      end
++    end
++    assert_equal @posts.first, last_batch.last
++  end
++
++  def test_should_not_find_any_batches_with_an_empty_table
++    Post.delete_all
++    assert_queries(1) do
++      Post.find_in_batches(:batch_size => 1, :order => :desc) do |batch|
++        flunk "Should not find any batches"
++      end
++    end
++    assert_queries(1) do
++      Post.find_in_batches(:batch_size => 1) do |batch|
++        flunk "Should not find any batches"
++      end
++    end
++  end
++
++
+   def test_find_in_batches_shouldnt_excute_query_unless_needed
+     post_count = Post.count
+ 
+-- 
+1.6.1.3
+

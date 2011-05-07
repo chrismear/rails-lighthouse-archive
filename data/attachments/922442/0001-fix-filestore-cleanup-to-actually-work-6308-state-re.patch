@@ -1,0 +1,128 @@
+From 83e570193ad30fc6509268b22756d16218c5e683 Mon Sep 17 00:00:00 2001
+From: Brian Durand <brian@embellishedvisions.com>
+Date: Mon, 21 Feb 2011 12:04:39 -0600
+Subject: [PATCH] Fix FileStore#cleanup to actually work [#6308 state:resolved]
+
+---
+ .../lib/active_support/cache/file_store.rb         |   22 +++++++++++--
+ activesupport/test/caching_test.rb                 |   34 ++++++++++++++++++++
+ railties/guides/source/caching_with_rails.textile  |    8 +++-
+ 3 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/activesupport/lib/active_support/cache/file_store.rb b/activesupport/lib/active_support/cache/file_store.rb
+index 18182bb..1cf3620 100644
+--- a/activesupport/lib/active_support/cache/file_store.rb
++++ b/activesupport/lib/active_support/cache/file_store.rb
+@@ -24,11 +24,26 @@ module ActiveSupport
+         FileUtils.rm_r(root_dirs.collect{|f| File.join(cache_path, f)})
+       end
+ 
++      # Cleanup the cache by removing old entries. By default this will delete entries
++      # that haven't been accessed in one day. You can change this behavior by passing
++      # in a +not_accessed_in+ option. Any entry not accessed in that number of seconds
++      # in the past will be deleted. Alternatively, you can pass in +:expired_only+ with
++      # +true+ to only delete expired entries.
+       def cleanup(options = nil)
+         options = merged_options(options)
+-        each_key(options) do |key|
+-          entry = read_entry(key, options)
+-          delete_entry(key, options) if entry && entry.expired?
++        expired_only = options[:expired_only]
++        timestamp = Time.now - (options[:not_accessed_in] || 1.day.to_i)
++        search_dir(cache_path) do |fname|
++          if expired_only
++            key = file_path_key(fname)
++            entry = read_entry(key, options)
++            delete_entry(key, options) if entry && entry.expired?
++          else
++            if File.atime(fname) <= timestamp
++              key = file_path_key(fname)
++              delete_entry(key, options)
++            end
++          end
+         end
+       end
+ 
+@@ -183,6 +198,7 @@ module ActiveSupport
+             end
+           end
+         end
++
+     end
+   end
+ end
+diff --git a/activesupport/test/caching_test.rb b/activesupport/test/caching_test.rb
+index 579d5da..cad6656 100644
+--- a/activesupport/test/caching_test.rb
++++ b/activesupport/test/caching_test.rb
+@@ -518,6 +518,29 @@ class FileStoreTest < ActiveSupport::TestCase
+     key = @cache.send(:key_file_path, "views/index?id=1")
+     assert_equal "views/index?id=1", @cache.send(:file_path_key, key)
+   end
++
++  def test_cleanup_with_not_accessed_in
++    @cache.write(1, "aaaaaaaaaa")
++    @cache.write(2, "bbbbbbbbbb")
++    @cache.write(3, "cccccccccc")
++    sleep(2)
++    @cache.read(2)
++    @cache.cleanup(:not_accessed_in => 1)
++    assert_equal false, @cache.exist?(1)
++    assert_equal true, @cache.exist?(2)
++    assert_equal false, @cache.exist?(3)
++  end
++
++  def test_cleanup_with_expired_only
++    @cache.write(1, "aaaaaaaaaa", :expires_in => 0.001)
++    @cache.write(2, "bbbbbbbbbb")
++    @cache.write(3, "cccccccccc", :expires_in => 0.001)
++    sleep(0.002)
++    @cache.cleanup(:expired_only => 0.001)
++    assert_equal false, @cache.exist?(1)
++    assert_equal true, @cache.exist?(2)
++    assert_equal false, @cache.exist?(3)
++  end
+ end
+ 
+ class MemoryStoreTest < ActiveSupport::TestCase
+@@ -589,6 +612,17 @@ class MemoryStoreTest < ActiveSupport::TestCase
+     assert_equal true, @cache.exist?(2)
+     assert_equal false, @cache.exist?(1)
+   end
++
++  def test_cleanup_removes_expired_entries
++    @cache.write(1, "aaaaaaaaaa", :expires_in => 0.001)
++    @cache.write(2, "bbbbbbbbbb")
++    @cache.write(3, "cccccccccc", :expires_in => 0.001)
++    sleep(0.002)
++    @cache.cleanup
++    assert_equal false, @cache.exist?(1)
++    assert_equal true, @cache.exist?(2)
++    assert_equal false, @cache.exist?(3)
++  end
+ end
+ 
+ class SynchronizedStoreTest < ActiveSupport::TestCase
+diff --git a/railties/guides/source/caching_with_rails.textile b/railties/guides/source/caching_with_rails.textile
+index 1b5ec40..aa0698a 100644
+--- a/railties/guides/source/caching_with_rails.textile
++++ b/railties/guides/source/caching_with_rails.textile
+@@ -290,9 +290,13 @@ ActionController::Base.cache_store = :file_store, "/path/to/cache/directory"
+ 
+ With this cache store, multiple server processes on the same host can share a cache. Servers processes running on different hosts could share a cache by using a shared file system, but that set up would not be ideal and is not recommended. The cache store is appropriate for low to medium traffic sites that are served off one or two hosts.
+ 
+-Note that the cache will grow until the disk is full unless you periodically clear out old entries.
++Note that the cache will grow until the disk is full unless you periodically clear out old entries. You can call +ActiveSupport::Cache::FileStore#cleanup+ to remove entries older than a specified time.
+ 
+-h4. ActiveSupport::Cache::MemCacheStore
++<ruby>
++Rails.cache.cleanup(:not_accessed_in => 2.days)
++</ruby>
++
++H4. ActiveSupport::Cache::MemCacheStore
+ 
+ This cache store uses Danga's +memcached+ server to provide a centralized cache for your application. Rails uses the bundled +memcached-client+ gem by default. This is currently the most popular cache store for production websites. It can be used to provide a single, shared cache cluster with very a high performance and redundancy.
+ 
+-- 
+1.7.3.4
+

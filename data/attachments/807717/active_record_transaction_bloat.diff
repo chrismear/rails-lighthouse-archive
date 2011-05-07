@@ -1,0 +1,146 @@
+From 6d8c1947bd81b0ffee09e19f97b5a5a0a31b9570 Mon Sep 17 00:00:00 2001
+From: Brian Durand <brian@embellishedvisions.com>
+Date: Tue, 7 Dec 2010 16:11:26 -0600
+Subject: [PATCH] Reduce memory bloat in large transactions by only holding onto references to objects that implement the transaction callbacks.
+
+---
+ .../abstract/database_statements.rb                |   25 +++++++-
+ .../test/cases/transaction_callbacks_test.rb       |   59 ++++++++++++++++++++
+ 2 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+index ee9a0af..0de0d76 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+@@ -1,3 +1,5 @@
++require 'weakref'
++
+ module ActiveRecord
+   module ConnectionAdapters # :nodoc:
+     module DatabaseStatements
+@@ -207,6 +209,9 @@ module ActiveRecord
+       # Register a record with the current transaction so that its after_commit and after_rollback callbacks
+       # can be called.
+       def add_transaction_record(record)
++        # Use a weak reference unless transaction based callbacks are defined to prevent large transactions
++        # from balooning the heap.
++        record = WeakRef.new(record) if record._commit_callbacks.empty? && record._rollback_callbacks.empty?
+         last_batch = @_current_transaction_records.last
+         last_batch << record if last_batch
+       end
+@@ -313,10 +318,10 @@ module ActiveRecord
+         # is false, only rollback records since the last save point.
+         def rollback_transaction_records(rollback) #:nodoc
+           if rollback
+-            records = @_current_transaction_records.flatten
++            records = _dereference_transaction_records(@_current_transaction_records)
+             @_current_transaction_records.clear
+           else
+-            records = @_current_transaction_records.pop
++            records = _dereference_transaction_records(@_current_transaction_records.pop)
+           end
+ 
+           unless records.blank?
+@@ -332,7 +337,7 @@ module ActiveRecord
+ 
+         # Send a commit message to all records after they have been committed.
+         def commit_transaction_records #:nodoc
+-          records = @_current_transaction_records.flatten
++          records = _dereference_transaction_records(@_current_transaction_records)
+           @_current_transaction_records.clear
+           unless records.blank?
+             records.uniq.each do |record|
+@@ -344,6 +349,20 @@ module ActiveRecord
+             end
+           end
+         end
++
++        # Flatten and dereference weak references to transaction records. Any garbage collected
++        # weak references will be removed.
++        def _dereference_transaction_records(records) #:nodoc
++          records.collect do |ref|
++            if ref.is_a?(WeakRef)
++              ref.weakref_alive? ? ref.__getobj__ : nil
++            elsif ref.is_a?(Array)
++              _dereference_transaction_records(ref)
++            else
++              ref
++            end
++          end.flatten.compact
++        end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/transaction_callbacks_test.rb b/activerecord/test/cases/transaction_callbacks_test.rb
+index 85f222b..a97e109 100644
+--- a/activerecord/test/cases/transaction_callbacks_test.rb
++++ b/activerecord/test/cases/transaction_callbacks_test.rb
+@@ -244,6 +244,65 @@ class TransactionCallbacksTest < ActiveRecord::TestCase
+     assert_equal :rollback, @first.last_after_transaction_error
+     assert_equal [:after_rollback], @second.history
+   end
++  
++  def test_transaction_records_only_held_if_referenced_or_callbacks_defined_on_rollback
++    # Stupid global variable needed to monitor objects since we need to test that
++    # everything works after the garbage collector kicks in.
++    $transaction_callback_results = []
++    topic_1 = TopicWithCallbacks.new
++    topic_2 = Topic.new
++    Topic.transaction do
++      [topic_1, topic_2, TopicWithCallbacks.new, Topic.new].each_with_index do |topic, index|
++        topic.id = index + 1
++        def topic.rolledback!(*args)
++          $transaction_callback_results << id
++        end
++        topic.add_to_transaction
++      end
++      # Use the GC.stress mode to force garbage collection whenever memory is allocated.
++      begin
++        GC.stress = true
++        allocated = "allocate some memory"
++      ensure
++        GC.stress = false
++      end
++      raise ActiveRecord::Rollback
++    end
++    # Expected behavior is that the object without a hard reference and that doesn't implement
++    # after transaction call backs will not be retained by the garbage collector and won't get
++    # the rolledback! message.
++    assert_equal $transaction_callback_results.sort, [1, 2, 3]
++    $transaction_callback_results = nil
++  end
++  
++  def test_transaction_records_only_held_if_referenced_or_callbacks_defined_on_commit
++    # Stupid global variable needed to monitor objects since we need to test that
++    # everything works after the garbage collector kicks in.
++    $transaction_callback_results = []
++    topic_1 = TopicWithCallbacks.new
++    topic_2 = Topic.new
++    Topic.transaction do
++      [topic_1, topic_2, TopicWithCallbacks.new, Topic.new].each_with_index do |topic, index|
++        topic.id = index + 1
++        def topic.committed!(*args)
++          $transaction_callback_results << id
++        end
++        topic.add_to_transaction
++      end
++      # Use the GC.stress mode to force garbage collection whenever memory is allocated.
++      begin
++        GC.stress = true
++        allocated = "allocate some memory"
++      ensure
++        GC.stress = false
++      end
++    end
++    # Expected behavior is that the object without a hard reference and that doesn't implement
++    # after transaction call backs will not be retained by the garbage collector and won't get
++    # the committed! message.
++    assert_equal $transaction_callback_results.sort, [1, 2, 3]
++    $transaction_callback_results = nil
++  end
+ end
+ 
+ 
+-- 
+1.6.4.1
+

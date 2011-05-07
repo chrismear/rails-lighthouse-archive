@@ -1,0 +1,93 @@
+From 735e2f3344930c50e5f2609cfb63a29ebe8e92cc Mon Sep 17 00:00:00 2001
+From: Charles Bedard <charles.bedard@gmail.com>
+Date: Tue, 6 Jan 2009 13:30:39 -0500
+Subject: [PATCH] ActiveRecord reloading in dev mode
+
+---
+ .../lib/active_record/attribute_methods.rb         |   12 ++++++++-
+ activerecord/lib/active_record/base.rb             |    4 ++-
+ activerecord/test/cases/reload_models_test.rb      |   25 ++++++++++++++++++++
+ 3 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/attribute_methods.rb b/activerecord/lib/active_record/attribute_methods.rb
+index 177d156..c65e127 100644
+--- a/activerecord/lib/active_record/attribute_methods.rb
++++ b/activerecord/lib/active_record/attribute_methods.rb
+@@ -10,7 +10,6 @@ module ActiveRecord
+       base.attribute_types_cached_by_default = ATTRIBUTE_TYPES_CACHED_BY_DEFAULT
+       base.cattr_accessor :time_zone_aware_attributes, :instance_writer => false
+       base.time_zone_aware_attributes = false
+-      base.class_inheritable_accessor :skip_time_zone_conversion_for_attributes, :instance_writer => false
+       base.skip_time_zone_conversion_for_attributes = []
+     end
+ 
+@@ -125,6 +124,17 @@ module ActiveRecord
+       def cache_attribute?(attr_name)
+         cached_attributes.include?(attr_name)
+       end
++      
++      # Returns the list of attributes for which time zone conversion is skipped
++      def skip_time_zone_conversion_for_attributes
++        read_inheritable_attribute(:attr_skipped_for_time_zone_conversion) || []
++      end
++
++      # Specifies a list of attributes for which time zone conversion is skipped (expects an Array) 
++      def skip_time_zone_conversion_for_attributes=(value)
++        write_inheritable_attribute(:attr_skipped_for_time_zone_conversion,
++              value.map(&:to_sym) + (skip_time_zone_conversion_for_attributes || []))
++      end
+ 
+       private
+         # Suffixes a, ?, c become regexp /(a|\?|c)$/
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index cca012e..a11b235 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -409,7 +409,9 @@ module ActiveRecord #:nodoc:
+           next
+         end
+         klass.instance_variables.each { |var| klass.send(:remove_instance_variable, var) }
+-        klass.instance_methods(false).each { |m| klass.send :undef_method, m }
++        # undefine all instance_methods except +id+ and +id=+, which are methods that are not re-generated
++        # but rather defined in ActiveRecord::Base 
++        klass.instance_methods(false).each { |m| klass.send(:undef_method, m) unless m =~ /^id(=$|\?$|$)/ }      
+       end
+       @@subclasses = {}
+       nonreloadables.each { |klass| (@@subclasses[klass.superclass] ||= []) << klass }
+diff --git a/activerecord/test/cases/reload_models_test.rb b/activerecord/test/cases/reload_models_test.rb
+index 0d16a35..af6fc81 100644
+--- a/activerecord/test/cases/reload_models_test.rb
++++ b/activerecord/test/cases/reload_models_test.rb
+@@ -19,4 +19,29 @@ class ReloadModelsTest < ActiveRecord::TestCase
+     pet.owner = Owner.find_by_name('ashley')
+     assert_equal pet.owner, Owner.find_by_name('ashley')
+   end
++  
++  def test_reset_subclasses
++    # simulate a first request in which we instantiate some models
++    pet = Pet.find_by_name('parrot')
++    pet.owner = Owner.find_by_name('ashley')
++
++    # at the end of request, ActionController::Dispatcher resets AR sub_classes    
++    ActiveRecord::Base.reset_subclasses
++
++    # simulate a second request, where Owner and Pet classes are reloaded 
++    Object.class_eval { remove_const :Pet }
++    Object.class_eval { remove_const :Owner }
++    Kernel.load(File.expand_path(File.join(File.dirname(__FILE__), "../models/pet.rb")))
++    Kernel.load(File.expand_path(File.join(File.dirname(__FILE__), "../models/owner.rb")))
++
++    pet = Pet.find_by_name('parrot')
++    pet.owner = Owner.find_by_name('ashley')
++   
++    # we call destroy on both objects, to test that association methods have been correctly re-generated
++    # These destroy calls also ensure that +ActiveRecord::Base#id+ method has not been wiped out
++    # (Internally, +id+ is called when associations are checked for dependencies)
++    pet.owner.destroy 
++    pet.destroy
++  end
++    
+ end
+-- 
+1.6.1.9.g97c34
+

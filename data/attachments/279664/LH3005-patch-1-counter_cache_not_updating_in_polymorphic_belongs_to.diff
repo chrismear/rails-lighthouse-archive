@@ -1,0 +1,203 @@
+From f238808f4b0f99fe86b0d5a439fba3f13b246409 Mon Sep 17 00:00:00 2001
+From: Henry Hsu <henry@qlane.com>
+Date: Sun, 27 Sep 2009 09:38:47 -0700
+Subject: [PATCH 1/2] Fixing :counter_cache not updated when appending to polymorphic :belongs_to, test for appending, updated tests for :add and :remove callbacks
+
+---
+ .../test/cases/associations/join_model_test.rb     |   10 +++++++++-
+ activerecord/test/cases/callbacks_test.rb          |   20 ++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/join_model_test.rb b/activerecord/test/cases/associations/join_model_test.rb
+index e9af5a6..1739586 100644
+--- a/activerecord/test/cases/associations/join_model_test.rb
++++ b/activerecord/test/cases/associations/join_model_test.rb
+@@ -318,7 +318,7 @@ class AssociationsJoinModelTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  def test_belongs_to_polymorphic_with_counter_cache
++  def test_belongs_to_polymorphic_with_counter_cache__create__
+     assert_equal 1, posts(:welcome)[:taggings_count]
+     tagging = posts(:welcome).taggings.create(:tag => tags(:general))
+     assert_equal 2, posts(:welcome, :reload)[:taggings_count]
+@@ -326,6 +326,14 @@ class AssociationsJoinModelTest < ActiveRecord::TestCase
+     assert_equal 1, posts(:welcome, :reload)[:taggings_count]
+   end
+ 
++  def test_belongs_to_polymorphic_with_counter_cache__append__
++    assert_equal 1, posts(:welcome)[:taggings_count]
++    posts(:welcome).taggings << (tagging = Tagging.create(:tag => tags(:general)))
++    assert_equal 2, posts(:welcome, :reload)[:taggings_count]
++    tagging.destroy
++    assert_equal 1, posts(:welcome, :reload)[:taggings_count]
++  end
++
+   def test_unavailable_through_reflection
+     assert_raise(ActiveRecord::HasManyThroughAssociationNotFoundError) { authors(:david).nothings }
+   end
+diff --git a/activerecord/test/cases/callbacks_test.rb b/activerecord/test/cases/callbacks_test.rb
+index 5a084a6..224d189 100644
+--- a/activerecord/test/cases/callbacks_test.rb
++++ b/activerecord/test/cases/callbacks_test.rb
+@@ -237,6 +237,16 @@ class CallbacksTest < ActiveRecord::TestCase
+       [ :before_create,               :proc   ],
+       [ :before_create,               :object ],
+       [ :before_create,               :block  ],
++      [ :before_add,                  :method ],
++      [ :before_add,                  :string ],
++      [ :before_add,                  :proc   ],
++      [ :before_add,                  :object ],
++      [ :before_add,                  :block  ],
++      [ :after_add,                   :method ],
++      [ :after_add,                   :string ],
++      [ :after_add,                   :proc   ],
++      [ :after_add,                   :object ],
++      [ :after_add,                   :block  ],
+       [ :after_create,                :method ],
+       [ :after_create,                :string ],
+       [ :after_create,                :proc   ],
+@@ -316,6 +326,16 @@ class CallbacksTest < ActiveRecord::TestCase
+       [ :before_destroy,              :proc   ],
+       [ :before_destroy,              :object ],
+       [ :before_destroy,              :block  ],
++      [ :before_remove,               :method ],
++      [ :before_remove,               :string ],
++      [ :before_remove,               :proc   ],
++      [ :before_remove,               :object ],
++      [ :before_remove,               :block  ],
++      [ :after_remove,                :method ],
++      [ :after_remove,                :string ],
++      [ :after_remove,                :proc   ],
++      [ :after_remove,                :object ],
++      [ :after_remove,                :block  ],
+       [ :after_destroy,               :method ],
+       [ :after_destroy,               :string ],
+       [ :after_destroy,               :proc   ],
+-- 
+1.6.4.2
+
+
+From d9d6c35141481fb4f27c984f09eed593d7857f21 Mon Sep 17 00:00:00 2001
+From: Henry Hsu <henry@qlane.com>
+Date: Sun, 27 Sep 2009 09:42:45 -0700
+Subject: [PATCH 2/2] Fixes :counter_cache not updated when appending to polymorphic :belongs_to, adding :add and :remove callbacks
+
+---
+ activerecord/lib/active_record/associations.rb |   11 +++++---
+ activerecord/lib/active_record/callbacks.rb    |   29 +++++++++++++++++++-----
+ 2 files changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 266a52d..de1df1a 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1424,17 +1424,20 @@ module ActiveRecord
+ 
+           method_name = "belongs_to_counter_cache_after_create_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+-            association = send(reflection.name)
+-            association.class.increment_counter(cache_column, association.id) unless association.nil?
++            association = send(reflection.name, true) rescue nil
++            
++            if send("#{reflection.primary_key_name}_changed?") && send("#{reflection.primary_key_name}_change") != send("#{reflection.primary_key_name}_change").compact
++              association.class.increment_counter(cache_column, association.id) unless association.nil?
++            end
+           end
+-          after_create(method_name)
++          after_add(method_name)
+ 
+           method_name = "belongs_to_counter_cache_before_destroy_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+             association = send(reflection.name)
+             association.class.decrement_counter(cache_column, association.id) unless association.nil?
+           end
+-          before_destroy(method_name)
++          before_remove(method_name)
+ 
+           module_eval(
+             "#{reflection.class_name}.send(:attr_readonly,\"#{cache_column}\".intern) if defined?(#{reflection.class_name}) && #{reflection.class_name}.respond_to?(:attr_readonly)"
+diff --git a/activerecord/lib/active_record/callbacks.rb b/activerecord/lib/active_record/callbacks.rb
+index 40a2581..83a8fdf 100644
+--- a/activerecord/lib/active_record/callbacks.rb
++++ b/activerecord/lib/active_record/callbacks.rb
+@@ -216,7 +216,8 @@ module ActiveRecord
+       :after_initialize, :after_find, :before_validation, :after_validation,
+       :before_save, :around_save, :after_save, :before_create, :around_create,
+       :after_create, :before_update, :around_update, :after_update,
+-      :before_destroy, :around_destroy, :after_destroy
++      :before_destroy, :around_destroy, :after_destroy,
++      :before_add, :after_add, :before_remove, :after_remove
+     ]
+ 
+     included do
+@@ -224,7 +225,7 @@ module ActiveRecord
+         alias_method_chain method, :callbacks
+       end
+ 
+-      define_callbacks :initialize, :find, :save, :create, :update, :destroy,
++      define_callbacks :initialize, :find, :save, :create, :update, :destroy, :add, :remove,
+                        :validation, :terminator => "result == false", :scope => [:kind, :name]
+     end
+ 
+@@ -241,7 +242,7 @@ module ActiveRecord
+         set_callback(:find, :after, *(args << options), &block)
+       end
+ 
+-      [:save, :create, :update, :destroy].each do |callback|
++      [:save, :create, :update, :destroy, :add, :remove].each do |callback|
+         module_eval <<-CALLBACKS, __FILE__, __LINE__
+           def before_#{callback}(*args, &block)
+             set_callback(:#{callback}, :before, *args, &block)
+@@ -287,6 +288,16 @@ module ActiveRecord
+       end
+     end
+ 
++    def if_changed?(method_symbol) #:nodoc:
++      if changed?
++        send(method_symbol) do
++          yield
++        end
++      else
++        yield
++      end
++    end
++
+     def create_or_update_with_callbacks #:nodoc:
+       _run_save_callbacks do
+         create_or_update_without_callbacks
+@@ -296,14 +307,18 @@ module ActiveRecord
+ 
+     def create_with_callbacks #:nodoc:
+       _run_create_callbacks do
+-        create_without_callbacks
++        if_changed?(:_run_add_callbacks) do
++          create_without_callbacks
++        end
+       end
+     end
+     private :create_with_callbacks
+ 
+     def update_with_callbacks(*args) #:nodoc:
+       _run_update_callbacks do
+-        update_without_callbacks(*args)
++        if_changed?(:_run_add_callbacks) do
++          update_without_callbacks(*args)
++        end
+       end
+     end
+     private :update_with_callbacks
+@@ -317,7 +332,9 @@ module ActiveRecord
+ 
+     def destroy_with_callbacks #:nodoc:
+       _run_destroy_callbacks do
+-        destroy_without_callbacks
++        _run_remove_callbacks do
++          destroy_without_callbacks
++        end
+       end
+     end
+ 
+-- 
+1.6.4.2
+

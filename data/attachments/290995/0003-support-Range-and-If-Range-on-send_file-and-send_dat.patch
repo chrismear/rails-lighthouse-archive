@@ -1,0 +1,283 @@
+From 9801a05a89a2b5191ed9dada00d12d909190c889 Mon Sep 17 00:00:00 2001
+From: Kouhei Sutou <kou@clear-code.com>
+Date: Fri, 9 Oct 2009 13:22:26 +0900
+Subject: [PATCH] support Range and If-Range on send_file and send_data.
+
+---
+ .../lib/action_controller/metal/streaming.rb       |   87 +++++++++++++-
+ actionpack/test/controller/send_file_test.rb       |  124 ++++++++++++++++++++
+ 2 files changed, 208 insertions(+), 3 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/metal/streaming.rb b/actionpack/lib/action_controller/metal/streaming.rb
+index 4761763..5467aa0 100644
+--- a/actionpack/lib/action_controller/metal/streaming.rb
++++ b/actionpack/lib/action_controller/metal/streaming.rb
+@@ -85,6 +85,7 @@ module ActionController #:nodoc:
+ 
+         options[:length]   ||= File.size(path)
+         options[:filename] ||= File.basename(path) unless options[:url_based_filename]
++        options[:last_modified] ||= File.mtime(path).httpdate
+         send_file_headers! options
+ 
+         @performed_render = false
+@@ -98,15 +99,21 @@ module ActionController #:nodoc:
+             render :status => options[:status], :text => Proc.new { |response, output|
+               logger.info "Streaming file #{path}" unless logger.nil?
+               len = options[:buffer_size] || 4096
++              rest = options[:length]
+               File.open(path, 'rb') do |file|
+-                while buf = file.read(len)
++                send_file_prepare_for_partial_content(file, options)
++                while rest > 0 && buf = file.read([len, rest].min)
+                   output.write(buf)
++                  rest -= buf.bytesize
+                 end
+               end
+             }
+           else
+             logger.info "Sending file #{path}" unless logger.nil?
+-            File.open(path, 'rb') { |file| render :status => options[:status], :text => file.read }
++            File.open(path, 'rb') { |file|
++              send_file_prepare_for_partial_content(file, options)
++              render :status => options[:status], :text => file.read(options[:length])
++            }
+           end
+         end
+       end
+@@ -144,7 +151,12 @@ module ActionController #:nodoc:
+       # instead. See ActionController::Base#render for more information.
+       def send_data(data, options = {}) #:doc:
+         logger.info "Sending data #{options[:filename]}" if logger
+-        send_file_headers! options.merge(:length => data.bytesize)
++        options.merge!(:length => data.bytesize)
++        send_file_headers! options
++        if options[:status] == :partial_content
++          data.force_encoding("ascii-8bit") if data.respond_to?(:force_encoding)
++          data = data[options[:first_byte], options[:length]]
++        end
+         render :status => options[:status], :text => data
+       end
+ 
+@@ -168,11 +180,14 @@ module ActionController #:nodoc:
+           self.content_type = content_type
+         end
+ 
++        send_file_headers_process_range!(options)
++
+         headers.merge!(
+           'Content-Length'            => options[:length].to_s,
+           'Content-Disposition'       => disposition,
+           'Content-Transfer-Encoding' => 'binary'
+         )
++        headers["Last-Modified"] ||= options[:last_modified]
+ 
+         response.sending_file = true
+ 
+@@ -184,5 +199,71 @@ module ActionController #:nodoc:
+         # is called for handling the download is run, so let's workaround that
+         response.cache_control[:public] ||= false
+       end
++
++      def send_file_headers_process_range!(options)
++        return unless request
++        if /\Abytes=(\d*)-(\d*)\z/ =~ request.headers["Range"].to_s
++          first_byte, last_byte = $1, $2
++        else
++          return
++        end
++
++        return if (options[:status] || :ok) != :ok
++        return if options[:x_send_file]
++        return unless send_file_headers_if_range_matches?(options)
++
++        if first_byte.blank? and last_byte.blank?
++          options[:status] = :requested_range_not_satisfiable
++          return
++        end
++
++        if last_byte.blank?
++          last_byte = options[:length] - 1
++        else
++          last_byte = last_byte.to_i
++        end
++        if first_byte.blank?
++          first_byte = options[:length] - last_byte
++          last_byte = options[:length] - 1
++        else
++          first_byte = first_byte.to_i
++        end
++
++        options[:status] = :partial_content
++        byte_range_spec = "#{first_byte}-#{last_byte}/#{options[:length]}"
++        headers["Accept-Ranges"] = "bytes"
++        headers["Content-Range"] = "bytes #{byte_range_spec}"
++        options[:length] = last_byte - first_byte + 1
++        options[:first_byte] = first_byte
++      end
++
++      def send_file_prepare_for_partial_content(file, options)
++        return if options[:status] != :partial_content
++        file.seek(options[:first_byte]) if options[:first_byte]
++      end
++
++      def send_file_headers_if_range_matches?(options)
++        if_range = request.headers["If-Range"]
++        return true if if_range.blank?
++
++        if /\A(?:Mo|Tu|We|Th|Fr|Sa|Su)/ =~ if_range
++          last_modified = options[:last_modified]
++          return false if last_modified.blank?
++          begin
++            if_range = Time.httpdate(if_range)
++            last_modified = Time.httpdate(last_modified)
++          rescue ArgumentError
++            return false
++          end
++          return if_range == last_modified
++        else
++          return if_range == response.etag
++        end
++      end
++
++      def generate_apache_style_file_etag(path)
++        stat = File.stat(path)
++        "%x-%x-%x" % [stat.ino, stat.size, stat.mtime.to_i * 1_000_000]
++      end
+   end
+ end
+diff --git a/actionpack/test/controller/send_file_test.rb b/actionpack/test/controller/send_file_test.rb
+index 0b9674f..961db5f 100644
+--- a/actionpack/test/controller/send_file_test.rb
++++ b/actionpack/test/controller/send_file_test.rb
+@@ -168,4 +168,128 @@ class SendFileTest < ActionController::TestCase
+     process('multibyte_text_data')
+     assert_equal '29', @controller.headers['Content-Length']
+   end
++
++  [:file, :stream, :data].each do |send_type|
++    define_method "test_range_#{send_type}" do
++      process_with_range send_type, "bytes=200-499"
++
++      data = file_data
++      data_length = data.bytesize
++      assert_equal 206, @response.status
++      assert_equal "300", @response.headers['Content-Length']
++      assert_equal "bytes 200-499/#{data_length}",
++                   @response.headers['Content-Range']
++      assert_equal data[200, 300], @response.body
++    end
++
++    define_method "test_range_#{send_type}_first_byte_only" do
++      process_with_range send_type, "bytes=200-"
++
++      data = file_data
++      data_length = data.bytesize
++      expected_bytes = data_length - 200
++      assert_equal 206, @response.status
++      assert_equal expected_bytes.to_s, @response.headers['Content-Length']
++      assert_equal "bytes 200-#{data_length - 1}/#{data_length}",
++                   @response.headers['Content-Range']
++      assert_equal data[200, expected_bytes], @response.body
++    end
++
++    define_method "test_range_#{send_type}_last_byte_only" do
++      process_with_range send_type, "bytes=-200"
++
++      data = file_data
++      data_length = data.bytesize
++      assert_equal 206, @response.status
++      assert_equal "200", @response.headers['Content-Length']
++      first_byte = data_length - 200
++      assert_equal "bytes #{first_byte}-#{data_length - 1}/#{data_length}",
++                   @response.headers['Content-Range']
++      assert_equal data[data_length - 200, 200], @response.body
++    end
++  end
++
++  def test_range_without_position
++    @request.env["Range"] = "bytes=-"
++    @controller.options = { :stream => false }
++    process('file')
++
++    assert_equal 416, @response.status
++  end
++
++  def test_range_if_range_date
++    @request.env["Range"] = "bytes=200-499"
++    @request.env["If-Range"] = File.mtime(file_path).httpdate
++    @controller.options = { :stream => false }
++    process('file')
++
++    data = file_data
++    data_length = data.bytesize
++    assert_equal 206, @response.status
++    assert_equal "300", @response.headers['Content-Length']
++    assert_equal "bytes 200-499/#{data_length}",
++                 @response.headers['Content-Range']
++    assert_equal data[200, 300], @response.body
++  end
++
++  def test_range_if_range_date_expired
++    @request.env["Range"] = "bytes=200-499"
++    @request.env["If-Range"] = Time.now.httpdate
++    @controller.options = { :stream => false }
++    process('file')
++
++    data = file_data
++    data_length = data.bytesize
++    assert_equal 200, @response.status
++    assert_equal "#{data_length}", @response.headers['Content-Length']
++    assert_nil @response.headers['Content-Range']
++    assert_equal file_data, @response.body
++  end
++
++  def test_range_if_range_etag
++    @request.env["Range"] = "bytes=200-499"
++    @response.etag = file_etag(file_path)
++    @request.env["If-Range"] = @response.etag
++    @controller.options = { :stream => false }
++    process('file')
++
++    data = file_data
++    data_length = data.bytesize
++    assert_equal 206, @response.status
++    assert_equal "300", @response.headers['Content-Length']
++    assert_equal "bytes 200-499/#{data_length}",
++                 @response.headers['Content-Range']
++    assert_equal data[200, 300], @response.body
++  end
++
++  def test_range_if_range_etag_expired
++    @request.env["Range"] = "bytes=200-499"
++    @response.etag = file_etag(file_path)
++    @request.env["If-Range"] = "not-match-etag"
++    @controller.options = { :stream => false }
++    process('file')
++
++    data = file_data
++    data_length = data.bytesize
++    assert_equal 200, @response.status
++    assert_equal "#{data_length}", @response.headers['Content-Length']
++    assert_nil @response.headers['Content-Range']
++    assert_equal file_data, @response.body
++  end
++
++  private
++    def process_with_range(send_type, range)
++      @request.env["Range"] = range
++      @controller.options = { :stream => true } if send_type == :stream
++      if send_type == :data
++        process('data')
++      else
++        process('file')
++      end
++    end
++
++    def file_etag(path)
++      stat = File.stat(path)
++      "%x-%x-%x" % [stat.ino, stat.size, stat.mtime.to_i * 1_000_000]
++    end
+ end
+-- 
+1.6.4.3
+

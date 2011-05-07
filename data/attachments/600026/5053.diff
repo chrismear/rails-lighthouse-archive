@@ -1,0 +1,110 @@
+From 9f15b3b98ff56a78fed3cef2cd5ff313e4b4c255 Mon Sep 17 00:00:00 2001
+From: Subba Rao Pasupuleti <subbarao.pasupuleti@gmail.com>
+Date: Thu, 22 Jul 2010 21:38:40 -0400
+Subject: [PATCH] In nested_attributes when association is not
+ loaded and association record is saved then
+ in memory record attributes should be saved
+
+[#5053 state:resolved]
+---
+ .../associations/association_collection.rb         |   18 +++++++++++++-----
+ activerecord/test/cases/associations_test.rb       |   19 +++++++++++++++++++
+ activerecord/test/cases/nested_attributes_test.rb  |    8 +++++++-
+ 3 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 2855073..5d0002b 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -352,11 +352,12 @@ module ActiveRecord
+                 if @target.is_a?(Array) && @target.any?
+                   @target = find_target.map do |f|
+                     i = @target.index(f)
+-                    t = @target.delete_at(i) if i
+-                    if t && t.changed?
+-                      t
++                    if i
++                      @target.delete_at(i).tap do |t|
++                        keys = ["id"] + t.changes.keys + (f.attribute_names - t.attribute_names)
++                        t.attributes = f.attributes.except(*keys)
++                      end
+                     else
+-                      f.mark_for_destruction if t && t.marked_for_destruction?
+                       f
+                     end
+                   end + @target
+@@ -432,7 +433,14 @@ module ActiveRecord
+           callback(:before_add, record)
+           yield(record) if block_given?
+           @target ||= [] unless loaded?
+-          @target << record unless @reflection.options[:uniq] && @target.include?(record)
++          index = @target.index(record)
++          unless @reflection.options[:uniq] && index
++            if index
++              @target[index] = record
++            else
++             @target << record
++            end
++          end 
+           callback(:after_add, record)
+           set_inverse_instance(record, @owner)
+           record
+diff --git a/activerecord/test/cases/associations_test.rb b/activerecord/test/cases/associations_test.rb
+index 048d042..47cb0d1 100644
+--- a/activerecord/test/cases/associations_test.rb
++++ b/activerecord/test/cases/associations_test.rb
+@@ -18,6 +18,8 @@ require 'models/person'
+ require 'models/reader'
+ require 'models/parrot'
+ require 'models/pirate'
++require 'models/ship'
++require 'models/ship_part'
+ require 'models/treasure'
+ require 'models/price_estimate'
+ require 'models/club'
+@@ -29,6 +31,23 @@ class AssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :companies, :developers, :projects, :developers_projects,
+            :computers, :people, :readers
+ 
++  def test_loading_the_association_target_should_keep_child_records_marked_for_destruction
++    ship = Ship.create!(:name => "The good ship Dollypop")
++    part = ship.parts.create!(:name => "Mast")
++    part.mark_for_destruction
++    ship.parts.send(:load_target)
++    assert ship.parts[0].marked_for_destruction?
++  end
++
++  def test_loading_the_association_target_should_load_most_recent_attributes_for_child_records_marked_for_destruction
++    ship = Ship.create!(:name => "The good ship Dollypop")
++    part = ship.parts.create!(:name => "Mast")
++    part.mark_for_destruction
++    ShipPart.find(part.id).update_attribute(:name, 'Deck')
++    ship.parts.send(:load_target)
++    assert_equal 'Deck', ship.parts[0].name
++  end
++
+   def test_include_with_order_works
+     assert_nothing_raised {Account.find(:first, :order => 'id', :include => :firm)}
+     assert_nothing_raised {Account.find(:first, :order => :id, :include => :firm)}
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index da8da45..cd432e2 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -810,7 +810,13 @@ class TestHasManyAutosaveAssoictaionWhichItselfHasAutosaveAssociations < ActiveR
+     @part = @ship.parts.create!(:name => "Mast")
+     @trinket = @part.trinkets.create!(:name => "Necklace")
+   end
+-  
++
++  test "if association is not loaded and association record is saved and then in memory record attributes should be saved" do
++    @ship.parts_attributes=[{:id => @part.id,:name =>'Deck'}]
++    assert_equal 1, @ship.parts.proxy_target.size
++    assert_equal 'Deck', @ship.parts[0].name
++  end  
++
+   test "when grandchild changed in memory, saving parent should save grandchild" do
+     @trinket.name = "changed"
+     @ship.save
+-- 
+1.7.0.4
+

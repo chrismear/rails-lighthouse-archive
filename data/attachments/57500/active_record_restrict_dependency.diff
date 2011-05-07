@@ -1,0 +1,239 @@
+From 09edf0ca018d90fe42a851cb660380ad010301f7 Mon Sep 17 00:00:00 2001
+From: Steven Soroka <ssoroka78@gmail.com>
+Date: Tue, 28 Oct 2008 03:30:34 -0500
+Subject: [PATCH] has_many and has_one :dependent => :restrict
+
+---
+ activerecord/lib/active_record/associations.rb     |   52 +++++++++++++++++---
+ .../associations/has_many_associations_test.rb     |   16 ++++++
+ .../associations/has_one_associations_test.rb      |   16 ++++++
+ activerecord/test/models/company.rb                |    5 ++
+ 4 files changed, 81 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 52f6a04..61547fe 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -72,6 +72,11 @@ module ActiveRecord
+       super("Can not add to a has_many :through association.  Try adding to #{reflection.through_reflection.name.inspect}.")
+     end
+   end
++  
++  class AssociationDestroyRestricted < ActiveRecordError #:nodoc:
++    # def initialize(owner, reflection)
++    # end
++  end
+ 
+   # See ActiveRecord::Associations::ClassMethods for documentation.
+   module Associations # :nodoc:
+@@ -700,8 +705,9 @@ module ActiveRecord
+       #   If set to <tt>:destroy</tt> all the associated objects are destroyed
+       #   alongside this object by calling their +destroy+ method.  If set to <tt>:delete_all</tt> all associated
+       #   objects are deleted *without* calling their +destroy+ method.  If set to <tt>:nullify</tt> all associated
+-      #   objects' foreign keys are set to +NULL+ *without* calling their +save+ callbacks. *Warning:* This option is ignored when also using
+-      #   the <tt>:through</tt> option.
++      #   objects' foreign keys are set to +NULL+ *without* calling their +save+ callbacks. If set to <tt>:restrict</tt>
++      #   objects of this class will not be permitted to destroy themselves if association objects exist.
++      #   *Warning:* This option is ignored when also using the <tt>:through</tt> option.
+       # [:finder_sql]
+       #   Specify a complete SQL statement to fetch the association. This is a good way to go for complex
+       #   associations that depend on multiple tables. Note: When this option is used, +find_in_collection+ is _not_ added.
+@@ -745,6 +751,7 @@ module ActiveRecord
+       #   has_many :comments, :include => :author
+       #   has_many :people, :class_name => "Person", :conditions => "deleted = 0", :order => "name"
+       #   has_many :tracks, :order => "position", :dependent => :destroy
++      #   has_many :ledger_entries, :dependent => :restrict
+       #   has_many :comments, :dependent => :nullify
+       #   has_many :tags, :as => :taggable
+       #   has_many :reports, :readonly => true
+@@ -824,7 +831,8 @@ module ActiveRecord
+       # [:dependent]
+       #   If set to <tt>:destroy</tt>, the associated object is destroyed when this object is. If set to
+       #   <tt>:delete</tt>, the associated object is deleted *without* calling its destroy method. If set to <tt>:nullify</tt>, the associated
+-      #   object's foreign key is set to +NULL+. Also, association is assigned.
++      #   object's foreign key is set to +NULL+. Also, association is assigned. If set to <tt>:restrict</tt>,
++      #   objects of this class will not be permitted to destroy themselves if an associated object exists.
+       # [:foreign_key]
+       #   Specify the foreign key used for the association. By default this is guessed to be the name
+       #   of this class in lower-case and "_id" suffixed. So a Person class that makes a +has_one+ association will use "person_id"
+@@ -857,6 +865,7 @@ module ActiveRecord
+       # Option examples:
+       #   has_one :credit_card, :dependent => :destroy  # destroys the associated credit card
+       #   has_one :credit_card, :dependent => :nullify  # updates the associated records foreign key value to NULL rather than destroying it
++      #   has_one :credit_card, :dependent => :restrict  # prevents destroying the object if the assocation object is not nil
+       #   has_one :last_comment, :class_name => "Comment", :order => "posted_on"
+       #   has_one :project_manager, :class_name => "Person", :conditions => "role = 'project_manager'"
+       #   has_one :attachment, :as => :attachable
+@@ -1421,11 +1430,11 @@ module ActiveRecord
+           []
+         end
+ 
+-        # Creates before_destroy callback methods that nullify, delete or destroy
++        # Creates before_destroy callback methods that nullify, delete, destroy, or restrict
+         # has_many associated objects, according to the defined :dependent rule.
+         #
+         # See HasManyAssociation#delete_records.  Dependent associations
+-        # delete children, otherwise foreign key is set to NULL.
++        # delete children, set foreign key to NULL, or restrict deleting the parent record, as appropriate.
+         #
+         # The +extra_conditions+ parameter, which is not used within the main
+         # Active Record codebase, is meant to allow plugins to define extra
+@@ -1466,13 +1475,22 @@ module ActiveRecord
+                       "#{dependent_conditions}")
+                   end
+                 }
++              when :restrict
++                module_eval %Q{
++                  before_destroy do |record|
++                    restrict_has_many_dependencies(record,
++                    "#{reflection.name}",
++                    #{reflection.class_name},
++                    "#{dependent_conditions}")
++                  end
++                }
+               else
+-                raise ArgumentError, "The :dependent option expects either :destroy, :delete_all, or :nullify (#{reflection.options[:dependent].inspect})"
++                raise ArgumentError, "The :dependent option expects either :destroy, :delete_all, :nullify, or :restrict (#{reflection.options[:dependent].inspect})"
+             end
+           end
+         end
+ 
+-        # Creates before_destroy callback methods that nullify, delete or destroy
++        # Creates before_destroy callback methods that nullify, delete, destroy, or restrict
+         # has_one associated objects, according to the defined :dependent rule.
+         def configure_dependency_for_has_one(reflection)
+           if reflection.options.include?(:dependent)
+@@ -1502,8 +1520,18 @@ module ActiveRecord
+                   association.update_attribute(reflection.primary_key_name, nil) unless association.nil?
+                 end
+                 before_destroy method_name
++              when :restrict
++                method_name = "has_one_dependent_restrict_for_#{reflection.name}".to_sym
++                define_method(method_name) do
++                  association = send("#{reflection.name}")
++                  unless association.nil?
++                    raise ActiveRecord::AssociationDestroyRestricted,
++                      "#{self.class.name} cannot be destroyed because it has a #{reflection.class_name}"
++                  end
++                end
++                before_destroy method_name
+               else
+-                raise ArgumentError, "The :dependent option expects either :destroy, :delete or :nullify (#{reflection.options[:dependent].inspect})"
++                raise ArgumentError, "The :dependent option expects either :destroy, :delete, :nullify, or :restrict (#{reflection.options[:dependent].inspect})"
+             end
+           end
+         end
+@@ -1538,6 +1566,14 @@ module ActiveRecord
+         def nullify_has_many_dependencies(record, reflection_name, association_class, primary_key_name, dependent_conditions)
+           association_class.update_all("#{primary_key_name} = NULL", dependent_conditions)
+         end
++        
++        def restrict_has_many_dependencies(record, reflection_name, association_class, dependent_conditions)
++          child_count = record.send(reflection_name).count(dependent_conditions)
++          if (child_count) != 0
++            raise ActiveRecord::AssociationDestroyRestricted, 
++              "#{record.class.name} #{record.id} cannot be deleted because it has #{child_count} #{reflection_name}"
++          end
++        end
+ 
+         mattr_accessor :valid_keys_for_has_many_association
+         @@valid_keys_for_has_many_association = [
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 59784e1..1e1f650 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -659,6 +659,22 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     # only the correctly associated client should have been deleted
+     assert_equal 1, Client.find_all_by_client_of(firm.id).size
+   end
++  
++  def test_dependent_restrict_association_allows_delete_with_no_children
++    firm = RestrictDependentFirm.create!(:name => "Out of Business")
++    firm.companies.delete_all
++    assert_nothing_raised do
++      firm.destroy
++    end
++  end
++
++  def test_dependent_restrict_association_prevents_delete_with_children
++    firm = RestrictDependentFirm.create!(:name => "Untouchable Firm")
++    firm.companies.create!(:name => "don't orphan me! Inc.")
++    assert_raises ActiveRecord::AssociationDestroyRestricted do
++      firm.destroy
++    end
++  end
+ 
+   def test_creation_respects_hash_condition
+     ms_client = companies(:first_firm).clients_like_ms_with_hash_conditions.build
+diff --git a/activerecord/test/cases/associations/has_one_associations_test.rb b/activerecord/test/cases/associations/has_one_associations_test.rb
+index 14032a6..2021980 100644
+--- a/activerecord/test/cases/associations/has_one_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_associations_test.rb
+@@ -150,6 +150,22 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+     assert_nothing_raised { firm.destroy }
+   end
+ 
++  def test_dependent_restrict_association_with_nil_associate
++    firm = RestrictDependentFirm.create!(:name => "Out of Business")
++    firm.account.delete
++    assert_nothing_raised do
++      firm.destroy
++    end
++  end
++
++  def test_dependent_restrict_association_with_associate
++    firm = RestrictDependentFirm.create!(:name => "Untouchable Firm")
++    firm.account.create!(:name => "don't orphan me!")
++    assert_raises ActiveRecord::AssociationDestroyRestricted do
++      firm.destroy
++    end
++  end
++
+   def test_succesful_build_association
+     firm = Firm.new("name" => "GlobalMegaCorp")
+     firm.save
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index 0e3fafa..973f6c6 100644
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -82,6 +82,11 @@ class ExclusivelyDependentFirm < Company
+   has_many :dependent_conditional_clients_of_firm, :foreign_key => "client_of", :class_name => "Client", :order => "id", :dependent => :delete_all, :conditions => ["name = ?", 'BigShot Inc.']
+ end
+ 
++class RestrictDependentFirm < Company
++  has_one :account, :foreign_key => "firm_id", :dependent => :restrict
++  has_many :companies, :foreign_key => 'client_of', :order => "id", :dependent => :restrict
++end
++
+ class Client < Company
+   belongs_to :firm, :foreign_key => "client_of"
+   belongs_to :firm_with_basic_id, :class_name => "Firm", :foreign_key => "firm_id"
+-- 
+1.5.5
+
+
+From 6b4598d6173282ac26b24e0311c8e13832e25bda Mon Sep 17 00:00:00 2001
+From: Steven Soroka <ssoroka78@gmail.com>
+Date: Tue, 28 Oct 2008 03:34:01 -0500
+Subject: [PATCH] Hmm. Don't need that line
+
+---
+ activerecord/lib/active_record/associations.rb |    2 --
+ 1 files changed, 0 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 61547fe..919b5e5 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -74,8 +74,6 @@ module ActiveRecord
+   end
+   
+   class AssociationDestroyRestricted < ActiveRecordError #:nodoc:
+-    # def initialize(owner, reflection)
+-    # end
+   end
+ 
+   # See ActiveRecord::Associations::ClassMethods for documentation.
+-- 
+1.5.5
+

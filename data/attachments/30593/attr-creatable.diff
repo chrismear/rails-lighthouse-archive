@@ -1,0 +1,221 @@
+From bc25115990d3e151ae9139ce44f94adc1a076a39 Mon Sep 17 00:00:00 2001
+From: David Dollar <ddollar@gmail.com>
+Date: Wed, 2 Jul 2008 16:31:56 -0400
+Subject: [PATCH] adds the attr_creatable method to ActiveRecord::Base which allows associations to be hydrated from nested hashes
+
+---
+ activerecord/lib/active_record/associations.rb     |    7 +++
+ .../associations/association_collection.rb         |   19 +++++++++
+ activerecord/lib/active_record/base.rb             |   41 ++++++++++++++++++++
+ .../associations/belongs_to_associations_test.rb   |    8 ++++
+ activerecord/test/cases/associations_test.rb       |   22 ++++++++++
+ activerecord/test/cases/base_test.rb               |   12 ++++++
+ activerecord/test/models/post.rb                   |    3 +
+ 7 files changed, 112 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 4b71540..7dc90d8 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1107,6 +1107,13 @@ module ActiveRecord
+               association = association_proxy_class.new(self, reflection)
+             end
+ 
++            # if a Hash is passed in, convert it to an ActiveRecord model
++            # using the Hash as the initialization attributes if the
++            # assocation was specified using attr_creatable
++            if new_value.is_a?(Hash)
++              new_value = reflection.klass.new(new_value) if (self.class.creatable_attributes || []).include?(reflection.name.to_s)
++            end
++
+             if association_proxy_class == HasOneThroughAssociation
+               association.create_through_record(new_value)
+               self.send(reflection.name, new_value)
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index bbd8af7..95f9d85 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -94,6 +94,14 @@ module ActiveRecord
+ 
+         @owner.transaction do
+           flatten_deeper(records).each do |record|
++
++            # if a Hash is passed in, convert it to an ActiveRecord model
++            # using the Hash as the initialization attributes if the
++            # assocation was specified using attr_creatable
++            if record.is_a?(Hash)
++              record = @reflection.klass.new(record) if (@owner.class.creatable_attributes || []).include?(@reflection.name.to_s)
++            end
++
+             raise_on_type_mismatch(record)
+             add_record_to_target_with_callbacks(record) do |r|
+               result &&= insert_record(record) unless @owner.new_record?
+@@ -226,6 +234,17 @@ module ActiveRecord
+       # Replace this collection with +other_array+
+       # This will perform a diff and delete/add only records that have changed.
+       def replace(other_array)
++
++        # if a Hash is passed in, convert it to an ActiveRecord model
++        # using the Hash as the initialization attributes if the
++        # assocation was specified using attr_creatable
++        other_array.map! do |val|
++          if val.is_a?(Hash)
++            val = @reflection.klass.new(val) if (@owner.class.creatable_attributes || []).include?(@reflection.name.to_s)
++          end
++          val
++        end
++
+         other_array.each { |val| raise_on_type_mismatch(val) }
+ 
+         load_target
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 962c2b3..d5ec627 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -869,6 +869,47 @@ module ActiveRecord #:nodoc:
+         update_counters(id, counter_name => -1)
+       end
+ 
++      # Attributes named in this macro are associations that you wish to be
++      # creatable using nested hashes.
++      #
++      # Mass-assignment to these attributes will simply be ignored, to assign
++      # to them you can use direct writer methods. This is meant to protect
++      # sensitive attributes from being overwritten by malicious users
++      # tampering with URLs or forms.
++      #
++      #   class AccountExecutive < ActiveRecord::Base
++      #   end
++      #
++      #   class Order < ActiveRecord::Base
++      #   end
++      #
++      #   class Customer < ActiveRecord::Base
++      #     has_one  :account_executive
++      #     has_many :orders
++      #     attr_creatable :account_executive, :orders
++      #   end
++      #
++      #   customer_data = {
++      #     'name' => 'David',
++      #     'account_executive' => {
++      #       'name' => 'Jim'
++      #     },
++      #     orders => [
++      #       { :number => 45 },
++      #       { :number => 49 }
++      #     ]
++      #   }
++      #
++      # Customer.new(customer_data) will cause the AccountExecutive and
++      # Order models to be hydrated and created as necessary
++      def attr_creatable(*attributes)
++        write_inheritable_attribute("attr_creatable", Set.new(attributes.map(&:to_s)) + (creatable_attributes || []))
++      end
++
++      # Returns an array of all the associations that are creatable using a Hash.
++      def creatable_attributes # :nodoc:
++        read_inheritable_attribute("attr_creatable")
++      end
+ 
+       # Attributes named in this macro are protected from mass-assignment,
+       # such as <tt>new(attributes)</tt>,
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 9c718c4..daa8430 100755
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -40,6 +40,14 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_raise(ActiveRecord::AssociationTypeMismatch) { Account.find(1).firm = Project.find(1) }
+   end
+ 
++  def test_belongs_to_mass_assignment
++    assert_no_difference 'Firm.count' do
++      assert_raise(ActiveRecord::AssociationTypeMismatch) do
++        Account.create(:credit_limit => 10, :firm => { :name => 'Apple' })
++      end
++    end
++  end
++
+   def test_natural_assignment
+     apple = Firm.create("name" => "Apple")
+     citibank = Account.create("credit_limit" => 10)
+diff --git a/activerecord/test/cases/associations_test.rb b/activerecord/test/cases/associations_test.rb
+index 59349dd..e49c281 100755
+--- a/activerecord/test/cases/associations_test.rb
++++ b/activerecord/test/cases/associations_test.rb
+@@ -189,6 +189,28 @@ class AssociationProxyTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_association_proxy_setter_can_take_hash
++    special_comment_attributes = { :body => 'Setter Takes Hash' }
++
++    post = posts(:welcome)
++    post.creatable_comment = { :body => 'Setter Takes Hash' }
++
++    assert_equal post.creatable_comment.body, special_comment_attributes[:body]
++  end
++
++  def test_association_collection_can_take_hash
++    post_attributes = { :title => 'Setter Takes', :body => 'Hash' }
++
++    david = authors(:david)
++    david.class.attr_creatable :posts
++
++    post = (david.posts << post_attributes).last
++    assert_equal post.title, post_attributes[:title]
++
++    david.posts = [post_attributes, post_attributes]
++    assert_equal david.posts.count, 2
++  end
++
+   def setup_dangling_association
+     josh = Author.create(:name => "Josh")
+     p = Post.create(:title => "New on Edge", :body => "More cool stuff!", :author => josh)
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index a4be629..b3ba57f 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -62,6 +62,13 @@ class ReadonlyTitlePost < Post
+   attr_readonly :title
+ end
+ 
++class Jedi < LoosePerson
++  has_one :father
++  has_one :mentor
++
++  attr_creatable :mentor
++end
++
+ class Booleantest < ActiveRecord::Base; end
+ 
+ class Task < ActiveRecord::Base
+@@ -906,6 +913,11 @@ class BasicsTest < ActiveRecord::TestCase
+     assert !reply.approved?
+   end
+ 
++  def test_creatable_associations
++    assert_nil LoosePerson.creatable_attributes
++    assert_equal Set.new([ 'mentor' ]), Jedi.creatable_attributes
++  end
++
+   def test_mass_assignment_protection_inheritance
+     assert_nil LoosePerson.accessible_attributes
+     assert_equal Set.new([ 'credit_rating', 'administrator' ]), LoosePerson.protected_attributes
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index 3adbc0c..bd137ed 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -30,6 +30,9 @@ class Post < ActiveRecord::Base
+   has_many :special_comments
+   has_many :nonexistant_comments, :class_name => 'Comment', :conditions => 'comments.id < 0'
+ 
++  has_one        :creatable_comment, :class_name => 'Comment'
++  attr_creatable :creatable_comment
++
+   has_and_belongs_to_many :categories
+   has_and_belongs_to_many :special_categories, :join_table => "categories_posts", :association_foreign_key => 'category_id'
+ 
+-- 
+1.5.5.1
+

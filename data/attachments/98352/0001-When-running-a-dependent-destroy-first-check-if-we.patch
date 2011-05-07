@@ -1,0 +1,90 @@
+From ae4d9e8f6616fe9ecc4c0dd9bb955374139a34ae Mon Sep 17 00:00:00 2001
+From: Richie Vos <jerry.vos@gmail.com>
+Date: Tue, 10 Mar 2009 21:25:22 -0500
+Subject: [PATCH] When running a dependent destroy, first check if we're a new record before firing off db commands to prevent WHERE foreign_key = NULL statements from running.
+
+Not only does this prevent an extra db connection, it also can prevent some bad behavior from occurring when you have rows where the foreign_key actually is set to null. In a nullify case, if you have 2 threads both trying to do something like UPDATE cars SET manufacturer_id = NULL WHERE manufacturer_id = NULL, you can run into deadlocks since both may require a large db read and write.
+---
+ activerecord/lib/active_record/associations.rb     |   30 +++++++++++--------
+ .../associations/has_many_associations_test.rb     |   14 +++++++++
+ 2 files changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 301b3a3..96e1338 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1366,22 +1366,26 @@ module ActiveRecord
+                 before_destroy method_name
+               when :delete_all
+                 module_eval %Q{
+-                  before_destroy do |record|                  # before_destroy do |record|
+-                    delete_all_has_many_dependencies(record,  #   delete_all_has_many_dependencies(record,
+-                      "#{reflection.name}",                   #     "posts",
+-                      #{reflection.class_name},               #     Post,
+-                      %@#{dependent_conditions}@)             #     %@...@) # this is a string literal like %(...)
+-                  end                                         # end
++                  before_destroy do |record|                    # before_destroy do |record|
++                    unless record.new_record?                   #   unless record.new_record?
++                      delete_all_has_many_dependencies(record,  #     delete_all_has_many_dependencies(record,
++                        "#{reflection.name}",                   #       "posts",
++                        #{reflection.class_name},               #       Post,
++                        %@#{dependent_conditions}@)             #       %@...@) # this is a string literal like %(...)
++                    end                                         #   end
++                  end                                           # end
+                 }
+               when :nullify
+                 module_eval %Q{
+-                  before_destroy do |record|                  # before_destroy do |record|
+-                    nullify_has_many_dependencies(record,     #   nullify_has_many_dependencies(record,
+-                      "#{reflection.name}",                   #     "posts",
+-                      #{reflection.class_name},               #     Post,
+-                      "#{reflection.primary_key_name}",       #     "user_id",
+-                      %@#{dependent_conditions}@)             #     %@...@) # this is a string literal like %(...)
+-                  end                                         # end
++                  before_destroy do |record|                    # before_destroy do |record|
++                    unless record.new_record?                   #   unless record.new_record?
++                      nullify_has_many_dependencies(record,     #     nullify_has_many_dependencies(record,
++                        "#{reflection.name}",                   #       "posts",
++                        #{reflection.class_name},               #       Post,
++                        "#{reflection.primary_key_name}",       #       "user_id",
++                        %@#{dependent_conditions}@)             #       %@...@) # this is a string literal like %(...)
++                    end                                         #   end
++                  end                                           # end
+                 }
+               else
+                 raise ArgumentError, "The :dependent option expects either :destroy, :delete_all, or :nullify (#{reflection.options[:dependent].inspect})"
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index b7fa9d9..5c866c7 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -480,6 +480,13 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal 0, companies(:first_firm).clients_of_firm.size
+     assert_equal 0, companies(:first_firm).clients_of_firm(true).size
+   end
++ 
++  def test_delete_all_on_new_record
++    new_company = Firm.new
++    
++    Client.expects(:delete_all).never
++    new_company.destroy
++  end
+ 
+   def test_delete_all_with_not_yet_loaded_association_collection
+     force_signal37_to_load_all_clients_of_firm
+@@ -709,6 +716,13 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+ 
+     assert_equal num_accounts, Account.count
+   end
++ 
++  def test_depends_and_nullify_on_new_record
++    new_company = DependentFirm.new
++    
++    Company.expects(:update_all).never
++    new_company.destroy
++  end
+ 
+   def test_included_in_collection
+     assert companies(:first_firm).clients.include?(Client.find(2))
+-- 
+1.6.0.2.g2ebc0
+

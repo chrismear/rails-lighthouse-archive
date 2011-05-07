@@ -1,0 +1,146 @@
+From a90edca6051ad2b9b0c292b3404e16b0931ad8ff Mon Sep 17 00:00:00 2001
+From: toby cabot <ccabot@mitre.org>
+Date: Wed, 29 Sep 2010 16:05:26 -0400
+Subject: [PATCH 1/2] bug 1108: fix a bug with find_or_create_by and additional values
+
+There was a bug with find_or_create_by_x introduced in 2.3.9 - if you
+included extra parameters for the create() then those parameters would
+confuse the find() so you'd never get to the create().  This patch
+filters the parameters so we only pass to find() the subset that it's
+interested in.  The code for the filtering was modelled on the code in
+base.rb's method_missing().
+---
+ .../associations/association_collection.rb         |   22 +++++++++++++++++++-
+ .../associations/has_many_associations_test.rb     |   17 +++++++++++++++
+ 2 files changed, 38 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 0953fa5..389bdfe 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -380,7 +380,8 @@ module ActiveRecord
+             return find(:first, :conditions => args.first) || create(args.first)
+           when /^find_or_create_by_(.*)$/
+             rest = $1
+-            return  send("find_by_#{rest}", *args) ||
++            find_args = pull_finder_args_from(DynamicFinderMatch.match(method).attribute_names, *args)
++            return  send("find_by_#{rest}", find_args) ||
+                     method_missing("create_by_#{rest}", *args)
+           when /^create_by_(.*)$/
+             return create($1.split('_and_').zip(args).inject({}) { |h,kv| k,v=kv ; h[k] = v ; h })
+@@ -447,6 +448,25 @@ module ActiveRecord
+         end
+ 
+       private
++        # Separate the "finder" args from the "create" args given to a
++        # find_or_create_by_ call.  Returns an array with the
++        # parameter values in the same order as the keys in the
++        # "names" array.  This code was based on code in base.rb's
++        # method_missing method.
++        def pull_finder_args_from(names, *args)
++          attributes = names.collect { |name| name.intern }
++          attribute_hash = {}
++          args.each_with_index do |arg, i|
++            if arg.is_a?(Hash)
++              attribute_hash.merge! arg
++            else
++              attribute_hash[attributes[i]] = arg
++            end
++          end
++          attribute_hash = attribute_hash.with_indifferent_access
++          attributes.collect { |attr| attribute_hash[attr] }
++        end
++
+         def create_record(attrs)
+           attrs.update(@reflection.options[:conditions]) if @reflection.options[:conditions].is_a?(Hash)
+           ensure_owner_is_not_new
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 59f7a03..2b18fdc 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -65,6 +65,23 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal person, person.readers.first.person
+   end
+ 
++  def test_find_or_create_by_with_additional_parameters
++    post = Post.create! :title => 'test_find_or_create_by_with_additional_parameters', :body => 'this is the body'
++    comment = post.comments.create! :body => 'test comment body', :type => 'test'
++
++    assert_equal comment, post.comments.find_or_create_by_body('test comment body')
++
++    post.comments.find_or_create_by_body(:body => 'other test comment body', :type => 'test')
++    assert_equal 2, post.comments.count
++    assert_equal 2, post.comments.length
++    post.comments.find_or_create_by_body('other other test comment body', :type => 'test')
++    assert_equal 3, post.comments.count
++    assert_equal 3, post.comments.length
++    post.comments.find_or_create_by_body_and_type('3rd test comment body', 'test')
++    assert_equal 4, post.comments.count
++    assert_equal 4, post.comments.length
++  end
++
+   def test_find_or_create
+     person = Person.create! :first_name => 'tenderlove'
+     post   = Post.find :first
+-- 
+1.7.0.4
+
+
+From d07d32ddd7b802d80e01dd6bbd667dbe88ff5a7b Mon Sep 17 00:00:00 2001
+From: toby cabot <ccabot@mitre.org>
+Date: Wed, 29 Sep 2010 16:24:57 -0400
+Subject: [PATCH 2/2] bug 1108: yield to block provided to find_or_create_by_x
+
+Starting in 2.3.8 we stopped yielding to blocks passed in to
+find_or_create_by_x methods.  This patch restores that behavior and
+adds a case to test it.
+---
+ .../associations/association_collection.rb         |    6 +++---
+ .../associations/has_many_associations_test.rb     |    6 ++++++
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 389bdfe..f01a931 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -374,7 +374,7 @@ module ActiveRecord
+           target
+         end
+         
+-        def method_missing(method, *args)
++        def method_missing(method, *args, &block)
+           case method.to_s
+           when 'find_or_create'
+             return find(:first, :conditions => args.first) || create(args.first)
+@@ -382,9 +382,9 @@ module ActiveRecord
+             rest = $1
+             find_args = pull_finder_args_from(DynamicFinderMatch.match(method).attribute_names, *args)
+             return  send("find_by_#{rest}", find_args) ||
+-                    method_missing("create_by_#{rest}", *args)
++                    method_missing("create_by_#{rest}", *args, &block)
+           when /^create_by_(.*)$/
+-            return create($1.split('_and_').zip(args).inject({}) { |h,kv| k,v=kv ; h[k] = v ; h })
++            return create($1.split('_and_').zip(args).inject({}) { |h,kv| k,v=kv ; h[k] = v ; h }, &block)
+           end
+ 
+           if @target.respond_to?(method) || (!@reflection.klass.respond_to?(method) && Class.respond_to?(method))
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 2b18fdc..0c87cdb 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -82,6 +82,12 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert_equal 4, post.comments.length
+   end
+ 
++  def test_find_or_create_by_with_block
++    post = Post.create! :title => 'test_find_or_create_by_with_additional_parameters', :body => 'this is the body'
++    comment = post.comments.find_or_create_by_body('other test comment body') { |comment| comment.type = 'test' }
++    assert_equal 'test', comment.type
++  end
++
+   def test_find_or_create
+     person = Person.create! :first_name => 'tenderlove'
+     post   = Post.find :first
+-- 
+1.7.0.4
+

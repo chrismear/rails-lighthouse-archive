@@ -1,0 +1,169 @@
+From 260220766128c4d00afb8367da75a27e46b37d87 Mon Sep 17 00:00:00 2001
+From: artemave <artemave@gmail.com>
+Date: Fri, 22 Jan 2010 15:57:50 +0000
+Subject: [PATCH] view inheritance squashed in a single commit
+
+---
+ actionpack/lib/abstract_controller/rendering.rb    |   26 +++++++++++++++++--
+ actionpack/lib/action_view/render/partials.rb      |    1 +
+ .../controller/new_base/render_partial_test.rb     |   14 +++++++++-
+ actionpack/test/controller/new_base/render_test.rb |   24 +++++++++++++++++-
+ 4 files changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/actionpack/lib/abstract_controller/rendering.rb b/actionpack/lib/abstract_controller/rendering.rb
+index 826e82c..52a0c6b 100644
+--- a/actionpack/lib/abstract_controller/rendering.rb
++++ b/actionpack/lib/abstract_controller/rendering.rb
+@@ -156,17 +156,37 @@ module AbstractController
+     end
+ 
+     def find_template(name, details, options)
+-      view_paths.find(name, details, options[:_prefix], options[:_partial])
++      view_paths_chain = []
++      with_template_inheritance(options[:_prefix]) do |c, prefix|
++        begin
++          return c.view_paths.find(name, details, prefix, options[:_partial])
++        rescue ActionView::MissingTemplate => e
++          view_paths_chain.concat c.view_paths
++        end
++      end
++      raise ActionView::MissingTemplate.new(view_paths_chain, "#{name} - #{details.inspect} - partial: #{!!options[:_partial]}")
+     end
+ 
+     def template_exists?(name, details, options)
+-      view_paths.exists?(name, details, options[:_prefix], options[:_partial])
++      with_template_inheritance(options[:_prefix]) do |c, prefix|
++        return true if c.view_paths.exists?(name, details, prefix, options[:_partial])
++      end
++      false
+     end
+ 
+     def with_template_cache(name)
+       yield
+     end
+ 
++    def with_template_inheritance(prefix)
++      yield self, prefix
++      k = self.class.superclass
++      while not k.abstract?
++        yield k, k.controller_path
++        k = k.superclass
++      end
++    end
++
+     def format_for_text
+       Mime[:text]
+     end
+@@ -212,4 +232,4 @@ module AbstractController
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/actionpack/lib/action_view/render/partials.rb b/actionpack/lib/action_view/render/partials.rb
+index 8c936ae..55e0976 100644
+--- a/actionpack/lib/action_view/render/partials.rb
++++ b/actionpack/lib/action_view/render/partials.rb
+@@ -307,6 +307,7 @@ module ActionView
+       def _find_template(path)
+         if controller = @view.controller
+           prefix = controller.controller_path unless path.include?(?/)
++          return controller.send(:find_template, path, {:formats => @view.formats}, {:_prefix => prefix, :_partial => true})
+         end
+ 
+         @view.find(path, {:formats => @view.formats}, prefix, true)
+diff --git a/actionpack/test/controller/new_base/render_partial_test.rb b/actionpack/test/controller/new_base/render_partial_test.rb
+index 8fddcbc..a509805 100644
+--- a/actionpack/test/controller/new_base/render_partial_test.rb
++++ b/actionpack/test/controller/new_base/render_partial_test.rb
+@@ -6,7 +6,7 @@ module RenderPartial
+     
+     self.view_paths = [ActionView::FixtureResolver.new(
+       "render_partial/basic/_basic.html.erb"    => "OMG!",
+-      "render_partial/basic/basic.html.erb"      => "<%= @test_unchanged = 'goodbye' %><%= render :partial => 'basic' %><%= @test_unchanged %>"
++      "render_partial/basic/basic.html.erb"     => "<%= @test_unchanged = 'goodbye' %><%= render :partial => 'basic' %><%= @test_unchanged %>"
+     )]
+     
+     def changing
+@@ -14,6 +14,8 @@ module RenderPartial
+       render :action => "basic"
+     end    
+   end
++
++  class ChildController < BasicController; end
+   
+   class TestPartial < Rack::TestCase
+     testing BasicController
+@@ -23,5 +25,13 @@ module RenderPartial
+       assert_response("goodbyeOMG!goodbye")
+     end
+   end
+-  
++
++  class TestInheritedPartial < Rack::TestCase
++    testing ChildController
++
++    test "partial from parent controller gets picked if missing in child one" do
++      get :changing
++      assert_response("goodbyeOMG!goodbye")
++    end
++  end
+ end
+diff --git a/actionpack/test/controller/new_base/render_test.rb b/actionpack/test/controller/new_base/render_test.rb
+index d985d9f..166b819 100644
+--- a/actionpack/test/controller/new_base/render_test.rb
++++ b/actionpack/test/controller/new_base/render_test.rb
+@@ -6,7 +6,8 @@ module Render
+       "render/blank_render/index.html.erb"                  => "Hello world!",
+       "render/blank_render/access_request.html.erb"         => "The request: <%= request.method.to_s.upcase %>",
+       "render/blank_render/access_action_name.html.erb"     => "Action Name: <%= action_name %>",
+-      "render/blank_render/access_controller_name.html.erb" => "Controller Name: <%= controller_name %>"
++      "render/blank_render/access_controller_name.html.erb" => "Controller Name: <%= controller_name %>",
++      "render/blank_render/overriden.html.erb"              => "parent content"
+     )]
+ 
+     def index
+@@ -21,6 +22,9 @@ module Render
+       render :action => "access_action_name"
+     end
+ 
++    def overriden
++    end
++
+     private
+ 
+     def secretz
+@@ -28,6 +32,12 @@ module Render
+     end
+   end
+ 
++  class ChildRenderController < BlankRenderController
++    self.view_paths = [ActionView::FixtureResolver.new(
++      "render/child_render/overriden.html.erb" => "child content"
++    )]
++  end
++
+   class DoubleRenderController < ActionController::Base
+     def index
+       render :text => "hello"
+@@ -82,4 +92,16 @@ module Render
+       assert_body "Controller Name: blank_render"
+     end
+   end
++
++  class TestViewInheritance < Rack::TestCase
++    test "Tempate from child contrller gets picked over parent one" do
++      get "/render/child_render/overriden"
++      assert_body "child content"
++    end
++
++    test "Tempate from parent contrller gets picked if missing in child controller" do
++      get "/render/child_render/index"
++      assert_body "Hello world!"
++    end
++  end
+ end
+-- 
+1.6.0.4
+

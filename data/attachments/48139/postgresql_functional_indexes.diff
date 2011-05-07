@@ -1,0 +1,203 @@
+From 5ec695780d9fabd0d4000e66b7bb58497ef73c64 Mon Sep 17 00:00:00 2001
+From: Philip Hallstrom <philip@pjkh.com>
+Date: Tue, 23 Sep 2008 14:12:02 -0700
+Subject: [PATCH] patch and tests to allow postgresql functional indexes via add_index....:functional => '...'
+
+---
+ .../abstract/schema_statements.rb                  |   14 +++++++++-
+ .../connection_adapters/abstract_adapter.rb        |    6 ++++
+ .../connection_adapters/postgresql_adapter.rb      |   27 +++++++++----------
+ activerecord/lib/active_record/schema_dumper.rb    |   10 ++++++-
+ activerecord/test/cases/migration_test.rb          |    3 ++
+ activerecord/test/cases/schema_dumper_test.rb      |    9 ++++++
+ .../test/schema/postgresql_specific_schema.rb      |    2 +-
+ activerecord/test/schema/schema.rb                 |    2 +
+ 8 files changed, 56 insertions(+), 17 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+index bececf8..f2a3520 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+@@ -252,17 +252,25 @@ module ActiveRecord
+       #  add_index(:accounts, [:branch_id, :party_id], :unique => true, :name => 'by_branch_party')
+       # generates
+       #  CREATE UNIQUE INDEX by_branch_party ON accounts(branch_id, party_id)
++      # ====== Creating a functional index (if supported)
++      #  add_index(:accounts, :name, :functional => 'lower(name)')
++      # generates (if supported)
++      #  CREATE INDEX accounts_name_index ON accounts(lower(name))
++      # generates (if not supported)
++      #  CREATE INDEX accounts_name_index ON accounts(name)
+       def add_index(table_name, column_name, options = {})
+         column_names = Array(column_name)
+         index_name   = index_name(table_name, :column => column_names)
++        functional   = nil
+ 
+         if Hash === options # legacy support, since this param was a string
+           index_type = options[:unique] ? "UNIQUE" : ""
+           index_name = options[:name] || index_name
++          functional = options[:functional] if supports_functional_indexes?
+         else
+           index_type = options
+         end
+-        quoted_column_names = column_names.map { |e| quote_column_name(e) }.join(", ")
++        quoted_column_names = functional.nil? ? column_names.map { |e| quote_column_name(e) }.join(", ") : functional
+         execute "CREATE #{index_type} INDEX #{quote_column_name(index_name)} ON #{quote_table_name(table_name)} (#{quoted_column_names})"
+       end
+ 
+@@ -280,6 +288,10 @@ module ActiveRecord
+         execute "DROP INDEX #{quote_column_name(index_name(table_name, options))} ON #{table_name}"
+       end
+ 
++      def column_names_from_index_name(table_name, index_name) #:nodoc:
++        index_name.sub(/^index_#{table_name}_on_/, '').split('_and_')
++      end
++
+       def index_name(table_name, options) #:nodoc:
+         if Hash === options # legacy support
+           if options[:column]
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index 7c37916..3335309 100755
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -49,6 +49,12 @@ module ActiveRecord
+         false
+       end
+ 
++      # Does this adapter support functional indexes? Backend specific, as the
++      # abstract adapter always returns +false+.
++      def supports_functional_indexes?
++        false
++      end
++
+       # Does this adapter support using DISTINCT within COUNT?  This is +true+
+       # for all adapters except sqlite.
+       def supports_count_distinct?
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index bebab5d..7b686a3 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -345,6 +345,10 @@ module ActiveRecord
+         @table_alias_length ||= (postgresql_version >= 80000 ? query('SHOW max_identifier_length')[0][0].to_i : 63)
+       end
+ 
++      def supports_functional_indexes?
++        true
++      end
++
+       # QUOTING ==================================================
+ 
+       # Quotes PostgreSQL-specific data types for SQL input.
+@@ -625,20 +629,15 @@ module ActiveRecord
+       def indexes(table_name, name = nil)
+          schemas = schema_search_path.split(/,/).map { |p| quote(p) }.join(',')
+          result = query(<<-SQL, name)
+-           SELECT distinct i.relname, d.indisunique, a.attname
+-             FROM pg_class t, pg_class i, pg_index d, pg_attribute a
+-           WHERE i.relkind = 'i'
+-             AND d.indexrelid = i.oid
+-             AND d.indisprimary = 'f'
+-             AND t.oid = d.indrelid
+-             AND t.relname = '#{table_name}'
+-             AND i.relnamespace IN (SELECT oid FROM pg_namespace WHERE nspname IN (#{schemas}) )
+-             AND a.attrelid = t.oid
+-             AND ( d.indkey[0]=a.attnum OR d.indkey[1]=a.attnum
+-                OR d.indkey[2]=a.attnum OR d.indkey[3]=a.attnum
+-                OR d.indkey[4]=a.attnum OR d.indkey[5]=a.attnum
+-                OR d.indkey[6]=a.attnum OR d.indkey[7]=a.attnum
+-                OR d.indkey[8]=a.attnum OR d.indkey[9]=a.attnum )
++          SELECT distinct i.relname, d.indisunique, pg_get_indexdef(i.oid, a.attnum, false)
++            FROM pg_class t, pg_class i, pg_index d, pg_attribute a
++          WHERE i.relkind = 'i'
++            AND d.indexrelid = i.oid
++            AND d.indisprimary = 'f'
++            AND t.oid = d.indrelid
++            AND t.relname = '#{table_name}'
++            AND i.relnamespace IN (SELECT oid FROM pg_namespace WHERE nspname IN (#{schemas}) )
++            AND a.attrelid = i.oid
+           ORDER BY i.relname
+         SQL
+ 
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index 4f96e22..0908845 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -160,8 +160,16 @@ HEADER
+       
+       def indexes(table, stream)
+         indexes = @connection.indexes(table)
++        column_names = @connection.columns(table).map(&:name)
+         indexes.each do |index|
+-          stream.print "  add_index #{index.table.inspect}, #{index.columns.inspect}, :name => #{index.name.inspect}"
++          stream.print "  add_index #{index.table.inspect}"
++          if @connection.supports_functional_indexes? && index.columns.size == 1 && !column_names.include?(index.columns.first)
++            stream.print ", #{@connection.column_names_from_index_name(table, index.name).inspect}"
++            stream.print ", :functional => \"#{index.columns.first}\""
++          else
++            stream.print ", #{index.columns.inspect}"
++          end
++          stream.print ", :name => #{index.name.inspect}"
+           stream.print ", :unique => true" if index.unique
+           stream.puts
+         end
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index ac44dd7..081cc46 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -63,6 +63,9 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert_nothing_raised { Person.connection.add_index("people", "last_name") }
+       assert_nothing_raised { Person.connection.remove_index("people", "last_name") }
+ 
++      assert_nothing_raised { Person.connection.add_index("people", "last_name", :functional => "LOWER(last_name)") }
++      assert_nothing_raised { Person.connection.remove_index("people", "last_name") }
++
+       # Orcl nds shrt indx nms.  Sybs 2.
+       # OpenBase does not have named indexes.  You must specify a single column name
+       unless current_adapter?(:OracleAdapter, :SybaseAdapter, :OpenBaseAdapter)
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index ee7e285..ce07c59 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -11,6 +11,15 @@ class SchemaDumperTest < ActiveRecord::TestCase
+     stream.string
+   end
+ 
++  def test_schema_dump_functional_indexes
++    output = standard_dump
++    if current_adapter?(:PostgreSQLAdapter)
++      assert_match %r{add_index "authors", \["name"\], :functional => "lower\(\(name\)::text\)", :name => "index_authors_on_name"}, output
++    else
++      assert_match %r{add_index "authors", \["name"\], :name => "index_authors_on_name"}, output
++    end
++  end
++
+   def test_schema_dump
+     output = standard_dump
+     assert_match %r{create_table "accounts"}, output
+diff --git a/activerecord/test/schema/postgresql_specific_schema.rb b/activerecord/test/schema/postgresql_specific_schema.rb
+index 576a4d0..7bfa22f 100644
+--- a/activerecord/test/schema/postgresql_specific_schema.rb
++++ b/activerecord/test/schema/postgresql_specific_schema.rb
+@@ -100,4 +100,4 @@ _SQL
+     obj_id OID
+   );
+ _SQL
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index ab5c7c5..83edcbb 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -37,6 +37,8 @@ ActiveRecord::Schema.define do
+     t.integer :author_address_extra_id
+   end
+ 
++  add_index :authors, :name, :functional => "LOWER(name)"
++
+   create_table :author_addresses, :force => true do |t|
+   end
+ 
+-- 
+1.5.6.2
+

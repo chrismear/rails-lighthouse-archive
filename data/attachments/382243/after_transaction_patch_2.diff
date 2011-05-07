@@ -1,0 +1,729 @@
+From 76e1b7cf9f84ebf47c419b58889adb8ca2efe66f Mon Sep 17 00:00:00 2001
+From: Brian Durand <bdurand@bdurand.local>
+Date: Tue, 2 Jun 2009 14:42:22 -0500
+Subject: [PATCH] add after_commit and after_rollback callbacks to active_record
+
+---
+ .../abstract/database_statements.rb                |   58 +++++-
+ activerecord/lib/active_record/transactions.rb     |  131 ++++++++++--
+ .../test/cases/transaction_callbacks_test.rb       |  243 ++++++++++++++++++++
+ activerecord/test/cases/transactions_test.rb       |   61 ++++--
+ 4 files changed, 464 insertions(+), 29 deletions(-)
+ create mode 100644 activerecord/test/cases/transaction_callbacks_test.rb
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+index 027d736..1a2b31d 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+@@ -122,6 +122,8 @@ module ActiveRecord
+         requires_new = options[:requires_new] || !last_transaction_joinable
+ 
+         transaction_open = false
++        @_current_transaction_records ||= []
++
+         begin
+           if block_given?
+             if requires_new || open_transactions == 0
+@@ -132,6 +134,7 @@ module ActiveRecord
+               end
+               increment_open_transactions
+               transaction_open = true
++              @_current_transaction_records.push([])
+             end
+             yield
+           end
+@@ -141,8 +144,10 @@ module ActiveRecord
+             decrement_open_transactions
+             if open_transactions == 0
+               rollback_db_transaction
++              rollback_transaction_records(true)
+             else
+               rollback_to_savepoint
++              rollback_transaction_records(false)
+             end
+           end
+           raise unless database_transaction_rollback.is_a?(ActiveRecord::Rollback)
+@@ -157,20 +162,35 @@ module ActiveRecord
+           begin
+             if open_transactions == 0
+               commit_db_transaction
++              commit_transaction_records
+             else
+               release_savepoint
++              save_point_records = @_current_transaction_records.pop
++              unless save_point_records.blank?
++                @_current_transaction_records.push([]) if @_current_transaction_records.empty?
++                @_current_transaction_records.last.concat(save_point_records)
++              end
+             end
+           rescue Exception => database_transaction_rollback
+             if open_transactions == 0
+               rollback_db_transaction
++              rollback_transaction_records(true)
+             else
+               rollback_to_savepoint
++              rollback_transaction_records(false)
+             end
+             raise
+           end
+         end
+       end
+-
++      
++      # Register a record with the current transaction so that its after_commit and after_rollback callbacks
++      # can be called.
++      def add_transaction_record (record)
++        last_batch = @_current_transaction_records.last
++        last_batch << record if last_batch
++      end
++      
+       # Begins the transaction (and turns off auto-committing).
+       def begin_db_transaction()    end
+ 
+@@ -245,6 +265,42 @@ module ActiveRecord
+             limit.to_i
+           end
+         end
++        
++        # Send a rollback message to all records after they have been rolled back. If rollback
++        # is false, only rollback records since the last save point.
++        def rollback_transaction_records (rollback) #:nodoc
++          if rollback
++            records = @_current_transaction_records.flatten
++            @_current_transaction_records.clear
++          else
++            records = @_current_transaction_records.pop
++          end
++          
++          unless records.blank?
++            records.uniq.each do |record|
++              begin
++                record.rolledback!(rollback)
++              rescue Exception => e
++                record.logger.error(e) if record.respond_to?(:logger)
++              end
++            end
++          end
++        end
++        
++        # Send a commit message to all records after they have been committed.
++        def commit_transaction_records #:nodoc
++          records = @_current_transaction_records.flatten
++          @_current_transaction_records.clear
++          unless records.blank?
++            records.uniq.each do |record|
++              begin
++                record.committed!
++              rescue Exception => e
++                record.logger.error(e) if record.respond_to?(:logger)
++              end
++            end
++          end
++        end
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/transactions.rb b/activerecord/lib/active_record/transactions.rb
+index cf0fe89..4de7d5d 100644
+--- a/activerecord/lib/active_record/transactions.rb
++++ b/activerecord/lib/active_record/transactions.rb
+@@ -12,6 +12,9 @@ module ActiveRecord
+       [:destroy, :save, :save!].each do |method|
+         alias_method_chain method, :transactions
+       end
++
++      define_model_callbacks :commit, :commit_on_update, :commit_on_create, :commit_on_destroy, :only => :after
++      define_model_callbacks :rollback, :rollback_on_update, :rollback_on_create, :rollback_on_destroy
+     end
+ 
+     # Transactions are protective blocks where SQL statements are only permanent
+@@ -108,7 +111,7 @@ module ActiveRecord
+     #     rescue ActiveRecord::StatementInvalid
+     #       # ...which we ignore.
+     #     end
+-    #     
++    #
+     #     # On PostgreSQL, the transaction is now unusable. The following
+     #     # statement will cause a PostgreSQL error, even though the unique
+     #     # constraint is no longer violated:
+@@ -132,7 +135,7 @@ module ActiveRecord
+     #       raise ActiveRecord::Rollback
+     #     end
+     #   end
+-    #   
++    #
+     #   User.find(:all)  # => empty
+     #
+     # It is also possible to requires a sub-transaction by passing
+@@ -147,7 +150,7 @@ module ActiveRecord
+     #       raise ActiveRecord::Rollback
+     #     end
+     #   end
+-    #   
++    #
+     #   User.find(:all)  # => Returns only Kotori
+     #
+     # Most databases don't support true nested transactions. At the time of
+@@ -157,6 +160,26 @@ module ActiveRecord
+     # http://dev.mysql.com/doc/refman/5.0/en/savepoints.html
+     # for more information about savepoints.
+     #
++    # === Callbacks
++    #
++    # There are two types of callbacks associated with committing and rolling back transactions:
++    # after_commit and after_rollback.
++    #
++    # The after_commit callbacks are called on every record saved or destroyed within a
++    # transaction immediately after the  transaction is committed. The after_rollback callbacks
++    # are called on every record saved or destroyed within a transaction immediately after the
++    # transaction or savepoint is rolled back.
++    #
++    # Additionally, there are callbacks for after_commit_on_create, after_rollback_on_create,
++    # after_commit_on_update, after_rollback_on_update, after_commit_on_destroy, and
++    # after_rollback_on_destroy which are only called if a record is created, updated or destroyed
++    # in the transaction.
++    #
++    # These callbacks are useful for interacting with other systems since you will be guaranteed
++    # that the callback is only executed when the database is in a permanent state. For example,
++    # after_commit is a good spot to put in a hook to clearing a cache since clearing it from
++    # within a transaction could trigger the cache to be regenerated before the database is updated.
++    #
+     # === Caveats
+     #
+     # If you're on MySQL, then do not use DDL operations in nested transactions
+@@ -166,7 +189,7 @@ module ActiveRecord
+     # is finished and tries to release the savepoint it created earlier, a
+     # database error will occur because the savepoint has already been
+     # automatically released. The following example demonstrates the problem:
+-    # 
++    #
+     #   Model.connection.transaction do                           # BEGIN
+     #     Model.connection.transaction(:requires_new => true) do  # CREATE SAVEPOINT active_record_1
+     #       Model.connection.create_table(...)                    # active_record_1 now automatically released
+@@ -197,24 +220,55 @@ module ActiveRecord
+     end
+ 
+     def save_with_transactions! #:nodoc:
+-      rollback_active_record_state! { self.class.transaction { save_without_transactions! } }
++      with_transaction_returning_status(:save_without_transactions!)
+     end
+ 
+     # Reset id and @new_record if the transaction rolls back.
+     def rollback_active_record_state!
+-      id_present = has_attribute?(self.class.primary_key)
+-      previous_id = id
+-      previous_new_record = new_record?
++      remember_transaction_record_state
+       yield
+     rescue Exception
+-      @new_record = previous_new_record
+-      if id_present
+-        self.id = previous_id
++      restore_transaction_record_state
++      raise
++    ensure
++      clear_transaction_record_state
++    end
++
++    # Call the after_commit callbacks
++    def committed! #:nodoc:
++      if transaction_record_state(:new_record)
++        _run_commit_on_create_callbacks
++      elsif transaction_record_state(:destroyed)
++        _run_commit_on_destroy_callbacks
+       else
+-        @attributes.delete(self.class.primary_key)
+-        @attributes_cache.delete(self.class.primary_key)
++        _run_commit_on_update_callbacks
++      end
++      _run_commit_callbacks
++    ensure
++      clear_transaction_record_state
++    end
++
++    # Call the after rollback callbacks. The restore_state argument indicates if the record
++    # state should be rolled back to the beginning or just to the last savepoint.
++    def rolledback! (force_restore_state = false) #:nodoc:
++      if transaction_record_state(:new_record)
++        _run_rollback_on_create_callbacks
++      elsif transaction_record_state(:destroyed)
++        _run_rollback_on_destroy_callbacks
++      else
++        _run_rollback_on_update_callbacks
++      end
++      _run_rollback_callbacks
++    ensure
++      restore_transaction_record_state(force_restore_state)
++    end
++
++    # Add the record to the current transaction so that the :after_rollback and :after_commit callbacks
++    # can be called.
++    def add_to_transaction
++      if self.class.connection.add_transaction_record(self)
++        remember_transaction_record_state
+       end
+-      raise
+     end
+ 
+     # Executes +method+ within a transaction and captures its return value as a
+@@ -226,10 +280,59 @@ module ActiveRecord
+     def with_transaction_returning_status(method, *args)
+       status = nil
+       self.class.transaction do
++        add_to_transaction
+         status = send(method, *args)
+         raise ActiveRecord::Rollback unless status
+       end
+       status
+     end
++
++    protected
++
++    # Save the new record state and id of a record so it can be restored later if a transaction fails.
++    def remember_transaction_record_state #:nodoc
++      @_start_transaction_state ||= {}
++      unless @_start_transaction_state.include?(:new_record)
++        @_start_transaction_state[:id] = id if has_attribute?(self.class.primary_key)
++        @_start_transaction_state[:new_record] = @new_record
++      end
++      unless @_start_transaction_state.include?(:destroyed)
++        @_start_transaction_state[:destroyed] = @new_record
++      end
++      @_start_transaction_state[:level] = (@_start_transaction_state[:level] || 0) + 1
++    end
++
++    # Clear the new record state and id of a record.
++    def clear_transaction_record_state #:nodoc
++      if defined?(@_start_transaction_state)
++        @_start_transaction_state[:level] = (@_start_transaction_state[:level] || 0) - 1
++        remove_instance_variable(:@_start_transaction_state) if @_start_transaction_state[:level] < 1
++      end
++    end
++
++    # Restore the new record state and id of a record that was previously saved by a call to save_record_state.
++    def restore_transaction_record_state (force = false) #:nodoc
++      if defined?(@_start_transaction_state)
++        @_start_transaction_state[:level] = (@_start_transaction_state[:level] || 0) - 1
++        if @_start_transaction_state[:level] < 1
++          restore_state = remove_instance_variable(:@_start_transaction_state)
++          if restore_state
++            @new_record = restore_state[:new_record]
++            @destroyed = restore_state[:destroyed]
++            if restore_state[:id]
++              self.id = restore_state[:id]
++            else
++              @attributes.delete(self.class.primary_key)
++              @attributes_cache.delete(self.class.primary_key)
++            end
++          end
++        end
++      end
++    end
++
++    # Determine if a record was created or destroyed in a transaction. State should be one of :new_record or :destroyed.
++    def transaction_record_state (state) #:nodoc
++      @_start_transaction_state[state] if defined?(@_start_transaction_state)
++    end
+   end
+ end
+diff --git a/activerecord/test/cases/transaction_callbacks_test.rb b/activerecord/test/cases/transaction_callbacks_test.rb
+new file mode 100644
+index 0000000..df9f1ca
+--- /dev/null
++++ b/activerecord/test/cases/transaction_callbacks_test.rb
+@@ -0,0 +1,243 @@
++require "cases/helper"
++require 'models/topic'
++require 'models/reply'
++
++class TransactionCallbacksTest < ActiveRecord::TestCase
++  self.use_transactional_fixtures = false
++  fixtures :topics
++
++  class TopicWithCallbacks < ActiveRecord::Base
++    set_table_name :topics
++
++    after_commit{|record| record.send(:do_after_commit, nil)}
++    after_commit_on_create{|record| record.send(:do_after_commit, :create)}
++    after_commit_on_update{|record| record.send(:do_after_commit, :update)}
++    after_commit_on_destroy{|record| record.send(:do_after_commit, :destroy)}
++    after_rollback{|record| record.send(:do_after_rollback, nil)}
++    after_rollback_on_create{|record| record.send(:do_after_rollback, :create)}
++    after_rollback_on_update{|record| record.send(:do_after_rollback, :update)}
++    after_rollback_on_destroy{|record| record.send(:do_after_rollback, :destroy)}
++
++    def history
++      @history ||= []
++    end
++
++    def after_commit_block (on = nil, &block)
++      @after_commit ||= {}
++      @after_commit[on] ||= []
++      @after_commit[on] << block
++    end
++
++    def after_rollback_block (on = nil, &block)
++      @after_rollback ||= {}
++      @after_rollback[on] ||= []
++      @after_rollback[on] << block
++    end
++
++    def do_after_commit (on)
++      blocks = @after_commit[on] if @after_commit
++      blocks.each{|b| b.call(self)} if blocks
++    end
++
++    def do_after_rollback (on)
++      blocks = @after_rollback[on] if @after_rollback
++      blocks.each{|b| b.call(self)} if blocks
++    end
++  end
++
++  def setup
++    @first, @second = TopicWithCallbacks.find(1, 3).sort_by { |t| t.id }
++  end
++
++  def test_call_after_commit_after_transaction_commits
++    @first.after_commit_block{|r| r.history << :after_commit}
++    @first.after_rollback_block{|r| r.history << :after_rollback}
++
++    @first.save!
++    assert @first.history, [:after_commit]
++  end
++
++  def test_only_call_after_commit_on_update_after_transaction_commits_for_existing_record
++    commit_callback = []
++    @first.after_commit_block(:create){|r| r.history << :commit_on_create}
++    @first.after_commit_block(:update){|r| r.history << :commit_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :commit_on_destroy}
++    @first.after_commit_block(:create){|r| r.history << :rollback_on_create}
++    @first.after_commit_block(:update){|r| r.history << :rollback_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :rollback_on_destroy}
++
++    @first.save!
++    assert @first.history, [:commit_on_update]
++  end
++
++  def test_only_call_after_commit_on_destroy_after_transaction_commits_for_destroyed_record
++    commit_callback = []
++    @first.after_commit_block(:create){|r| r.history << :commit_on_create}
++    @first.after_commit_block(:update){|r| r.history << :commit_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :commit_on_destroy}
++    @first.after_commit_block(:create){|r| r.history << :rollback_on_create}
++    @first.after_commit_block(:update){|r| r.history << :rollback_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :rollback_on_destroy}
++
++    @first.destroy
++    assert @first.history, [:commit_on_destroy]
++  end
++
++  def test_only_call_after_commit_on_create_after_transaction_commits_for_new_record
++    @new_record = TopicWithCallbacks.new(:title => "New topic", :written_on => Date.today)
++    @new_record.after_commit_block(:create){|r| r.history << :commit_on_create}
++    @new_record.after_commit_block(:update){|r| r.history << :commit_on_update}
++    @new_record.after_commit_block(:destroy){|r| r.history << :commit_on_destroy}
++    @new_record.after_commit_block(:create){|r| r.history << :rollback_on_create}
++    @new_record.after_commit_block(:update){|r| r.history << :rollback_on_update}
++    @new_record.after_commit_block(:destroy){|r| r.history << :rollback_on_destroy}
++
++    @new_record.save!
++    assert @new_record.history, [:commit_on_create]
++  end
++
++  def test_call_after_rollback_after_transaction_rollsback
++    @first.after_commit_block{|r| r.history << :after_commit}
++    @first.after_rollback_block{|r| r.history << :after_rollback}
++
++    Topic.transaction do
++      @first.save!
++      raise ActiveRecord::Rollback
++    end
++
++    assert @first.history, [:after_rollback]
++  end
++
++  def test_only_call_after_rollback_on_update_after_transaction_rollsback_for_existing_record
++    commit_callback = []
++    @first.after_commit_block(:create){|r| r.history << :commit_on_create}
++    @first.after_commit_block(:update){|r| r.history << :commit_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :commit_on_destroy}
++    @first.after_commit_block(:create){|r| r.history << :rollback_on_create}
++    @first.after_commit_block(:update){|r| r.history << :rollback_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :rollback_on_destroy}
++
++    Topic.transaction do
++      @first.save!
++      raise ActiveRecord::Rollback
++    end
++
++    assert @first.history, [:rollback_on_update]
++  end
++
++  def test_only_call_after_rollback_on_destroy_after_transaction_rollsback_for_destroyed_record
++    commit_callback = []
++    @first.after_commit_block(:create){|r| r.history << :commit_on_create}
++    @first.after_commit_block(:update){|r| r.history << :commit_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :commit_on_update}
++    @first.after_commit_block(:create){|r| r.history << :rollback_on_create}
++    @first.after_commit_block(:update){|r| r.history << :rollback_on_update}
++    @first.after_commit_block(:destroy){|r| r.history << :rollback_on_destroy}
++
++    Topic.transaction do
++      @first.destroy
++      raise ActiveRecord::Rollback
++    end
++
++    assert @first.history, [:rollback_on_destroy]
++  end
++
++  def test_only_call_after_rollback_on_create_after_transaction_rollsback_for_new_record
++    @new_record = TopicWithCallbacks.new(:title => "New topic", :written_on => Date.today)
++    @new_record.after_commit_block(:create){|r| r.history << :commit_on_create}
++    @new_record.after_commit_block(:update){|r| r.history << :commit_on_update}
++    @new_record.after_commit_block(:destroy){|r| r.history << :commit_on_destroy}
++    @new_record.after_commit_block(:create){|r| r.history << :rollback_on_create}
++    @new_record.after_commit_block(:update){|r| r.history << :rollback_on_update}
++    @new_record.after_commit_block(:destroy){|r| r.history << :rollback_on_destroy}
++
++    Topic.transaction do
++      @new_record.save!
++      raise ActiveRecord::Rollback
++    end
++
++    assert @new_record.history, [:rollback_on_create]
++  end
++
++  def test_call_after_rollback_when_commit_fails
++    @first.connection.class.send(:alias_method, :real_method_commit_db_transaction, :commit_db_transaction)
++    begin
++      @first.connection.class.class_eval do
++        def commit_db_transaction; raise "boom!"; end
++      end
++
++      @first.after_commit_block{|r| r.history << :after_commit}
++      @first.after_rollback_block{|r| r.history << :after_rollback}
++
++      assert !@first.save rescue nil
++      assert @first.history == [:after_rollback]
++    ensure
++      @first.connection.class.send(:alias_method, :commit_db_transaction, :real_method_commit_db_transaction)
++    end
++  end
++
++  def test_only_call_after_rollback_on_records_rolled_back_to_a_savepoint
++    def @first.rollbacks(i=0); @rollbacks ||= 0; @rollbacks += i if i; end
++    def @first.commits(i=0); @commits ||= 0; @commits += i if i; end
++    @first.after_rollback_block{|r| r.rollbacks(1)}
++    @first.after_commit_block{|r| r.commits(1)}
++
++    def @second.rollbacks(i=0); @rollbacks ||= 0; @rollbacks += i if i; end
++    def @second.commits(i=0); @commits ||= 0; @commits += i if i; end
++    @second.after_rollback_block{|r| r.rollbacks(1)}
++    @second.after_commit_block{|r| r.commits(1)}
++
++    Topic.transaction do
++      @first.save!
++      Topic.transaction(:requires_new => true) do
++        @second.save!
++        raise ActiveRecord::Rollback
++      end
++    end
++
++    assert 1, @first.commits
++    assert 0, @first.rollbacks
++    assert 1, @second.commits
++    assert 1, @second.rollbacks
++  end
++
++  def test_only_call_after_rollback_on_records_rolled_back_to_a_savepoint_when_release_savepoint_fails
++    def @first.rollbacks(i=0); @rollbacks ||= 0; @rollbacks += i if i; end
++    def @first.commits(i=0); @commits ||= 0; @commits += i if i; end
++
++    @second.after_rollback_block{|r| r.rollbacks(1)}
++    @second.after_commit_block{|r| r.commits(1)}
++
++    Topic.transaction do
++      @first.save
++      Topic.transaction(:requires_new => true) do
++        @first.save!
++        raise ActiveRecord::Rollback
++      end
++      Topic.transaction(:requires_new => true) do
++        @first.save!
++        raise ActiveRecord::Rollback
++      end
++    end
++
++    assert 1, @first.commits
++    assert 2, @first.rollbacks
++  end
++
++  def test_after_transaction_callbacks_should_not_raise_errors
++    def @first.last_after_transaction_error=(e); @last_transaction_error = e; end
++    def @first.last_after_transaction_error; @last_transaction_error; end
++    @first.after_commit_block{|r| r.last_after_transaction_error = :commit; raise "fail!";}
++    @first.after_rollback_block{|r| r.last_after_transaction_error = :rollback; raise "fail!";}
++
++    @first.save!
++    assert_equal @first.last_after_transaction_error, :commit
++
++    Topic.transaction do
++      @first.save!
++      raise ActiveRecord::Rollback
++    end
++
++    assert_equal @first.last_after_transaction_error, :rollback
++  end
++end
+diff --git a/activerecord/test/cases/transactions_test.rb b/activerecord/test/cases/transactions_test.rb
+index aca70b4..55f92ef 100644
+--- a/activerecord/test/cases/transactions_test.rb
++++ b/activerecord/test/cases/transactions_test.rb
+@@ -261,22 +261,22 @@ class TransactionTest < ActiveRecord::TestCase
+     assert !@first.reload.approved?
+     assert !@second.reload.approved?
+   end if Topic.connection.supports_savepoints?
+-  
++
+   def test_many_savepoints
+     Topic.transaction do
+       @first.content = "One"
+       @first.save!
+-      
++
+       begin
+         Topic.transaction :requires_new => true do
+           @first.content = "Two"
+           @first.save!
+-          
++
+           begin
+             Topic.transaction :requires_new => true do
+               @first.content = "Three"
+               @first.save!
+-              
++
+               begin
+                 Topic.transaction :requires_new => true do
+                   @first.content = "Four"
+@@ -285,22 +285,22 @@ class TransactionTest < ActiveRecord::TestCase
+                 end
+               rescue
+               end
+-              
++
+               @three = @first.reload.content
+               raise
+             end
+           rescue
+           end
+-          
++
+           @two = @first.reload.content
+           raise
+         end
+       rescue
+       end
+-      
++
+       @one = @first.reload.content
+     end
+-    
++
+     assert_equal "One", @one
+     assert_equal "Two", @two
+     assert_equal "Three", @three
+@@ -318,7 +318,34 @@ class TransactionTest < ActiveRecord::TestCase
+       end
+     end
+   end
+-  
++
++  def test_restore_active_record_state_for_all_records_in_a_transaction
++    topic_1 = Topic.new(:title => 'test_1')
++    topic_2 = Topic.new(:title => 'test_2')
++    Topic.transaction do
++      assert topic_1.save
++      assert topic_2.save
++      @first.save
++      @second.destroy
++      assert_equal false, topic_1.new_record?
++      assert_not_nil topic_1.id
++      assert_equal false, topic_2.new_record?
++      assert_not_nil topic_2.id
++      assert_equal false, @first.new_record?
++      assert_not_nil @first.id
++      assert_equal true, @second.destroyed?
++      raise ActiveRecord::Rollback
++    end
++
++    assert_equal true, topic_1.new_record?
++    assert_nil topic_1.id
++    assert_equal true, topic_2.new_record?
++    assert_nil topic_2.id
++    assert_equal false, @first.new_record?
++    assert_not_nil @first.id
++    assert_equal false, @second.destroyed?
++  end
++
+   if current_adapter?(:PostgreSQLAdapter) && defined?(PGconn::PQTRANS_IDLE)
+     def test_outside_transaction_works
+       assert Topic.connection.outside_transaction?
+@@ -327,7 +354,7 @@ class TransactionTest < ActiveRecord::TestCase
+       Topic.connection.rollback_db_transaction
+       assert Topic.connection.outside_transaction?
+     end
+-    
++
+     def test_rollback_wont_be_executed_if_no_transaction_active
+       assert_raise RuntimeError do
+         Topic.transaction do
+@@ -337,7 +364,7 @@ class TransactionTest < ActiveRecord::TestCase
+         end
+       end
+     end
+-    
++
+     def test_open_transactions_count_is_reset_to_zero_if_no_transaction_active
+       Topic.transaction do
+         Topic.transaction do
+@@ -357,12 +384,12 @@ class TransactionTest < ActiveRecord::TestCase
+     #
+     # We go back to the connection for the column queries because
+     # Topic.columns is cached and won't report changes to the DB
+-    
++
+     assert_nothing_raised do
+       Topic.reset_column_information
+       Topic.connection.add_column('topics', 'stuff', :string)
+       assert Topic.column_names.include?('stuff')
+-      
++
+       Topic.reset_column_information
+       Topic.connection.remove_column('topics', 'stuff')
+       assert !Topic.column_names.include?('stuff')
+@@ -381,6 +408,12 @@ class TransactionTest < ActiveRecord::TestCase
+   end
+ 
+   private
++    def define_callback_method(callback_method)
++      define_method(callback_method) do
++        self.history << [callback_method, :method]
++      end
++    end
++
+     def add_exception_raising_after_save_callback_to_topic
+       Topic.class_eval "def after_save_for_transaction; raise 'Make the transaction rollback' end"
+     end
+@@ -414,7 +447,7 @@ class TransactionsWithTransactionalFixturesTest < ActiveRecord::TestCase
+ 
+   def test_automatic_savepoint_in_outer_transaction
+     @first = Topic.find(1)
+-    
++
+     begin
+       Topic.transaction do
+         @first.approved = true
+-- 
+1.6.4.1
+

@@ -1,0 +1,1052 @@
+From c04e332aa89503fe5282ba79faa9024d57748b1a Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sat, 2 Aug 2008 17:14:01 +0200
+Subject: [PATCH] Made Date/DateTime/Time/TimeWithZone i18n compatible.
+
+---
+ .../active_support/core_ext/date/conversions.rb    |   30 ++++---
+ .../core_ext/date_time/conversions.rb              |   17 +++-
+ .../active_support/core_ext/time/conversions.rb    |   25 ++++--
+ activesupport/lib/active_support/locale/en-US.rb   |   24 +++++--
+ activesupport/lib/active_support/time_with_zone.rb |   78 ++++++++++----------
+ activesupport/test/i18n_test.rb                    |   44 ++++++------
+ 6 files changed, 125 insertions(+), 93 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/date/conversions.rb b/activesupport/lib/active_support/core_ext/date/conversions.rb
+index d2d9699..0345518 100644
+--- a/activesupport/lib/active_support/core_ext/date/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/date/conversions.rb
+@@ -1,16 +1,18 @@
++require 'active_support/core_ext/kernel'
++require 'active_support/core_ext/module'
++require 'active_support/deprecation'
++
+ module ActiveSupport #:nodoc:
+   module CoreExtensions #:nodoc:
+     module Date #:nodoc:
+       # Converting dates to formatted strings, times, and datetimes.
+       module Conversions
+-        DATE_FORMATS = {
+-          :short        => "%e %b",
+-          :long         => "%B %e, %Y",
++        DEFAULT_FORMATS = {
+           :db           => "%Y-%m-%d",
+           :number       => "%Y%m%d",
+-          :long_ordinal => lambda { |date| date.strftime("%B #{date.day.ordinalize}, %Y") }, # => "April 25th, 2007"
+           :rfc822       => "%e %b %Y"
+-        }
++        }.freeze
++        DATE_FORMATS = {} # should be deprecated
+ 
+         def self.included(base) #:nodoc:
+           base.instance_eval do
+@@ -51,15 +53,17 @@ module ActiveSupport #:nodoc:
+         #   Date::DATE_FORMATS[:month_and_year] = "%B %Y"
+         #   Date::DATE_FORMATS[:short_ordinal] = lambda { |date| date.strftime("%B #{date.day.ordinalize}") }
+         def to_formatted_s(format = :default)
+-          if formatter = DATE_FORMATS[format]
+-            if formatter.respond_to?(:call)
+-              formatter.call(self).to_s
+-            else
+-              strftime(formatter)
+-            end
+-          else
+-            to_default_s
++          # don't allow to overwrite formats that Rails uses internally
++          formats = ::Date::DEFAULT_FORMATS.reverse_merge(::Date::DATE_FORMATS)
++          formatter = formats[format]
++
++          unless formatter
++            formatters = I18n.translate(:"date.formats")
++            formatter  = formatters[format]
+           end
++
++          format_to_localize = formatter.respond_to?(:call) ? formatter.call(self) : formatter
++          I18n.localize(self, :format => format_to_localize)
+         end
+ 
+         # Overrides the default inspect method with a human readable one, e.g., "Mon, 21 Feb 2005"
+diff --git a/activesupport/lib/active_support/core_ext/date_time/conversions.rb b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+index c0175a5..3de74ea 100644
+--- a/activesupport/lib/active_support/core_ext/date_time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+@@ -46,8 +46,17 @@ module ActiveSupport #:nodoc:
+         #   Time::DATE_FORMATS[:month_and_year] = "%B %Y"
+         #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| time.strftime("%B #{time.day.ordinalize}") }
+         def to_formatted_s(format = :default)
+-          return to_default_s unless formatter = ::Time::DATE_FORMATS[format]
+-          formatter.respond_to?(:call) ? formatter.call(self).to_s : strftime(formatter)
++          # don't allow to overwrite formats that Rails uses internally
++          formats = ::Time::DEFAULT_FORMATS.reverse_merge(::Time::DATE_FORMATS)
++          formatter = formats[format]
++
++          unless formatter
++            formatters = I18n.translate(:"datetime.formats")
++            formatter  = formatters[format]
++          end
++
++          format_to_localize = formatter.respond_to?(:call) ? formatter.call(self) : formatter
++          I18n.localize(self, :format => format_to_localize)
+         end
+ 
+         # Returns the +utc_offset+ as an +HH:MM formatted string. Examples:
+@@ -58,7 +67,7 @@ module ActiveSupport #:nodoc:
+         def formatted_offset(colon = true, alternate_utc_string = nil)
+           utc? && alternate_utc_string || utc_offset.to_utc_offset_s(colon)
+         end
+-        
++
+         # Overrides the default inspect method with a human readable one, e.g., "Mon, 21 Feb 2005 14:30:00 +0000"
+         def readable_inspect
+           to_s(:rfc822)
+@@ -84,7 +93,7 @@ module ActiveSupport #:nodoc:
+         def xmlschema
+           strftime("%Y-%m-%dT%H:%M:%S%Z")
+         end if RUBY_VERSION < '1.9'
+-        
++
+         # Converts self to a floating-point number of seconds since the Unix epoch 
+         def to_f
+           days_since_unix_epoch = self - ::DateTime.civil(1970)
+diff --git a/activesupport/lib/active_support/core_ext/time/conversions.rb b/activesupport/lib/active_support/core_ext/time/conversions.rb
+index f42be46..eb68bff 100644
+--- a/activesupport/lib/active_support/core_ext/time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/time/conversions.rb
+@@ -3,15 +3,13 @@ module ActiveSupport #:nodoc:
+     module Time #:nodoc:
+       # Converting times to formatted strings, dates, and datetimes.
+       module Conversions
+-        DATE_FORMATS = {
++        DEFAULT_FORMATS = {
+           :db           => "%Y-%m-%d %H:%M:%S",
+           :number       => "%Y%m%d%H%M%S",
+-          :time         => "%H:%M",
+-          :short        => "%d %b %H:%M",
+-          :long         => "%B %d, %Y %H:%M",
+-          :long_ordinal => lambda { |time| time.strftime("%B #{time.day.ordinalize}, %Y %H:%M") },
+           :rfc822       => "%a, %d %b %Y %H:%M:%S %z"
+-        }
++        }.freeze
++
++        DATE_FORMATS = {} # should be deprecated
+ 
+         def self.included(base) #:nodoc:
+           base.class_eval do
+@@ -45,10 +43,19 @@ module ActiveSupport #:nodoc:
+         #   Time::DATE_FORMATS[:month_and_year] = "%B %Y"
+         #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| time.strftime("%B #{time.day.ordinalize}") }
+         def to_formatted_s(format = :default)
+-          return to_default_s unless formatter = DATE_FORMATS[format]
+-          formatter.respond_to?(:call) ? formatter.call(self).to_s : strftime(formatter)
++          # don't allow to overwrite formats that Rails uses internally
++          formats = ::Time::DEFAULT_FORMATS.reverse_merge(::Time::DATE_FORMATS)
++          formatter = formats[format]
++
++          unless formatter
++            formatters = I18n.translate(:"time.formats")
++            formatter  = formatters[format]
++          end
++
++          format_to_localize = formatter.respond_to?(:call) ? formatter.call(self) : formatter
++          I18n.localize(self, :format => format_to_localize)
+         end
+-        
++
+         # Returns the UTC offset as an +HH:MM formatted string.
+         #
+         #   Time.local(2000).formatted_offset         # => "-06:00"
+diff --git a/activesupport/lib/active_support/locale/en-US.rb b/activesupport/lib/active_support/locale/en-US.rb
+index 51324a9..4720c9d 100644
+--- a/activesupport/lib/active_support/locale/en-US.rb
++++ b/activesupport/lib/active_support/locale/en-US.rb
+@@ -6,9 +6,10 @@ I18n.backend.store_translations :'en-US', {
+   },
+   :date => {
+     :formats => {
+-      :default => "%Y-%m-%d",
+-      :short => "%b %d",
+-      :long => "%B %d, %Y",
++      :default      => "%Y-%m-%d",
++      :short        => "%e %b",
++      :long         => "%B %e, %Y",
++      :long_ordinal => lambda { |date| "%B #{date.day.ordinalize}, %Y" }
+     },
+     :day_names => Date::DAYNAMES,
+     :abbr_day_names => Date::ABBR_DAYNAMES,
+@@ -16,11 +17,22 @@ I18n.backend.store_translations :'en-US', {
+     :abbr_month_names => Date::ABBR_MONTHNAMES,
+     :order => [:year, :month, :day]
+   },
++  :datetime => {
++    :formats => {
++      :default      => "%Y-%m-%dT%H:%M:%S%Z",
++      :time         => "%H:%M",
++      :short        => "%d %b %H:%M",
++      :long         => "%B %d, %Y %H:%M",
++      :long_ordinal => lambda { |datetime| "%B #{datetime.day.ordinalize}, %Y %H:%M" }
++    }
++  },
+   :time => {
+     :formats => {
+-      :default => "%a, %d %b %Y %H:%M:%S %z",
+-      :short => "%d %b %H:%M",
+-      :long => "%B %d, %Y %H:%M",
++      :default      => "%a %b %d %H:%M:%S %Z %Y",
++      :time         => "%H:%M",
++      :short        => "%d %b %H:%M",
++      :long         => "%B %d, %Y %H:%M",
++      :long_ordinal => lambda { |time| "%B #{time.day.ordinalize}, %Y %H:%M" }
+     },
+     :am => 'am',
+     :pm => 'pm'
+diff --git a/activesupport/lib/active_support/time_with_zone.rb b/activesupport/lib/active_support/time_with_zone.rb
+index 4866fa0..4c739ee 100644
+--- a/activesupport/lib/active_support/time_with_zone.rb
++++ b/activesupport/lib/active_support/time_with_zone.rb
+@@ -32,12 +32,12 @@ module ActiveSupport
+   class TimeWithZone
+     include Comparable
+     attr_reader :time_zone
+-  
++
+     def initialize(utc_time, time_zone, local_time = nil, period = nil)
+       @utc, @time_zone, @time = utc_time, time_zone, local_time
+       @period = @utc ? period : get_period_and_ensure_valid_local_time
+     end
+-  
++
+     # Returns a Time or DateTime instance that represents the time in +time_zone+.
+     def time
+       @time ||= period.to_local(@utc)
+@@ -51,7 +51,7 @@ module ActiveSupport
+     alias_method :getgm, :utc
+     alias_method :getutc, :utc
+     alias_method :gmtime, :utc
+-  
++
+     # Returns the underlying TZInfo::TimezonePeriod.
+     def period
+       @period ||= time_zone.period_for_utc(@utc)
+@@ -62,38 +62,38 @@ module ActiveSupport
+       return self if time_zone == new_zone
+       utc.in_time_zone(new_zone)
+     end
+-  
++
+     # Returns a <tt>Time.local()</tt> instance of the simultaneous time in your system's <tt>ENV['TZ']</tt> zone
+     def localtime
+       utc.getlocal
+     end
+     alias_method :getlocal, :localtime
+-  
++
+     def dst?
+       period.dst?
+     end
+     alias_method :isdst, :dst?
+-  
++
+     def utc?
+       time_zone.name == 'UTC'
+     end
+     alias_method :gmt?, :utc?
+-  
++
+     def utc_offset
+       period.utc_total_offset
+     end
+     alias_method :gmt_offset, :utc_offset
+     alias_method :gmtoff, :utc_offset
+-  
++
+     def formatted_offset(colon = true, alternate_utc_string = nil)
+       utc? && alternate_utc_string || utc_offset.to_utc_offset_s(colon)
+     end
+-  
++
+     # Time uses +zone+ to display the time zone abbreviation, so we're duck-typing it.
+     def zone
+       period.zone_identifier.to_s
+     end
+-  
++
+     def inspect
+       "#{time.strftime('%a, %d %b %Y %H:%M:%S')} #{zone} #{formatted_offset}"
+     end
+@@ -122,7 +122,7 @@ module ActiveSupport
+         %("#{time.strftime("%Y/%m/%d %H:%M:%S")} #{formatted_offset(false)}")
+       end
+     end
+-    
++
+     def to_yaml(options = {})
+       if options.kind_of?(YAML::Emitter)
+         utc.to_yaml(options)
+@@ -130,47 +130,47 @@ module ActiveSupport
+         time.to_yaml(options).gsub('Z', formatted_offset(true, 'Z'))
+       end
+     end
+-    
++
+     def httpdate
+       utc.httpdate
+     end
+-  
++
+     def rfc2822
+       to_s(:rfc822)
+     end
+     alias_method :rfc822, :rfc2822
+-  
++
+     # <tt>:db</tt> format outputs time in UTC; all others output time in local.
+     # Uses TimeWithZone's +strftime+, so <tt>%Z</tt> and <tt>%z</tt> work correctly.
+-    def to_s(format = :default) 
++    def to_s(format = :default)
+       return utc.to_s(format) if format == :db
+-      if formatter = ::Time::DATE_FORMATS[format]
++      if formatter = ::Time::DEFAULT_FORMATS.merge(::Time::DATE_FORMATS)[format]
+         formatter.respond_to?(:call) ? formatter.call(self).to_s : strftime(formatter)
+       else
+         "#{time.strftime("%Y-%m-%d %H:%M:%S")} #{formatted_offset(false, 'UTC')}" # mimicking Ruby 1.9 Time#to_s format
+       end
+     end
+-    
++
+     # Replaces <tt>%Z</tt> and <tt>%z</tt> directives with +zone+ and +formatted_offset+, respectively, before passing to
+     # Time#strftime, so that zone information is correct
+     def strftime(format)
+       format = format.gsub('%Z', zone).gsub('%z', formatted_offset(false))
+       time.strftime(format)
+     end
+-  
++
+     # Use the time in UTC for comparisons.
+     def <=>(other)
+       utc <=> other
+     end
+-    
++
+     def between?(min, max)
+       utc.between?(min, max)
+     end
+-    
++
+     def eql?(other)
+       utc == other
+     end
+-    
++
+     def +(other)
+       # If we're adding a Duration of variable length (i.e., years, months, days), move forward from #time,
+       # otherwise move forward from #utc, for accuracy when moving across DST boundaries
+@@ -194,7 +194,7 @@ module ActiveSupport
+         result.in_time_zone(time_zone)
+       end
+     end
+-    
++
+     def since(other)
+       # If we're adding a Duration of variable length (i.e., years, months, days), move forward from #time,
+       # otherwise move forward from #utc, for accuracy when moving across DST boundaries
+@@ -204,7 +204,7 @@ module ActiveSupport
+         utc.since(other).in_time_zone(time_zone)
+       end
+     end
+-    
++
+     def ago(other)
+       since(-other)
+     end
+@@ -218,7 +218,7 @@ module ActiveSupport
+         utc.advance(options).in_time_zone(time_zone)
+       end
+     end
+-    
++
+     %w(year mon month day mday hour min sec).each do |method_name|
+       class_eval <<-EOV
+         def #{method_name}
+@@ -226,45 +226,45 @@ module ActiveSupport
+         end
+       EOV
+     end
+-    
++
+     def usec
+       time.respond_to?(:usec) ? time.usec : 0
+     end
+-    
++
+     def to_a
+       [time.sec, time.min, time.hour, time.day, time.mon, time.year, time.wday, time.yday, dst?, zone]
+     end
+-    
++
+     def to_f
+       utc.to_f
+-    end    
+-    
++    end
++
+     def to_i
+       utc.to_i
+     end
+     alias_method :hash, :to_i
+     alias_method :tv_sec, :to_i
+-  
++
+     # A TimeWithZone acts like a Time, so just return +self+.
+     def to_time
+       self
+     end
+-    
++
+     def to_datetime
+       utc.to_datetime.new_offset(Rational(utc_offset, 86_400))
+     end
+-    
++
+     # So that +self+ <tt>acts_like?(:time)</tt>.
+     def acts_like_time?
+       true
+     end
+-  
++
+     # Say we're a Time to thwart type checking.
+     def is_a?(klass)
+       klass == ::Time || super
+     end
+     alias_method :kind_of?, :is_a?
+-  
++
+     # Neuter freeze because freezing can cause problems with lazy loading of attributes.
+     def freeze
+       self
+@@ -273,7 +273,7 @@ module ActiveSupport
+     def marshal_dump
+       [utc, time_zone.name, time]
+     end
+-    
++
+     def marshal_load(variables)
+       initialize(variables[0].utc, ::Time.send!(:get_zone, variables[1]), variables[2].utc)
+     end
+@@ -290,8 +290,8 @@ module ActiveSupport
+       result = time.__send__(sym, *args, &block)
+       result.acts_like?(:time) ? self.class.new(nil, time_zone, result) : result
+     end
+-    
+-    private      
++
++    private
+       def get_period_and_ensure_valid_local_time
+         # we don't want a Time.local instance enforcing its own DST rules as well, 
+         # so transfer time values to a utc constructor if necessary
+@@ -304,11 +304,11 @@ module ActiveSupport
+           retry
+         end
+       end
+-      
++
+       def transfer_time_values_to_utc_constructor(time)
+         ::Time.utc_time(time.year, time.month, time.day, time.hour, time.min, time.sec, time.respond_to?(:usec) ? time.usec : 0)
+       end
+-      
++
+       def duration_of_variable_length?(obj)
+         ActiveSupport::Duration === obj && obj.parts.flatten.detect {|p| [:years, :months, :days].include? p }
+       end
+diff --git a/activesupport/test/i18n_test.rb b/activesupport/test/i18n_test.rb
+index 4b17e3c..10450d8 100644
+--- a/activesupport/test/i18n_test.rb
++++ b/activesupport/test/i18n_test.rb
+@@ -5,70 +5,70 @@ class I18nTest < Test::Unit::TestCase
+     @date = Date.parse("2008-7-2")
+     @time = Time.utc(2008, 7, 2, 16, 47, 1)
+   end
+-  
++
+   uses_mocha 'I18nTimeZoneTest' do
+     def test_time_zone_localization_with_default_format
+       Time.zone.stubs(:now).returns Time.local(2000)
+-      assert_equal Time.zone.now.strftime("%a, %d %b %Y %H:%M:%S %z"), I18n.localize(Time.zone.now)
++      assert_equal Time.zone.now.strftime("%a %b %d %H:%M:%S %Z %Y"), I18n.localize(Time.zone.now)
+     end
+   end
+-  
++
+   def test_date_localization_should_use_default_format
+     assert_equal @date.strftime("%Y-%m-%d"), I18n.localize(@date)
+   end
+-  
++
+   def test_date_localization_with_default_format
+     assert_equal @date.strftime("%Y-%m-%d"), I18n.localize(@date, :format => :default)
+   end
+-  
++
+   def test_date_localization_with_short_format
+-    assert_equal @date.strftime("%b %d"), I18n.localize(@date, :format => :short)
++    assert_equal @date.strftime("%e %b"), I18n.localize(@date, :format => :short)
+   end
+-  
++
+   def test_date_localization_with_long_format
+-    assert_equal @date.strftime("%B %d, %Y"), I18n.localize(@date, :format => :long)
++    assert_equal @date.strftime("%B %e, %Y"), I18n.localize(@date, :format => :long)
+   end
+-  
+-  def test_time_localization_should_use_default_format    
+-    assert_equal @time.strftime("%a, %d %b %Y %H:%M:%S %z"), I18n.localize(@time)
++
++  def test_time_localization_should_use_default_format
++    assert_equal @time.strftime("%a %b %d %H:%M:%S %Z %Y"), I18n.localize(@time)
+   end
+-  
++
+   def test_time_localization_with_default_format
+-    assert_equal @time.strftime("%a, %d %b %Y %H:%M:%S %z"), I18n.localize(@time, :format => :default)
++    assert_equal @time.strftime("%a %b %d %H:%M:%S %Z %Y"), I18n.localize(@time, :format => :default)
+   end
+-  
++
+   def test_time_localization_with_short_format
+     assert_equal @time.strftime("%d %b %H:%M"), I18n.localize(@time, :format => :short)
+   end
+-  
++
+   def test_time_localization_with_long_format
+     assert_equal @time.strftime("%B %d, %Y %H:%M"), I18n.localize(@time, :format => :long)
+   end
+-    
++
+   def test_day_names
+     assert_equal Date::DAYNAMES, I18n.translate(:'date.day_names')
+   end
+-  
++
+   def test_abbr_day_names
+     assert_equal Date::ABBR_DAYNAMES, I18n.translate(:'date.abbr_day_names')
+   end
+-  
++
+   def test_month_names
+     assert_equal Date::MONTHNAMES, I18n.translate(:'date.month_names')
+   end
+-  
++
+   def test_abbr_month_names
+     assert_equal Date::ABBR_MONTHNAMES, I18n.translate(:'date.abbr_month_names')
+   end
+-  
++
+   def test_date_order
+     assert_equal [:year, :month, :day], I18n.translate(:'date.order')
+   end
+-  
++
+   def test_time_am
+     assert_equal 'am', I18n.translate(:'time.am')
+   end
+-  
++
+   def test_time_pm
+     assert_equal 'pm', I18n.translate(:'time.pm')
+   end
+-- 
+1.5.2.4
+
+
+From 44caba938a66ab76e0157310c228cb269be2a455 Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sat, 2 Aug 2008 17:40:06 +0200
+Subject: [PATCH] Added i18n support for TimeWithZone.
+
+---
+ activesupport/lib/active_support/time_with_zone.rb |   14 ++++++++++----
+ 1 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/activesupport/lib/active_support/time_with_zone.rb b/activesupport/lib/active_support/time_with_zone.rb
+index 4c739ee..acb8294 100644
+--- a/activesupport/lib/active_support/time_with_zone.rb
++++ b/activesupport/lib/active_support/time_with_zone.rb
+@@ -144,11 +144,17 @@ module ActiveSupport
+     # Uses TimeWithZone's +strftime+, so <tt>%Z</tt> and <tt>%z</tt> work correctly.
+     def to_s(format = :default)
+       return utc.to_s(format) if format == :db
+-      if formatter = ::Time::DEFAULT_FORMATS.merge(::Time::DATE_FORMATS)[format]
+-        formatter.respond_to?(:call) ? formatter.call(self).to_s : strftime(formatter)
+-      else
+-        "#{time.strftime("%Y-%m-%d %H:%M:%S")} #{formatted_offset(false, 'UTC')}" # mimicking Ruby 1.9 Time#to_s format
++      formats = ::Time::DEFAULT_FORMATS.merge(::Time::DATE_FORMATS).merge(
++        :default => lambda { |time| "%Y-%m-%d %H:%M:%S #{formatted_offset(false, 'UTC')}" }
++      )
++      formatter = formats[format]
++      unless formatter
++        formatters = I18n.translate(:"time.formats")
++        formatter  = formatters[format]
+       end
++
++      format_to_localize = formatter.respond_to?(:call) ? formatter.call(self) : formatter
++      I18n.localize(self, :format => format_to_localize)
+     end
+ 
+     # Replaces <tt>%Z</tt> and <tt>%z</tt> directives with +zone+ and +formatted_offset+, respectively, before passing to
+-- 
+1.5.2.4
+
+
+From 4e71ba7efa4a5fd75ae43a22ccc07f9ce637d4e9 Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sat, 2 Aug 2008 17:46:32 +0200
+Subject: [PATCH] Restructured locale definition to match style of actionview/locale/en-US.
+
+---
+ .../core_ext/date_time/conversions.rb              |    3 ++-
+ activesupport/lib/active_support/locale/en-US.rb   |   19 ++++++++++---------
+ activesupport/lib/active_support/time_with_zone.rb |    8 ++++----
+ 3 files changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/date_time/conversions.rb b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+index 3de74ea..5be62fa 100644
+--- a/activesupport/lib/active_support/core_ext/date_time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+@@ -51,7 +51,8 @@ module ActiveSupport #:nodoc:
+           formatter = formats[format]
+ 
+           unless formatter
+-            formatters = I18n.translate(:"datetime.formats")
++            default_formatters, datetime_formatters = I18n.translate([:'time.formats', :'time.datetime.formats'])
++            formatters = default_formatters.merge(datetime_formatters)
+             formatter  = formatters[format]
+           end
+ 
+diff --git a/activesupport/lib/active_support/locale/en-US.rb b/activesupport/lib/active_support/locale/en-US.rb
+index 4720c9d..27ff8a2 100644
+--- a/activesupport/lib/active_support/locale/en-US.rb
++++ b/activesupport/lib/active_support/locale/en-US.rb
+@@ -17,15 +17,6 @@ I18n.backend.store_translations :'en-US', {
+     :abbr_month_names => Date::ABBR_MONTHNAMES,
+     :order => [:year, :month, :day]
+   },
+-  :datetime => {
+-    :formats => {
+-      :default      => "%Y-%m-%dT%H:%M:%S%Z",
+-      :time         => "%H:%M",
+-      :short        => "%d %b %H:%M",
+-      :long         => "%B %d, %Y %H:%M",
+-      :long_ordinal => lambda { |datetime| "%B #{datetime.day.ordinalize}, %Y %H:%M" }
+-    }
+-  },
+   :time => {
+     :formats => {
+       :default      => "%a %b %d %H:%M:%S %Z %Y",
+@@ -34,6 +25,16 @@ I18n.backend.store_translations :'en-US', {
+       :long         => "%B %d, %Y %H:%M",
+       :long_ordinal => lambda { |time| "%B #{time.day.ordinalize}, %Y %H:%M" }
+     },
++    :datetime => {
++      :formats => {
++        :default => "%Y-%m-%dT%H:%M:%S%Z"
++      }
++    },
++    :time_with_zone => {
++      :formats => {
++        :default => lambda { |time| "%Y-%m-%d %H:%M:%S #{time.formatted_offset(false, 'UTC')}" }
++      }
++    },
+     :am => 'am',
+     :pm => 'pm'
+   }
+diff --git a/activesupport/lib/active_support/time_with_zone.rb b/activesupport/lib/active_support/time_with_zone.rb
+index acb8294..ab6e563 100644
+--- a/activesupport/lib/active_support/time_with_zone.rb
++++ b/activesupport/lib/active_support/time_with_zone.rb
+@@ -144,12 +144,12 @@ module ActiveSupport
+     # Uses TimeWithZone's +strftime+, so <tt>%Z</tt> and <tt>%z</tt> work correctly.
+     def to_s(format = :default)
+       return utc.to_s(format) if format == :db
+-      formats = ::Time::DEFAULT_FORMATS.merge(::Time::DATE_FORMATS).merge(
+-        :default => lambda { |time| "%Y-%m-%d %H:%M:%S #{formatted_offset(false, 'UTC')}" }
+-      )
++      formats = ::Time::DEFAULT_FORMATS.merge(::Time::DATE_FORMATS)
+       formatter = formats[format]
++
+       unless formatter
+-        formatters = I18n.translate(:"time.formats")
++        default_formatters, twz_formatters = I18n.translate([:'time.formats', :'time.time_with_zone.formats'])
++        formatters = default_formatters.merge(twz_formatters)
+         formatter  = formatters[format]
+       end
+ 
+-- 
+1.5.2.4
+
+
+From 5a03ef1c05c46b06e997dfff1f4ca4e720bdd536 Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sat, 2 Aug 2008 18:11:50 +0200
+Subject: [PATCH] Added implementation tests.
+
+---
+ activesupport/test/i18n_test.rb |   34 ++++++++++++++++++++++++++++++++++
+ 1 files changed, 34 insertions(+), 0 deletions(-)
+
+diff --git a/activesupport/test/i18n_test.rb b/activesupport/test/i18n_test.rb
+index 10450d8..ed27a35 100644
+--- a/activesupport/test/i18n_test.rb
++++ b/activesupport/test/i18n_test.rb
+@@ -4,6 +4,15 @@ class I18nTest < Test::Unit::TestCase
+   def setup
+     @date = Date.parse("2008-7-2")
+     @time = Time.utc(2008, 7, 2, 16, 47, 1)
++
++    @date_defaults = { :precision => 3, :delimiter => ',', :separator => '.' }
++    @time_defaults = { :unit => '$', :format => '%u%n', :precision => 2 }
++    @datetime_defaults = { :precision => 1 }
++    @time_with_zone_defaults = { :delimiter => '' }
++
++    I18n.backend.store_translations 'en-US', :date => { :formats => @date_defaults},
++      :time => { :formats => @time_defaults, :datetime => { :formats => @datetime_defaults },
++      :time_with_zone => { :formats => @time_with_zone_defaults } }
+   end
+ 
+   uses_mocha 'I18nTimeZoneTest' do
+@@ -13,6 +22,31 @@ class I18nTest < Test::Unit::TestCase
+     end
+   end
+ 
++  uses_mocha 'date and time i18n tests' do
++    def test_date_to_s_translates_format
++      I18n.expects(:translate).with(:'date.formats').returns(@date_defaults)
++      Date.today.to_s(:format => :short)
++    end
++
++    def test_datetime_to_s_translates_format
++      I18n.expects(:translate).with(
++        [:'time.formats', :'time.datetime.formats']).returns([@time_defaults, @datetime_defaults])
++      DateTime.now.to_s(:format => :short)
++    end
++
++    def test_time_to_s_translates_format
++      I18n.expects(:translate).with(:'time.formats').returns(@time_defaults)
++      Time.now.to_s(:format => :short)
++    end
++
++    def test_time_with_zone_to_s_translates_format
++      t, z = Time.utc(2000, 1, 1, 0), ActiveSupport::TimeZone['UTC']
++      I18n.expects(:translate).with(
++        [:'time.formats', :'time.time_with_zone.formats']).returns([@time_defaults, @time_with_zone_defaults])
++      ActiveSupport::TimeWithZone.new(t, z).to_s(:format => :short)
++    end
++  end
++
+   def test_date_localization_should_use_default_format
+     assert_equal @date.strftime("%Y-%m-%d"), I18n.localize(@date)
+   end
+-- 
+1.5.2.4
+
+
+From 39cf005babbe208fb8e19a20dff3f278dc0cfc4d Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sat, 2 Aug 2008 18:35:41 +0200
+Subject: [PATCH] Updated documentation.
+
+---
+ .../active_support/core_ext/date/conversions.rb    |   21 ++++++++++---
+ .../core_ext/date_time/conversions.rb              |   30 +++++++++++++++++--
+ .../active_support/core_ext/time/conversions.rb    |   17 +++++++++--
+ 3 files changed, 56 insertions(+), 12 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/date/conversions.rb b/activesupport/lib/active_support/core_ext/date/conversions.rb
+index 0345518..232d200 100644
+--- a/activesupport/lib/active_support/core_ext/date/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/date/conversions.rb
+@@ -44,14 +44,25 @@ module ActiveSupport #:nodoc:
+         #   date.to_formatted_s(:long_ordinal)  # => "November 10th, 2007"
+         #   date.to_formatted_s(:rfc822)        # => "10 Nov 2007"
+         #
+-        # == Adding your own time formats to to_formatted_s
+-        # You can add your own formats to the Date::DATE_FORMATS hash.
+-        # Use the format name as the hash key and either a strftime string
+-        # or Proc instance that takes a date argument as the value.
++        # == Adding your own time formats to +to_formatted_s+
++        # You can add your own formats by adding them to your i18n locale.
++        # Use the format name as the hash key and either a +strftime+ string
++        # or +Proc+ instance that takes a +date+ argument as the value.
+         #
+         #   # config/initializers/time_formats.rb
++        #   I18n.backend.store_translations :'en-US', {
++        #     :date => {
++        #       :formats => {
++        #         :month_and_year => "%B %Y",
++        #         :short_ordinal  => lambda { |date| "%B #{date.day.ordinalize}" }
++        #       }
++        #     }
++        #
++        # You can still add formats by using the Date::DATE_FORMATS constant.
++        # Note however that this is deprecated and shouldn't be used any longer.
++        #   # config/initializers/time_formats.rb
+         #   Date::DATE_FORMATS[:month_and_year] = "%B %Y"
+-        #   Date::DATE_FORMATS[:short_ordinal] = lambda { |date| date.strftime("%B #{date.day.ordinalize}") }
++        #   Date::DATE_FORMATS[:short_ordinal]  = lambda { |date| "%B #{date.day.ordinalize}" }
+         def to_formatted_s(format = :default)
+           # don't allow to overwrite formats that Rails uses internally
+           formats = ::Date::DEFAULT_FORMATS.reverse_merge(::Date::DATE_FORMATS)
+diff --git a/activesupport/lib/active_support/core_ext/date_time/conversions.rb b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+index 5be62fa..4a0b71d 100644
+--- a/activesupport/lib/active_support/core_ext/date_time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+@@ -37,12 +37,34 @@ module ActiveSupport #:nodoc:
+         #   datetime.to_formatted_s(:rfc822)        # => "Tue, 04 Dec 2007 00:00:00 +0000"
+         #
+         # == Adding your own datetime formats to to_formatted_s
+-        # DateTime formats are shared with Time. You can add your own to the
+-        # Time::DATE_FORMATS hash. Use the format name as the hash key and
+-        # either a strftime string or Proc instance that takes a time or
+-        # datetime argument as the value.
++        # +DateTime+ formats are shared with +Time+. You can add your own 
++        # formats by adding them to your i18n locale. Use the format name as
++        # the hash key and either a +strftime+ string or +Proc+ instance that
++        # takes a +time+ or +datetime+ argument as the value.
+         #
+         #   # config/initializers/time_formats.rb
++        #   I18n.backend.store_translations :'en-US', {
++        #     :time => {
++        #       :formats => {
++        #         :month_and_year => "%B %Y",
++        #         :short_ordinal  => lambda { |time| "%B #{time.day.ordinalize}" }
++        #       },
++        #       :datetime => {
++        #         :formats => {
++        #           :month_and_year           => "%Y %B",
++        #           :ordinal_with_day_of_week => lambda { |time| "%a, %B #{time.day.ordinalize}, %Y" }
++        #         }
++        #       }
++        #     }
++        #
++        # In the above example, +DateTime+ applies all +Time+ formats. The 
++        # <tt>:month_and_year</tt> format in <tt>:datetime</tt> takes
++        # precedence over the one defined in <tt>:time</tt>.
++        # <tt>:ordinal_with_day_of_week</tt> is only available to +DateTime+.
++        #
++        # You can still add formats by using the Time::DATE_FORMATS constant.
++        # Note however that this is deprecated and shouldn't be used any longer.
++        #   # config/initializers/time_formats.rb
+         #   Time::DATE_FORMATS[:month_and_year] = "%B %Y"
+         #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| time.strftime("%B #{time.day.ordinalize}") }
+         def to_formatted_s(format = :default)
+diff --git a/activesupport/lib/active_support/core_ext/time/conversions.rb b/activesupport/lib/active_support/core_ext/time/conversions.rb
+index eb68bff..c6a55e8 100644
+--- a/activesupport/lib/active_support/core_ext/time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/time/conversions.rb
+@@ -35,11 +35,22 @@ module ActiveSupport #:nodoc:
+         #   time.to_formatted_s(:rfc822)        # => "Thu, 18 Jan 2007 06:10:17 -0600"
+         #
+         # == Adding your own time formats to +to_formatted_s+
+-        # You can add your own formats to the Time::DATE_FORMATS hash.
+-        # Use the format name as the hash key and either a strftime string
+-        # or Proc instance that takes a time argument as the value.
++        # You can add your own formats by adding them to your i18n locale.
++        # Use the format name as the hash key and either a +strftime+ string
++        # or +Proc+ instance that takes a +time+ argument as the value.
+         #
+         #   # config/initializers/time_formats.rb
++        #   I18n.backend.store_translations :'en-US', {
++        #     :time => {
++        #       :formats => {
++        #         :month_and_year => "%B %Y",
++        #         :short_ordinal  => lambda { |date| "%B #{date.day.ordinalize}" }
++        #       }
++        #     }
++        #
++        # You can still add formats by using the Time::DATE_FORMATS constant.
++        # Note however that this is deprecated and shouldn't be used any longer.
++        #   # config/initializers/time_formats.rb
+         #   Time::DATE_FORMATS[:month_and_year] = "%B %Y"
+         #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| time.strftime("%B #{time.day.ordinalize}") }
+         def to_formatted_s(format = :default)
+-- 
+1.5.2.4
+
+
+From 6407f59ebb6e916cb57daef70712707ad3c0baca Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sat, 2 Aug 2008 18:49:04 +0200
+Subject: [PATCH] Added deprecation warnings for DATE_FORMATS constant.
+
+---
+ .../active_support/core_ext/date/conversions.rb    |   12 +++++++++++-
+ .../active_support/core_ext/time/conversions.rb    |   11 ++++++++++-
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/date/conversions.rb b/activesupport/lib/active_support/core_ext/date/conversions.rb
+index 232d200..d75db43 100644
+--- a/activesupport/lib/active_support/core_ext/date/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/date/conversions.rb
+@@ -12,7 +12,17 @@ module ActiveSupport #:nodoc:
+           :number       => "%Y%m%d",
+           :rfc822       => "%e %b %Y"
+         }.freeze
+-        DATE_FORMATS = {} # should be deprecated
++
++        DATE_FORMATS = {}
++
++        def DATE_FORMATS.[]=(key, value)
++          ActiveSupport::Deprecation.warn('The DATE_HELPER constant should ' +
++            'be used to define formats anymore. Define custom formats in ' +
++            'your locale instead. ' +
++            'See http://api.rubyonrails.org/classes/ActiveSupport/CoreExtensions/Date/Conversions.html#M000351 ' +
++            'for details.', caller)
++          super
++        end
+ 
+         def self.included(base) #:nodoc:
+           base.instance_eval do
+diff --git a/activesupport/lib/active_support/core_ext/time/conversions.rb b/activesupport/lib/active_support/core_ext/time/conversions.rb
+index c6a55e8..f4e6848 100644
+--- a/activesupport/lib/active_support/core_ext/time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/time/conversions.rb
+@@ -9,7 +9,16 @@ module ActiveSupport #:nodoc:
+           :rfc822       => "%a, %d %b %Y %H:%M:%S %z"
+         }.freeze
+ 
+-        DATE_FORMATS = {} # should be deprecated
++        DATE_FORMATS = {}
++
++        def DATE_FORMATS.[]=(key, value)
++          ActiveSupport::Deprecation.warn('The DATE_HELPER constant should ' +
++            'be used to define formats anymore. Define custom formats in ' +
++            'your locale instead. ' +
++            'See http://api.rubyonrails.org/classes/ActiveSupport/CoreExtensions/Time/Conversions.html#M000278 ' +
++            'for details.', caller)
++          super
++        end
+ 
+         def self.included(base) #:nodoc:
+           base.class_eval do
+-- 
+1.5.2.4
+
+
+From f93a9c0f515e9cefcc0203d18fcbecc310876764 Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sat, 2 Aug 2008 19:59:32 +0200
+Subject: [PATCH] Tiny doc updates.
+
+---
+ .../core_ext/date_time/conversions.rb              |    2 +-
+ .../active_support/core_ext/time/conversions.rb    |    4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/date_time/conversions.rb b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+index 4a0b71d..c02212b 100644
+--- a/activesupport/lib/active_support/core_ext/date_time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/date_time/conversions.rb
+@@ -66,7 +66,7 @@ module ActiveSupport #:nodoc:
+         # Note however that this is deprecated and shouldn't be used any longer.
+         #   # config/initializers/time_formats.rb
+         #   Time::DATE_FORMATS[:month_and_year] = "%B %Y"
+-        #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| time.strftime("%B #{time.day.ordinalize}") }
++        #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| "%B #{time.day.ordinalize}" }
+         def to_formatted_s(format = :default)
+           # don't allow to overwrite formats that Rails uses internally
+           formats = ::Time::DEFAULT_FORMATS.reverse_merge(::Time::DATE_FORMATS)
+diff --git a/activesupport/lib/active_support/core_ext/time/conversions.rb b/activesupport/lib/active_support/core_ext/time/conversions.rb
+index f4e6848..ed343ed 100644
+--- a/activesupport/lib/active_support/core_ext/time/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/time/conversions.rb
+@@ -53,7 +53,7 @@ module ActiveSupport #:nodoc:
+         #     :time => {
+         #       :formats => {
+         #         :month_and_year => "%B %Y",
+-        #         :short_ordinal  => lambda { |date| "%B #{date.day.ordinalize}" }
++        #         :short_ordinal  => lambda { |time| "%B #{time.day.ordinalize}" }
+         #       }
+         #     }
+         #
+@@ -61,7 +61,7 @@ module ActiveSupport #:nodoc:
+         # Note however that this is deprecated and shouldn't be used any longer.
+         #   # config/initializers/time_formats.rb
+         #   Time::DATE_FORMATS[:month_and_year] = "%B %Y"
+-        #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| time.strftime("%B #{time.day.ordinalize}") }
++        #   Time::DATE_FORMATS[:short_ordinal] = lambda { |time| "%B #{time.day.ordinalize}" }
+         def to_formatted_s(format = :default)
+           # don't allow to overwrite formats that Rails uses internally
+           formats = ::Time::DEFAULT_FORMATS.reverse_merge(::Time::DATE_FORMATS)
+-- 
+1.5.2.4
+
+
+From ff5f4f37970c342d31b8b12a1c6f397c609a6301 Mon Sep 17 00:00:00 2001
+From: Clemens Kofler <clemens@railway.at>
+Date: Sun, 3 Aug 2008 20:40:47 +0200
+Subject: [PATCH] Fixed faulty tests. *smack self*
+
+---
+ activesupport/test/i18n_test.rb |   25 +++++++++++++++++--------
+ 1 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/activesupport/test/i18n_test.rb b/activesupport/test/i18n_test.rb
+index ed27a35..3f694e9 100644
+--- a/activesupport/test/i18n_test.rb
++++ b/activesupport/test/i18n_test.rb
+@@ -5,10 +5,19 @@ class I18nTest < Test::Unit::TestCase
+     @date = Date.parse("2008-7-2")
+     @time = Time.utc(2008, 7, 2, 16, 47, 1)
+ 
+-    @date_defaults = { :precision => 3, :delimiter => ',', :separator => '.' }
+-    @time_defaults = { :unit => '$', :format => '%u%n', :precision => 2 }
+-    @datetime_defaults = { :precision => 1 }
+-    @time_with_zone_defaults = { :delimiter => '' }
++    @date_defaults = { :default      => "%Y-%m-%d",
++                       :short        => "%e %b",
++                       :long         => "%B %e, %Y",
++                       :long_ordinal => lambda { |date| "%B #{date.day.ordinalize}, %Y" } }
++    @time_defaults = { :default      => "%a %b %d %H:%M:%S %Z %Y",
++                       :time         => "%H:%M",
++                       :short        => "%d %b %H:%M",
++                       :long         => "%B %d, %Y %H:%M",
++                       :long_ordinal => lambda { |time| "%B #{time.day.ordinalize}, %Y %H:%M" } }
++    @datetime_defaults = { :default => "%Y-%m-%dT%H:%M:%S%Z" }
++    @time_with_zone_defaults = { 
++      :default => lambda { |time| "%Y-%m-%d %H:%M:%S #{time.formatted_offset(false, 'UTC')}" }
++    }
+ 
+     I18n.backend.store_translations 'en-US', :date => { :formats => @date_defaults},
+       :time => { :formats => @time_defaults, :datetime => { :formats => @datetime_defaults },
+@@ -25,25 +34,25 @@ class I18nTest < Test::Unit::TestCase
+   uses_mocha 'date and time i18n tests' do
+     def test_date_to_s_translates_format
+       I18n.expects(:translate).with(:'date.formats').returns(@date_defaults)
+-      Date.today.to_s(:format => :short)
++      Date.today.to_s(:short)
+     end
+ 
+     def test_datetime_to_s_translates_format
+       I18n.expects(:translate).with(
+         [:'time.formats', :'time.datetime.formats']).returns([@time_defaults, @datetime_defaults])
+-      DateTime.now.to_s(:format => :short)
++      DateTime.now.to_s(:short)
+     end
+ 
+     def test_time_to_s_translates_format
+       I18n.expects(:translate).with(:'time.formats').returns(@time_defaults)
+-      Time.now.to_s(:format => :short)
++      Time.now.to_s(:short)
+     end
+ 
+     def test_time_with_zone_to_s_translates_format
+       t, z = Time.utc(2000, 1, 1, 0), ActiveSupport::TimeZone['UTC']
+       I18n.expects(:translate).with(
+         [:'time.formats', :'time.time_with_zone.formats']).returns([@time_defaults, @time_with_zone_defaults])
+-      ActiveSupport::TimeWithZone.new(t, z).to_s(:format => :short)
++      ActiveSupport::TimeWithZone.new(t, z).to_s(:short)
+     end
+   end
+ 
+-- 
+1.5.2.4
+

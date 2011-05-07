@@ -1,0 +1,139 @@
+From 910e8afdc519057d6d4567a00342756cb25057ef Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?=D0=9F=D0=B0=D0=B2=D0=B5=D0=BB=20=D0=93=D0=BE=D0=BB=D1=83=D0=B1=D0=B5=D0=B2?= <pavelgolubev@pavel-golubev-komputer.local>
+Date: Fri, 20 Jun 2008 19:05:02 +0400
+Subject: [PATCH] Added reloadable attributes to AR
+
+---
+ .../lib/active_record/attribute_methods.rb         |   26 +++++++++++++++++--
+ activerecord/lib/active_record/base.rb             |    5 ++-
+ activerecord/test/cases/attribute_methods_test.rb  |   12 +++++++++
+ activerecord/test/cases/base_test.rb               |    2 +-
+ 4 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/attribute_methods.rb b/activerecord/lib/active_record/attribute_methods.rb
+index fab16a4..0f66f36 100644
+--- a/activerecord/lib/active_record/attribute_methods.rb
++++ b/activerecord/lib/active_record/attribute_methods.rb
+@@ -53,7 +53,11 @@ module ActiveRecord
+         rebuild_attribute_method_regexp unless defined?(@@attribute_method_regexp) && @@attribute_method_regexp
+         @@attribute_method_regexp.match(method_name)
+       end
+-
++      
++      # Returns MatchData if method_name is a reloadable attribute method.
++      def match_reloadable_attribute_method?(method_name)
++        method_name.match(/^(.+)!$/)
++      end
+ 
+       # Contains the names of the generated attribute methods.
+       def generated_methods #:nodoc:
+@@ -220,7 +224,6 @@ module ActiveRecord
+         end
+     end #  ClassMethods
+ 
+-
+     # Allows access to the object attributes, which are held in the <tt>@attributes</tt> hash, as though they
+     # were first-class methods. So a Person class with a name attribute can use Person#name and
+     # Person#name= and never directly use the attributes hash -- except for multiple assigns with
+@@ -229,8 +232,12 @@ module ActiveRecord
+     #
+     # It's also possible to instantiate related objects, so a Client class belonging to the clients
+     # table with a +master_id+ foreign key can instantiate master through Client#master.
++    #
++    # It enables using automatically reloading attributes, ending with "!".
++    # For example, if you have @post.title, you can also use @post.title!, which will force reloading title. 
++    
+     def method_missing(method_id, *args, &block)
+-      method_name = method_id.to_s
++      method_name = method_id.to_s  
+ 
+       # If we haven't generated any methods yet, generate them, then
+       # see if we've created the method we're looking for.
+@@ -250,12 +257,25 @@ module ActiveRecord
+         else
+           super
+         end
++      elsif md = self.class.match_reloadable_attribute_method?(method_name)
++        attribute_name = md[1]
++        if @attributes.include?(attribute_name)
++          self.send("#{attribute_name}=", reload_attribute(attribute_name))
++          return self.attributes[attribute_name]
++        else
++          super
++        end  
+       elsif @attributes.include?(method_name)
+         read_attribute(method_name)
+       else
+         super
+       end
+     end
++    
++    # Reloads attribute from the database
++    def reload_attribute(attribute_name)
++      self.connection.select_all("SELECT #{self.connection.quote_column_name(attribute_name)} FROM #{self.connection.quote_table_name(self.class.table_name)} WHERE id = #{self.connection.quote(self.id)}")[0][attribute_name]
++    end
+ 
+     # Returns the value of the attribute identified by <tt>attr_name</tt> after it has been typecast (for example,
+     # "2004-12-12" in a data column is cast to a date object, like Date.new(2004, 12, 12)).
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 8fca34e..56c2da1 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1592,7 +1592,7 @@ module ActiveRecord #:nodoc:
+           table_name = table_name.pluralize if pluralize_table_names
+           table_name
+         end
+-
++        
+         # Enables dynamic finders like find_by_user_name(user_name) and find_by_user_name_and_password(user_name, password) that are turned into
+         # find(:first, :conditions => ["user_name = ?", user_name]) and  find(:first, :conditions => ["user_name = ? AND password = ?", user_name, password])
+         # respectively. Also works for find(:all) by using find_all_by_amount(50) that is turned into find(:all, :conditions => ["amount = ?", 50]).
+@@ -1605,7 +1605,8 @@ module ActiveRecord #:nodoc:
+         #
+         # Each dynamic finder or initializer/creator is also defined in the class after it is first invoked, so that future
+         # attempts to use it do not run through method_missing.
+-        def method_missing(method_id, *arguments)
++
++        def method_missing(method_id, *arguments)                                  
+           if match = matches_dynamic_finder?(method_id)
+             finder = determine_finder(match)
+ 
+diff --git a/activerecord/test/cases/attribute_methods_test.rb b/activerecord/test/cases/attribute_methods_test.rb
+index 7999e29..f5a56f1 100755
+--- a/activerecord/test/cases/attribute_methods_test.rb
++++ b/activerecord/test/cases/attribute_methods_test.rb
+@@ -28,6 +28,18 @@ class AttributeMethodsTest < ActiveRecord::TestCase
+       assert_equal [suffix], md.captures
+     end
+   end
++  
++  def test_match_reloading_attribute
++    assert_not_nil Topic.match_reloadable_attribute_method?("title!")
++  end
++  
++  def test_reloading_attribute
++    topic = Topic.find(1)
++    old_title = topic.title
++    topic.title = 'Some new title'
++    assert_equal topic.title!, old_title
++  end
++  
+ 
+   def test_declared_attribute_method_affects_respond_to_and_method_missing
+     topic = @target.new(:title => 'Budget')
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index a4be629..414b6ab 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -935,7 +935,7 @@ class BasicsTest < ActiveRecord::TestCase
+     assert_equal "cannot change this", post.title
+     assert_equal "changed", post.body
+   end
+-
++  
+   def test_multiparameter_attributes_on_date
+     attributes = { "last_read(1i)" => "2004", "last_read(2i)" => "6", "last_read(3i)" => "24" }
+     topic = Topic.find(1)
+-- 
+1.5.3.1
+

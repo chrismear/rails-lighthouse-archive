@@ -1,0 +1,129 @@
+From 923bdff54d7f2e31bdfffc16e7b2f1ec25f63583 Mon Sep 17 00:00:00 2001
+From: Prem Sichanugrist <s@sikachu.com>
+Date: Thu, 18 Feb 2010 22:28:48 +0700
+Subject: [PATCH] Add validators reflection so you can do 'Person.validators' and 'Person.validators_on(:name)'.
+
+---
+ activemodel/lib/active_model/validations.rb        |   33 ++++++++++++++++++--
+ .../test/cases/validations/with_validation_test.rb |    1 +
+ activemodel/test/cases/validations_test.rb         |   29 +++++++++++++++++
+ 3 files changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/activemodel/lib/active_model/validations.rb b/activemodel/lib/active_model/validations.rb
+index 03733a9..54e13b8 100644
+--- a/activemodel/lib/active_model/validations.rb
++++ b/activemodel/lib/active_model/validations.rb
+@@ -1,4 +1,5 @@
+ require 'active_support/core_ext/array/extract_options'
++require 'active_support/core_ext/class/attribute'
+ require 'active_support/core_ext/hash/keys'
+ require 'active_model/errors'
+ 
+@@ -45,6 +46,9 @@ module ActiveModel
+     included do
+       extend ActiveModel::Translation
+       define_callbacks :validate, :scope => :name
++
++      class_attribute :_validators
++      self._validators = Hash.new { |h,k| h[k] = [] }
+     end
+ 
+     module ClassMethods
+@@ -115,11 +119,34 @@ module ActiveModel
+           options[:if] = Array(options[:if])
+           options[:if] << "@_on_validate == :#{options[:on]}"
+         end
++
++        validator = args.first
++        if validator.respond_to?(:validate)
++          if validator.respond_to?(:attributes) and !validator.attributes.empty?
++            validator.attributes.each do |attribute|
++              _validators[attribute.to_sym] << validator
++            end
++          else
++            _validators[nil] << validator
++          end
++        end
++
+         set_callback(:validate, *args, &block)
+       end
+-    
+-      private
+-    
++
++      # List all validators that being used to validate the model using +validates_with+
++      # method.
++      def validators
++        _validators.values.flatten.uniq
++      end
++
++      # List all validators that being used to validate a specific attribute.
++      def validators_on_attribute(attribute)
++        _validators[attribute.to_sym]
++      end
++
++    private
++
+       def _merge_attributes(attr_names)
+         options = attr_names.extract_options!
+         options.merge(:attributes => attr_names)
+diff --git a/activemodel/test/cases/validations/with_validation_test.rb b/activemodel/test/cases/validations/with_validation_test.rb
+index 66b072e..7b4d77c 100644
+--- a/activemodel/test/cases/validations/with_validation_test.rb
++++ b/activemodel/test/cases/validations/with_validation_test.rb
+@@ -9,6 +9,7 @@ class ValidatesWithTest < ActiveRecord::TestCase
+ 
+   def teardown
+     Topic.reset_callbacks(:validate)
++    Topic.instance_variable_set(:@_validators, nil)
+   end
+ 
+   ERROR_MESSAGE = "Validation error from validator"
+diff --git a/activemodel/test/cases/validations_test.rb b/activemodel/test/cases/validations_test.rb
+index eb100d1..18f3254 100644
+--- a/activemodel/test/cases/validations_test.rb
++++ b/activemodel/test/cases/validations_test.rb
+@@ -9,6 +9,10 @@ require 'models/custom_reader'
+ 
+ class ValidationsTest < ActiveModel::TestCase
+   include ActiveModel::TestsDatabase
++  
++  def setup
++    Topic._validators = Hash.new { |h,k| h[k] = [] }
++  end
+ 
+   # Most of the tests mess with the validations of Topic, so lets repair it all the time.
+   # Other classes we mess with will be dealt with in the specific tests
+@@ -220,4 +224,29 @@ class ValidationsTest < ActiveModel::TestCase
+     assert !t.valid?
+     assert ["NO BLANKS HERE"], t.errors[:title]
+   end
++
++  def test_list_of_validators_for_model
++    Topic.validates_presence_of :title
++    Topic.validates_length_of :title, :minimum => 2
++
++    assert_equal 2, Topic.validators.count
++    assert Topic.validators.map(&:class).include? ActiveModel::Validations::PresenceValidator
++    assert Topic.validators.map(&:class).include? ActiveModel::Validations::LengthValidator
++  end
++
++  def test_list_of_validators_on_an_attribute
++    Topic.validates_presence_of :title, :content
++    Topic.validates_length_of :title, :minimum => 2
++
++    assert_equal 2, Topic.validators_on_attribute(:title).count
++    assert Topic.validators_on_attribute(:title).map(&:class).include? ActiveModel::Validations::PresenceValidator
++    assert Topic.validators_on_attribute(:title).map(&:class).include? ActiveModel::Validations::LengthValidator
++    assert_equal 1, Topic.validators_on_attribute(:content).count
++    assert Topic.validators_on_attribute(:content).map(&:class).include? ActiveModel::Validations::PresenceValidator
++  end
++
++  def test_accessing_instance_of_validator_on_an_attribute
++    Topic.validates_length_of :title, :minimum => 10
++    assert_equal 10, Topic.validators_on_attribute(:title).first.options[:minimum]
++  end
+ end
+-- 
+1.6.4.2
+

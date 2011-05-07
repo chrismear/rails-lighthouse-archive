@@ -1,0 +1,180 @@
+From a4d494971e9bc2aa2ac55ae04c5134e3631ce7a3 Mon Sep 17 00:00:00 2001
+From: Frederick Cheung <frederick.cheung@gmail.com>
+Date: Tue, 16 Dec 2008 02:09:19 +0000
+Subject: [PATCH] Make include fallback code aware of tables joined by :joins
+
+---
+ activerecord/lib/active_record/associations.rb     |   46 ++++++++++---
+ activerecord/test/cases/associations/eager_test.rb |   66 ++++++++++++++++++++
+ 2 files changed, 101 insertions(+), 11 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 3fbbea4..91ebd3e 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1730,7 +1730,12 @@ module ActiveRecord
+ 
+           return sanitize_sql(sql)
+         end
+-
++        
++        def tables_in_string(string)
++          return [] if string.blank?
++          string.scan(/([\.a-zA-Z_]+).?\./).flatten
++        end
++        
+         def conditions_tables(options)
+           # look in both sets of conditions
+           conditions = [scope(:find, :conditions), options[:conditions]].inject([]) do |all, cond|
+@@ -1741,37 +1746,56 @@ module ActiveRecord
+               else            all << cond
+             end
+           end
+-          conditions.join(' ').scan(/([\.a-zA-Z_]+).?\./).flatten
++          tables_in_string(conditions.join(' '))
+         end
+ 
+         def order_tables(options)
+           order = [options[:order], scope(:find, :order) ].join(", ")
+           return [] unless order && order.is_a?(String)
+-          order.scan(/([\.a-zA-Z_]+).?\./).flatten
++          tables_in_string(order)
+         end
+ 
+         def selects_tables(options)
+           select = options[:select]
+           return [] unless select && select.is_a?(String)
+-          select.scan(/"?([\.a-zA-Z_]+)"?.?\./).flatten
++          tables_in_string(select)
+         end
+ 
++
++        def joined_tables(options)
++          scope = scope(:find)
++          joins = options[:joins]
++          merged_joins = scope && scope[:joins] && joins ? merge_joins(scope[:joins], joins) : (joins || scope && scope[:joins])
++          [table_name] + case merged_joins 
++          when Symbol, Hash, Array
++            if array_of_strings?(merged_joins)
++              tables_in_string(merged_joins.join(' '))
++            else
++              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, merged_joins, nil)
++              [table_name] + join_dependency.join_associations.collect {|join_association| [join_association.aliased_join_table_name, join_association.aliased_table_name]}.flatten.compact
++            end
++          else
++            tables_in_string(merged_joins)
++          end
++        end     
++          
+         # Checks if the conditions reference a table other than the current model table
+-        def include_eager_conditions?(options, tables = nil)
+-          ((tables || conditions_tables(options)) - [table_name]).any?
++        def include_eager_conditions?(options, tables = nil, joined_tables = nil)
++          ((tables || conditions_tables(options)) - (joined_tables || joined_tables(options))).any?
+         end
+ 
+         # Checks if the query order references a table other than the current model's table.
+-        def include_eager_order?(options, tables = nil)
+-          ((tables || order_tables(options)) - [table_name]).any?
++        def include_eager_order?(options, tables = nil, joined_tables = nil)
++          ((tables || order_tables(options)) - (joined_tables || joined_tables(options))).any?
+         end
+ 
+-        def include_eager_select?(options)
+-          (selects_tables(options) - [table_name]).any?
++        def include_eager_select?(options, joined_tables = nil)
++          (selects_tables(options) - (joined_tables || joined_tables(options))).any?
+         end
+ 
+         def references_eager_loaded_tables?(options)
+-          include_eager_order?(options) || include_eager_conditions?(options) || include_eager_select?(options)
++          joined_tables = joined_tables(options)
++          include_eager_order?(options, nil, joined_tables) || include_eager_conditions?(options, nil, joined_tables) || include_eager_select?(options, joined_tables)
+         end
+ 
+         def using_limitable_reflections?(reflections)
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 3c8408d..ad7870e 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -1,6 +1,7 @@
+ require "cases/helper"
+ require 'models/post'
+ require 'models/tagging'
++require 'models/tag'
+ require 'models/comment'
+ require 'models/author'
+ require 'models/category'
+@@ -705,4 +706,69 @@ class EagerAssociationTest < ActiveRecord::TestCase
+   def test_order_on_join_table_with_include_and_limit
+     assert_equal 5, Developer.find(:all, :include => 'projects', :order => 'developers_projects.joined_on DESC', :limit => 5).size
+   end
++  
++  def test_eager_loading_with_order_on_joined_table_preloads
++    posts = assert_queries(2) do
++      Post.find(:all, :joins => :comments, :include => :author, :order => 'comments.id DESC')
++    end
++    assert_equal posts(:eager_other), posts[0]
++    assert_equal authors(:mary), assert_no_queries { posts[0].author}
++  end
++  
++  def test_eager_loading_with_conditions_on_joined_table_preloads
++    posts = assert_queries(2) do
++      Post.find(:all, :select => 'distinct posts.*', :include => :author, :joins => [:comments], :conditions => "comments.body like 'Thank you%'", :order => 'posts.id')
++    end
++    assert_equal [posts(:welcome)], posts
++    assert_equal authors(:david), assert_no_queries { posts[0].author}
++
++    posts = assert_queries(2) do
++      Post.find(:all, :select => 'distinct posts.*', :include => :author, :joins => [:comments], :conditions => "comments.body like 'Thank you%'", :order => 'posts.id')
++    end
++    assert_equal [posts(:welcome)], posts
++    assert_equal authors(:david), assert_no_queries { posts[0].author}
++
++
++    posts = assert_queries(2) do
++      Post.find(:all, :include => :author, :joins => {:taggings => :tag}, :conditions => "tags.name = 'General'")
++    end
++    assert_equal posts(:welcome, :thinking), posts
++
++    posts = assert_queries(2) do
++      Post.find(:all, :include => :author, :joins => {:taggings => {:tag => :taggings}}, :conditions => "taggings_tags.super_tag_id=2")
++    end
++    assert_equal posts(:welcome, :thinking), posts
++
++  end
++
++  def test_eager_loading_with_conditions_on_string_joined_table_preloads
++    posts = assert_queries(2) do
++      Post.find(:all, :select => 'distinct posts.*', :include => :author, :joins => "INNER JOIN comments on comments.post_id = posts.id", :conditions => "comments.body like 'Thank you%'", :order => 'posts.id')
++    end
++    assert_equal [posts(:welcome)], posts
++    assert_equal authors(:david), assert_no_queries { posts[0].author}
++
++#    posts = assert_queries(2) do
++      Post.find(:all, :select => 'distinct posts.*', :include => :author, :joins => ["INNER JOIN comments on comments.post_id = posts.id"], :conditions => "comments.body like 'Thank you%'", :order => 'posts.id')
++ #   end
++    assert_equal [posts(:welcome)], posts
++    assert_equal authors(:david), assert_no_queries { posts[0].author}
++
++  end
++  
++  def test_eager_loading_with_select_on_joined_table_preloads
++    posts = assert_queries(2) do
++      Post.find(:all, :select => 'posts.*, authors.name as author_name', :include => :comments, :joins => :author, :order => 'posts.id')
++    end
++    assert_equal 'David', posts[0].author_name
++    assert_equal posts(:welcome).comments, assert_no_queries { posts[0].comments}
++  end
++  
++  def test_eager_loading_with_conditions_on_join_model_preloads
++    authors = assert_queries(2) do
++      Author.find(:all, :include => :author_address, :joins => :comments, :conditions => "posts.title like 'Welcome%'")
++    end
++    assert_equal authors(:david), authors[0]
++    assert_equal author_addresses(:david_address), authors[0].author_address
++  end
+ end
+-- 
+1.6.0.1
+

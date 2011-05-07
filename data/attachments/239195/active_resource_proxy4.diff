@@ -1,0 +1,235 @@
+From 24b4900816580d25031a9ed6a7b06a1e3ada0016 Mon Sep 17 00:00:00 2001
+From: Marshall Huss <mwhuss@gmail.com>
+Date: Mon, 18 May 2009 18:34:44 -0400
+Subject: [PATCH] Added some more tests for proxy support
+
+---
+ activeresource/lib/active_resource/base.rb |   22 ++++++++++
+ activeresource/test/base_test.rb           |   64 ++++++++++++++++++++++++++++
+ activeresource/test/connection_test.rb     |   10 ++++
+ activeresource/test/fixtures/proxy.rb      |    4 ++
+ 4 files changed, 100 insertions(+), 0 deletions(-)
+ create mode 100644 activeresource/test/fixtures/proxy.rb
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index bc82139..1c629f4 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -256,6 +256,22 @@ module ActiveResource
+           @password = URI.decode(@site.password) if @site.password
+         end
+       end
++      
++      # Gets the \proxy variable if a proxy is required
++      def proxy
++        # Not using superclass_delegating_reader. See +site+ for explanation
++        if defined?(@proxy)
++          @proxy
++        elsif superclass != Object && superclass.proxy
++          superclass.proxy.dup.freeze
++        end
++      end
++
++      # Sets the URI of the http proxy to the value in the +proxy+ argument.
++      def proxy=(proxy)
++        @connection = nil
++        @proxy = proxy.nil? ? nil : create_proxy_uri_from(proxy)
++      end
+ 
+       # Gets the \user for REST HTTP authentication.
+       def user
+@@ -332,6 +348,7 @@ module ActiveResource
+       def connection(refresh = false)
+         if defined?(@connection) || superclass == Object
+           @connection = Connection.new(site, format) if refresh || @connection.nil?
++          @connection.proxy = proxy if proxy
+           @connection.user = user if user
+           @connection.password = password if password
+           @connection.timeout = timeout if timeout
+@@ -621,6 +638,11 @@ module ActiveResource
+         def create_site_uri_from(site)
+           site.is_a?(URI) ? site.dup : URI.parse(site)
+         end
++        
++        # Accepts a URI and creates the proxy URI from that.
++        def create_proxy_uri_from(proxy)
++          proxy.is_a?(URI) ? proxy.dup : URI.parse(proxy)
++        end
+ 
+         # contains a set of the current prefix parameters.
+         def prefix_parameters
+diff --git a/activeresource/test/base_test.rb b/activeresource/test/base_test.rb
+index 82d3b2a..5ff1f29 100644
+--- a/activeresource/test/base_test.rb
++++ b/activeresource/test/base_test.rb
+@@ -3,6 +3,7 @@ require "fixtures/person"
+ require "fixtures/customer"
+ require "fixtures/street_address"
+ require "fixtures/beast"
++require "fixtures/proxy"
+ require 'active_support/core_ext/hash/conversions'
+ 
+ class BaseTest < Test::Unit::TestCase
+@@ -124,6 +125,28 @@ class BaseTest < Test::Unit::TestCase
+     actor.site = nil
+     assert_nil actor.site
+   end
++  
++  def test_proxy_accessor_accepts_uri_or_string_argument
++    proxy = URI.parse('http://localhost')
++
++    assert_nothing_raised { Person.proxy = 'http://localhost' }
++    assert_equal proxy, Person.proxy
++
++    assert_nothing_raised { Person.proxy = proxy }
++    assert_equal proxy, Person.proxy
++  end
++  
++  def test_should_use_proxy_prefix_and_credentials
++    assert_equal 'http://user:password@proxy.local:3000', ProxyResource.proxy.to_s
++  end
++
++  def test_proxy_variable_can_be_reset
++    actor = Class.new(ActiveResource::Base)
++    assert_nil actor.site
++    actor.proxy = 'http://localhost:31337'
++    actor.proxy = nil
++    assert_nil actor.site
++  end
+ 
+   def test_should_accept_setting_user
+     Forum.user = 'david'
+@@ -221,6 +244,47 @@ class BaseTest < Test::Unit::TestCase
+     assert_equal fruit.site, apple.site, 'subclass did not adopt changes from parent class'
+   end
+ 
++  def test_proxy_reader_uses_superclass_site_until_written
++    # Superclass is Object so returns nil.
++    assert_nil ActiveResource::Base.proxy
++    assert_nil Class.new(ActiveResource::Base).proxy
++
++    # Subclass uses superclass proxy.
++    actor = Class.new(Person)
++    assert_equal Person.proxy, actor.proxy
++
++    # Subclass returns frozen superclass copy.
++    assert !Person.proxy.frozen?
++    assert actor.proxy.frozen?
++
++    # Changing subclass proxy doesn't change superclass site.
++    actor.proxy = 'http://localhost:31337'
++    assert_not_equal Person.proxy, actor.proxy
++
++    # Changed subclass proxy is not frozen.
++    assert !actor.proxy.frozen?
++
++    # Changing superclass proxy doesn't overwrite subclass site.
++    Person.proxy = 'http://somewhere.else'
++    assert_not_equal Person.proxy, actor.proxy
++
++    # Changing superclass proxy after subclassing changes subclass site.
++    jester = Class.new(actor)
++    actor.proxy = 'http://nomad'
++    assert_equal actor.proxy, jester.proxy
++    assert jester.proxy.frozen?
++
++    # Subclasses are always equal to superclass proxy when not overridden
++    fruit = Class.new(ActiveResource::Base)
++    apple = Class.new(fruit)
++
++    fruit.proxy = 'http://market'
++    assert_equal fruit.proxy, apple.proxy, 'subclass did not adopt changes from parent class'
++
++    fruit.proxy = 'http://supermarket'
++    assert_equal fruit.proxy, apple.proxy, 'subclass did not adopt changes from parent class'
++  end
++
+   def test_user_reader_uses_superclass_user_until_written
+     # Superclass is Object so returns nil.
+     assert_nil ActiveResource::Base.user
+diff --git a/activeresource/test/connection_test.rb b/activeresource/test/connection_test.rb
+index 831fbc4..12c1894 100644
+--- a/activeresource/test/connection_test.rb
++++ b/activeresource/test/connection_test.rb
+@@ -100,6 +100,16 @@ class ConnectionTest < Test::Unit::TestCase
+     assert_nothing_raised { @conn.site = site }
+     assert_equal site, @conn.site
+   end
++  
++  def test_proxy_accessor_accepts_uri_or_string_argument
++    proxy = URI.parse("http://proxy_user:proxy_password@proxy.local:4242")
++
++    assert_nothing_raised { @conn.proxy = "http://proxy_user:proxy_password@proxy.local:4242" }
++    assert_equal proxy, @conn.proxy
++
++    assert_nothing_raised { @conn.proxy = proxy }
++    assert_equal proxy, @conn.proxy
++  end
+ 
+   def test_timeout_accessor
+     @conn.timeout = 5
+diff --git a/activeresource/test/fixtures/proxy.rb b/activeresource/test/fixtures/proxy.rb
+new file mode 100644
+index 0000000..bb8e015
+--- /dev/null
++++ b/activeresource/test/fixtures/proxy.rb
+@@ -0,0 +1,4 @@
++class ProxyResource < ActiveResource::Base
++  self.site = "http://localhost"
++  self.proxy = "http://user:password@proxy.local:3000"
++end
+\ No newline at end of file
+-- 
+1.6.0.4
+
+
+From 4ff273be3ecac231b4a0d5e82f67382f65ff35e0 Mon Sep 17 00:00:00 2001
+From: Marshall Huss <mwhuss@gmail.com>
+Date: Sat, 8 Aug 2009 17:55:58 -0400
+Subject: [PATCH] Adding proxy support to active_resource
+
+---
+ activeresource/lib/active_resource/connection.rb |   13 +++++++++++--
+ 1 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index 99d4b8f..0520d3e 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -16,7 +16,7 @@ module ActiveResource
+       :delete => 'Accept'
+     }
+ 
+-    attr_reader :site, :user, :password, :timeout
++    attr_reader :site, :user, :password, :timeout, :proxy
+     attr_accessor :format
+ 
+     class << self
+@@ -40,6 +40,11 @@ module ActiveResource
+       @user = URI.decode(@site.user) if @site.user
+       @password = URI.decode(@site.password) if @site.password
+     end
++    
++    # Set the proxy for remote service.
++    def proxy=(proxy)
++      @proxy = proxy.is_a?(URI) ? proxy : URI.parse(proxy)
++    end
+ 
+     # Sets the user for remote service.
+     def user=(user)
+@@ -132,7 +137,11 @@ module ActiveResource
+       # Creates new Net::HTTP instance for communication with the
+       # remote service and resources.
+       def http
+-        http             = Net::HTTP.new(@site.host, @site.port)
++        if @proxy
++          http  = Net::HTTP.new(@site.host, @site.port, @proxy.host, @proxy.port, @proxy.user, @proxy.password)
++        else
++          http  = Net::HTTP.new(@site.host, @site.port)
++        end
+         http.use_ssl     = @site.is_a?(URI::HTTPS)
+         http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl?
+         http.read_timeout = @timeout if @timeout # If timeout is not set, the default Net::HTTP timeout (60s) is used.
+-- 
+1.6.0.4
+

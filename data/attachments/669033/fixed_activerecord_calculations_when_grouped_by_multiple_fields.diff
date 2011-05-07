@@ -1,0 +1,96 @@
+From 70081881d405e99b5e9d072c6cfd84efab579d43 Mon Sep 17 00:00:00 2001
+From: Sebastian <sebastian@yo.lk>
+Date: Sat, 11 Sep 2010 04:17:40 +0200
+Subject: [PATCH] Fix ActiveRecord calculations when grouped by multiple fields
+
+---
+ .../lib/active_record/relation/calculations.rb     |   27 ++++++++++++-------
+ activerecord/test/cases/calculations_test.rb       |   15 +++++++++++
+ 2 files changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/activerecord/lib/active_record/relation/calculations.rb b/activerecord/lib/active_record/relation/calculations.rb
+index 398ab75..3187c28 100644
+--- a/activerecord/lib/active_record/relation/calculations.rb
++++ b/activerecord/lib/active_record/relation/calculations.rb
+@@ -196,14 +196,18 @@ module ActiveRecord
+     end
+ 
+     def execute_grouped_calculation(operation, column_name) #:nodoc:
+-      group_attr      = @group_values.first
+-      association     = @klass.reflect_on_association(group_attr.to_sym)
++      group_attrs     = @group_values.join(",").scan(/[^\(\), ]+\([^\(\)]+\)|[^\(^), ]+/) # split fields by comma except if within SQL function
++      association     = @klass.reflect_on_association(group_attrs.first.to_sym)
+       associated      = association && association.macro == :belongs_to # only count belongs_to associations
+-      group_field     = associated ? association.primary_key_name : group_attr
+-      group_alias     = column_alias_for(group_field)
+-      group_column    = column_for(group_field)
++      group_fields    = Array(associated ? association.primary_key_name : group_attrs)
++      group_columns   = {}
++      group_aliases   = group_fields.inject([]) do |aliases, field|
++        column_alias = column_alias_for(field)
++        group_columns[column_alias] = column_for(field)
++        aliases << column_alias
++      end
+ 
+-      group = @klass.connection.adapter_name == 'FrontBase' ? group_alias : group_field
++      groups = @klass.connection.adapter_name == 'FrontBase' ? group_aliases : group_fields
+ 
+       aggregate_alias = column_alias_for(operation, column_name)
+ 
+@@ -213,20 +217,23 @@ module ActiveRecord
+         Arel::Attribute.new(@klass.unscoped.table, column_name).send(operation).as(aggregate_alias).to_sql
+       end
+ 
+-      select_statement <<  ", #{group_field} AS #{group_alias}"
++      group_fields.each do |field|
++        select_statement <<  ", #{field} AS #{column_alias_for(field)}"
++      end
+ 
+-      relation = except(:group).select(select_statement).group(group)
++      relation = except(:group).select(select_statement).group(groups.join(", "))
+ 
+       calculated_data = @klass.connection.select_all(relation.to_sql)
+ 
+       if association
+-        key_ids     = calculated_data.collect { |row| row[group_alias] }
++        key_ids     = calculated_data.collect { |row| row[group_aliases.first] }
+         key_records = association.klass.base_class.find(key_ids)
+         key_records = key_records.inject({}) { |hsh, r| hsh.merge(r.id => r) }
+       end
+ 
+       calculated_data.inject(ActiveSupport::OrderedHash.new) do |all, row|
+-        key   = type_cast_calculated_value(row[group_alias], group_column)
++        key   = group_aliases.collect{|group_alias| type_cast_calculated_value(row[group_alias], group_columns[group_alias]) }
++        key   = key.first if key.size == 1
+         key   = key_records[key] if associated
+         value = row[aggregate_alias]
+         all[key] = type_cast_calculated_value(value, column_for(column_name), operation)
+diff --git a/activerecord/test/cases/calculations_test.rb b/activerecord/test/cases/calculations_test.rb
+index afef313..4544106 100644
+--- a/activerecord/test/cases/calculations_test.rb
++++ b/activerecord/test/cases/calculations_test.rb
+@@ -216,6 +216,21 @@ class CalculationsTest < ActiveRecord::TestCase
+     assert_equal 2, c['FIRM']
+   end
+ 
++  def test_should_group_by_multiple_fields
++    c = Account.group('firm_id, credit_limit').count(:all)
++    [[nil, 50], [1, 50], [2, 60], [6, 50], [6, 55], [9, 53]].each do |key|
++      assert_equal 1, c[key]
++    end
++  end
++
++  def test_should_group_by_multiple_fields_having_functions
++    c = Topic.group('author_name, COALESCE(type, title)').count(:all)
++    assert_equal 1, c[["Carl", "The Third Topic of the day"]]
++    assert_equal 1, c[["Mary", "Reply"]]
++    assert_equal 1, c[["David", "The First Topic"]]
++    assert_equal 1, c[["Carl", "Reply"]]
++  end
++
+   def test_should_not_overshadow_enumerable_sum
+     assert_equal 6, [1, 2, 3].sum(&:abs)
+   end
+-- 
+1.6.3.3
+

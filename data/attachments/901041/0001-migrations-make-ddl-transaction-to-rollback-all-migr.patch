@@ -1,0 +1,98 @@
+From 27cc3cf11629b6800b7a70559aeda9eb1096ab2b Mon Sep 17 00:00:00 2001
+From: Bogdan Gusiev <agresso@gmail.com>
+Date: Tue, 8 Feb 2011 11:39:59 +0200
+Subject: [PATCH] migrations: Make ddl transaction to rollback all migrations [#5742]
+
+Currenty AR::Migrator rollbacks only last migration if ddl transactions
+is supported. We need to rollback all migrations instead.
+---
+ activerecord/lib/active_record/migration.rb        |   30 ++++++++++----------
+ activerecord/test/cases/migration_test.rb          |    3 +-
+ .../migrations/broken/99_migration_that_pass.rb    |   10 ++++++
+ 3 files changed, 27 insertions(+), 16 deletions(-)
+ create mode 100644 activerecord/test/migrations/broken/99_migration_that_pass.rb
+
+diff --git a/activerecord/lib/active_record/migration.rb b/activerecord/lib/active_record/migration.rb
+index 6401110..8f42a18 100644
+--- a/activerecord/lib/active_record/migration.rb
++++ b/activerecord/lib/active_record/migration.rb
+@@ -660,29 +660,29 @@ module ActiveRecord
+       runnable.pop if down? && target
+ 
+       ran = []
+-      runnable.each do |migration|
+-        Base.logger.info "Migrating to #{migration.name} (#{migration.version})" if Base.logger
++      ddl_transaction do
++        begin
++          runnable.each do |migration|
++            Base.logger.info "Migrating to #{migration.name} (#{migration.version})" if Base.logger
+ 
+-        seen = migrated.include?(migration.version.to_i)
++            seen = migrated.include?(migration.version.to_i)
+ 
+-        # On our way up, we skip migrating the ones we've already migrated
+-        next if up? && seen
++            # On our way up, we skip migrating the ones we've already migrated
++            next if up? && seen
+ 
+-        # On our way down, we skip reverting the ones we've never migrated
+-        if down? && !seen
+-          migration.announce 'never migrated, skipping'; migration.write
+-          next
+-        end
++            # On our way down, we skip reverting the ones we've never migrated
++            if down? && !seen
++              migration.announce 'never migrated, skipping'; migration.write
++              next
++            end
+ 
+-        begin
+-          ddl_transaction do
+             migration.migrate(@direction)
+             record_version_state_after_migrating(migration.version)
++            ran << migration
+           end
+-          ran << migration
+         rescue => e
+-          canceled_msg = Base.connection.supports_ddl_transactions? ? "this and " : ""
+-          raise StandardError, "An error has occurred, #{canceled_msg}all later migrations canceled:\n\n#{e}", e.backtrace
++          canceled_msg = Base.connection.supports_ddl_transactions? ? "all" : "later"
++          raise StandardError, "An error has occurred, #{canceled_msg} migrations canceled:\n\n#{e}", e.backtrace
+         end
+       end
+       ran
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index 9d7c497..a5241de 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -1259,9 +1259,10 @@ if ActiveRecord::Base.connection.supports_migrations?
+           ActiveRecord::Migrator.up(MIGRATIONS_ROOT + "/broken", 100)
+         end
+ 
+-        assert_equal "An error has occurred, this and all later migrations canceled:\n\nSomething broke", e.message
++        assert_equal "An error has occurred, all migrations canceled:\n\nSomething broke", e.message
+ 
+         Person.reset_column_information
++        assert !Person.column_methods_hash.include?(:phone)
+         assert !Person.column_methods_hash.include?(:last_name)
+       end
+     end
+diff --git a/activerecord/test/migrations/broken/99_migration_that_pass.rb b/activerecord/test/migrations/broken/99_migration_that_pass.rb
+new file mode 100644
+index 0000000..41e09ad
+--- /dev/null
++++ b/activerecord/test/migrations/broken/99_migration_that_pass.rb
+@@ -0,0 +1,10 @@
++
++class MigrationThatPass < ActiveRecord::Migration
++  def self.up
++    add_column "people", "phone", :string
++  end
++
++  def self.down
++    remove_column "people", "phone"
++  end
++end
+-- 
+1.7.0.4
+

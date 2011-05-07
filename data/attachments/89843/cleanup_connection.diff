@@ -1,0 +1,127 @@
+From b83fe4f472f17b217e06c3a18de023a5ff9da4c0 Mon Sep 17 00:00:00 2001
+From: steve <coderrr.contact@gmail.com>
+Date: Thu, 15 Jan 2009 05:00:38 +0700
+Subject: [PATCH] added cleanup_connection which releases connection after block finishes while protecting against nested calls
+
+---
+ .../abstract/connection_pool.rb                    |   15 +++++
+ .../abstract/connection_specification.rb           |    3 +-
+ activerecord/test/cases/pooled_connections_test.rb |   57 ++++++++++++++++++++
+ 3 files changed, 74 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+index 901b171..6df55c8 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_pool.rb
+@@ -317,6 +317,21 @@ module ActiveRecord
+         @connection_pools.each_value {|pool| pool.verify_active_connections! }
+       end
+ 
++      # Yields to a block and ensures that the connection is released after the
++      # block completes.  Makes sure the connection is only released on the
++      # topmost method call in case they are nested.
++      def cleanup_connection
++        return yield if Thread.current[:__AR__using_connection]
++
++        begin
++          Thread.current[:__AR__using_connection] = true
++          yield
++        ensure
++          clear_active_connections!
++          Thread.current[:__AR__using_connection] = false
++        end
++      end
++
+       # Locate the connection of the nearest super class. This can be an
+       # active or defined connection: if it is the latter, it will be
+       # opened and set as the active connection for the class it was defined
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+index bbc290f..d3a8021 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+@@ -133,7 +133,8 @@ module ActiveRecord
+       end
+ 
+       delegate :clear_active_connections!, :clear_reloadable_connections!,
+-        :clear_all_connections!,:verify_active_connections!, :to => :connection_handler
++        :clear_all_connections!, :verify_active_connections!, 
++        :cleanup_connection, :to => :connection_handler
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/pooled_connections_test.rb b/activerecord/test/cases/pooled_connections_test.rb
+index 2649a93..e677d2e 100644
+--- a/activerecord/test/cases/pooled_connections_test.rb
++++ b/activerecord/test/cases/pooled_connections_test.rb
+@@ -1,4 +1,5 @@
+ require "cases/helper"
++require "timeout"
+ 
+ class PooledConnectionsTest < ActiveRecord::TestCase
+   def setup
+@@ -89,6 +90,62 @@ class PooledConnectionsTest < ActiveRecord::TestCase
+   ensure
+     ActiveRecord::Base.connection_handler = old_handler
+   end
++
++  def test_cleanup_connection
++    ActiveRecord::Base.establish_connection(@connection.merge({:pool => 2, :wait_timeout => 10}))
++    threads = []
++    10.times do
++      threads << Thread.new do
++        ActiveRecord::Base.cleanup_connection do
++          ActiveRecord::Base.connection.execute("select 1")
++        end
++      end
++    end
++
++    assert_nothing_raised do
++      Timeout.timeout(2) do
++        threads.each {|t| t.join }
++      end
++    end
++  end
++
++  def test_cleanup_connection_nesting_safety
++    ActiveRecord::Base.establish_connection(@connection.merge({:pool => 1, :wait_timeout => 0.1}))
++
++    before_count = ActiveRecord::Base.connection.execute("select * from projects").num_rows
++
++    add_record('one')
++
++    transaction do
++      add_record('two')
++      # have another thread try to screw up the transaction
++      Thread.new do
++        ActiveRecord::Base.connection.execute("rollback")
++        ActiveRecord::Base.connection_pool.release_connection
++      end.join rescue nil
++      add_record('three')
++    end
++
++    after_count = ActiveRecord::Base.connection.execute("select * from projects").num_rows
++    assert_equal 3, after_count - before_count
++  end
++
++  private
++
++  def add_record(name)
++    ActiveRecord::Base.cleanup_connection do
++      ActiveRecord::Base.connection.execute("insert into projects (name) values ('#{name}')")
++    end
++  end
++
++  def transaction
++    ActiveRecord::Base.cleanup_connection do
++      ActiveRecord::Base.connection.execute("start transaction")
++      yield
++      ActiveRecord::Base.connection.execute("commit")
++    end
++  end
++
+ end unless %w(FrontBase).include? ActiveRecord::Base.connection.adapter_name
+ 
+ class AllowConcurrencyDeprecatedTest < ActiveRecord::TestCase
+-- 
+1.5.6.3
+

@@ -1,0 +1,100 @@
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index ebea313..c13a38e 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -40,6 +40,32 @@ module ActiveRecord
+         end
+         @reflection.klass.send(:with_scope, construct_scope) { @reflection.klass.count(column_name, options) } 
+       end
++      
++      # Iterates over the objects in a has_many :through relationship, but also includes an instance of the join
++      # model that connects the has_many objects with its owner
++      #
++      # Example:
++      #
++      # class User < ActiveRecord::Base
++      #   has_many :memberships
++      #   has_many :groups, :through => :memberships
++      # end
++      #
++      # user.groups.each_with_join { |group, membership| puts "#{group.name}, #{membership.status}" }
++      def each_with_join
++        @owner.send(@reflection.name).each do |obj|
++          if @reflection.source_reflection.macro == :belongs_to
++            # faster with small data sets
++            #temp = @owner.send(@reflection.through_reflection.name).select {|join| join.send(@reflection.source_reflection.primary_key_name.to_sym) == obj.id}
++            # faster with large data sets
++            temp = @reflection.through_reflection.klass.send(:find, :all, :conditions => "#{@reflection.through_reflection.primary_key_name} = #{@owner.id} AND #{@reflection.source_reflection.primary_key_name} = #{obj.id}")
++            obj_join = (temp.size == 1) ? temp.first : temp
++          else
++            obj_join = @reflection.through_reflection.klass.send(:find, obj.send(@reflection.source_reflection.primary_key_name.to_sym))
++          end
++          yield obj, obj_join
++        end
++      end
+ 
+       protected
+         def construct_find_options!(options)
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index a989910..fe72f41 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -2,9 +2,14 @@ require "cases/helper"
+ require 'models/post'
+ require 'models/person'
+ require 'models/reader'
++require 'models/author'
++require 'models/post'
++require 'models/category'
++require 'models/categorization'
++require 'models/comment'
+ 
+ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+-  fixtures :posts, :readers, :people
++  fixtures :posts, :readers, :people, :authors, :posts
+ 
+   def test_associate_existing
+     assert_queries(2) { posts(:thinking);people(:david) }
+@@ -174,4 +179,42 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     post.people_with_callbacks.clear
+     assert_equal (%w(Michael David Julian Roger) * 2).sort, log.last(8).collect(&:last).sort
+   end
++  
++  def test_each_with_join_through_belongs_to
++    authors(:david).categories << Category.create!(:name => "A Category")
++    
++    authors(:david).categories.each_with_join do |category, categorization|
++      assert category.instance_of?(Category)
++      assert categorization.instance_of?(Categorization)
++      assert_equal category.id, categorization.category_id
++      assert_equal authors(:david).id, categorization.author_id
++    end
++  end
++
++  def test_each_with_join_through_belongs_to_is_array
++    ft = Category.create(:name => "Fairy Tails")
++    ss = Category.create(:name => "Short Story")
++    Categorization.create(:author => authors(:david), :post => posts(:welcome), :category => ft)
++    Categorization.create(:author => authors(:david), :post => posts(:welcome), :category => ss)
++    
++    authors(:david).categorized_posts.each_with_join do |post, categorization|
++      assert post.respond_to?(:title)
++      assert categorization.instance_of?(Array)
++      assert categorization.first.instance_of?(Categorization)
++      assert_equal post.id, categorization.first.post_id
++      assert_equal authors(:david).id, categorization.first.author_id
++    end
++  end
++  
++  def test_each_with_join_through_has_many
++    authors(:david).special_posts.create(:title => "Special Post", :body => "hello").comments.create(:body => "A Comment")
++    
++    authors(:david).special_post_comments.each_with_join do |comment, special_post|
++      assert comment.respond_to?(:body)
++      assert special_post.respond_to?(:title)
++      assert special_post.instance_of?(SpecialPost)
++      assert_equal comment.post_id, special_post.id
++      assert_equal authors(:david).id, special_post.author_id
++    end
++  end
+ end

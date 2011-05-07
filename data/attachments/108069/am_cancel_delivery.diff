@@ -1,0 +1,108 @@
+From 40e190d48d2c1fa922d0b18eb0f41609dd2a4ad1 Mon Sep 17 00:00:00 2001
+From: Henrik N <henrik@nyh.se>
+Date: Sun, 5 Apr 2009 09:38:01 +0200
+Subject: [PATCH] ActionMailer delivery can be cancelled from within the mailer by raising CancelDelivery.
+
+---
+ actionmailer/lib/action_mailer/base.rb |   24 ++++++++++++++++++++++++
+ actionmailer/test/mail_service_test.rb |   28 ++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 0 deletions(-)
+
+diff --git a/actionmailer/lib/action_mailer/base.rb b/actionmailer/lib/action_mailer/base.rb
+index b77409b..c77da4a 100644
+--- a/actionmailer/lib/action_mailer/base.rb
++++ b/actionmailer/lib/action_mailer/base.rb
+@@ -115,6 +115,25 @@ module ActionMailer #:nodoc:
+   # like to deliver. The <tt>signup_notification</tt> method defined above is
+   # delivered by invoking <tt>Notifier.deliver_signup_notification</tt>.
+   #
++  # To cancel delivery from within your mailer, raise CancelDelivery. If there's an exception message, it will go in the log.
++  # For example:
++  #
++  #  class Notifier < ActionMailer::Base
++  #    def friend_notification(recipient)
++  #      raise(CancelDelivery, "Bounced.") if recipient.emails_have_bounced?
++  #      recipients recipient.email_address_with_name
++  #      from       "system@example.com"
++  #      subject    "Someone added you as a friend"
++  #    end
++  #  end
++  #
++  # If you create a message to deliver later, you will need to handle the exception yourself at creation time:
++  #
++  #   begin
++  #     mail = Notifier.create_friend_notification(david)
++  #   rescue ActionMailer::Base::CancelDelivery
++  #     # handle the exception
++  #   end
+   #
+   # = HTML email
+   #
+@@ -250,6 +269,8 @@ module ActionMailer #:nodoc:
+       include ActionController::UrlWriter
+       include ActionController::Layout
+     end
++    
++    class CancelDelivery < StandardError; end
+ 
+     private_class_method :new #:nodoc:
+ 
+@@ -399,6 +420,9 @@ module ActionMailer #:nodoc:
+         else
+           super
+         end
++      rescue ActionMailer::Base::CancelDelivery => e
++        raise unless match[1] == 'deliver'
++        logger.info "Cancelled mail delivery. #{e}".strip unless logger.nil?
+       end
+ 
+       # Receives a raw email, parses it into an email object, decodes it,
+diff --git a/actionmailer/test/mail_service_test.rb b/actionmailer/test/mail_service_test.rb
+index 277a913..9794909 100644
+--- a/actionmailer/test/mail_service_test.rb
++++ b/actionmailer/test/mail_service_test.rb
+@@ -279,6 +279,14 @@ class TestMailer < ActionMailer::Base
+     from         "test@example.com"
+     body         :body => "foo", :bar => "baz"
+   end
++  
++  def cancel_delivery(cancel)
++    raise(CancelDelivery, "Return to sender.") if cancel
++    recipients "no.one@nowhere.test"
++    subject    "delivery may be cancelled"
++    from       "test@example.com"
++    body       "testing"
++  end
+ 
+   class <<self
+     attr_accessor :received_body
+@@ -972,6 +980,26 @@ EOF
+   ensure
+     ActionMailer::Base.smtp_settings[:enable_starttls_auto] = true
+   end
++  
++  def test_cancel_delivery_respects_cancelling
++    TestMailer.deliver_cancel_delivery(true)
++    assert_equal 0, TestMailer.deliveries.length
++    TestMailer.deliver_cancel_delivery(false)
++    assert_equal 1, TestMailer.deliveries.length
++  end
++  
++  def test_cancel_delivery_raises_on_create_without_deliver
++    assert_raise(ActionMailer::Base::CancelDelivery) { TestMailer.create_cancel_delivery(true) }
++    assert_nothing_raised { TestMailer.create_cancel_delivery(false) }
++  end
++  
++  def test_cancel_delivery_message_is_logged
++    logger = mock()
++    logger.expects(:info).with("Cancelled mail delivery. Return to sender.")
++    TestMailer.logger = logger
++    TestMailer.deliver_cancel_delivery(true)
++  end
++  
+ end
+ 
+ class InheritableTemplateRootTest < Test::Unit::TestCase
+-- 
+1.6.0.5
+

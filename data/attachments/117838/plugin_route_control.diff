@@ -1,0 +1,211 @@
+From f8ce1f42b354872983b129c8c8055eba97ef1f1c Mon Sep 17 00:00:00 2001
+From: James Adam <james@lazyatom.com>
+Date: Fri, 1 May 2009 18:49:04 +0100
+Subject: [PATCH 2/2] Allow application developers control of when a plugin loads its routes in terms of precedence.
+
+---
+ ./actionpack/lib/action_controller/routing/route_set.rb     |   49 ++++++++++-
+ ./actionpack/test/controller/routing_test.rb         |   91 ++++++++++++++++++++
+ 2 files changed, 138 insertions(+), 2 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/route_set.rb b/actionpack/lib/action_controller/routing/route_set.rb
+index f3f8bf9..0ec8839 100644
+--- a/actionpack/lib/action_controller/routing/route_set.rb
++++ b/actionpack/lib/action_controller/routing/route_set.rb
+@@ -32,6 +32,10 @@ module ActionController
+         def named_route(name, path, options = {}) #:nodoc:
+           @set.add_named_route(name, path, options)
+         end
++        
++        def bundle(name, options={})
++          @set.install_bundle_placeholder(name, options)
++        end
+ 
+         # Enables the use of resources in a module by setting the name_prefix, path_prefix, and namespace for the model.
+         # Example:
+@@ -58,6 +62,14 @@ module ActionController
+         end
+       end
+ 
++      class BundlePlaceholder
++        attr_reader :name, :options
++        def initialize(name, options)
++          @name = name
++          @options = options
++        end
++      end
++
+       # A NamedRouteCollection instance is a collection of named routes, and also
+       # maintains an anonymous module that can be used to install helpers for the
+       # named routes.
+@@ -205,11 +217,12 @@ module ActionController
+           end
+       end
+ 
+-      attr_accessor :routes, :named_routes, :configuration_files
++      attr_accessor :routes, :named_routes, :configuration_files, :bundles
+ 
+       def initialize
+         self.configuration_files = []
+-
++        self.bundles = {}
++        
+         self.routes = []
+         self.named_routes = NamedRouteCollection.new
+ 
+@@ -226,6 +239,10 @@ module ActionController
+         yield Mapper.new(self)
+         install_helpers
+       end
++      
++      def bundle(name, &block)
++        @bundles[name] = block
++      end
+ 
+       def clear!
+         routes.clear
+@@ -288,6 +305,7 @@ module ActionController
+       def load_routes!
+         if configuration_files.any?
+           configuration_files.each { |config| load(config) }
++          load_bundles
+           @routes_last_modified = routes_changed_at
+         else
+           add_route ":controller/:action/:id"
+@@ -319,6 +337,33 @@ module ActionController
+         name = options[:name_prefix] + name.to_s if options[:name_prefix]
+         named_routes[name.to_sym] = add_route(path, options)
+       end
++      
++      def install_bundle_placeholder(name, options)
++        routes << BundlePlaceholder.new(name, options)
++      end
++      
++      def load_bundles
++        unreferenced_bundles = @bundles.values.dup
++        routes.map! do |route|
++          if route.is_a?(BundlePlaceholder)
++            # this is a little bit hacky. there's no clean way to generate
++            # route so we can place them in here, so instead we have to
++            # scoop newly generated ones off the bottom of the set, and
++            # replace the bundle with them.
++            current_last_route = routes.last
++            unreferenced_bundles.delete(route)
++            @bundles[route.name].call(Mapper.new(self))
++            index = routes.index(current_last_route)
++            routes.slice!(index+1, routes.length) # map! replaces the bundle with these
++          else
++            route
++          end
++        end
++        unreferenced_bundles.each do |bundle|
++          bundle.call(Mapper.new(self))
++        end
++        routes.flatten!
++      end
+ 
+       def options_as_params(options)
+         # If an explicit :controller was given, always make :action explicit
+diff --git a/actionpack/test/controller/routing_test.rb b/actionpack/test/controller/routing_test.rb
+index b9d46d3..7b930a8 100644
+--- a/actionpack/test/controller/routing_test.rb
++++ b/actionpack/test/controller/routing_test.rb
+@@ -2569,3 +2569,94 @@ class RouteLoadingTest < Test::Unit::TestCase
+       ActionController::Routing::Routes
+     end
+ end
++
++class RouteBundleTest < Test::Unit::TestCase
++  def setup
++    routes.instance_variable_set '@routes_last_modified', nil
++    silence_warnings { Object.const_set :RAILS_ROOT, '.' }
++    routes.add_configuration_file(File.join(RAILS_ROOT, 'config', 'routes.rb'))
++    routes.stubs(:load) # don't load any files
++    File.stubs(:stat).returns(stub_everything)
++    routes.clear!
++  end
++
++  def teardown
++    ActionController::Routing::Routes.configuration_files.clear
++    Object.send :remove_const, :RAILS_ROOT
++  end
++  
++  def test_should_recognise_bundled_routes
++    routes.bundle :bundle_name do |map|
++      map.connect "/bundled", :controller => "example"
++    end
++    routes.draw do |map|
++      map.bundle :bundle_name
++    end
++
++    routes.load_routes!
++
++    assert_equal({:controller => 'example', :action => 'index'}, routes.recognize_path('/bundled'))
++  end
++  
++  def test_should_ensure_prior_routes_take_precidence_over_bundled_routes
++    routes.bundle :bundle_name do |map|
++      map.connect "/bundled", :controller => "plugin"
++    end
++    routes.draw do |map|
++      map.connect "/bundled", :controller => "application"
++      map.bundle :bundle_name
++    end
++
++    routes.load_routes!
++
++    assert_equal({:controller => 'application', :action => 'index'}, routes.recognize_path('/bundled'))
++  end
++  
++  def test_should_allow_mixing_of_bundles_and_appliation_routes
++    routes.bundle :bundle_name do |map|
++      map.connect "/bundled", :controller => "plugin"
++    end
++    routes.draw do |map|
++      map.connect "/app", :controller => "application"
++      map.bundle :bundle_name
++      map.connect "/other_app", :controller => "other_application"
++    end
++
++    routes.load_routes!
++
++    assert_equal({:controller => 'application', :action => 'index'}, routes.recognize_path('/app'))
++    assert_equal({:controller => 'plugin', :action => 'index'}, routes.recognize_path('/bundled'))
++    assert_equal({:controller => 'other_application', :action => 'index'}, routes.recognize_path('/other_app'))
++  end
++  
++  def test_should_add_unreferenced_bundles
++    routes.bundle :unreferenced do |map|
++      map.connect "/forgotten", :controller => "another_plugin"
++    end
++    routes.draw do |map|
++      map.connect "/app", :controller => "application"
++    end
++
++    routes.load_routes!
++
++    assert_equal({:controller => 'application', :action => 'index'}, routes.recognize_path('/app'))
++    assert_equal({:controller => 'another_plugin', :action => 'index'}, routes.recognize_path('/forgotten'))
++  end
++  
++  def test_should_add_unreferenced_bundles_below_application_routes
++    routes.bundle :unreferenced do |map|
++      map.connect "/forgotten", :controller => "another_plugin"
++    end
++    routes.draw do |map|
++      map.connect "/forgotten", :controller => "application"
++    end
++
++    routes.load_routes!
++
++    assert_equal({:controller => 'application', :action => 'index'}, routes.recognize_path('/forgotten'))
++  end
++  private
++    def routes
++      ActionController::Routing::Routes
++    end
++end
+\ No newline at end of file
+-- 
+1.6.2.2
+

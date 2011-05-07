@@ -1,0 +1,244 @@
+From 67eb80e72d8d4782334aabf3b120adf6fdca5cda Mon Sep 17 00:00:00 2001
+From: Rodrigo Rosenfeld Rosas <rr_rosas@yahoo.com.br>
+Date: Thu, 25 Feb 2010 00:29:43 -0300
+Subject: [PATCH] Include support for :full_message option to validations.
+
+---
+ activemodel/lib/active_model/errors.rb             |   54 +++++++++++++------
+ .../lib/active_model/validations/acceptance.rb     |    2 +-
+ .../lib/active_model/validations/confirmation.rb   |    2 +-
+ .../lib/active_model/validations/exclusion.rb      |    2 +-
+ activemodel/lib/active_model/validations/format.rb |    4 +-
+ .../lib/active_model/validations/inclusion.rb      |    2 +-
+ activemodel/lib/active_model/validations/length.rb |    2 +-
+ .../lib/active_model/validations/numericality.rb   |    6 +-
+ .../lib/active_model/validations/presence.rb       |    2 +-
+ activemodel/lib/active_model/validator.rb          |    5 ++
+ 10 files changed, 53 insertions(+), 28 deletions(-)
+
+diff --git a/activemodel/lib/active_model/errors.rb b/activemodel/lib/active_model/errors.rb
+index d832027..282e201 100644
+--- a/activemodel/lib/active_model/errors.rb
++++ b/activemodel/lib/active_model/errors.rb
+@@ -161,20 +161,52 @@ module ActiveModel
+       end
+     end
+ 
+-    # Adds an error message (+messsage+) to the +attribute+, which will be returned on a call to <tt>on(attribute)</tt>
++    class ErrorMessage < String
++      attr_reader :options, :message
++      def initialize(options=nil)
++        if options.is_a? ErrorMessage
++          @options = options.options
++          return super(options.message)
++        end
++        @options = options.is_a?(Hash) ? options : {:message => options}
++        @message = @options[:full_message] || @options[:message]
++        super(@message.to_s) # in case of symbols...
++      end
++
++      def full_message?
++        !!options[:full_message] rescue false # options could be nil for ErrorMessage.new.sub, for instance
++      end
++    end
++
++    # Adds an error message (+message+) to the +attribute+, which will be returned on a call to <tt>on(attribute)</tt>
+     # for the same attribute and ensure that this error object returns false when asked if <tt>empty?</tt>. More than one
+     # error can be added to the same +attribute+ in which case an array will be returned on a call to <tt>on(attribute)</tt>.
+-    # If no +messsage+ is supplied, :invalid is assumed.
+-    # 
++    # If no +message+ is supplied, :invalid is assumed.
++    #
+     # If +message+ is a Symbol, it will be translated, using the appropriate scope (see translate_error).
+     # If +message+ is a Proc, it will be called, allowing for things like Time.now to be used within an error
+     def add(attribute, message = nil, options = {})
+       message ||= :invalid
++      full_message = (m=options[:default]).full_message? rescue false
++      options[:default] = m.message rescue m
+       message = generate_message(attribute, message, options) if message.is_a?(Symbol)
+       message = message.call if message.is_a?(Proc)
++      message = ErrorMessage.new :full_message => message if full_message
+       self[attribute] << message
+     end
+ 
++    def generate_full_message(attribute, predicate)
++      predicate = ErrorMessage.new(predicate) unless predicate.is_a? ErrorMessage
++      return (predicate.message.is_a?(Symbol) ? I18n.t(predicate.message) : predicate) if
++        attribute == :base or predicate.full_message?
++
++      attr_name = attribute.to_s.gsub('.', '_').humanize
++      attr_name = @base.class.human_attribute_name(attribute, :default => attr_name)
++      options = { :default => "{{attribute}} {{message}}", :attribute => attr_name }
++
++      I18n.t(:"errors.format", options.merge(:message => predicate))
++    end   
++    
+     # Will add an error message to each of the attributes in +attributes+ that is empty.
+     def add_on_empty(attributes, custom_message = nil)
+       [attributes].flatten.each do |attribute|
+@@ -206,20 +238,8 @@ module ActiveModel
+       full_messages = []
+ 
+       each do |attribute, messages|
+-        messages = Array(messages)
+-        next if messages.empty?
+-
+-        if attribute == :base
+-          messages.each {|m| full_messages << m }
+-        else
+-          attr_name = attribute.to_s.gsub('.', '_').humanize
+-          attr_name = @base.class.human_attribute_name(attribute, :default => attr_name)
+-          options = { :default => "{{attribute}} {{message}}", :attribute => attr_name }
+-
+-          messages.each do |m|
+-            full_messages << I18n.t(:"errors.format", options.merge(:message => m))
+-          end
+-        end
++        messages = Array.wrap(messages)
++        messages.each {|m| full_messages << generate_full_message(attribute, m)}
+       end
+ 
+       full_messages
+diff --git a/activemodel/lib/active_model/validations/acceptance.rb b/activemodel/lib/active_model/validations/acceptance.rb
+index 0423fcd..d02a9e3 100644
+--- a/activemodel/lib/active_model/validations/acceptance.rb
++++ b/activemodel/lib/active_model/validations/acceptance.rb
+@@ -7,7 +7,7 @@ module ActiveModel
+ 
+       def validate_each(record, attribute, value)
+         unless value == options[:accept]
+-          record.errors.add(attribute, :accepted, :default => options[:message])
++          record.errors.add(attribute, :accepted, :default => message)
+         end
+       end
+       
+diff --git a/activemodel/lib/active_model/validations/confirmation.rb b/activemodel/lib/active_model/validations/confirmation.rb
+index 8041d4b..37649ee 100644
+--- a/activemodel/lib/active_model/validations/confirmation.rb
++++ b/activemodel/lib/active_model/validations/confirmation.rb
+@@ -4,7 +4,7 @@ module ActiveModel
+       def validate_each(record, attribute, value)
+         confirmed = record.send(:"#{attribute}_confirmation")
+         return if confirmed.nil? || value == confirmed
+-        record.errors.add(attribute, :confirmation, :default => options[:message])
++        record.errors.add(attribute, :confirmation, :default => message)
+       end
+       
+       def setup(klass)
+diff --git a/activemodel/lib/active_model/validations/exclusion.rb b/activemodel/lib/active_model/validations/exclusion.rb
+index 7ee718c..8bc2cf9 100644
+--- a/activemodel/lib/active_model/validations/exclusion.rb
++++ b/activemodel/lib/active_model/validations/exclusion.rb
+@@ -8,7 +8,7 @@ module ActiveModel
+ 
+       def validate_each(record, attribute, value)
+         return unless options[:in].include?(value)
+-        record.errors.add(attribute, :exclusion, :default => options[:message], :value => value)
++        record.errors.add(attribute, :exclusion, :default => message, :value => value)
+       end
+     end
+ 
+diff --git a/activemodel/lib/active_model/validations/format.rb b/activemodel/lib/active_model/validations/format.rb
+index 9a9e7ec..f92d51b 100644
+--- a/activemodel/lib/active_model/validations/format.rb
++++ b/activemodel/lib/active_model/validations/format.rb
+@@ -3,9 +3,9 @@ module ActiveModel
+     class FormatValidator < EachValidator
+       def validate_each(record, attribute, value)
+         if options[:with] && value.to_s !~ options[:with]
+-          record.errors.add(attribute, :invalid, :default => options[:message], :value => value)
++          record.errors.add(attribute, :invalid, :default => message, :value => value)
+         elsif options[:without] && value.to_s =~ options[:without]
+-          record.errors.add(attribute, :invalid, :default => options[:message], :value => value)
++          record.errors.add(attribute, :invalid, :default => message, :value => value)
+         end
+       end
+       
+diff --git a/activemodel/lib/active_model/validations/inclusion.rb b/activemodel/lib/active_model/validations/inclusion.rb
+index 0c1334f..f8bcf73 100644
+--- a/activemodel/lib/active_model/validations/inclusion.rb
++++ b/activemodel/lib/active_model/validations/inclusion.rb
+@@ -8,7 +8,7 @@ module ActiveModel
+ 
+       def validate_each(record, attribute, value)
+         return if options[:in].include?(value)
+-        record.errors.add(attribute, :inclusion, :default => options[:message], :value => value)
++        record.errors.add(attribute, :inclusion, :default => message, :value => value)
+       end
+     end
+ 
+diff --git a/activemodel/lib/active_model/validations/length.rb b/activemodel/lib/active_model/validations/length.rb
+index 9ceb754..c7ea251 100644
+--- a/activemodel/lib/active_model/validations/length.rb
++++ b/activemodel/lib/active_model/validations/length.rb
+@@ -37,7 +37,7 @@ module ActiveModel
+ 
+         CHECKS.each do |key, validity_check|
+           next unless check_value = options[key]
+-          custom_message = options[:message] || options[MESSAGES[key]]
++          custom_message = message || options[MESSAGES[key]]
+ 
+           valid_value = if key == :maximum
+             value.nil? || value.size.send(validity_check, check_value)
+diff --git a/activemodel/lib/active_model/validations/numericality.rb b/activemodel/lib/active_model/validations/numericality.rb
+index c6d84c5..95e71b8 100644
+--- a/activemodel/lib/active_model/validations/numericality.rb
++++ b/activemodel/lib/active_model/validations/numericality.rb
+@@ -26,7 +26,7 @@ module ActiveModel
+         return if options[:allow_nil] && raw_value.nil?
+ 
+         unless value = parse_raw_value(raw_value, options)
+-          record.errors.add(attr_name, :not_a_number, :value => raw_value, :default => options[:message])
++          record.errors.add(attr_name, :not_a_number, :value => raw_value, :default => message)
+           return
+         end
+ 
+@@ -34,14 +34,14 @@ module ActiveModel
+           case option
+           when :odd, :even
+             unless value.to_i.send(CHECKS[option])
+-              record.errors.add(attr_name, option, :value => value, :default => options[:message])
++              record.errors.add(attr_name, option, :value => value, :default => message)
+             end
+           else
+             option_value = option_value.call(record) if option_value.is_a?(Proc)
+             option_value = record.send(option_value) if option_value.is_a?(Symbol)
+ 
+             unless value.send(CHECKS[option], option_value)
+-              record.errors.add(attr_name, option, :default => options[:message], :value => value, :count => option_value)
++              record.errors.add(attr_name, option, :default => message, :value => value, :count => option_value)
+             end
+           end
+         end      
+diff --git a/activemodel/lib/active_model/validations/presence.rb b/activemodel/lib/active_model/validations/presence.rb
+index 4a71cf7..3f4a846 100644
+--- a/activemodel/lib/active_model/validations/presence.rb
++++ b/activemodel/lib/active_model/validations/presence.rb
+@@ -4,7 +4,7 @@ module ActiveModel
+   module Validations
+     class PresenceValidator < EachValidator
+       def validate(record)
+-        record.errors.add_on_blank(attributes, options[:message])
++        record.errors.add_on_blank(attributes, message)
+       end
+     end
+ 
+diff --git a/activemodel/lib/active_model/validator.rb b/activemodel/lib/active_model/validator.rb
+index b61f0cb..48413b8 100644
+--- a/activemodel/lib/active_model/validator.rb
++++ b/activemodel/lib/active_model/validator.rb
+@@ -158,6 +158,11 @@ module ActiveModel #:nodoc:
+     # ArgumentError when invalid options are supplied.
+     def check_validity!
+     end
++
++    def message
++      return nil unless options[:full_message] || options[:message]
++      @message ||= Errors::ErrorMessage.new(options)
++    end    
+   end
+ 
+   # BlockValidator is a special EachValidator which receives a block on initialization
+-- 
+1.7.0
+

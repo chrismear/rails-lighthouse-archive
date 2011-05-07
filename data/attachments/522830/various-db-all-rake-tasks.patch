@@ -1,0 +1,315 @@
+From 8a9b57db8186a596dbe4fec7b0779a4ad86df079 Mon Sep 17 00:00:00 2001
+From: Anil Wadghule <anildigital@gmail.com>
+Date: Sun, 16 May 2010 16:18:53 +0530
+Subject: [PATCH] Added various db:*:all rake tasks [#2762 state:resolved]
+
+---
+ .../lib/active_record/railties/databases.rake      |  195 ++++++++++++++++----
+ 1 files changed, 155 insertions(+), 40 deletions(-)
+
+diff --git a/activerecord/lib/active_record/railties/databases.rake b/activerecord/lib/active_record/railties/databases.rake
+index cb7eade..4fb0527 100644
+--- a/activerecord/lib/active_record/railties/databases.rake
++++ b/activerecord/lib/active_record/railties/databases.rake
+@@ -7,22 +7,7 @@ namespace :db do
+   namespace :create do
+     desc 'Create all the local databases defined in config/database.yml'
+     task :all => :load_config do
+-      ActiveRecord::Base.configurations.each_value do |config|
+-        # Skip entries that don't have a database key, such as the first entry here:
+-        #
+-        #  defaults: &defaults
+-        #    adapter: mysql
+-        #    username: root
+-        #    password:
+-        #    host: localhost
+-        #
+-        #  development:
+-        #    database: blog_development
+-        #    <<: *defaults
+-        next unless config['database']
+-        # Only connect to local databases
+-        local_database?(config) { create_database(config) }
+-      end
++      for_all_schemas { |config| create_database(config) }
+     end
+   end
+ 
+@@ -32,10 +17,10 @@ namespace :db do
+     if Rails.env.development? && ActiveRecord::Base.configurations['test']
+       create_database(ActiveRecord::Base.configurations['test'])
+     end
+-    create_database(ActiveRecord::Base.configurations[Rails.env])
++    create_database
+   end
+ 
+-  def create_database(config)
++  def create_database(config=ActiveRecord::Base.configurations[Rails.env])
+     begin
+       if config['adapter'] =~ /sqlite/
+         if File.exist?(config['database'])
+@@ -102,16 +87,7 @@ namespace :db do
+   namespace :drop do
+     desc 'Drops all the local databases defined in config/database.yml'
+     task :all => :load_config do
+-      ActiveRecord::Base.configurations.each_value do |config|
+-        # Skip entries that don't have a database key
+-        next unless config['database']
+-        begin
+-          # Only connect to local databases
+-          local_database?(config) { drop_database(config) }
+-        rescue Exception => e
+-          $stderr.puts "Couldn't drop #{config['database']} : #{e.inspect}"
+-        end
+-      end
++      for_all_schemas {|config| drop_database(config) }
+     end
+   end
+ 
+@@ -133,60 +109,148 @@ namespace :db do
+     end
+   end
+ 
++  namespace :migrate do
++    desc 'Migrate all the local databases defined in config/database.yml'
++    task :all => :load_config do
++      for_all_schemas {|config| puts config; migrate_database(config) }
++    end
++  end
+ 
+   desc "Migrate the database through scripts in db/migrate and update db/schema.rb by invoking db:schema:dump. Target specific version with VERSION=x. Turn off output with VERBOSE=false."
+   task :migrate => :environment do
++    migrate_database
++  end
++
++  def migrate_database(config=(ActiveRecord::Base.configurations[Rails.env]))
++    ActiveRecord::Base.establish_connection(config)
+     ActiveRecord::Migration.verbose = ENV["VERBOSE"] ? ENV["VERBOSE"] == "true" : true
+     ActiveRecord::Migrator.migrate("db/migrate/", ENV["VERSION"] ? ENV["VERSION"].to_i : nil)
+     Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
+   end
+ 
+   namespace :migrate do
++
++    namespace :redo do
++      desc  'Roll back all local databases defined in config/database.yml one migration, and re migrate up.'
++      task :all => :load_config do
++        for_all_schemas {|config| redo_migration(config) }
++      end
++    end
++
+     desc  'Rollbacks the database one migration and re migrate up. If you want to rollback more than one step, define STEP=x. Target specific version with VERSION=x.'
+     task :redo => :environment do
++      redo_migration
++    end
++
++    def redo_migration(config=ActiveRecord::Base.configurations(Rails.env))
+       if ENV["VERSION"]
+-        Rake::Task["db:migrate:down"].invoke
+-        Rake::Task["db:migrate:up"].invoke
++        run_single_migration(:down, config)
++        run_single_migration(:up, config)
+       else
+-        Rake::Task["db:rollback"].invoke
+-        Rake::Task["db:migrate"].invoke
++        rollback_database(config)
++        migrate_database(config)
+       end
+     end
+ 
+-    desc 'Resets your database using your migrations for the current environment'
++    namespace :reset do
++      desc 'Reset all the local databases defined in config/database.yml, using migrations'
++       task :all => :load_config do
++        for_all_schemas do |config|
++          drop_database(config)
++          create_database(config)
++          migrate_database(config)
++        end
++      end
++    end
++
++    desc 'Resets the database using your migrations for the current environment'
+     task :reset => ["db:drop", "db:create", "db:migrate"]
+ 
++    namespace :up do
++      desc 'Run the "up" for a given migration VERSION, for all the local databases defined in config/database.yml'
++      task :all => :load_config do
++        for_all_schemas {|config| run_single_migration(:up, config) }
++      end
++    end
++
+     desc 'Runs the "up" for a given migration VERSION.'
+     task :up => :environment do
+-      version = ENV["VERSION"] ? ENV["VERSION"].to_i : nil
+-      raise "VERSION is required" unless version
+-      ActiveRecord::Migrator.run(:up, "db/migrate/", version)
+-      Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
++      run_single_migration(:up)
++    end
++
++    namespace :down do
++      desc 'Run the "up" for a given migration VERSION, for all the local databases defined in config/database.yml'
++      task :all => :load_config do
++        for_all_schemas {|config| run_single_migration(:down, config) }
++      end
+     end
+ 
+     desc 'Runs the "down" for a given migration VERSION.'
+     task :down => :environment do
++      run_single_migration(:down)
++    end
++
++     # _direction_ is either :up or :down.
++    def run_single_migration(direction, config=ActiveRecord::Base.configurations[Rails.env])
++      ActiveRecord::Base.establish_connection(config)
+       version = ENV["VERSION"] ? ENV["VERSION"].to_i : nil
+       raise "VERSION is required" unless version
+-      ActiveRecord::Migrator.run(:down, "db/migrate/", version)
++      ActiveRecord::Migrator.run(direction, "db/migrate/", version)
+       Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
+     end
++
++  end
++
++  namespace :rollback do
++    desc 'Roll back all the local databases defined in config/database.yml'
++    task :all => :load_config do
++      for_all_schemas {|config| rollback_database(config) }
++    end
+   end
+ 
+   desc 'Rolls the schema back to the previous version. Specify the number of steps with STEP=n'
+   task :rollback => :environment do
++    rollback_database
++  end
++
++  def rollback_database(config=ActiveRecord::Base.configurations[Rails.env])
++    ActiveRecord::Base.establish_connection(config)
+     step = ENV['STEP'] ? ENV['STEP'].to_i : 1
+     ActiveRecord::Migrator.rollback('db/migrate/', step)
+     Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
+   end
+ 
++  namespace :forward do
++    desc 'Pushes all the local databases defined in config/database.yml to next schema version'
++    task :all => :load_config do
++      for_all_schemas {|config| forward_database(config) }
++    end
++  end
++
+   desc 'Pushes the schema to the next version. Specify the number of steps with STEP=n'
+   task :forward => :environment do
++    forward_database
++  end
++
++  def forward_database(config=ActiveRecord::Base.configurations[Rails.env])
++    ActiveRecord::Base.establish_connection(config)
+     step = ENV['STEP'] ? ENV['STEP'].to_i : 1
+     ActiveRecord::Migrator.forward('db/migrate/', step)
+     Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
+   end
+ 
++  namespace :reset do
++    desc 'Reset all the local databases defined in config/database.yml'
++    task :all => :load_config do
++      for_all_schemas do |config|
++        drop_database(config)
++        create_database(config)
++        load_schema(config)
++      end
++      Rake::Task["db:seed:all"].invoke
++    end
++  end
++
+   desc 'Drops and recreates the database from db/schema.rb for the current environment and loads the seeds.'
+   task :reset => [ 'db:drop', 'db:setup' ]
+ 
+@@ -240,9 +304,29 @@ namespace :db do
+     end
+   end
+ 
++  namespace :setup do
++    desc 'Set up all local databases defined in config/database.yml'
++    task :all => :load_config do
++      for_all_schemas do |config|
++        create_database(config)
++        load_schema(config)
++      end
++      Rake::Task["db:seed:all"].invoke
++    end
++  end
++
+   desc 'Create the database, load the schema, and initialize with the seed data'
+   task :setup => [ 'db:create', 'db:schema:load', 'db:seed' ]
+ 
++  namespace :seed do
++    desc 'Load the seed data from db/seeds.rb into all local databases defined in config/database.yml'
++    task :all  do
++      system("rake db:seed RAILS_ENV=development")
++      system("rake db:seed RAILS_ENV=test")
++      system("rake db:seed RAILS_ENV=production")
++    end
++  end
++
+   desc 'Load the seed data from db/seeds.rb'
+   task :seed => :environment do
+     seed_file = File.join(Rails.root, 'db', 'seeds.rb')
+@@ -297,13 +381,25 @@ namespace :db do
+       Rake::Task["db:schema:dump"].reenable
+     end
+ 
++    namespace :load do
++      desc 'Load a schema.rb file into all the local databases defined in config/database.yml'
++      task :all => :load_config do
++        for_all_schemas {|config| load_schema(config) }
++      end
++    end
++
+     desc "Load a schema.rb file into the database"
+     task :load => :environment do
++      load_schema
++    end
++
++    def load_schema(config=ActiveRecord::Base.configurations[Rails.env])
++      ActiveRecord::Base.establish_connection(config)
+       file = ENV['SCHEMA'] || "#{Rails.root}/db/schema.rb"
+       if File.exists?(file)
+         load(file)
+       else
+-        abort %{#{file} doesn't exist yet. Run "rake db:migrate" to create it then try again. If you do not intend to use a database, you should instead alter #{Rails.root}/config/boot.rb to limit the frameworks that will be loaded}
++        abort %{#{file} doesn\'t exist yet. Run "rake db:migrate" to create it then try again. If you do not intend to use a database, you should instead alter #{Rails.root}/config/boot.rb to limit the frameworks that will be loaded}
+       end
+     end
+   end
+@@ -448,7 +544,26 @@ end
+ 
+ task 'test:prepare' => 'db:test:prepare'
+ 
+-def drop_database(config)
++def for_all_schemas
++  ActiveRecord::Base.configurations.each_value do |config|
++    # Skip entries that don't have a database key, such as the first entry here:
++    #
++    #  defaults: &defaults
++    #    adapter: mysql
++    #    username: root
++    #    password:
++    #    host: localhost
++    #
++    #  development:
++    #    database: blog_development
++    #    <<: *defaults
++    next unless config['database']
++    # Only connect to local databases
++    local_database?(config) { yield(config) }
++  end
++end
++
++def drop_database(config=ActiveRecord::Base.configurations[Rails.env])
+   case config['adapter']
+   when 'mysql'
+     ActiveRecord::Base.establish_connection(config)
+-- 
+1.7.0.4
+

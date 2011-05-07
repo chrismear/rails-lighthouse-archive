@@ -1,0 +1,119 @@
+From c78818a1be61a820b312ab0cd9edefe76a385de4 Mon Sep 17 00:00:00 2001
+From: Alex Pooley <alex@brownbeagle.com.au>
+Date: Wed, 10 Dec 2008 14:12:42 +0900
+Subject: [PATCH] Added cross tabulation method to ActiveRecord::Base
+
+---
+ activerecord/lib/active_record/base.rb |   60 ++++++++++++++++++++++++++++++++
+ activerecord/test/cases/finder_test.rb |   24 +++++++++++++
+ 2 files changed, 84 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index a23518b..fc01d17 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -616,6 +616,66 @@ module ActiveRecord #:nodoc:
+         end
+       end
+ 
++      # A cross tabulation compares one variable against the tabulation of another variable. This is often useful
++      # when you need to aggregate data in categories.
++      #
++      # For example, you may want to find the sum of sales for each department in a supermarket. Given the schema:
++      #
++      #   Departments: id, name
++      #   Sales: id, department_id, amount
++      #
++      # and the example data:
++      #
++      # Departments:
++      #   +------------------+
++      #   | id |    name     |
++      #   |----+-------------+
++      #   | 1  | Vegetables  |
++      #   | 2  | Deli        |
++      #   | 3  | Frozen      |
++      #   +------------------+
++      #
++      # Sales:
++      #   +-----------------------------+
++      #   | id | department_id | amount |
++      #   |----+---------------+--------+
++      #   | 1  |       1       | 11     |
++      #   | 1  |       1       | 111    |
++      #   | 2  |       2       | 22     |
++      #   | 2  |       2       | 222    |
++      #   | 3  |       3       | 3      |
++      #   +-----------------------------+
++      #
++      # You would want the output:
++      #   +----------------------------+
++      #   | Vegetables | Deli | Frozen |
++      #   |------------+------+--------+
++      #   |    122     |  244 |   3    |
++      #   +----------------------------+
++      #
++      # Which could be achieved using the method call:
++      #
++      #   Department.cross('name', :aggregator => 'sum', aggregator_column => 'amount', :joins => 'INNER JOIN sales ON sales.department_id = departments.id')
++      #
++      # ==== Parameters
++      #
++      # * <tt>:column</tt> - The name of the column to build categories. This can include table names if crossing on a join table such as 'sales.department_id'.
++      # * <tt>:options</tt> - A hash of the same parameters acceptable by find with the addition of 'aggregator' and 'aggregator_column'.
++      #   The aggregator defaults to 'count' and determines how to process the data for each category. By default, the aggregator will operate
++      #   on the category column, but you can override this by setting the :aggregator_column option.
++      #
++      # This method will return an array of hashes, with one hash for each group. Hash keys are column names, and their values are the aggregate values.
++      def cross(column, options={})
++        options = {:aggregator => 'count', :aggregator_column => column}.merge(options)
++
++        sql = construct_finder_sql(options.merge(:select => connection.distinct(column,'')).except(:group))
++        categories = connection.select_values(sql)
++
++        categories.map! {|category| "#{options[:aggregator]}(CASE WHEN #{column}=#{quote_value(category)} THEN #{options[:aggregator_column]} ELSE NULL END) AS #{quote_value(category)}"}
++        options[:select] = [options[:group], options[:select]].concat(categories).compact.join(',')
++        connection.select_all(construct_finder_sql(options))
++      end
++
+       # A convenience wrapper for <tt>find(:first, *args)</tt>. You can pass in all the
+       # same arguments to this method as you can to <tt>find(:first)</tt>.
+       def first(*args)
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index d4d770b..a498798 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -1043,6 +1043,30 @@ class FinderTest < ActiveRecord::TestCase
+     assert_equal 3, posts.size
+     assert_equal [0, 1, 1], posts.map(&:author_id).sort
+   end
++  
++  def test_basic_cross
++    cross = Comment.cross('post_id')
++    assert_equal [{"7"=>"1", "1"=>"2", "2"=>"1", "4"=>"4", "5"=>"2"}], cross
++  end
++  
++  def test_cross_with_sum_aggregator
++    cross = Comment.cross('post_id', :aggregator => 'sum', :aggregator_column => 'id')
++    assert_equal [{"7"=>"11", "1"=>"3", "2"=>"3", "4"=>"26", "5"=>"19"}], cross
++  end
++  
++  def test_cross_with_joins
++    cross = Comment.cross('posts.title', :joins => 'INNER JOIN posts ON comments.post_id = posts.id')
++    assert_equal [{"sti comments"=>"4", "So I was thinking"=>"1", "eager loading with OR'd conditions"=>"1", "Welcome to the weblog"=>"2", "sti me"=>"2"}], cross
++  end
++
++  def test_cross_with_joins_and_group_and_aggregator
++    # "Show me the number of comments an author receives based on post type"
++    cross = Comment.cross('posts.type', :joins => 'INNER JOIN posts ON comments.post_id = posts.id', :group => 'posts.author_id', :aggregator_column => 'comments.id')
++    assert_equal(
++      [{"Post"=>"6", "SpecialPost"=>"1", "StiPost"=>"2", "author_id"=>"1"},
++       {"Post"=>"1", "SpecialPost"=>"0", "StiPost"=>"0", "author_id"=>"2"}],
++      cross)
++  end
+ 
+   protected
+     def bind(statement, *vars)
+-- 
+1.6.0.4
+

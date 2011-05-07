@@ -1,0 +1,167 @@
+From d474c733e615a90b8fc0f4a39668c00f4517183c Mon Sep 17 00:00:00 2001
+From: Xavier Noria <fxn@hashref.com>
+Date: Sun, 24 Aug 2008 02:51:45 +0200
+Subject: [PATCH] let cancels from before filters issue a ROLLBACK
+
+---
+ activerecord/lib/active_record/callbacks.rb    |   12 +++++
+ activerecord/lib/active_record/transactions.rb |   16 +++++-
+ activerecord/test/cases/transactions_test.rb   |   62 +++++++++++++++++++++++-
+ 3 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/activerecord/lib/active_record/callbacks.rb b/activerecord/lib/active_record/callbacks.rb
+index be2621f..eec531c 100644
+--- a/activerecord/lib/active_record/callbacks.rb
++++ b/activerecord/lib/active_record/callbacks.rb
+@@ -169,6 +169,18 @@ module ActiveRecord
+   # If a <tt>before_*</tt> callback returns +false+, all the later callbacks and the associated action are cancelled. If an <tt>after_*</tt> callback returns
+   # +false+, all the later callbacks are cancelled. Callbacks are generally run in the order they are defined, with the exception of callbacks
+   # defined as methods on the model, which are called last.
++  #
++  # == Transactions
++  #
++  # The entire callback chain of a +save+, <tt>save!</tt>, or +destroy+ call runs
++  # within a transaction. That includes <tt>after_*</tt> hooks. If everything
++  # goes fine a COMMIT is executed once the chain has been completed.
++  #
++  # If a <tt>before_*</tt> callback cancels the action a ROLLBACK is issued. You
++  # can also trigger a ROLLBACK raising an exception in any of the callbacks,
++  # including <tt>after_*</tt> hooks. Note, however, that in that case the client
++  # needs to be aware of it because an ordinary +save+ will raise such exception
++  # instead of quietly returning +false+.
+   module Callbacks
+     CALLBACKS = %w(
+       after_find after_initialize before_save after_save before_create after_create before_update after_update before_validation
+diff --git a/activerecord/lib/active_record/transactions.rb b/activerecord/lib/active_record/transactions.rb
+index 0531afb..81462a2 100644
+--- a/activerecord/lib/active_record/transactions.rb
++++ b/activerecord/lib/active_record/transactions.rb
+@@ -91,11 +91,11 @@ module ActiveRecord
+     end
+ 
+     def destroy_with_transactions #:nodoc:
+-      transaction { destroy_without_transactions }
++      with_transaction_returning_status(:destroy_without_transactions)
+     end
+ 
+     def save_with_transactions(perform_validation = true) #:nodoc:
+-      rollback_active_record_state! { transaction { save_without_transactions(perform_validation) } }
++      rollback_active_record_state! { with_transaction_returning_status(:save_without_transactions, perform_validation) }
+     end
+ 
+     def save_with_transactions! #:nodoc:
+@@ -118,5 +118,17 @@ module ActiveRecord
+       end
+       raise
+     end
++
++    # Executes +method+ within a transaction and captures its return value as a
++    # status flag. If the status is true the transaction is committed, otherwise
++    # a ROLLBACK is issued. In any case the status flag is returned.
++    def with_transaction_returning_status(method, *args)
++      status = nil
++      transaction do
++        status = send(method, *args)
++        raise ActiveRecord::Rollback unless status
++      end
++      status
++    end
+   end
+ end
+diff --git a/activerecord/test/cases/transactions_test.rb b/activerecord/test/cases/transactions_test.rb
+index 06a76ea..4ec28d4 100644
+--- a/activerecord/test/cases/transactions_test.rb
++++ b/activerecord/test/cases/transactions_test.rb
+@@ -2,6 +2,7 @@ require "cases/helper"
+ require 'models/topic'
+ require 'models/reply'
+ require 'models/developer'
++require 'models/book'
+ 
+ class TransactionTest < ActiveRecord::TestCase
+   self.use_transactional_fixtures = false
+@@ -86,8 +87,7 @@ class TransactionTest < ActiveRecord::TestCase
+     assert Topic.find(2).approved?, "Second should still be approved"
+   end
+ 
+-
+-  def test_callback_rollback_in_save
++  def test_raising_exception_in_callback_rollbacks_in_save
+     add_exception_raising_after_save_callback_to_topic
+ 
+     begin
+@@ -102,6 +102,54 @@ class TransactionTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_cancellation_from_before_destroy_rollbacks_in_destroy
++    add_cancelling_before_destroy_with_db_side_effect_to_topic
++    begin
++      nbooks_before_destroy = Book.count
++      status = @first.destroy
++      assert !status
++      assert_nothing_raised(ActiveRecord::RecordNotFound) { @first.reload }
++      assert_equal nbooks_before_destroy, Book.count
++    ensure
++      remove_cancelling_before_destroy_with_db_side_effect_to_topic
++    end
++  end
++
++  def test_cancellation_from_before_filters_rollbacks_in_save
++    %w(validation save).each do |filter|
++      send("add_cancelling_before_#{filter}_with_db_side_effect_to_topic")
++      begin
++        nbooks_before_save = Book.count
++        original_author_name = @first.author_name
++        @first.author_name += '_this_should_not_end_up_in_the_db'
++        status = @first.save
++        assert !status
++        assert_equal original_author_name, @first.reload.author_name
++        assert_equal nbooks_before_save, Book.count
++      ensure
++        send("remove_cancelling_before_#{filter}_with_db_side_effect_to_topic")
++      end
++    end
++  end
++
++  def test_cancellation_from_before_filters_rollbacks_in_save!
++    %w(validation save).each do |filter|
++      send("add_cancelling_before_#{filter}_with_db_side_effect_to_topic")
++      begin
++        nbooks_before_save = Book.count
++        original_author_name = @first.author_name
++        @first.author_name += '_this_should_not_end_up_in_the_db'
++        @first.save!
++        flunk
++      rescue => e
++        assert_equal original_author_name, @first.reload.author_name
++        assert_equal nbooks_before_save, Book.count
++      ensure
++        send("remove_cancelling_before_#{filter}_with_db_side_effect_to_topic")
++      end
++    end
++  end
++
+   def test_callback_rollback_in_create
+     new_topic = Topic.new(
+       :title => "A new topic",
+@@ -221,6 +269,16 @@ class TransactionTest < ActiveRecord::TestCase
+     def remove_exception_raising_after_create_callback_to_topic
+       Topic.class_eval { remove_method :after_create }
+     end
++
++    %w(validation save destroy).each do |filter|
++      define_method("add_cancelling_before_#{filter}_with_db_side_effect_to_topic") do
++        Topic.class_eval "def before_#{filter}() Book.create; false end"
++      end
++      
++      define_method("remove_cancelling_before_#{filter}_with_db_side_effect_to_topic") do
++        Topic.class_eval "remove_method :before_#{filter}"
++      end
++    end
+ end
+ 
+ if current_adapter?(:PostgreSQLAdapter)
+-- 
+1.5.4.1
+

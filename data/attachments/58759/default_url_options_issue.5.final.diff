@@ -1,0 +1,144 @@
+From be6810477d28f9f3db4f54c492d8f56ea7df3d75 Mon Sep 17 00:00:00 2001
+From: Tom Lea <contrib@tomlea.co.uk>
+Date: Sat, 1 Nov 2008 17:50:16 +0000
+Subject: [PATCH] When optimised named route url generators are called, we must take care to check for default_url_options in both the current scope (for when included in a controller) and on the controller (for when included in a view).
+
+---
+ .../lib/action_controller/routing/optimisations.rb |    6 +++---
+ actionpack/test/template/url_helper_test.rb        |   13 +++++++++++++
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/optimisations.rb b/actionpack/lib/action_controller/routing/optimisations.rb
+index 894d410..6f9d103 100644
+--- a/actionpack/lib/action_controller/routing/optimisations.rb
++++ b/actionpack/lib/action_controller/routing/optimisations.rb
+@@ -62,9 +62,9 @@ module ActionController
+           # if they're using foo_url(:id=>2) it's one
+           # argument, but we don't want to generate /foos/id2
+           if number_of_arguments == 1
+-            "(!defined?(default_url_options) || default_url_options.blank?) && defined?(request) && request && args.size == 1 && !args.first.is_a?(Hash)"
++            "(!defined?(default_url_options) || default_url_options.blank?) && (!defined?(controller.default_url_options) || controller.default_url_options.blank?) && defined?(request) && request && args.size == 1 && !args.first.is_a?(Hash)"
+           else
+-            "(!defined?(default_url_options) || default_url_options.blank?) && defined?(request) && request && args.size == #{number_of_arguments}"
++            "(!defined?(default_url_options) || default_url_options.blank?) && (!defined?(controller.default_url_options) || controller.default_url_options.blank?) && defined?(request) && request && args.size == #{number_of_arguments}"
+           end
+         end
+ 
+@@ -99,7 +99,7 @@ module ActionController
+       # argument
+       class PositionalArgumentsWithAdditionalParams < PositionalArguments
+         def guard_condition
+-          "(!defined?(default_url_options) || default_url_options.blank?) && defined?(request) && request && args.size == #{route.segment_keys.size + 1} && !args.last.has_key?(:anchor) && !args.last.has_key?(:port) && !args.last.has_key?(:host)"
++          "(!defined?(default_url_options) || default_url_options.blank?) && (!defined?(controller.default_url_options) || controller.default_url_options.blank?) && defined?(request) && request && args.size == #{route.segment_keys.size + 1} && !args.last.has_key?(:anchor) && !args.last.has_key?(:port) && !args.last.has_key?(:host)"
+         end
+ 
+         # This case uses almost the same code as positional arguments,
+diff --git a/actionpack/test/template/url_helper_test.rb b/actionpack/test/template/url_helper_test.rb
+index 797b74e..2f6fa13 100644
+--- a/actionpack/test/template/url_helper_test.rb
++++ b/actionpack/test/template/url_helper_test.rb
+@@ -376,6 +376,19 @@ class UrlHelperWithControllerTest < ActionView::TestCase
+     assert_equal '/url_helper_with_controller/nil_url_for', @response.body
+   end
+ 
++  def test_named_route_should_show_host_and_path_using_controller_default_url_options
++    class << @controller
++      def default_url_options(options = nil)
++        {:host => 'testtwo.host'}
++      end
++    end
++
++    with_url_helper_routing do
++      get :show_named_route, :kind => 'url'
++      assert_equal 'http://testtwo.host/url_helper_with_controller/show_named_route', @response.body
++    end
++  end
++
+   protected
+     def with_url_helper_routing
+       with_routing do |set|
+-- 
+1.5.5.4
+
+
+From ffaa5042a3bda2ad10c011755662facfb68a89ea Mon Sep 17 00:00:00 2001
+From: Tom Lea <contrib@tomlea.co.uk>
+Date: Sat, 1 Nov 2008 17:52:42 +0000
+Subject: [PATCH] Cleaned up route optimisation guard condition generation code as it was getting a little damp.
+
+---
+ .../lib/action_controller/routing/optimisations.rb |   26 ++++++++++++++-----
+ 1 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/routing/optimisations.rb b/actionpack/lib/action_controller/routing/optimisations.rb
+index 6f9d103..0a87303 100644
+--- a/actionpack/lib/action_controller/routing/optimisations.rb
++++ b/actionpack/lib/action_controller/routing/optimisations.rb
+@@ -20,14 +20,20 @@ module ActionController
+ 
+       class Optimiser
+         attr_reader :route, :kind
++        GLOBAL_GUARD_CONDITIONS = [
++          "(!defined?(default_url_options) || default_url_options.blank?)",
++          "(!defined?(controller.default_url_options) || controller.default_url_options.blank?)",
++          "defined?(request)",
++          "request"
++          ]
+ 
+         def initialize(route, kind)
+           @route = route
+           @kind  = kind
+         end
+ 
+-        def guard_condition
+-          'false'
++        def guard_conditions
++          ["false"]
+         end
+ 
+         def generation_code
+@@ -36,6 +42,7 @@ module ActionController
+ 
+         def source_code
+           if applicable?
++            guard_condition = (GLOBAL_GUARD_CONDITIONS + guard_conditions).join(" && ")
+             "return #{generation_code} if #{guard_condition}\n"
+           else
+             "\n"
+@@ -57,14 +64,14 @@ module ActionController
+       # return a string like "/people/#{@person.to_param}"
+       # rather than triggering the expensive logic in +url_for+.
+       class PositionalArguments < Optimiser
+-        def guard_condition
++        def guard_conditions
+           number_of_arguments = route.segment_keys.size
+           # if they're using foo_url(:id=>2) it's one
+           # argument, but we don't want to generate /foos/id2
+           if number_of_arguments == 1
+-            "(!defined?(default_url_options) || default_url_options.blank?) && (!defined?(controller.default_url_options) || controller.default_url_options.blank?) && defined?(request) && request && args.size == 1 && !args.first.is_a?(Hash)"
++            ["args.size == 1", "!args.first.is_a?(Hash)"]
+           else
+-            "(!defined?(default_url_options) || default_url_options.blank?) && (!defined?(controller.default_url_options) || controller.default_url_options.blank?) && defined?(request) && request && args.size == #{number_of_arguments}"
++            ["args.size == #{number_of_arguments}"]
+           end
+         end
+ 
+@@ -98,8 +105,13 @@ module ActionController
+       # above, but it supports additional query parameters as the last
+       # argument
+       class PositionalArgumentsWithAdditionalParams < PositionalArguments
+-        def guard_condition
+-          "(!defined?(default_url_options) || default_url_options.blank?) && (!defined?(controller.default_url_options) || controller.default_url_options.blank?) && defined?(request) && request && args.size == #{route.segment_keys.size + 1} && !args.last.has_key?(:anchor) && !args.last.has_key?(:port) && !args.last.has_key?(:host)"
++        def guard_conditions
++          [
++            "args.size == #{route.segment_keys.size + 1}",
++            "!args.last.has_key?(:anchor)",
++            "!args.last.has_key?(:port)",
++            "!args.last.has_key?(:host)"
++          ]
+         end
+ 
+         # This case uses almost the same code as positional arguments,
+-- 
+1.5.5.4
+

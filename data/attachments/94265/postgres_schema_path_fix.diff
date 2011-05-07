@@ -1,0 +1,146 @@
+From 2325dda2930201977fd352ce0496c0282083eda5 Mon Sep 17 00:00:00 2001
+From: Jon Oler <joler@timp.infopia.lan>
+Date: Sat, 28 Feb 2009 00:55:29 -0700
+Subject: [PATCH] Fixed postgres adapter bug with search path and multiple schemas.
+
+Fixed a bug in the postgres adapter where the adapter was handling whitespace in the schema_search_path incorrectly causing the indexes() and tables() methods to return incorrect results.  Also fixed an untruth in the comments for the tables() method where it indicated the method could return the tables for a specified schema when in reality the method only returns tables in the search path.  Stated differently, the method doesn't even take a parameter that allows the schema to be specified--the schema_search_path is always used.
+---
+ .../connection_adapters/postgresql_adapter.rb      |   16 ++++--
+ activerecord/test/cases/schema_test_postgresql.rb  |   50 +++++++++++++++++++-
+ 2 files changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 913bb52..f0f88ca 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -606,20 +606,17 @@ module ActiveRecord
+         end
+       end
+ 
+-
+-      # Returns the list of all tables in the schema search path or a specified schema.
++      # Returns the list of all tables in the schema search path.
+       def tables(name = nil)
+-        schemas = schema_search_path.split(/,/).map { |p| quote(p) }.join(',')
+         query(<<-SQL, name).map { |row| row[0] }
+           SELECT tablename
+             FROM pg_tables
+-           WHERE schemaname IN (#{schemas})
++           WHERE schemaname IN (#{quoted_schema_search_path})
+         SQL
+       end
+ 
+       # Returns the list of all indexes for a table.
+       def indexes(table_name, name = nil)
+-         schemas = schema_search_path.split(/,/).map { |p| quote(p) }.join(',')
+          result = query(<<-SQL, name)
+            SELECT distinct i.relname, d.indisunique, a.attname
+              FROM pg_class t, pg_class i, pg_index d, pg_attribute a
+@@ -628,7 +625,8 @@ module ActiveRecord
+              AND d.indisprimary = 'f'
+              AND t.oid = d.indrelid
+              AND t.relname = '#{table_name}'
+-             AND i.relnamespace IN (SELECT oid FROM pg_namespace WHERE nspname IN (#{schemas}) )
++             AND i.relnamespace IN (SELECT oid FROM pg_namespace 
++             WHERE nspname IN (#{quoted_schema_search_path}) )
+              AND a.attrelid = t.oid
+              AND ( d.indkey[0]=a.attnum OR d.indkey[1]=a.attnum
+                 OR d.indkey[2]=a.attnum OR d.indkey[3]=a.attnum
+@@ -1045,6 +1043,12 @@ module ActiveRecord
+              ORDER BY a.attnum
+           end_sql
+         end
++
++      # Returns a string containing all members of the schema_search_path with each member quoted
++      # and separated from each other with a comma, suitable for use in a sql 'in' clause.
++      def quoted_schema_search_path
++        schema_search_path.split(/,/).map { |p| quote(p.strip) }.join(',')
++      end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/schema_test_postgresql.rb b/activerecord/test/cases/schema_test_postgresql.rb
+index 336a387..671fe80 100644
+--- a/activerecord/test/cases/schema_test_postgresql.rb
++++ b/activerecord/test/cases/schema_test_postgresql.rb
+@@ -39,7 +39,7 @@ class SchemaTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  def test_with_schema_search_path
++  def test_columns_with_schema_search_path
+     assert_nothing_raised do
+       with_schema_search_path(SCHEMA_NAME) do
+         assert_equal COLUMNS, columns(TABLE_NAME)
+@@ -47,6 +47,36 @@ class SchemaTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_tables_with_schema_search_path
++    assert_nothing_raised do
++      with_schema_search_path(SCHEMA_NAME) do
++        assert_equal [TABLE_NAME], table_names
++      end
++    end
++  end
++
++  def test_tables_with_schema_not_first_in_search_path_no_whitespace
++    assert_nothing_raised do
++      with_schema_search_path("'$user',#{SCHEMA_NAME}") do
++        assert_equal [TABLE_NAME], table_names
++      end
++    end
++  end
++
++  def test_tables_with_schema_not_first_in_search_path_with_whitespace
++    # Handling whitespace is significant because the postgres adapter uses 
++    # "SHOW search_path" to retrieve the search path if it's not set, and SHOW search_path 
++    # returns its results with spaces.  Besides, the adapter is not removing spaces when
++    # the search path is explicitly set.  The results of SHOW search path are used to form
++    # the query for tables, and there was previously a bug where the whitespace was
++    # handled incorrectly.
++    assert_nothing_raised do
++      with_schema_search_path("'$user', #{SCHEMA_NAME}") do
++        assert_equal [TABLE_NAME], table_names
++      end
++    end
++  end
++
+   def test_raise_on_unquoted_schema_name
+     assert_raise(ActiveRecord::StatementInvalid) do
+       with_schema_search_path '$user,public'
+@@ -69,6 +99,20 @@ class SchemaTest < ActiveRecord::TestCase
+     do_dump_index_tests_for_schema(SCHEMA2_NAME, INDEX_A_COLUMN, INDEX_B_COLUMN_S2)
+   end
+ 
++  def test_dump_indexes_for_schema_one_with_schema_not_first_in_search_path_no_whitespace
++    do_dump_index_tests_for_schema("'$user',#{SCHEMA_NAME}", INDEX_A_COLUMN, INDEX_B_COLUMN_S1)
++  end
++
++  def test_dump_indexes_for_schema_one_with_schema_not_first_in_search_path_with_whitespace
++    # Handling whitespace is significant because the postgres adapter uses 
++    # "SHOW search_path" to retrieve the search path if it's not set, and SHOW search_path 
++    # returns its results with spaces.  Besides, the adapter is not removing spaces when
++    # the search path is explicitly set.  The results of SHOW search path are used to form
++    # the query for indexes, and there was previously a bug where the whitespace was
++    # handled incorrectly.
++    do_dump_index_tests_for_schema("'$user', #{SCHEMA_NAME}", INDEX_A_COLUMN, INDEX_B_COLUMN_S1)
++  end
++
+   private
+     def columns(table_name)
+       @connection.send(:column_definitions, table_name).map do |name, type, default|
+@@ -76,6 +120,10 @@ class SchemaTest < ActiveRecord::TestCase
+       end
+     end
+ 
++    def table_names
++      @connection.tables
++    end
++
+     def with_schema_search_path(schema_search_path)
+       @connection.schema_search_path = schema_search_path
+       yield if block_given?
+-- 
+1.5.4.3
+

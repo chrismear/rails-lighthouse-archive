@@ -1,0 +1,970 @@
+From e92fe89d2782d9b6f19cb05b7e6bd16944ecffb2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bernardo=20de=20P=C3=A1dua?= <berpasan@gmail.com>
+Date: Sat, 20 Mar 2010 16:54:47 -0300
+Subject: [PATCH] Adds number_to_human and several improvements in NumberHelper.
+ [#4239 state:resolved]
+
+---
+ .../lib/action_view/helpers/number_helper.rb       |  322 ++++++++++++++------
+ actionpack/lib/action_view/locale/en.yml           |   51 +++-
+ .../test/template/number_helper_i18n_test.rb       |  128 +++++---
+ actionpack/test/template/number_helper_test.rb     |  170 +++++++++--
+ 4 files changed, 503 insertions(+), 168 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/number_helper.rb b/actionpack/lib/action_view/helpers/number_helper.rb
+index 46e41bc..024b5fc 100644
+--- a/actionpack/lib/action_view/helpers/number_helper.rb
++++ b/actionpack/lib/action_view/helpers/number_helper.rb
+@@ -5,7 +5,10 @@ module ActionView
+   module Helpers #:nodoc:
+     # Provides methods for converting numbers into formatted strings.
+     # Methods are provided for phone numbers, currency, percentage,
+-    # precision, positional notation, and file size.
++    # precision, positional notation, file size and pretty printing.
++    #
++    # Most methods expect a +number+ argument, and will return it
++    # unchanged if can't be converted into a valid number.
+     module NumberHelper
+       # Formats a +number+ into a US phone number (e.g., (555) 123-9876). You can customize the format
+       # in the +options+ hash.
+@@ -74,21 +77,17 @@ module ActionView
+       def number_to_currency(number, options = {})
+         options.symbolize_keys!
+ 
+-        defaults  = I18n.translate(:'number.format', :locale => options[:locale], :raise => true) rescue {}
+-        currency  = I18n.translate(:'number.currency.format', :locale => options[:locale], :raise => true) rescue {}
++        defaults  = I18n.translate(:'number.format', :locale => options[:locale], :default => {})
++        currency  = I18n.translate(:'number.currency.format', :locale => options[:locale], :default => {})
+         defaults  = defaults.merge(currency)
+ 
+-        precision = options[:precision] || defaults[:precision]
+-        unit      = options[:unit]      || defaults[:unit]
+-        separator = options[:separator] || defaults[:separator]
+-        delimiter = options[:delimiter] || defaults[:delimiter]
+-        format    = options[:format]    || defaults[:format]
+-        separator = '' if precision == 0
++        options = options.reverse_merge(defaults)
++        options[:separator] = '' if options[:precision] == 0
+ 
+-        value = number_with_precision(number,
+-          :precision => precision,
+-          :delimiter => delimiter,
+-          :separator => separator)
++        unit      = options.delete(:unit)
++        format    = options.delete(:format)
++
++        value = number_with_precision(number, options)
+ 
+         if value
+           format.gsub(/%n/, value).gsub(/%u/, unit).html_safe
+@@ -101,9 +100,11 @@ module ActionView
+       # format in the +options+ hash.
+       #
+       # ==== Options
+-      # * <tt>:precision</tt>  - Sets the level of precision (defaults to 3).
+-      # * <tt>:separator</tt>  - Sets the separator between the units (defaults to ".").
++      # * <tt>:precision</tt>  - Sets the precision of the number (defaults to 3).
++      # * <tt>:significant</tt>  - If +true+, precision will be the # of significant_digits. If +false+, the # of fractional digits (defaults to +false+)
++      # * <tt>:separator</tt>  - Sets the separator between the fractional and integer digits (defaults to ".").
+       # * <tt>:delimiter</tt>  - Sets the thousands delimiter (defaults to "").
++      # * <tt>:strip_unsignificant_zeros</tt>  - If +true+ removes unsignificant zeros after the decimal separator (defaults to +false+)
+       #
+       # ==== Examples
+       #  number_to_percentage(100)                                        # => 100.000%
+@@ -113,18 +114,13 @@ module ActionView
+       def number_to_percentage(number, options = {})
+         options.symbolize_keys!
+ 
+-        defaults   = I18n.translate(:'number.format', :locale => options[:locale], :raise => true) rescue {}
+-        percentage = I18n.translate(:'number.percentage.format', :locale => options[:locale], :raise => true) rescue {}
++        defaults   = I18n.translate(:'number.format', :locale => options[:locale], :default => {})
++        percentage = I18n.translate(:'number.percentage.format', :locale => options[:locale], :default => {})
+         defaults  = defaults.merge(percentage)
+ 
+-        precision = options[:precision] || defaults[:precision]
+-        separator = options[:separator] || defaults[:separator]
+-        delimiter = options[:delimiter] || defaults[:delimiter]
++        options = options.reverse_merge(defaults)
+ 
+-        value = number_with_precision(number,
+-          :precision => precision,
+-          :separator => separator,
+-          :delimiter => delimiter)
++        value = number_with_precision(number, options)
+         value ? value + "%" : number
+       end
+ 
+@@ -133,7 +129,7 @@ module ActionView
+       #
+       # ==== Options
+       # * <tt>:delimiter</tt>  - Sets the thousands delimiter (defaults to ",").
+-      # * <tt>:separator</tt>  - Sets the separator between the units (defaults to ".").
++      # * <tt>:separator</tt>  - Sets the separator between the fractional and integer digits (defaults to ".").
+       #
+       # ==== Examples
+       #  number_with_delimiter(12345678)                        # => 12,345,678
+@@ -146,139 +142,163 @@ module ActionView
+       # You can still use <tt>number_with_delimiter</tt> with the old API that accepts the
+       # +delimiter+ as its optional second and the +separator+ as its
+       # optional third parameter:
+-      #  number_with_delimiter(12345678, " ")                     # => 12 345.678
++      #  number_with_delimiter(12345678, " ")                     # => 12 345 678
+       #  number_with_delimiter(12345678.05, ".", ",")             # => 12.345.678,05
+       def number_with_delimiter(number, *args)
+         options = args.extract_options!
+         options.symbolize_keys!
+ 
+-        defaults = I18n.translate(:'number.format', :locale => options[:locale], :raise => true) rescue {}
++        defaults = I18n.translate(:'number.format', :locale => options[:locale], :default => {})
+ 
+         unless args.empty?
+           ActiveSupport::Deprecation.warn('number_with_delimiter takes an option hash ' +
+             'instead of separate delimiter and precision arguments.', caller)
+-          delimiter = args[0] || defaults[:delimiter]
+-          separator = args[1] || defaults[:separator]
++          options[:delimiter] ||= args[0] if args[0]
++          options[:separator] ||= args[1] if args[1]
+         end
+ 
+-        delimiter ||= (options[:delimiter] || defaults[:delimiter])
+-        separator ||= (options[:separator] || defaults[:separator])
++        options = options.reverse_merge(defaults)
+ 
+         parts = number.to_s.split('.')
+         if parts[0]
+-          parts[0].gsub!(/(\d)(?=(\d\d\d)+(?!\d))/, "\\1#{delimiter}")
+-          parts.join(separator)
++          parts[0].gsub!(/(\d)(?=(\d\d\d)+(?!\d))/, "\\1#{options[:delimiter]}")
++          parts.join(options[:separator])
+         else
+           number
+         end
++
+       end
+ 
+-      # Formats a +number+ with the specified level of <tt>:precision</tt> (e.g., 112.32 has a precision of 2).
++      # Formats a +number+ with the specified level of <tt>:precision</tt> (e.g., 112.32 has a precision
++      # of 2 if +:significant+ is +false+, and 5 if +:significant+ is +true+).
+       # You can customize the format in the +options+ hash.
+       #
+       # ==== Options
+-      # * <tt>:precision</tt>  - Sets the level of precision (defaults to 3).
+-      # * <tt>:separator</tt>  - Sets the separator between the units (defaults to ".").
++      # * <tt>:precision</tt>  - Sets the precision of the number (defaults to 3).
++      # * <tt>:significant</tt>  - If +true+, precision will be the # of significant_digits. If +false+, the # of fractional digits (defaults to +false+)
++      # * <tt>:separator</tt>  - Sets the separator between the fractional and integer digits (defaults to ".").
+       # * <tt>:delimiter</tt>  - Sets the thousands delimiter (defaults to "").
++      # * <tt>:strip_unsignificant_zeros</tt>  - If +true+ removes unsignificant zeros after the decimal separator (defaults to +false+)
+       #
+       # ==== Examples
+-      #  number_with_precision(111.2345)                    # => 111.235
+-      #  number_with_precision(111.2345, :precision => 2)   # => 111.23
+-      #  number_with_precision(13, :precision => 5)         # => 13.00000
+-      #  number_with_precision(389.32314, :precision => 0)  # => 389
++      #  number_with_precision(111.2345)                                            # => 111.235
++      #  number_with_precision(111.2345, :precision => 2)                           # => 111.23
++      #  number_with_precision(13, :precision => 5)                                 # => 13.00000
++      #  number_with_precision(389.32314, :precision => 0)                          # => 389
++      #  number_with_precision(111.2345, :significant => true)                      # => 111
++      #  number_with_precision(111.2345, :precision => 1, :significant => true)     # => 100
++      #  number_with_precision(13, :precision => 5, :significant => true)           # => 13.000
++      #  number_with_precision(13, :precision => 5, :significant => true, strip_unsignificant_zeros => true)
++      #  # => 13
++      #  number_with_precision(389.32314, :precision => 4, :significant => true)    # => 389.3
+       #  number_with_precision(1111.2345, :precision => 2, :separator => ',', :delimiter => '.')
+       #  # => 1.111,23
+       #
+       # You can still use <tt>number_with_precision</tt> with the old API that accepts the
+       # +precision+ as its optional second parameter:
+-      #   number_with_precision(number_with_precision(111.2345, 2)   # => 111.23
++      #   number_with_precision(111.2345, 2)   # => 111.23
+       def number_with_precision(number, *args)
++        number = begin
++          Float(number)
++        rescue ArgumentError, TypeError
++          return number
++        end
++
+         options = args.extract_options!
+         options.symbolize_keys!
+ 
+-        defaults           = I18n.translate(:'number.format', :locale => options[:locale], :raise => true) rescue {}
+-        precision_defaults = I18n.translate(:'number.precision.format', :locale => options[:locale],
+-                                                                        :raise => true) rescue {}
++        defaults           = I18n.translate(:'number.format', :locale => options[:locale], :default => {})
++        precision_defaults = I18n.translate(:'number.precision.format', :locale => options[:locale], :default => {})
+         defaults           = defaults.merge(precision_defaults)
+ 
++        #Backwards compatibility
+         unless args.empty?
+           ActiveSupport::Deprecation.warn('number_with_precision takes an option hash ' +
+             'instead of a separate precision argument.', caller)
+-          precision = args[0] || defaults[:precision]
++          options[:precision] ||= args[0] if args[0]
+         end
+ 
+-        precision ||= (options[:precision] || defaults[:precision])
+-        separator ||= (options[:separator] || defaults[:separator])
+-        delimiter ||= (options[:delimiter] || defaults[:delimiter])
++        options = options.reverse_merge(defaults)  # Allow the user to unset default values: Eg.: :significant => false
++        precision = options.delete :precision
++        significant = options.delete :significant
++        strip_unsignificant_zeros = options.delete :strip_unsignificant_zeros
+ 
+-        begin
+-          value = Float(number)
+-        rescue ArgumentError, TypeError
+-          value = nil
++        if significant and precision > 0
++          digits = (Math.log10(number) + 1).floor
++          rounded_number = BigDecimal.new((number / 10 ** (digits - precision)).to_s).round.to_f * 10 ** (digits - precision)
++          precision = precision - digits
++          precision = precision > 0 ? precision : 0  #don't let it be negative
++        else
++          rounded_number = BigDecimal.new((number * (10 ** precision)).to_s).round.to_f / 10 ** precision
+         end
+-
+-        if value
+-          rounded_number = BigDecimal.new((Float(number) * (10 ** precision)).to_s).round.to_f / 10 ** precision
+-          number_with_delimiter("%01.#{precision}f" % rounded_number,
+-            :separator => separator,
+-            :delimiter => delimiter)
++        formatted_number = number_with_delimiter("%01.#{precision}f" % rounded_number, options)
++        if strip_unsignificant_zeros
++          escaped_separator = Regexp.escape(options[:separator])
++          formatted_number.sub(/(#{escaped_separator})(\d*[1-9])?0+\z/, '\1\2').sub(/#{escaped_separator}\z/, '')
+         else
+-          number
++          formatted_number
+         end
++
+       end
+ 
+       STORAGE_UNITS = [:byte, :kb, :mb, :gb, :tb].freeze
+ 
+-      # Formats the bytes in +size+ into a more understandable representation
++      # Formats the bytes in +number+ into a more understandable representation
+       # (e.g., giving it 1500 yields 1.5 KB). This method is useful for
+-      # reporting file sizes to users. This method returns nil if
+-      # +size+ cannot be converted into a number. You can customize the
++      # reporting file sizes to users. You can customize the
+       # format in the +options+ hash.
+       #
++      # See <tt>number_to_human</tt> if you want to pretty-print a generic number.
++      #
+       # ==== Options
+-      # * <tt>:precision</tt>  - Sets the level of precision (defaults to 1).
+-      # * <tt>:separator</tt>  - Sets the separator between the units (defaults to ".").
++      # * <tt>:precision</tt>  - Sets the precision of the number (defaults to 3).
++      # * <tt>:significant</tt>  - If +true+, precision will be the # of significant_digits. If +false+, the # of fractional digits (defaults to +true+)
++      # * <tt>:separator</tt>  - Sets the separator between the fractional and integer digits (defaults to ".").
+       # * <tt>:delimiter</tt>  - Sets the thousands delimiter (defaults to "").
+-      #
++      # * <tt>:strip_unsignificant_zeros</tt>  - If +true+ removes unsignificant zeros after the decimal separator (defaults to +true+)
+       # ==== Examples
+       #  number_to_human_size(123)                                          # => 123 Bytes
+-      #  number_to_human_size(1234)                                         # => 1.2 KB
++      #  number_to_human_size(1234)                                         # => 1.21 KB
+       #  number_to_human_size(12345)                                        # => 12.1 KB
+-      #  number_to_human_size(1234567)                                      # => 1.2 MB
+-      #  number_to_human_size(1234567890)                                   # => 1.1 GB
+-      #  number_to_human_size(1234567890123)                                # => 1.1 TB
+-      #  number_to_human_size(1234567, :precision => 2)                     # => 1.18 MB
+-      #  number_to_human_size(483989, :precision => 0)                      # => 473 KB
+-      #  number_to_human_size(1234567, :precision => 2, :separator => ',')  # => 1,18 MB
++      #  number_to_human_size(1234567)                                      # => 1.18 MB
++      #  number_to_human_size(1234567890)                                   # => 1.15 GB
++      #  number_to_human_size(1234567890123)                                # => 1.12 TB
++      #  number_to_human_size(1234567, :precision => 2)                     # => 1.2 MB
++      #  number_to_human_size(483989, :precision => 2)                      # => 470 KB
++      #  number_to_human_size(1234567, :precision => 2, :separator => ',')  # => 1,2 MB
+       #
+-      # Zeros after the decimal point are always stripped out, regardless of the
+-      # specified precision:
+-      #  helper.number_to_human_size(1234567890123, :precision => 5)        # => "1.12283 TB"
+-      #  helper.number_to_human_size(524288000, :precision=>5)              # => "500 MB"
++      # Unsignificant zeros after the fractional separator are stripped out by default (set
++      # <tt>:strip_unsignificant_zeros</tt> to +false+ to change that):
++      #  number_to_human_size(1234567890123, :precision => 5)        # => "1.1229 TB"
++      #  number_to_human_size(524288000, :precision=>5)              # => "500 MB"
+       #
+       # You can still use <tt>number_to_human_size</tt> with the old API that accepts the
+       # +precision+ as its optional second parameter:
+-      #  number_to_human_size(1234567, 2)    # => 1.18 MB
+-      #  number_to_human_size(483989, 0)     # => 473 KB
++      #  number_to_human_size(1234567, 1)    # => 1 MB
++      #  number_to_human_size(483989, 2)     # => 470 KB
+       def number_to_human_size(number, *args)
+-        return nil if number.nil?
++        number = begin
++          Float(number)
++        rescue ArgumentError, TypeError
++          return number
++        end
+ 
+         options = args.extract_options!
+         options.symbolize_keys!
+ 
+-        defaults = I18n.translate(:'number.format', :locale => options[:locale], :raise => true) rescue {}
+-        human    = I18n.translate(:'number.human.format', :locale => options[:locale], :raise => true) rescue {}
++        defaults = I18n.translate(:'number.format', :locale => options[:locale], :default => {})
++        human    = I18n.translate(:'number.human.format', :locale => options[:locale], :default => {})
+         defaults = defaults.merge(human)
+ 
+         unless args.empty?
+           ActiveSupport::Deprecation.warn('number_to_human_size takes an option hash ' +
+             'instead of a separate precision argument.', caller)
+-          precision = args[0] || defaults[:precision]
++          options[:precision] ||= args[0] if args[0]
+         end
+ 
+-        precision ||= (options[:precision] || defaults[:precision])
+-        separator ||= (options[:separator] || defaults[:separator])
+-        delimiter ||= (options[:delimiter] || defaults[:delimiter])
++        options = options.reverse_merge(defaults)
++        #for backwards compatibility with those that didn't add strip_unsignificant_zeros to their locale files
++        options[:strip_unsignificant_zeros] = true if not options.key?(:strip_unsignificant_zeros)
+ 
+         storage_units_format = I18n.translate(:'number.human.storage_units.format', :locale => options[:locale], :raise => true)
+ 
+@@ -287,7 +307,6 @@ module ActionView
+           storage_units_format.gsub(/%n/, number.to_i.to_s).gsub(/%u/, unit)
+         else
+           max_exp  = STORAGE_UNITS.size - 1
+-          number   = Float(number)
+           exponent = (Math.log(number) / Math.log(1024)).to_i # Convert to base 1024
+           exponent = max_exp if exponent > max_exp # we need this to avoid overflow for the highest unit
+           number  /= 1024 ** exponent
+@@ -295,15 +314,134 @@ module ActionView
+           unit_key = STORAGE_UNITS[exponent]
+           unit = I18n.translate(:"number.human.storage_units.units.#{unit_key}", :locale => options[:locale], :count => number, :raise => true)
+ 
+-          escaped_separator = Regexp.escape(separator)
+-          formatted_number = number_with_precision(number,
+-            :precision => precision,
+-            :separator => separator,
+-            :delimiter => delimiter
+-          ).sub(/(#{escaped_separator})(\d*[1-9])?0+\z/, '\1\2').sub(/#{escaped_separator}\z/, '')
++          formatted_number = number_with_precision(number, options)
+           storage_units_format.gsub(/%n/, formatted_number).gsub(/%u/, unit)
+         end
+       end
++
++      DECIMAL_UNITS = {0 => :unit, 1 => :ten, 2 => :hundred, 3 => :thousand, 6 => :million, 9 => :billion, 12 => :trillion, 15 => :quadrillion,
++        -1 => :deci, -2 => :centi, -3 => :mili, -6 => :micro, -9 => :nano, -12 => :pico, -15 => :femto}.freeze
++
++      # Pretty prints (formats and approximates) a number in a way it is more readable by humans
++      # (eg.: 1200000000 becomes "1.2 Billion"). This is useful for numbers that
++      # can get very large (and too hard to read).
++      #
++      # See <tt>number_to_human_size</tt> if you want to print a file size.
++      #
++      # You can also define you own unit-quantifier names if you want to use other decimal units
++      # (eg.: 1500 becomes "1.5 kilometers", 0.150 becomes "150 mililiters", etc). You may define
++      # a wide range of unit quantifiers, even fractional ones (centi, deci, mili, etc).
++      #
++      # ==== Options
++      # * <tt>:precision</tt>  - Sets the precision of the number (defaults to 3).
++      # * <tt>:significant</tt>  - If +true+, precision will be the # of significant_digits. If +false+, the # of fractional digits (defaults to +true+)
++      # * <tt>:separator</tt>  - Sets the separator between the fractional and integer digits (defaults to ".").
++      # * <tt>:delimiter</tt>  - Sets the thousands delimiter (defaults to "").
++      # * <tt>:strip_unsignificant_zeros</tt>  - If +true+ removes unsignificant zeros after the decimal separator (defaults to +true+)
++      # * <tt>:units</tt> - A Hash of unit quantifier names. Or a string containing an i18n scope where to find this hash. It might have the following keys:
++      #   * *integers*: <tt>:unit</tt>, <tt>:ten</tt>, <tt>:hundred</tt>, <tt>:thousand</tt>,  <tt>:million</tt>,  <tt>:billion</tt>, <tt>:trillion</tt>, <tt>:quadrillion</tt>
++      #   * *fractionals*: <tt>:deci</tt>, <tt>:centi</tt>, <tt>:mili</tt>, <tt>:micro</tt>, <tt>:nano</tt>, <tt>:pico</tt>, <tt>:femto</tt>
++      # * <tt>:format</tt> - Sets the format of the output string (defaults to "%n %u"). The field types are:
++      #
++      #     %u  The quantifier (ex.: 'thousand')
++      #     %n  The number
++      #
++      # ==== Examples
++      #  number_to_human(123)                                          # => "123"
++      #  number_to_human(1234)                                         # => "1.23 Thousand"
++      #  number_to_human(12345)                                        # => "12.3 Thousand"
++      #  number_to_human(1234567)                                      # => "1.23 Million"
++      #  number_to_human(1234567890)                                   # => "1.23 Billion"
++      #  number_to_human(1234567890123)                                # => "1.23 Trillion"
++      #  number_to_human(1234567890123456)                             # => "1.23 Quadrillion"
++      #  number_to_human(1234567890123456789)                          # => "1230 Quadrillion"
++      #  number_to_human(489939, :precision => 2)                      # => "490 Thousand"
++      #  number_to_human(489939, :precision => 4)                      # => "489.9 Thousand"
++      #  number_to_human(1234567, :precision => 4,
++      #                           :significant => false)               # => "1.2346 Million"
++      #  number_to_human(1234567, :precision => 1,
++      #                           :separator => ',',
++      #                           :significant => false)               # => "1,2 Million"
++      #
++      # Unsignificant zeros after the decimal separator are stripped out by default (set
++      # <tt>:strip_unsignificant_zeros</tt> to +false+ to change that):
++      #  number_to_human(12345012345, :significant_digits => 6)       # => "12.345 Billion"
++      #  number_to_human(500000000, :precision=>5)                    # => "500 Million"
++      #
++      # ==== Custom Unit Quantifiers
++      #
++      # You can also use your own custom unit quantifiers:
++      #  number_to_human(500000, :units => {:unit => "ml", :thousand => "lt"})  # => "500 lt"
++      #
++      # If in your I18n locale you have:
++      #   distance:
++      #     centi:
++      #       one: "centimeter"
++      #       other: "centimeters"
++      #     unit:
++      #       one: "meter"
++      #       other: "meters"
++      #     thousand:
++      #       one: "kilometer"
++      #       other: "kilometers"
++      #     billion: "gazilion-distance"
++      #
++      # Then you could do:
++      #
++      #  number_to_human(543934, :units => :distance)                              # => "544 kilometers"
++      #  number_to_human(54393498, :units => :distance)                            # => "54400 kilometers"
++      #  number_to_human(54393498000, :units => :distance)                         # => "54.4 gazilion-distance"
++      #  number_to_human(343, :units => :distance, :precision => 1)                # => "300 meters"
++      #  number_to_human(1, :units => :distance)                                   # => "1 meter"
++      #  number_to_human(0.34, :units => :distance)                                # => "34 centimeters"
++      #
++      def number_to_human(number, options = {})
++        number = begin
++          Float(number)
++        rescue ArgumentError, TypeError
++          return number
++        end
++
++        options.symbolize_keys!
++
++        defaults = I18n.translate(:'number.format', :locale => options[:locale], :default => {})
++        human    = I18n.translate(:'number.human.format', :locale => options[:locale], :default => {})
++        defaults = defaults.merge(human)
++
++        options = options.reverse_merge(defaults)
++        #for backwards compatibility with those that didn't add strip_unsignificant_zeros to their locale files
++        options[:strip_unsignificant_zeros] = true if not options.key?(:strip_unsignificant_zeros)
++
++        units = options.delete :units
++        unit_exponents = case units
++        when Hash
++          units
++        when String, Symbol
++          I18n.translate(:"#{units}", :locale => options[:locale], :raise => true)
++        when nil
++          I18n.translate(:"number.human.decimal_units.units", :locale => options[:locale], :raise => true)
++        else
++          raise ArgumentError, ":units must be a Hash or String translation scope."
++        end.keys.map{|e_name| DECIMAL_UNITS.invert[e_name] }.sort_by{|e| -e}
++
++        number_exponent = Math.log10(number).floor
++        display_exponent = unit_exponents.find{|e| number_exponent >= e }
++        number  /= 10 ** display_exponent
++
++        unit = case units
++        when Hash
++          units[DECIMAL_UNITS[display_exponent]]
++        when String, Symbol
++          I18n.translate(:"#{units}.#{DECIMAL_UNITS[display_exponent]}", :locale => options[:locale], :count => number.to_i)
++        else
++          I18n.translate(:"number.human.decimal_units.units.#{DECIMAL_UNITS[display_exponent]}", :locale => options[:locale], :count => number.to_i)
++        end
++
++        decimal_format = options[:format] || I18n.translate(:'number.human.decimal_units.format', :locale => options[:locale], :default => "%n %u")
++        formatted_number = number_with_precision(number, options)
++        decimal_format.gsub(/%n/, formatted_number).gsub(/%u/, unit).strip
++      end
++
+     end
+   end
+ end
+diff --git a/actionpack/lib/action_view/locale/en.yml b/actionpack/lib/action_view/locale/en.yml
+index a354805..cfb4f7c 100644
+--- a/actionpack/lib/action_view/locale/en.yml
++++ b/actionpack/lib/action_view/locale/en.yml
+@@ -9,6 +9,11 @@
+       delimiter: ","
+       # Number of decimals, behind the separator (the number 1 with a precision of 2 gives: 1.00)
+       precision: 3
++      # If set to true, precision will mean the number of significant digits instead
++      # of the number of decimal digits (1234 with precision 2 becomes 1200, 1.23543 becomes 1.2)
++      significant: false
++      # If set, the zeros after the decimal separator will always be stripped (eg.: 1.200 will be 1.2)
++      strip_unsignificant_zeros: false
+ 
+     # Used in number_to_currency()
+     currency:
+@@ -16,34 +21,43 @@
+         # Where is the currency sign? %u is the currency unit, %n the number (default: $5.00)
+         format: "%u%n"
+         unit: "$"
+-        # These three are to override number.format and are optional
++        # These five are to override number.format and are optional
+         separator: "."
+         delimiter: ","
+         precision: 2
++        significant: false
++        strip_unsignificant_zeros: false
+ 
+     # Used in number_to_percentage()
+     percentage:
+       format:
+-        # These three are to override number.format and are optional
++        # These five are to override number.format and are optional
+         # separator:
+         delimiter: ""
+         # precision:
++        # significant: false
++        # strip_unsignificant_zeros: false
+ 
+     # Used in number_to_precision()
+     precision:
+       format:
+-        # These three are to override number.format and are optional
++        # These five are to override number.format and are optional
+         # separator:
+         delimiter: ""
+         # precision:
++        # significant: false
++        # strip_unsignificant_zeros: false
+ 
+-    # Used in number_to_human_size()
++    # Used in number_to_human_size() and number_to_human()
+     human:
+       format:
+-        # These three are to override number.format and are optional
++        # These five are to override number.format and are optional
+         # separator:
+         delimiter: ""
+-        precision: 1
++        precision: 3
++        significant: true
++        strip_unsignificant_zeros: true
++      # Used in number_to_human_size()
+       storage_units:
+         # Storage units output formatting.
+         # %u is the storage unit, %n is the number (default: 2 MB)
+@@ -56,6 +70,31 @@
+           mb: "MB"
+           gb: "GB"
+           tb: "TB"
++      # Used in number_to_human()
++      decimal_units:
++        format: "%n %u"
++        # Decimal units output formatting
++        # By default we will only quantify some of the exponents
++        # but the commented ones might be defined or overridden
++        # by the user.
++        units:
++          # femto: Quadrillionth
++          # pico: Trillionth
++          # nano: Billionth
++          # micro: Millionth
++          # mili: Thousandth
++          # centi: Hundredth
++          # deci: Tenth
++          unit: ""
++          # ten:
++          #   one: Ten
++          #   other: Tens
++          # hundred: Hundred
++          thousand: Thousand
++          million: Million
++          billion: Billion
++          trillion: Trillion
++          quadrillion: Quadrillion
+ 
+   # Used in distance_of_time_in_words(), distance_of_time_in_words_to_now(), time_ago_in_words()
+   datetime:
+diff --git a/actionpack/test/template/number_helper_i18n_test.rb b/actionpack/test/template/number_helper_i18n_test.rb
+index bf5b812..07a0e27 100644
+--- a/actionpack/test/template/number_helper_i18n_test.rb
++++ b/actionpack/test/template/number_helper_i18n_test.rb
+@@ -1,69 +1,95 @@
+ require 'abstract_unit'
+ 
+-class NumberHelperI18nTests < Test::Unit::TestCase
+-  include ActionView::Helpers::NumberHelper
+-
+-  attr_reader :request
++class NumberHelperTest < ActionView::TestCase
++  tests ActionView::Helpers::NumberHelper
+ 
+   def setup
+-    @number_defaults = { :precision => 3, :delimiter => ',', :separator => '.' }
+-    @currency_defaults = { :unit => '$', :format => '%u%n', :precision => 2 }
+-    @human_defaults = { :precision => 1 }
+-    @human_storage_units_format_default = "%n %u"
+-    @human_storage_units_units_byte_other = "Bytes"
+-    @human_storage_units_units_kb_other = "KB"
+-    @percentage_defaults = { :delimiter => '' }
+-    @precision_defaults = { :delimiter => '' }
++    I18n.backend.store_translations 'ts',
++      :number => {
++        :format => { :precision => 3, :delimiter => ',', :separator => '.', :significant => false, :strip_unsignificant_zeros => false },
++        :currency => { :format => { :unit => '&$', :format => '%u - %n', :precision => 2 } },
++        :human => {
++          :format => {
++            :precision => 2,
++            :significant => true,
++            :strip_unsignificant_zeros => true
++          },
++          :storage_units => {
++            :format => "%n %u",
++            :units => {
++              :byte => "b",
++              :kb => "k"
++            }
++          },
++          :decimal_units => {
++            :format => "%n %u",
++            :units => {
++              :deci => {:one => "Tenth", :other => "Tenths"},
++              :unit =>  "u",
++              :ten => {:one => "Ten", :other => "Tens"},
++              :thousand => "t",
++              :million => "m" ,
++              :billion =>"b" ,
++              :trillion =>"t" ,
++              :quadrillion =>"q"
++            }
++          }
++        },
++        :percentage => { :format => {:delimiter => '', :precision => 2, :strip_unsignificant_zeros => true} },
++        :precision => { :format => {:delimiter => '', :significant => true} }
++      },
++      :custom_units_for_number_to_human => {:mili => "mm", :centi => "cm", :deci => "dm", :unit => "m", :ten => "dam", :hundred => "hm", :thousand => "km"}
++  end
+ 
+-    I18n.backend.store_translations 'en', :number => { :format => @number_defaults,
+-      :currency => { :format => @currency_defaults }, :human => @human_defaults }
++  def test_number_to_currency
++    assert_equal("&$ - 10.00", number_to_currency(10, :locale => 'ts'))
+   end
+ 
+-  def test_number_to_currency_translates_currency_formats
+-    I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
+-    I18n.expects(:translate).with(:'number.currency.format', :locale => 'en',
+-                                  :raise => true).returns(@currency_defaults)
+-    number_to_currency(1, :locale => 'en')
++  def test_number_with_precision
++    #Delimiter was set to ""
++    assert_equal("10000", number_with_precision(10000, :locale => 'ts'))
++
++    #Precision inherited and significant was set
++    assert_equal("1.00", number_with_precision(1.0, :locale => 'ts'))
++
+   end
+ 
+-  def test_number_with_precision_translates_number_formats
+-    I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
+-    I18n.expects(:translate).with(:'number.precision.format', :locale => 'en',
+-                                  :raise => true).returns(@precision_defaults)
+-    number_with_precision(1, :locale => 'en')
++  def test_number_with_delimiter
++    #Delimiter "," and separator "."
++    assert_equal("1,000,000.234", number_with_delimiter(1000000.234, :locale => 'ts'))
+   end
+ 
+-  def test_number_with_delimiter_translates_number_formats
+-    I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
+-    number_with_delimiter(1, :locale => 'en')
++  def test_number_to_percentage
++    # to see if strip_unsignificant_zeros is true
++    assert_equal("1%", number_to_percentage(1, :locale => 'ts'))
++    # precision is 2, significant should be inherited
++    assert_equal("1.24%", number_to_percentage(1.2434, :locale => 'ts'))
++    # no delimiter
++    assert_equal("12434%", number_to_percentage(12434, :locale => 'ts'))
+   end
+ 
+-  def test_number_to_percentage_translates_number_formats
+-    I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
+-    I18n.expects(:translate).with(:'number.percentage.format', :locale => 'en',
+-                                  :raise => true).returns(@percentage_defaults)
+-    number_to_percentage(1, :locale => 'en')
++  def test_number_to_human_size
++    #b for bytes and k for kbytes
++    assert_equal("2 k", number_to_human_size(2048, :locale => 'ts'))
++    assert_equal("42 b", number_to_human_size(42, :locale => 'ts'))
+   end
+ 
+-  def test_number_to_human_size_translates_human_formats
+-    I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
+-    I18n.expects(:translate).with(:'number.human.format', :locale => 'en',
+-                                  :raise => true).returns(@human_defaults)
+-    I18n.expects(:translate).with(:'number.human.storage_units.format', :locale => 'en',
+-                                  :raise => true).returns(@human_storage_units_format_default)
+-    I18n.expects(:translate).with(:'number.human.storage_units.units.kb', :locale => 'en', :count => 2,
+-                                  :raise => true).returns(@human_storage_units_units_kb_other)
+-    # 2KB
+-    number_to_human_size(2048, :locale => 'en')
++  def test_number_to_human_with_default_translation_scope
++    #Using t for thousand
++    assert_equal "2 t", number_to_human(2000, :locale => 'ts')
++    #Significant was set to true with precision 2, using b for billion
++    assert_equal "1.2 b", number_to_human(1234567890, :locale => 'ts')
++    #Using pluralization (Ten/Tens and Tenth/Tenths)
++    assert_equal "1 Tenth", number_to_human(0.1, :locale => 'ts')
++    assert_equal "1.3 Tenth", number_to_human(0.134, :locale => 'ts')
++    assert_equal "2 Tenths", number_to_human(0.2, :locale => 'ts')
++    assert_equal "1 Ten", number_to_human(10, :locale => 'ts')
++    assert_equal "1.2 Ten", number_to_human(12, :locale => 'ts')
++    assert_equal "2 Tens", number_to_human(20, :locale => 'ts')
++  end
+ 
+-    I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
+-    I18n.expects(:translate).with(:'number.human.format', :locale => 'en',
+-                                  :raise => true).returns(@human_defaults)
+-    I18n.expects(:translate).with(:'number.human.storage_units.format', :locale => 'en',
+-                                  :raise => true).returns(@human_storage_units_format_default)
+-    I18n.expects(:translate).with(:'number.human.storage_units.units.byte', :locale => 'en', :count => 42,
+-                                  :raise => true).returns(@human_storage_units_units_byte_other)
+-    # 42 Bytes
+-    number_to_human_size(42, :locale => 'en')
++  def test_number_to_human_with_custom_translation_scope
++    #Significant was set to true with precision 2, with custom translated units
++    assert_equal "4.3 cm", number_to_human(0.0432, :locale => 'ts', :units => :custom_units_for_number_to_human)
+   end
+ end
+diff --git a/actionpack/test/template/number_helper_test.rb b/actionpack/test/template/number_helper_test.rb
+index 0a2b82b..c90d89f 100644
+--- a/actionpack/test/template/number_helper_test.rb
++++ b/actionpack/test/template/number_helper_test.rb
+@@ -19,6 +19,15 @@ class NumberHelperTest < ActionView::TestCase
+     gigabytes(number) * 1024
+   end
+ 
++  def silence_deprecation_warnings
++    @old_deprecatios_silenced = ActiveSupport::Deprecation.silenced
++    ActiveSupport::Deprecation.silenced  = true
++  end
++
++  def restore_deprecation_warnings
++    ActiveSupport::Deprecation.silenced  = @old_deprecatios_silenced
++  end
++
+   def test_number_to_phone
+     assert_equal("555-1234", number_to_phone(5551234))
+     assert_equal("800-555-1212", number_to_phone(8005551212))
+@@ -43,7 +52,7 @@ class NumberHelperTest < ActionView::TestCase
+     assert_equal("&pound;1234567890,50", number_to_currency(1234567890.50, {:unit => "&pound;", :separator => ",", :delimiter => ""}))
+     assert_equal("$1,234,567,890.50", number_to_currency("1234567890.50"))
+     assert_equal("1,234,567,890.50 K&#269;", number_to_currency("1234567890.50", {:unit => "K&#269;", :format => "%n %u"}))
+-    #assert_equal("$x.", number_to_currency("x")) # fails due to API consolidation
++    assert_equal("$x.", number_to_currency("x."))
+     assert_equal("$x", number_to_currency("x"))
+     assert_nil number_to_currency(nil)
+   end
+@@ -55,6 +64,7 @@ class NumberHelperTest < ActionView::TestCase
+     assert_equal("100.000%", number_to_percentage("100"))
+     assert_equal("1000.000%", number_to_percentage("1000"))
+     assert_equal("x%", number_to_percentage("x"))
++    assert_equal("123.4%", number_to_percentage(123.400, :precision => 3, :strip_unsignificant_zeros => true))
+     assert_equal("1.000,000%", number_to_percentage(1000, :delimiter => '.', :separator => ','))
+     assert_nil number_to_percentage(nil)
+   end
+@@ -81,6 +91,16 @@ class NumberHelperTest < ActionView::TestCase
+     assert_equal '12.345.678,05', number_with_delimiter(12345678.05, :delimiter => '.', :separator => ',')
+   end
+ 
++  def test_number_with_delimiter_old_api
++    silence_deprecation_warnings
++    assert_equal '12 345 678', number_with_delimiter(12345678, " ")
++    assert_equal '12-345-678.05', number_with_delimiter(12345678.05, '-')
++    assert_equal '12.345.678,05', number_with_delimiter(12345678.05, '.', ',')
++    assert_equal '12,345,678.05', number_with_delimiter(12345678.05, ',', '.')
++    assert_equal '12 345 678-05', number_with_delimiter(12345678.05, ',', '.', :delimiter => ' ', :separator => '-')
++    restore_deprecation_warnings
++  end
++
+   def test_number_with_precision
+     assert_equal("111.235", number_with_precision(111.2346))
+     assert_equal("31.83", number_with_precision(31.825, :precision => 2))
+@@ -93,6 +113,7 @@ class NumberHelperTest < ActionView::TestCase
+     assert_equal("1234567892", number_with_precision(1234567891.50, :precision => 0))
+ 
+     # Return non-numeric params unchanged.
++    assert_equal("x.", number_with_precision("x."))
+     assert_equal("x", number_with_precision("x"))
+     assert_nil number_with_precision(nil)
+   end
+@@ -102,48 +123,159 @@ class NumberHelperTest < ActionView::TestCase
+     assert_equal '1.231,83',    number_with_precision(1231.825, :precision => 2, :separator => ',', :delimiter => '.')
+   end
+ 
++  def test_number_with_precision_with_significant_digits
++    assert_equal "124000", number_with_precision(123987, :precision => 3, :significant => true)
++    assert_equal "120000000", number_with_precision(123987876, :precision => 2, :significant => true )
++    assert_equal "40000", number_with_precision("43523", :precision => 1, :significant => true )
++    assert_equal "9775", number_with_precision(9775, :precision => 4, :significant => true )
++    assert_equal "5.4", number_with_precision(5.3923, :precision => 2, :significant => true )
++    assert_equal "5", number_with_precision(5.3923, :precision => 1, :significant => true )
++    assert_equal "1", number_with_precision(1.232, :precision => 1, :significant => true )
++    assert_equal "7", number_with_precision(7, :precision => 1, :significant => true )
++    assert_equal "1", number_with_precision(1, :precision => 1, :significant => true )
++    assert_equal "53", number_with_precision(52.7923, :precision => 2, :significant => true )
++    assert_equal "9775.00", number_with_precision(9775, :precision => 6, :significant => true )
++    assert_equal "5.392900", number_with_precision(5.3929, :precision => 7, :significant => true )
++  end
++
++  def test_number_with_precision_with_strip_unsignificant_zeros
++    assert_equal "9775.43", number_with_precision(9775.43, :precision => 4, :strip_unsignificant_zeros => true )
++    assert_equal "9775.2", number_with_precision(9775.2, :precision => 6, :significant => true, :strip_unsignificant_zeros => true )
++  end
++
++  def test_number_with_precision_with_significant_true_and_zero_precision
++    # Zero precision with significant is a mistake (would always return zero),
++    # so we treat it as if significant was false (increases backwards compatibily for number_to_human_size)
++    assert_equal "124", number_with_precision(123.987, :precision => 0, :significant => true)
++    assert_equal "12", number_with_precision(12, :precision => 0, :significant => true )
++    assert_equal "12", number_with_precision("12.3", :precision => 0, :significant => true )
++  end
++
++  def test_number_with_precision_old_api
++    silence_deprecation_warnings
++    assert_equal("31.8250", number_with_precision(31.825, 4))
++    assert_equal("111.235", number_with_precision(111.2346, 3))
++    assert_equal("111.00", number_with_precision(111, 2))
++    assert_equal("111.000", number_with_precision(111, 2, :precision =>3))
++    restore_deprecation_warnings
++  end
++
+   def test_number_to_human_size
+     assert_equal '0 Bytes',   number_to_human_size(0)
+     assert_equal '1 Byte',    number_to_human_size(1)
+     assert_equal '3 Bytes',   number_to_human_size(3.14159265)
+     assert_equal '123 Bytes', number_to_human_size(123.0)
+     assert_equal '123 Bytes', number_to_human_size(123)
+-    assert_equal '1.2 KB',    number_to_human_size(1234)
++    assert_equal '1.21 KB',    number_to_human_size(1234)
+     assert_equal '12.1 KB',   number_to_human_size(12345)
+-    assert_equal '1.2 MB',    number_to_human_size(1234567)
+-    assert_equal '1.1 GB',    number_to_human_size(1234567890)
+-    assert_equal '1.1 TB',    number_to_human_size(1234567890123)
+-    assert_equal '1025 TB',   number_to_human_size(terabytes(1025))
++    assert_equal '1.18 MB',    number_to_human_size(1234567)
++    assert_equal '1.15 GB',    number_to_human_size(1234567890)
++    assert_equal '1.12 TB',    number_to_human_size(1234567890123)
++    assert_equal '1030 TB',   number_to_human_size(terabytes(1026))
+     assert_equal '444 KB',    number_to_human_size(kilobytes(444))
+-    assert_equal '1023 MB',   number_to_human_size(megabytes(1023))
++    assert_equal '1020 MB',   number_to_human_size(megabytes(1023))
+     assert_equal '3 TB',      number_to_human_size(terabytes(3))
+-    assert_equal '1.18 MB',   number_to_human_size(1234567, :precision => 2)
++    assert_equal '1.2 MB',   number_to_human_size(1234567, :precision => 2)
+     assert_equal '3 Bytes',   number_to_human_size(3.14159265, :precision => 4)
+-    assert_equal("123 Bytes", number_to_human_size("123"))
+-    assert_equal '1.01 KB',   number_to_human_size(kilobytes(1.0123), :precision => 2)
++    assert_equal '123 Bytes', number_to_human_size('123')
++    assert_equal '1 KB',   number_to_human_size(kilobytes(1.0123), :precision => 2)
+     assert_equal '1.01 KB',   number_to_human_size(kilobytes(1.0100), :precision => 4)
+     assert_equal '10 KB',   number_to_human_size(kilobytes(10.000), :precision => 4)
+     assert_equal '1 Byte',   number_to_human_size(1.1)
+     assert_equal '10 Bytes', number_to_human_size(10)
+-    #assert_nil number_to_human_size('x') # fails due to API consolidation
++
++    # Return non-numeric params unchanged.
++    assert_equal "x", number_to_human_size('x')
+     assert_nil number_to_human_size(nil)
+   end
+ 
+   def test_number_to_human_size_with_options_hash
+-    assert_equal '1.18 MB',   number_to_human_size(1234567, :precision => 2)
++    assert_equal '1.2 MB',   number_to_human_size(1234567, :precision => 2)
+     assert_equal '3 Bytes',   number_to_human_size(3.14159265, :precision => 4)
+-    assert_equal '1.01 KB',   number_to_human_size(kilobytes(1.0123), :precision => 2)
++    assert_equal '1 KB',   number_to_human_size(kilobytes(1.0123), :precision => 2)
+     assert_equal '1.01 KB',   number_to_human_size(kilobytes(1.0100), :precision => 4)
+     assert_equal '10 KB',     number_to_human_size(kilobytes(10.000), :precision => 4)
+-    assert_equal '1 TB', number_to_human_size(1234567890123, :precision => 0)
+-    assert_equal '500 MB', number_to_human_size(524288000, :precision=>0)
+-    assert_equal '40 KB', number_to_human_size(41010, :precision => 0)
+-    assert_equal '40 KB', number_to_human_size(41100, :precision => 0)
++    assert_equal '1 TB', number_to_human_size(1234567890123, :precision => 1)
++    assert_equal '500 MB', number_to_human_size(524288000, :precision=>3)
++    assert_equal '40 KB', number_to_human_size(41010, :precision => 1)
++    assert_equal '40 KB', number_to_human_size(41100, :precision => 2)
++    assert_equal '1.0 KB',   number_to_human_size(kilobytes(1.0123), :precision => 2, :strip_unsignificant_zeros => false)
++    assert_equal '1.012 KB',   number_to_human_size(kilobytes(1.0123), :precision => 3, :significant => false)
++    assert_equal '1 KB',   number_to_human_size(kilobytes(1.0123), :precision => 0, :significant => true) #ignores significant it precision is 0
+   end
+ 
+   def test_number_to_human_size_with_custom_delimiter_and_separator
+-    assert_equal '1,01 KB',     number_to_human_size(kilobytes(1.0123), :precision => 2, :separator => ',')
++    assert_equal '1,01 KB',     number_to_human_size(kilobytes(1.0123), :precision => 3, :separator => ',')
+     assert_equal '1,01 KB',     number_to_human_size(kilobytes(1.0100), :precision => 4, :separator => ',')
+-    assert_equal '1.000,1 TB',  number_to_human_size(terabytes(1000.1), :delimiter => '.', :separator => ',')
++    assert_equal '1.000,1 TB',  number_to_human_size(terabytes(1000.1), :precision => 5, :delimiter => '.', :separator => ',')
++  end
++
++  def test_number_to_human_size_old_api
++    silence_deprecation_warnings
++    assert_equal '1.3143 KB',   number_to_human_size(kilobytes(1.3143), 4, :significant => false)
++    assert_equal '10.45 KB',   number_to_human_size(kilobytes(10.453), 4)
++    assert_equal '10 KB',   number_to_human_size(kilobytes(10.453), 4, :precision => 2)
++    restore_deprecation_warnings
++  end
++
++  def test_number_to_human
++     assert_equal '123', number_to_human(123)
++     assert_equal '1.23 Thousand', number_to_human(1234)
++     assert_equal '12.3 Thousand', number_to_human(12345)
++     assert_equal '1.23 Million', number_to_human(1234567)
++     assert_equal '1.23 Billion', number_to_human(1234567890)
++     assert_equal '1.23 Trillion', number_to_human(1234567890123)
++     assert_equal '1.23 Quadrillion', number_to_human(1234567890123456)
++     assert_equal '1230 Quadrillion', number_to_human(1234567890123456789)
++     assert_equal '490 Thousand', number_to_human(489939, :precision => 2)
++     assert_equal '489.9 Thousand', number_to_human(489939, :precision => 4)
++     assert_equal '489 Thousand', number_to_human(489000, :precision => 4)
++     assert_equal '489.0 Thousand', number_to_human(489000, :precision => 4, :strip_unsignificant_zeros => false)
++     assert_equal '1.2346 Million', number_to_human(1234567, :precision => 4, :significant => false)
++     assert_equal '1,2 Million', number_to_human(1234567, :precision => 1, :significant => false, :separator => ',')
++     assert_equal '1 Million', number_to_human(1234567, :precision => 0, :significant => true, :separator => ',') #significant forced to false
++
++     # Return non-numeric params unchanged.
++     assert_equal "x", number_to_human('x')
++     assert_nil number_to_human(nil)
++  end
++
++  def test_number_to_human_with_custom_units
++     #Only integers
++     volume = {:unit => "ml", :thousand => "lt", :million => "m3"}
++     assert_equal '123 lt', number_to_human(123456, :units => volume)
++     assert_equal '12 ml', number_to_human(12, :units => volume)
++     assert_equal '1.23 m3', number_to_human(1234567, :units => volume)
++
++     #Including fractionals
++     distance = {:mili => "mm", :centi => "cm", :deci => "dm", :unit => "m", :ten => "dam", :hundred => "hm", :thousand => "km"}
++     assert_equal '1.23 mm', number_to_human(0.00123, :units => distance)
++     assert_equal '1.23 cm', number_to_human(0.0123, :units => distance)
++     assert_equal '1.23 dm', number_to_human(0.123, :units => distance)
++     assert_equal '1.23 m', number_to_human(1.23, :units => distance)
++     assert_equal '1.23 dam', number_to_human(12.3, :units => distance)
++     assert_equal '1.23 hm', number_to_human(123, :units => distance)
++     assert_equal '1.23 km', number_to_human(1230, :units => distance)
++     assert_equal '1.23 km', number_to_human(1230, :units => distance)
++     assert_equal '1.23 km', number_to_human(1230, :units => distance)
++     assert_equal '12.3 km', number_to_human(12300, :units => distance)
++
++     #The quantifiers don't need to be a continuous sequence
++     gangster = {:hundred => "hundred bucks", :million => "thousand quids"}
++     assert_equal '1 hundred bucks', number_to_human(100, :units => gangster)
++     assert_equal '25 hundred bucks', number_to_human(2500, :units => gangster)
++     assert_equal '25 thousand quids', number_to_human(25000000, :units => gangster)
++     assert_equal '12300 thousand quids', number_to_human(12345000000, :units => gangster)
++
++     #Spaces are stripped from the resulting string
++     assert_equal '4', number_to_human(4, :units => {:unit => "", :ten => 'tens '})
++     assert_equal '4.5  tens', number_to_human(45, :units => {:unit => "", :ten => ' tens   '})
+   end
++
++  def test_number_to_human_with_custom_format
++    assert_equal '123 times Thousand', number_to_human(123456, :format => "%n times %u")
++    volume = {:unit => "ml", :thousand => "lt", :million => "m3"}
++    assert_equal '123.lt', number_to_human(123456, :units => volume, :format => "%n.%u")
++  end
++
+ end
+-- 
+1.7.0.2
+

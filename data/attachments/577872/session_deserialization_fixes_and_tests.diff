@@ -1,0 +1,281 @@
+From e6492b76716e5dcb195f8e432bc24449824164aa Mon Sep 17 00:00:00 2001
+From: Michael Lovitt <michael@lovitt.net>
+Date: Sun, 27 Jun 2010 14:35:31 -0400
+Subject: [PATCH] Fixed that an ArgumentError is thrown when request.session_options[:id] is read in the following scenario: when the cookie store is used, and the session contains a serialized object of an unloaded class, and no session data accesses have occurred yet. Pushed the stale_session_check responsibility out of the SessionHash and down into the session store, closer to where the deserialization actually occurs. Added some test coverage for this case and others related to deserialization of unloaded types.
+
+---
+ .../middleware/session/abstract_store.rb           |   63 ++++++++++----------
+ .../middleware/session/cookie_store.rb             |   10 ++-
+ actionpack/test/abstract_unit.rb                   |   15 +++++
+ .../test/dispatch/session/cookie_store_test.rb     |   28 ++++++++-
+ .../test/dispatch/session/mem_cache_store_test.rb  |   25 ++++++++
+ .../session_autoload_test/foo.rb                   |   10 +++
+ 6 files changed, 115 insertions(+), 36 deletions(-)
+ create mode 100644 actionpack/test/fixtures/session_autoload_test/session_autoload_test/foo.rb
+
+diff --git a/actionpack/lib/action_dispatch/middleware/session/abstract_store.rb b/actionpack/lib/action_dispatch/middleware/session/abstract_store.rb
+index bc1d6fa..25dbbc0 100644
+--- a/actionpack/lib/action_dispatch/middleware/session/abstract_store.rb
++++ b/actionpack/lib/action_dispatch/middleware/session/abstract_store.rb
+@@ -88,9 +88,7 @@ module ActionDispatch
+ 
+         def exists?
+           return @exists if instance_variable_defined?(:@exists)
+-          stale_session_check! do
+-            @exists = @by.send(:exists?, @env)
+-          end
++          @exists = @by.send(:exists?, @env)
+         end
+ 
+         def loaded?
+@@ -115,29 +113,12 @@ module ActionDispatch
+           end
+ 
+           def load!
+-            stale_session_check! do
+-              id, session = @by.send(:load_session, @env)
+-              @env[ENV_SESSION_OPTIONS_KEY][:id] = id
+-              replace(session.stringify_keys)
+-              @loaded = true
+-            end
++            id, session = @by.send(:load_session, @env)
++            @env[ENV_SESSION_OPTIONS_KEY][:id] = id
++            replace(session.stringify_keys)
++            @loaded = true
+           end
+ 
+-          def stale_session_check!
+-            yield
+-          rescue ArgumentError => argument_error
+-            if argument_error.message =~ %r{undefined class/module ([\w:]*\w)}
+-              begin
+-                # Note that the regexp does not allow $1 to end with a ':'
+-                $1.constantize
+-              rescue LoadError, NameError => const_error
+-                raise ActionDispatch::Session::SessionRestoreError, "Session contains objects whose class definition isn't available.\nRemember to require the classes for all objects kept in the session.\n(Original exception: #{const_error.message} [#{const_error.class}])\n"
+-              end
+-              retry
+-            else
+-              raise
+-            end
+-          end
+       end
+ 
+       DEFAULT_OPTIONS = {
+@@ -204,16 +185,20 @@ module ActionDispatch
+         end
+ 
+         def load_session(env)
+-          sid = current_session_id(env)
+-          sid, session = get_session(env, sid)
+-          [sid, session]
++          stale_session_check! do
++            sid = current_session_id(env)
++            sid, session = get_session(env, sid)
++            [sid, session]
++          end
+         end
+ 
+         def extract_session_id(env)
+-          request = ActionDispatch::Request.new(env)
+-          sid = request.cookies[@key]
+-          sid ||= request.params[@key] unless @cookie_only
+-          sid
++          stale_session_check! do
++            request = ActionDispatch::Request.new(env)
++            sid = request.cookies[@key]
++            sid ||= request.params[@key] unless @cookie_only
++            sid
++          end
+         end
+ 
+         def current_session_id(env)
+@@ -228,6 +213,22 @@ module ActionDispatch
+               '"_myapp_session" } in config/application.rb'
+           end
+         end
++        
++        def stale_session_check!
++          yield
++        rescue ArgumentError => argument_error
++          if argument_error.message =~ %r{undefined class/module ([\w:]*\w)}
++            begin
++              # Note that the regexp does not allow $1 to end with a ':'
++              $1.constantize
++            rescue LoadError, NameError => const_error
++              raise ActionDispatch::Session::SessionRestoreError, "Session contains objects whose class definition isn't available.\nRemember to require the classes for all objects kept in the session.\n(Original exception: #{const_error.message} [#{const_error.class}])\n"
++            end
++            retry
++          else
++            raise
++          end
++        end
+ 
+         def exists?(env)
+           current_session_id(env).present?
+diff --git a/actionpack/lib/action_dispatch/middleware/session/cookie_store.rb b/actionpack/lib/action_dispatch/middleware/session/cookie_store.rb
+index 7ebd532..dce47c6 100644
+--- a/actionpack/lib/action_dispatch/middleware/session/cookie_store.rb
++++ b/actionpack/lib/action_dispatch/middleware/session/cookie_store.rb
+@@ -63,11 +63,13 @@ module ActionDispatch
+ 
+         def unpacked_cookie_data(env)
+           env["action_dispatch.request.unsigned_session_cookie"] ||= begin
+-            request = ActionDispatch::Request.new(env)
+-            if data = request.cookie_jar.signed[@key]
+-              data.stringify_keys!
++            stale_session_check! do
++              request = ActionDispatch::Request.new(env)
++              if data = request.cookie_jar.signed[@key]
++                data.stringify_keys!
++              end
++              data || {}
+             end
+-            data || {}
+           end
+         end
+ 
+diff --git a/actionpack/test/abstract_unit.rb b/actionpack/test/abstract_unit.rb
+index 84c5395..f17e64b 100644
+--- a/actionpack/test/abstract_unit.rb
++++ b/actionpack/test/abstract_unit.rb
+@@ -202,6 +202,21 @@ class ActionController::IntegrationTest < ActiveSupport::TestCase
+     self.class.app = old_app
+     silence_warnings { Object.const_set(:SharedTestRoutes, old_routes) }
+   end
++  
++  def with_autoload_path(path)
++    path = File.join(File.dirname(__FILE__), "fixtures", path)  
++    if ActiveSupport::Dependencies.autoload_paths.include?(path)
++      yield
++    else
++      begin
++        ActiveSupport::Dependencies.autoload_paths << path
++        yield
++      ensure
++        ActiveSupport::Dependencies.autoload_paths.reject! {|p| p == path}
++        ActiveSupport::Dependencies.clear
++      end              
++    end
++  end
+ end
+ 
+ # Temporary base class
+diff --git a/actionpack/test/dispatch/session/cookie_store_test.rb b/actionpack/test/dispatch/session/cookie_store_test.rb
+index 6aca22b..c186413 100644
+--- a/actionpack/test/dispatch/session/cookie_store_test.rb
++++ b/actionpack/test/dispatch/session/cookie_store_test.rb
+@@ -42,7 +42,7 @@ class CookieStoreTest < ActionController::IntegrationTest
+     
+     def rescue_action(e) raise end
+   end
+-
++    
+   def test_raises_argument_error_if_missing_session_key
+     assert_raise(ArgumentError, nil.inspect) {
+       ActionDispatch::Session::CookieStore.new(nil,
+@@ -96,6 +96,31 @@ class CookieStoreTest < ActionController::IntegrationTest
+     end
+   end
+ 
++  # {:foo=>#<SessionAutoloadTest::Foo bar:"baz">, :session_id=>"ce8b0752a6ab7c7af3cdb8a80e6b9e46"}  
++  SignedSerializedCookie = "BAh7BzoIZm9vbzodU2Vzc2lvbkF1dG9sb2FkVGVzdDo6Rm9vBjoJQGJhciIIYmF6Og9zZXNzaW9uX2lkIiVjZThiMDc1MmE2YWI3YzdhZjNjZGI4YTgwZTZiOWU0Ng==--2bf3af1ae8bd4e52b9ac2099258ace0c380e601c"
++  
++  def test_deserializes_unloaded_classes_on_get_id
++    with_test_route_set do
++      with_autoload_path "session_autoload_test" do
++        cookies[SessionKey] = SignedSerializedCookie
++        get '/get_session_id'
++        assert_response :success
++        assert_equal 'id: ce8b0752a6ab7c7af3cdb8a80e6b9e46', response.body, "should auto-load unloaded class"
++      end
++    end
++  end  
++  
++  def test_deserializes_unloaded_classes_on_get_value
++    with_test_route_set do
++      with_autoload_path "session_autoload_test" do 
++        cookies[SessionKey] = SignedSerializedCookie
++        get '/get_session_value'
++        assert_response :success
++        assert_equal 'foo: #<SessionAutoloadTest::Foo bar:"baz">', response.body, "should auto-load unloaded class"
++      end
++    end
++  end
++
+   def test_close_raises_when_data_overflows
+     with_test_route_set do
+       assert_raise(ActionDispatch::Cookies::CookieOverflow) {
+@@ -247,4 +272,5 @@ class CookieStoreTest < ActionController::IntegrationTest
+         yield
+       end
+     end
++
+ end
+diff --git a/actionpack/test/dispatch/session/mem_cache_store_test.rb b/actionpack/test/dispatch/session/mem_cache_store_test.rb
+index d388992..0494076 100644
+--- a/actionpack/test/dispatch/session/mem_cache_store_test.rb
++++ b/actionpack/test/dispatch/session/mem_cache_store_test.rb
+@@ -11,6 +11,11 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+       session[:foo] = "bar"
+       head :ok
+     end
++    
++    def set_serialized_session_value
++      session[:foo] = SessionAutoloadTest::Foo.new
++      head :ok
++    end
+ 
+     def get_session_value
+       render :text => "foo: #{session[:foo].inspect}"
+@@ -117,6 +122,25 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+       end
+     end
+ 
++    def test_deserializes_unloaded_class
++      with_test_route_set do
++        with_autoload_path "session_autoload_test" do        
++          get '/set_serialized_session_value'
++          assert_response :success
++          assert cookies['_session_id']
++        end
++        with_autoload_path "session_autoload_test" do                
++          get '/get_session_id'
++          assert_response :success
++        end
++        with_autoload_path "session_autoload_test" do                
++          get '/get_session_value'
++          assert_response :success
++          assert_equal 'foo: #<SessionAutoloadTest::Foo bar:"baz">', response.body, "should auto-load unloaded class"
++        end
++      end
++    end
++
+     def test_doesnt_write_session_cookie_if_session_id_is_already_exists
+       with_test_route_set do
+         get '/set_session_value'
+@@ -162,4 +186,5 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+         yield
+       end
+     end
++    
+ end
+diff --git a/actionpack/test/fixtures/session_autoload_test/session_autoload_test/foo.rb b/actionpack/test/fixtures/session_autoload_test/session_autoload_test/foo.rb
+new file mode 100644
+index 0000000..4ee7a24
+--- /dev/null
++++ b/actionpack/test/fixtures/session_autoload_test/session_autoload_test/foo.rb
+@@ -0,0 +1,10 @@
++module SessionAutoloadTest
++  class Foo
++    def initialize(bar='baz')
++      @bar = bar
++    end
++    def inspect
++      "#<#{self.class} bar:#{@bar.inspect}>"
++    end
++  end
++end
+-- 
+1.6.4.4
+

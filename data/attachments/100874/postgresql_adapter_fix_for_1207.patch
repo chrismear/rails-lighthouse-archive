@@ -1,0 +1,105 @@
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 913bb52..77c4083 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -865,8 +865,7 @@ module ActiveRecord
+ 
+         # Construct a clean list of column names from the ORDER BY clause, removing
+         # any ASC/DESC modifiers
+-        order_columns = order_by.split(',').collect { |s| s.split.first }
+-        order_columns.delete_if &:blank?
++        order_columns = parse_order_by(order_by).collect(&:first)
+         order_columns = order_columns.zip((0...order_columns.size).to_a).map { |s,i| "#{s} AS alias_#{i}" }
+ 
+         # Return a DISTINCT ON() clause that's distinct on the columns we want but includes
+@@ -881,11 +880,10 @@ module ActiveRecord
+       # by wrapping the +sql+ string as a sub-select and ordering in that query.
+       def add_order_by_for_association_limiting!(sql, options) #:nodoc:
+         return sql if options[:order].blank?
+-        
+-        order = options[:order].split(',').collect { |s| s.strip }.reject(&:blank?)
+-        order.map! { |s| 'DESC' if s =~ /\bdesc$/i }
++
++        order = parse_order_by(options[:order]).collect(&:last)
+         order = order.zip((0...order.size).to_a).map { |s,i| "id_list.alias_#{i} #{s}" }.join(', ')
+-        
++
+         sql.replace "SELECT * FROM (#{sql}) AS id_list ORDER BY #{order}"
+       end
+ 
+@@ -1045,6 +1043,40 @@ module ActiveRecord
+              ORDER BY a.attnum
+           end_sql
+         end
++
++        def parse_order_by(order_by)
++          order_columns = []
++          apos = false
++          quot = false
++          paren = 0
++          brack = 0
++          acc = ""
++          (order_by.split(//)+[',']).each do |c|
++            acc << c
++            case c
++            when '('
++              paren += 1 unless apos or quot
++            when ')'
++              paren -= 1 unless apos or quot
++            when '['
++              brack += 1 unless apos or quot
++            when ']'
++              brack -= 1 unless apos or quot
++            when '"'
++              quot = !quot unless apos
++            when "'"
++              apos = !apos unless quot
++            when ','
++              unless apos or quot or paren > 0 or brack > 0
++                match = /^(.*?)((\s+(ASC|DESC))?(\s+NULLS\s+(FIRST|LAST))?)\s*,$/i.match(acc)
++                # [ordering expression, modifier flags]
++                order_columns << [match[1].strip, match[2].strip.upcase]
++                acc = ''
++              end
++            end
++          end
++          order_columns.delete_if(&:blank?)
++        end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 4072381..4fa36f4 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -500,6 +500,30 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_equal posts_with_explicit_order, posts_with_scoped_order
+   end
+ 
++  if current_adapter?(:PostgreSQLAdapter)
++    def test_eager_with_scoped_order_using_association_limiting_without_explicit_scope_with_nulls_first_and_last
++      posts_with_explicit_order = Post.find(:all, :conditions => 'comments.id is not null', :include => :comments, :order => 'posts.id DESC NULLS FIRST', :limit => 2)
++      posts_with_scoped_order = Post.with_scope(:find => {:order => 'posts.id DESC NULLS FIRST'}) do
++        Post.find(:all, :conditions => 'comments.id is not null', :include => :comments, :limit => 2)
++      end
++      assert_equal posts_with_explicit_order, posts_with_scoped_order
++
++      posts_with_explicit_order = Post.find(:all, :conditions => 'comments.id is not null', :include => :comments, :order => 'posts.id DESC NULLS LAST', :limit => 2)
++      posts_with_scoped_order = Post.with_scope(:find => {:order => 'posts.id DESC NULLS LAST'}) do
++        Post.find(:all, :conditions => 'comments.id is not null', :include => :comments, :limit => 2)
++      end
++      assert_equal posts_with_explicit_order, posts_with_scoped_order
++    end
++
++    def test_eager_with_scoped_order_using_association_limiting_without_explicit_scope_order_with_function
++      posts_with_explicit_order = Post.find(:all, :include => :comments, :order => 'coalesce(comments.id, 0) DESC', :limit => 2)
++      posts_with_scoped_order = Post.with_scope(:find => {:order => 'coalesce(comments.id, 0) DESC'}) do
++        Post.find(:all, :include => :comments, :limit => 2)
++      end
++      assert_equal posts_with_explicit_order, posts_with_scoped_order
++    end
++  end
++
+   def test_eager_association_loading_with_habtm
+     posts = Post.find(:all, :include => :categories, :order => "posts.id")
+     assert_equal 2, posts[0].categories.size

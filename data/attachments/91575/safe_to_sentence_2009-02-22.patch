@@ -1,0 +1,260 @@
+From 4e748976f5808ab048933af8362da51de41dcc75 Mon Sep 17 00:00:00 2001
+From: Andrew Briening <abriening@gmail.com>
+Date: Sun, 22 Feb 2009 13:29:07 -0500
+Subject: [PATCH] Safe use of Array#to_sentence in Rails' Internals
+   - Array#to_sentence only looks-up translations if no default is passed in
+   - Array#to_sentence passes defaults from Array::SENTENCE_CONVERSION_DEFAULTS as I18n.translate defaults to avoid hitting the I18n exception handler
+   - Updated all usage of to_sentence in Rails's error messages and logging to pass Array::SENTENCE_CONVERSION_DEFAULTS
+   - Added a test to ensure that defaults are not looked up by I18n backend if defaults are used
+
+---
+ actionpack/lib/action_controller/base.rb           |    4 +-
+ actionpack/lib/action_controller/request.rb        |    2 +-
+ activerecord/lib/active_record/associations.rb     |   20 +++++-----
+ .../active_support/core_ext/array/conversions.rb   |   37 +++++++++++++------
+ activesupport/lib/active_support/duration.rb       |    2 +-
+ activesupport/test/i18n_test.rb                    |    7 ++++
+ railties/lib/rails/plugin/loader.rb                |    2 +-
+ railties/lib/tasks/testing.rake                    |    2 +-
+ 8 files changed, 48 insertions(+), 28 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index def57a8..880b58c 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -22,7 +22,7 @@ module ActionController #:nodoc:
+     attr_reader :allowed_methods
+ 
+     def initialize(*allowed_methods)
+-      super("Only #{allowed_methods.to_sentence} requests are allowed.")
++      super("Only #{allowed_methods.to_sentence(Array::SENTENCE_CONVERSION_DEFAULTS)} requests are allowed.")
+       @allowed_methods = allowed_methods
+     end
+ 
+@@ -1270,7 +1270,7 @@ module ActionController #:nodoc:
+           rescue ActionView::MissingTemplate => e
+             # Was the implicit template missing, or was it another template?
+             if e.path == default_template_name
+-              raise UnknownAction, "No action responded to #{action_name}. Actions: #{action_methods.sort.to_sentence}", caller
++              raise UnknownAction, "No action responded to #{action_name}. Actions: #{action_methods.sort.to_sentence(Array::SENTENCE_CONVERSION_DEFAULTS)}", caller
+             else
+               raise e
+             end
+diff --git a/actionpack/lib/action_controller/request.rb b/actionpack/lib/action_controller/request.rb
+index 0e95cfc..1ce1e47 100755
+--- a/actionpack/lib/action_controller/request.rb
++++ b/actionpack/lib/action_controller/request.rb
+@@ -32,7 +32,7 @@ module ActionController
+     # <tt>:get</tt>. If the request \method is not listed in the HTTP_METHODS
+     # constant above, an UnknownHttpMethod exception is raised.
+     def request_method
+-      @request_method ||= HTTP_METHOD_LOOKUP[super] || raise(UnknownHttpMethod, "#{super}, accepted HTTP methods are #{HTTP_METHODS.to_sentence}")
++      @request_method ||= HTTP_METHOD_LOOKUP[super] || raise(UnknownHttpMethod, "#{super}, accepted HTTP methods are #{HTTP_METHODS.to_sentence(Array::SENTENCE_CONVERSION_DEFAULTS)}")
+     end
+ 
+     # Returns the HTTP request \method used for action processing as a
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 05ce8ff..3fc1a1a 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -22,7 +22,7 @@ module ActiveRecord
+       through_reflection      = reflection.through_reflection
+       source_reflection_names = reflection.source_reflection_names
+       source_associations     = reflection.through_reflection.klass.reflect_on_all_associations.collect { |a| a.name.inspect }
+-      super("Could not find the source association(s) #{source_reflection_names.collect(&:inspect).to_sentence :two_words_connector => ' or ', :last_word_connector => ', or '} in model #{through_reflection.klass}.  Try 'has_many #{reflection.name.inspect}, :through => #{through_reflection.name.inspect}, :source => <name>'.  Is it one of #{source_associations.to_sentence :two_words_connector => ' or ', :last_word_connector => ', or '}?")
++      super("Could not find the source association(s) #{source_reflection_names.collect(&:inspect).to_sentence :words_connector => Array::SENTENCE_CONVERSION_DEFAULTS[:words_connector], :two_words_connector => ' or ', :last_word_connector => ', or '} in model #{through_reflection.klass}.  Try 'has_many #{reflection.name.inspect}, :through => #{through_reflection.name.inspect}, :source => <name>'.  Is it one of #{source_associations.to_sentence :words_connector => Array::SENTENCE_CONVERSION_DEFAULTS[:words_connector], :two_words_connector => ' or ', :last_word_connector => ', or '}?")
+     end
+   end
+ 
+@@ -505,14 +505,14 @@ module ActiveRecord
+     #
+     # Since only one table is loaded at a time, conditions or orders cannot reference tables other than the main one. If this is the case
+     # Active Record falls back to the previously used LEFT OUTER JOIN based strategy. For example
+-    #  
++    #
+     #   Post.find(:all, :include => [ :author, :comments ], :conditions => ['comments.approved = ?', true])
+     #
+     # will result in a single SQL query with joins along the lines of: <tt>LEFT OUTER JOIN comments ON comments.post_id = posts.id</tt> and
+     # <tt>LEFT OUTER JOIN authors ON authors.id = posts.author_id</tt>. Note that using conditions like this can have unintended consequences.
+     # In the above example posts with no approved comments are not returned at all, because the conditions apply to the SQL statement as a whole
+     # and not just to the association. You must disambiguate column references for this fallback to happen, for example
+-    # <tt>:order => "author.name DESC"</tt> will work but <tt>:order => "name DESC"</tt> will not. 
++    # <tt>:order => "author.name DESC"</tt> will work but <tt>:order => "name DESC"</tt> will not.
+     #
+     # If you do want eagerload only some members of an association it is usually more natural to <tt>:include</tt> an association
+     # which has conditions defined on it:
+@@ -546,10 +546,10 @@ module ActiveRecord
+     #
+     #   Address.find(:all, :include => :addressable)
+     #
+-    # will execute one query to load the addresses and load the addressables with one query per addressable type. 
++    # will execute one query to load the addresses and load the addressables with one query per addressable type.
+     # For example if all the addressables are either of class Person or Company then a total of 3 queries will be executed. The list of
+     # addressable types to load is determined on the back of the addresses loaded. This is not supported if Active Record has to fallback
+-    # to the previous implementation of eager loading and will raise ActiveRecord::EagerLoadPolymorphicError. The reason is that the parent 
++    # to the previous implementation of eager loading and will raise ActiveRecord::EagerLoadPolymorphicError. The reason is that the parent
+     # model's type is a column value so its corresponding table name cannot be put in the +FROM+/+JOIN+ clauses of that query.
+     #
+     # == Table Aliasing
+@@ -871,15 +871,15 @@ module ActiveRecord
+       #   but not include the joined columns. Do not forget to include the primary and foreign keys, otherwise it will raise an error.
+       # [:through]
+       #   Specifies a Join Model through which to perform the query.  Options for <tt>:class_name</tt> and <tt>:foreign_key</tt>
+-      #   are ignored, as the association uses the source reflection. You can only use a <tt>:through</tt> query through a 
++      #   are ignored, as the association uses the source reflection. You can only use a <tt>:through</tt> query through a
+       #   <tt>has_one</tt> or <tt>belongs_to</tt> association on the join model.
+       # [:source]
+       #   Specifies the source association name used by <tt>has_one :through</tt> queries.  Only use it if the name cannot be
+       #   inferred from the association.  <tt>has_one :favorite, :through => :favorites</tt> will look for a
+-      #   <tt>:favorite</tt> on Favorite, unless a <tt>:source</tt> is given.      
++      #   <tt>:favorite</tt> on Favorite, unless a <tt>:source</tt> is given.
+       # [:source_type]
+       #   Specifies type of the source association used by <tt>has_one :through</tt> queries where the source
+-      #   association is a polymorphic +belongs_to+.      
++      #   association is a polymorphic +belongs_to+.
+       # [:readonly]
+       #   If true, the associated object is readonly through the association.
+       # [:validate]
+@@ -1190,8 +1190,8 @@ module ActiveRecord
+       #   the association will use "project_id" as the default <tt>:association_foreign_key</tt>.
+       # [:conditions]
+       #   Specify the conditions that the associated object must meet in order to be included as a +WHERE+
+-      #   SQL fragment, such as <tt>authorized = 1</tt>.  Record creations from the association are scoped if a hash is used.  
+-      #   <tt>has_many :posts, :conditions => {:published => true}</tt> will create published posts with <tt>@blog.posts.create</tt> 
++      #   SQL fragment, such as <tt>authorized = 1</tt>.  Record creations from the association are scoped if a hash is used.
++      #   <tt>has_many :posts, :conditions => {:published => true}</tt> will create published posts with <tt>@blog.posts.create</tt>
+       #   or <tt>@blog.posts.build</tt>.
+       # [:order]
+       #   Specify the order in which the associated objects are returned as an <tt>ORDER BY</tt> SQL fragment,
+diff --git a/activesupport/lib/active_support/core_ext/array/conversions.rb b/activesupport/lib/active_support/core_ext/array/conversions.rb
+index a9b50ca..a57def9 100644
+--- a/activesupport/lib/active_support/core_ext/array/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/array/conversions.rb
+@@ -2,15 +2,29 @@ module ActiveSupport #:nodoc:
+   module CoreExtensions #:nodoc:
+     module Array #:nodoc:
+       module Conversions
++
++        SENTENCE_CONVERSION_DEFAULTS = {
++          :words_connector     => ', ',
++          :two_words_connector => ' and ',
++          :last_word_connector => ', and '
++        }
++
+         # Converts the array to a comma-separated sentence where the last element is joined by the connector word. Options:
+         # * <tt>:words_connector</tt> - The sign or word used to join the elements in arrays with two or more elements (default: ", ")
+         # * <tt>:two_words_connector</tt> - The sign or word used to join the elements in arrays with two elements (default: " and ")
+         # * <tt>:last_word_connector</tt> - The sign or word used to join the last element in arrays with three or more elements (default: ", and ")
+         def to_sentence(options = {})
+-   
+-          default_words_connector = I18n.translate(:'support.array.words_connector', :locale => options[:locale])
+-          default_two_words_connector = I18n.translate(:'support.array.two_words_connector', :locale => options[:locale])
+-          default_last_word_connector = I18n.translate(:'support.array.last_word_connector', :locale => options[:locale])          
++
++          # get translations or defaults
++          [:words_connector, :two_words_connector, :last_word_connector].each do | option |
++            unless options.has_key? option
++              options[option] = I18n.translate( option,
++                                                :scope   => :'support.array',
++                                                :default => SENTENCE_CONVERSION_DEFAULTS[option],
++                                                :locale  => options[:locale]
++                                               )
++            end
++          end
+ 
+           # Try to emulate to_senteces previous to 2.3
+           if options.has_key?(:connector) || options.has_key?(:skip_last_comma)
+@@ -19,15 +33,14 @@ module ActiveSupport #:nodoc:
+ 
+             skip_last_comma = options.delete :skip_last_comma
+             if connector = options.delete(:connector)
+-              options[:last_word_connector] ||= skip_last_comma ? connector : ", #{connector}"
++              options[:last_word_connector] = skip_last_comma ? connector : ", #{connector}"
+             else
+-              options[:last_word_connector] ||= skip_last_comma ? default_two_words_connector : default_last_word_connector
++              options[:last_word_connector] = skip_last_comma ? options[:two_words_connector] : options[:last_word_connector]
+             end
+           end
+-          
+-          options.assert_valid_keys(:words_connector, :two_words_connector, :last_word_connector, :locale)       
+-          options.reverse_merge! :words_connector => default_words_connector, :two_words_connector => default_two_words_connector, :last_word_connector => default_last_word_connector
+-          
++
++          options.assert_valid_keys(:words_connector, :two_words_connector, :last_word_connector, :locale)
++
+           case length
+             when 0
+               ""
+@@ -39,10 +52,10 @@ module ActiveSupport #:nodoc:
+               "#{self[0...-1].join(options[:words_connector])}#{options[:last_word_connector]}#{self[-1]}"
+           end
+         end
+-        
++
+ 
+         # Calls <tt>to_param</tt> on all its elements and joins the result with
+-        # slashes. This is used by <tt>url_for</tt> in Action Pack. 
++        # slashes. This is used by <tt>url_for</tt> in Action Pack.
+         def to_param
+           collect { |e| e.to_param }.join '/'
+         end
+diff --git a/activesupport/lib/active_support/duration.rb b/activesupport/lib/active_support/duration.rb
+index c41e86d..5868070 100644
+--- a/activesupport/lib/active_support/duration.rb
++++ b/activesupport/lib/active_support/duration.rb
+@@ -70,7 +70,7 @@ module ActiveSupport
+       [:years, :months, :days, :minutes, :seconds].map do |length|
+         n = consolidated[length]
+         "#{n} #{n == 1 ? length.to_s.singularize : length.to_s}" if n.nonzero?
+-      end.compact.to_sentence
++      end.compact.to_sentence(Array::SENTENCE_CONVERSION_DEFAULTS)
+     end
+ 
+     protected
+diff --git a/activesupport/test/i18n_test.rb b/activesupport/test/i18n_test.rb
+index 7535f4a..27a6d98 100644
+--- a/activesupport/test/i18n_test.rb
++++ b/activesupport/test/i18n_test.rb
+@@ -83,6 +83,13 @@ class I18nTest < Test::Unit::TestCase
+     assert_equal ', and ', I18n.translate(:'support.array.last_word_connector')
+   end
+ 
++  def test_to_sentence_does_not_lookup_if_defaults_are_used
++    I18n.backend.expects(:translate).never
++    assert_equal 'a, b, and c', %w[a b c].to_sentence(Array::SENTENCE_CONVERSION_DEFAULTS)
++  ensure
++    I18n.backend = nil
++  end
++
+   def test_to_sentence
+     default_two_words_connector = I18n.translate(:'support.array.two_words_connector')
+     default_last_word_connector = I18n.translate(:'support.array.last_word_connector')
+diff --git a/railties/lib/rails/plugin/loader.rb b/railties/lib/rails/plugin/loader.rb
+index 7f85bb8..1749ac2 100644
+--- a/railties/lib/rails/plugin/loader.rb
++++ b/railties/lib/rails/plugin/loader.rb
+@@ -178,7 +178,7 @@ module Rails
+           if explicit_plugin_loading_order?
+             if configuration.plugins.detect {|plugin| plugin != :all && !loaded?(plugin) }
+               missing_plugins = configuration.plugins - (plugins.map{|p| p.name.to_sym} + [:all])
+-              raise LoadError, "Could not locate the following plugins: #{missing_plugins.to_sentence}"
++              raise LoadError, "Could not locate the following plugins: #{missing_plugins.to_sentence(Array::SENTENCE_CONVERSION_DEFAULTS)}"
+             end
+           end
+         end
+diff --git a/railties/lib/tasks/testing.rake b/railties/lib/tasks/testing.rake
+index 4242458..290c7fb 100644
+--- a/railties/lib/tasks/testing.rake
++++ b/railties/lib/tasks/testing.rake
+@@ -48,7 +48,7 @@ task :test do
+       task
+     end
+   end.compact
+-  abort "Errors running #{errors.to_sentence}!" if errors.any?
++  abort "Errors running #{errors.to_sentence(Array::SENTENCE_CONVERSION_DEFAULTS)}!" if errors.any?
+ end
+ 
+ namespace :test do
+-- 
+1.6.0.2
+

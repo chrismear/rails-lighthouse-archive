@@ -1,0 +1,133 @@
+From d0d563077711a21b9a1bd752e552fc5b3850fccd Mon Sep 17 00:00:00 2001
+From: Joe Hannon <ziggurism@gmail.com>
+Date: Sun, 2 May 2010 16:26:02 -0700
+Subject: [PATCH 1/2] add test which fails for has_many through self join [#4361 state:open]
+
+---
+ .../has_many_through_associations_test.rb          |    7 +++++++
+ activerecord/test/models/person.rb                 |    1 +
+ 2 files changed, 8 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index 94e1eb8..f6b94a9 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -389,6 +389,13 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     ].each {|block| assert_raise(ActiveRecord::HasManyThroughCantAssociateThroughHasOneOrManyReflection, &block) }
+   end
+ 
++  def test_has_many_association_through_a_has_many_association_to_self
++    sarah = Person.create!(:first_name => 'Sarah', :primary_contact_id => people(:susan).id, :gender => 'F', :number1_fan_id => 1)
++    john = Person.create!(:first_name => 'John', :primary_contact_id => sarah.id, :gender => 'M', :number1_fan_id => 1)
++    assert_equal sarah.agents, [john]
++    assert_equal people(:susan).agents_of_agents, [john]
++  end
++
+   def test_collection_singular_ids_getter_with_string_primary_keys
+     book = books(:awdr)
+     assert_equal 2, book.subscriber_ids.size
+diff --git a/activerecord/test/models/person.rb b/activerecord/test/models/person.rb
+index 951ec93..56f195a 100644
+--- a/activerecord/test/models/person.rb
++++ b/activerecord/test/models/person.rb
+@@ -12,6 +12,7 @@ class Person < ActiveRecord::Base
+ 
+   belongs_to :primary_contact, :class_name => 'Person'
+   has_many :agents, :class_name => 'Person', :foreign_key => 'primary_contact_id'
++  has_many :agents_of_agents, :through => :agents, :source => :primary_contact
+   belongs_to :number1_fan, :class_name => 'Person'
+ 
+   scope :males, :conditions => { :gender => 'M' }
+-- 
+1.7.3.3
+
+
+From 3dcc5231b4dac83ead92617e2368bba166e1a9e5 Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Mon, 3 May 2010 20:47:42 -0400
+Subject: [PATCH 2/2] Fix hm:t to self table aliasing in construct_scope
+
+---
+ .../associations/through_association_scope.rb      |   16 +++++++++++-----
+ .../has_many_through_associations_test.rb          |    4 ++--
+ activerecord/test/models/person.rb                 |    2 +-
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/through_association_scope.rb b/activerecord/lib/active_record/associations/through_association_scope.rb
+index cabb33c..0aa6635 100644
+--- a/activerecord/lib/active_record/associations/through_association_scope.rb
++++ b/activerecord/lib/active_record/associations/through_association_scope.rb
+@@ -16,12 +16,17 @@ module ActiveRecord
+                        :readonly    => @reflection.options[:readonly],
+            } }
+       end
++      
++      def aliased_through_table_name
++        @reflection.table_name == @reflection.through_reflection.table_name ?
++            Base.connection.quote_table_name(@reflection.through_reflection.table_name + '_join') :
++            Base.connection.quote_table_name(@reflection.through_reflection.table_name)
++      end
+ 
+       # Build SQL conditions from attributes, qualified by table name.
+       def construct_conditions
+-        table_name = @reflection.through_reflection.quoted_table_name
+         conditions = construct_quoted_owner_attributes(@reflection.through_reflection).map do |attr, value|
+-          "#{table_name}.#{attr} = #{value}"
++          "#{aliased_through_table_name}.#{attr} = #{value}"
+         end
+         conditions << sql_conditions if sql_conditions
+         "(" + conditions.join(') AND (') + ")"
+@@ -57,7 +62,7 @@ module ActiveRecord
+           source_primary_key     = @reflection.source_reflection.primary_key_name
+           if @reflection.options[:source_type]
+             polymorphic_join = "AND %s.%s = %s" % [
+-              @reflection.through_reflection.quoted_table_name, "#{@reflection.source_reflection.options[:foreign_type]}",
++              aliased_through_table_name, "#{@reflection.source_reflection.options[:foreign_type]}",
+               @owner.class.quote_value(@reflection.options[:source_type])
+             ]
+           end
+@@ -72,10 +77,11 @@ module ActiveRecord
+           end
+         end
+ 
+-        "INNER JOIN %s ON %s.%s = %s.%s %s #{@reflection.options[:joins]} #{custom_joins}" % [
++        "INNER JOIN %s %s ON %s.%s = %s.%s %s #{@reflection.options[:joins]} #{custom_joins}" % [
+           @reflection.through_reflection.quoted_table_name,
++          aliased_through_table_name,
+           @reflection.quoted_table_name, reflection_primary_key,
+-          @reflection.through_reflection.quoted_table_name, source_primary_key,
++          aliased_through_table_name, source_primary_key,
+           polymorphic_join
+         ]
+       end
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index f6b94a9..2b8b811 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -392,8 +392,8 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+   def test_has_many_association_through_a_has_many_association_to_self
+     sarah = Person.create!(:first_name => 'Sarah', :primary_contact_id => people(:susan).id, :gender => 'F', :number1_fan_id => 1)
+     john = Person.create!(:first_name => 'John', :primary_contact_id => sarah.id, :gender => 'M', :number1_fan_id => 1)
+-    assert_equal sarah.agents, [john]
+-    assert_equal people(:susan).agents_of_agents, [john]
++    assert_equal [john], sarah.agents
++    assert_equal people(:susan).agents.map(&:agents).flatten, people(:susan).agents_of_agents
+   end
+ 
+   def test_collection_singular_ids_getter_with_string_primary_keys
+diff --git a/activerecord/test/models/person.rb b/activerecord/test/models/person.rb
+index 56f195a..bee89de 100644
+--- a/activerecord/test/models/person.rb
++++ b/activerecord/test/models/person.rb
+@@ -12,7 +12,7 @@ class Person < ActiveRecord::Base
+ 
+   belongs_to :primary_contact, :class_name => 'Person'
+   has_many :agents, :class_name => 'Person', :foreign_key => 'primary_contact_id'
+-  has_many :agents_of_agents, :through => :agents, :source => :primary_contact
++  has_many :agents_of_agents, :through => :agents, :source => :agents
+   belongs_to :number1_fan, :class_name => 'Person'
+ 
+   scope :males, :conditions => { :gender => 'M' }
+-- 
+1.7.3.3
+

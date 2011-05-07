@@ -1,0 +1,1266 @@
+From 089cdfc05fe5a9340627bb87c48f9e123a18dde9 Mon Sep 17 00:00:00 2001
+From: Eric Chapweske <eric@chapweske.com>
+Date: Fri, 16 Oct 2009 18:09:17 -0700
+Subject: [PATCH] Refactoring attributes/types
+
+---
+ activerecord/lib/active_record.rb                  |   16 +++
+ .../attribute_methods/before_type_cast.rb          |   13 +--
+ .../lib/active_record/attribute_methods/query.rb   |   20 +---
+ .../lib/active_record/attribute_methods/read.rb    |   49 +--------
+ .../attribute_methods/time_zone_conversion.rb      |   48 ++-------
+ .../lib/active_record/attribute_methods/write.rb   |    9 +-
+ activerecord/lib/active_record/attributes.rb       |   37 ++++++
+ .../lib/active_record/attributes/aliasing.rb       |   42 +++++++
+ activerecord/lib/active_record/attributes/store.rb |   15 +++
+ .../lib/active_record/attributes/typecasting.rb    |  111 ++++++++++++++++++
+ activerecord/lib/active_record/base.rb             |   38 +-----
+ activerecord/lib/active_record/types.rb            |   38 +++++++
+ activerecord/lib/active_record/types/number.rb     |   30 +++++
+ activerecord/lib/active_record/types/object.rb     |   37 ++++++
+ activerecord/lib/active_record/types/serialize.rb  |   33 ++++++
+ .../lib/active_record/types/time_with_zone.rb      |   20 ++++
+ activerecord/lib/active_record/types/unknown.rb    |   37 ++++++
+ .../test/cases/attributes/aliasing_test.rb         |   20 ++++
+ .../test/cases/attributes/typecasting_test.rb      |  118 ++++++++++++++++++++
+ activerecord/test/cases/types/number_test.rb       |   30 +++++
+ activerecord/test/cases/types/object_test.rb       |   24 ++++
+ activerecord/test/cases/types/serialize_test.rb    |   20 ++++
+ .../test/cases/types/time_with_zone_test.rb        |   42 +++++++
+ activerecord/test/cases/types/unknown_test.rb      |   29 +++++
+ activerecord/test/cases/types_test.rb              |   32 ++++++
+ 25 files changed, 760 insertions(+), 148 deletions(-)
+ create mode 100644 activerecord/lib/active_record/attributes.rb
+ create mode 100644 activerecord/lib/active_record/attributes/aliasing.rb
+ create mode 100644 activerecord/lib/active_record/attributes/store.rb
+ create mode 100644 activerecord/lib/active_record/attributes/typecasting.rb
+ create mode 100644 activerecord/lib/active_record/types.rb
+ create mode 100644 activerecord/lib/active_record/types/number.rb
+ create mode 100644 activerecord/lib/active_record/types/object.rb
+ create mode 100644 activerecord/lib/active_record/types/serialize.rb
+ create mode 100644 activerecord/lib/active_record/types/time_with_zone.rb
+ create mode 100644 activerecord/lib/active_record/types/unknown.rb
+ create mode 100644 activerecord/test/cases/attributes/aliasing_test.rb
+ create mode 100644 activerecord/test/cases/attributes/typecasting_test.rb
+ create mode 100644 activerecord/test/cases/types/number_test.rb
+ create mode 100644 activerecord/test/cases/types/object_test.rb
+ create mode 100644 activerecord/test/cases/types/serialize_test.rb
+ create mode 100644 activerecord/test/cases/types/time_with_zone_test.rb
+ create mode 100644 activerecord/test/cases/types/unknown_test.rb
+ create mode 100644 activerecord/test/cases/types_test.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 2d66fa9..8f118a6 100644
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -51,6 +51,7 @@ module ActiveRecord
+   autoload :AssociationPreload, 'active_record/association_preload'
+   autoload :Associations, 'active_record/associations'
+   autoload :AttributeMethods, 'active_record/attribute_methods'
++  autoload :Attributes, 'active_record/attributes'
+   autoload :AutosaveAssociation, 'active_record/autosave_association'
+   autoload :Relation, 'active_record/relation'
+   autoload :Base, 'active_record/base'
+@@ -74,6 +75,7 @@ module ActiveRecord
+   autoload :TestCase, 'active_record/test_case'
+   autoload :Timestamp, 'active_record/timestamp'
+   autoload :Transactions, 'active_record/transactions'
++  autoload :Types, 'active_record/types'
+   autoload :Validator, 'active_record/validator'
+   autoload :Validations, 'active_record/validations'
+ 
+@@ -87,6 +89,20 @@ module ActiveRecord
+     autoload :Write, 'active_record/attribute_methods/write'
+   end
+ 
++  module Attributes
++    autoload :Aliasing, 'active_record/attributes/aliasing'
++    autoload :Store, 'active_record/attributes/store'
++    autoload :Typecasting, 'active_record/attributes/typecasting'
++  end
++
++  module Type
++    autoload :Number, 'active_record/types/number'
++    autoload :Object, 'active_record/types/object'
++    autoload :Serialize, 'active_record/types/serialize'
++    autoload :TimeWithZone, 'active_record/types/time_with_zone'
++    autoload :Unknown, 'active_record/types/unknown'
++  end
++
+   module Locking
+     autoload :Optimistic, 'active_record/locking/optimistic'
+     autoload :Pessimistic, 'active_record/locking/pessimistic'
+diff --git a/activerecord/lib/active_record/attribute_methods/before_type_cast.rb b/activerecord/lib/active_record/attribute_methods/before_type_cast.rb
+index a4e144f..7492124 100644
+--- a/activerecord/lib/active_record/attribute_methods/before_type_cast.rb
++++ b/activerecord/lib/active_record/attribute_methods/before_type_cast.rb
+@@ -8,25 +8,18 @@ module ActiveRecord
+       end
+ 
+       def read_attribute_before_type_cast(attr_name)
+-        @attributes[attr_name]
++        _attributes.without_typecast[attr_name]
+       end
+ 
+       # Returns a hash of attributes before typecasting and deserialization.
+       def attributes_before_type_cast
+-        self.attribute_names.inject({}) do |attrs, name|
+-          attrs[name] = read_attribute_before_type_cast(name)
+-          attrs
+-        end
++        _attributes.without_typecast
+       end
+ 
+       private
+         # Handle *_before_type_cast for method_missing.
+         def attribute_before_type_cast(attribute_name)
+-          if attribute_name == 'id'
+-            read_attribute_before_type_cast(self.class.primary_key)
+-          else
+-            read_attribute_before_type_cast(attribute_name)
+-          end
++          read_attribute_before_type_cast(attribute_name)
+         end
+     end
+   end
+diff --git a/activerecord/lib/active_record/attribute_methods/query.rb b/activerecord/lib/active_record/attribute_methods/query.rb
+index a949d80..0154ee3 100644
+--- a/activerecord/lib/active_record/attribute_methods/query.rb
++++ b/activerecord/lib/active_record/attribute_methods/query.rb
+@@ -8,23 +8,7 @@ module ActiveRecord
+       end
+ 
+       def query_attribute(attr_name)
+-        unless value = read_attribute(attr_name)
+-          false
+-        else
+-          column = self.class.columns_hash[attr_name]
+-          if column.nil?
+-            if Numeric === value || value !~ /[^0-9]/
+-              !value.to_i.zero?
+-            else
+-              return false if ActiveRecord::ConnectionAdapters::Column::FALSE_VALUES.include?(value)
+-              !value.blank?
+-            end
+-          elsif column.number?
+-            !value.zero?
+-          else
+-            !value.blank?
+-          end
+-        end
++        _attributes.has?(attr_name)
+       end
+ 
+       private
+@@ -35,3 +19,5 @@ module ActiveRecord
+     end
+   end
+ end
++
++
+diff --git a/activerecord/lib/active_record/attribute_methods/read.rb b/activerecord/lib/active_record/attribute_methods/read.rb
+index 3da3d9d..97caec7 100644
+--- a/activerecord/lib/active_record/attribute_methods/read.rb
++++ b/activerecord/lib/active_record/attribute_methods/read.rb
+@@ -37,11 +37,7 @@ module ActiveRecord
+ 
+         protected
+           def define_method_attribute(attr_name)
+-            if self.serialized_attributes[attr_name]
+-              define_read_method_for_serialized_attribute(attr_name)
+-            else
+-              define_read_method(attr_name.to_sym, attr_name, columns_hash[attr_name])
+-            end
++            define_read_method(attr_name.to_sym, attr_name, columns_hash[attr_name])
+ 
+             if attr_name == primary_key && attr_name != "id"
+               define_read_method(:id, attr_name, columns_hash[attr_name])
+@@ -49,18 +45,12 @@ module ActiveRecord
+           end
+ 
+         private
+-          # Define read method for serialized attribute.
+-          def define_read_method_for_serialized_attribute(attr_name)
+-            generated_attribute_methods.module_eval("def #{attr_name}; unserialize_attribute('#{attr_name}'); end", __FILE__, __LINE__)
+-          end
+ 
+           # Define an attribute reader method.  Cope with nil column.
+           def define_read_method(symbol, attr_name, column)
+-            cast_code = column.type_cast_code('v') if column
+-            access_code = cast_code ? "(v=@attributes['#{attr_name}']) && #{cast_code}" : "@attributes['#{attr_name}']"
+-
++            access_code = "_attributes['#{attr_name}']"
+             unless attr_name.to_s == self.primary_key.to_s
+-              access_code = access_code.insert(0, "missing_attribute('#{attr_name}', caller) unless @attributes.has_key?('#{attr_name}'); ")
++              access_code = access_code.insert(0, "missing_attribute('#{attr_name}', caller) unless _attributes.key?('#{attr_name}'); ")
+             end
+ 
+             if cache_attribute?(attr_name)
+@@ -73,38 +63,7 @@ module ActiveRecord
+       # Returns the value of the attribute identified by <tt>attr_name</tt> after it has been typecast (for example,
+       # "2004-12-12" in a data column is cast to a date object, like Date.new(2004, 12, 12)).
+       def read_attribute(attr_name)
+-        attr_name = attr_name.to_s
+-        attr_name = self.class.primary_key if attr_name == 'id'
+-        if !(value = @attributes[attr_name]).nil?
+-          if column = column_for_attribute(attr_name)
+-            if unserializable_attribute?(attr_name, column)
+-              unserialize_attribute(attr_name)
+-            else
+-              column.type_cast(value)
+-            end
+-          else
+-            value
+-          end
+-        else
+-          nil
+-        end
+-      end
+-
+-      # Returns true if the attribute is of a text column and marked for serialization.
+-      def unserializable_attribute?(attr_name, column)
+-        column.text? && self.class.serialized_attributes[attr_name]
+-      end
+-
+-      # Returns the unserialized object of the attribute.
+-      def unserialize_attribute(attr_name)
+-        unserialized_object = object_from_yaml(@attributes[attr_name])
+-
+-        if unserialized_object.is_a?(self.class.serialized_attributes[attr_name]) || unserialized_object.nil?
+-          @attributes.frozen? ? unserialized_object : @attributes[attr_name] = unserialized_object
+-        else
+-          raise SerializationTypeMismatch,
+-            "#{attr_name} was supposed to be a #{self.class.serialized_attributes[attr_name]}, but was a #{unserialized_object.class.to_s}"
+-        end
++        _attributes[attr_name]
+       end
+ 
+       private
+diff --git a/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb b/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
+index a8e3e28..4ac0c7f 100644
+--- a/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
++++ b/activerecord/lib/active_record/attribute_methods/time_zone_conversion.rb
+@@ -12,48 +12,20 @@ module ActiveRecord
+       end
+ 
+       module ClassMethods
++
++        def cache_attribute?(attr_name)
++          time_zone_aware?(attr_name) || super
++        end
++
+         protected
+-          # Defined for all +datetime+ and +timestamp+ attributes when +time_zone_aware_attributes+ are enabled.
+-          # This enhanced read method automatically converts the UTC time stored in the database to the time zone stored in Time.zone.
+-          def define_method_attribute(attr_name)
+-            if create_time_zone_conversion_attribute?(attr_name, columns_hash[attr_name])
+-              method_body = <<-EOV
+-                def #{attr_name}(reload = false)
+-                  cached = @attributes_cache['#{attr_name}']
+-                  return cached if cached && !reload
+-                  time = read_attribute('#{attr_name}')
+-                  @attributes_cache['#{attr_name}'] = time.acts_like?(:time) ? time.in_time_zone : time
+-                end
+-              EOV
+-              generated_attribute_methods.module_eval(method_body, __FILE__, __LINE__)
+-            else
+-              super
+-            end
+-          end
+ 
+-          # Defined for all +datetime+ and +timestamp+ attributes when +time_zone_aware_attributes+ are enabled.
+-          # This enhanced write method will automatically convert the time passed to it to the zone stored in Time.zone.
+-          def define_method_attribute=(attr_name)
+-            if create_time_zone_conversion_attribute?(attr_name, columns_hash[attr_name])
+-              method_body = <<-EOV
+-                def #{attr_name}=(time)
+-                  unless time.acts_like?(:time)
+-                    time = time.is_a?(String) ? Time.zone.parse(time) : time.to_time rescue time
+-                  end
+-                  time = time.in_time_zone rescue nil if time
+-                  write_attribute(:#{attr_name}, time)
+-                end
+-              EOV
+-              generated_attribute_methods.module_eval(method_body, __FILE__, __LINE__)
+-            else
+-              super
+-            end
++          def time_zone_aware?(attr_name)
++            column = columns_hash[attr_name]
++            time_zone_aware_attributes &&
++              !skip_time_zone_conversion_for_attributes.include?(attr_name.to_sym) &&
++                [:datetime, :timestamp].include?(column.type)
+           end
+ 
+-        private
+-          def create_time_zone_conversion_attribute?(name, column)
+-            time_zone_aware_attributes && !skip_time_zone_conversion_for_attributes.include?(name.to_sym) && [:datetime, :timestamp].include?(column.type)
+-          end
+       end
+     end
+   end
+diff --git a/activerecord/lib/active_record/attribute_methods/write.rb b/activerecord/lib/active_record/attribute_methods/write.rb
+index e31acac..37eadbe 100644
+--- a/activerecord/lib/active_record/attribute_methods/write.rb
++++ b/activerecord/lib/active_record/attribute_methods/write.rb
+@@ -17,14 +17,9 @@ module ActiveRecord
+       # Updates the attribute identified by <tt>attr_name</tt> with the specified +value+. Empty strings for fixnum and float
+       # columns are turned into +nil+.
+       def write_attribute(attr_name, value)
+-        attr_name = attr_name.to_s
+-        attr_name = self.class.primary_key if attr_name == 'id'
++        attr_name = _attributes.unalias(attr_name)
+         @attributes_cache.delete(attr_name)
+-        if (column = column_for_attribute(attr_name)) && column.number?
+-          @attributes[attr_name] = convert_number_column_value(value)
+-        else
+-          @attributes[attr_name] = value
+-        end
++        _attributes[attr_name] = value
+       end
+ 
+       private
+diff --git a/activerecord/lib/active_record/attributes.rb b/activerecord/lib/active_record/attributes.rb
+new file mode 100644
+index 0000000..e4d9e89
+--- /dev/null
++++ b/activerecord/lib/active_record/attributes.rb
+@@ -0,0 +1,37 @@
++module ActiveRecord
++  module Attributes
++
++     # Returns true if the given attribute is in the attributes hash
++     def has_attribute?(attr_name)
++       _attributes.key?(attr_name)
++     end
++
++     # Returns an array of names for the attributes available on this object sorted alphabetically.
++     def attribute_names
++       _attributes.keys.sort!
++     end
++
++     # Returns a hash of all the attributes with their names as keys and the values of the attributes as values.
++     def attributes
++       attributes = _attributes.dup
++       attributes.typecast! unless _attributes.frozen?
++       attributes.to_h
++     end
++
++     protected
++
++     # Not to be confused with the public #attributes method, which returns a typecasted Hash.
++     def _attributes
++       @attributes
++     end
++
++     def initialize_attribute_store(merge_attributes = nil)
++       @attributes = ActiveRecord::Attributes::Store.new
++       @attributes.merge!(merge_attributes) if merge_attributes
++       @attributes.types.merge!(self.class.attribute_types)
++       @attributes.aliases.merge!('id' => self.class.primary_key) unless 'id' == self.class.primary_key
++       @attributes
++     end
++
++  end
++end
+diff --git a/activerecord/lib/active_record/attributes/aliasing.rb b/activerecord/lib/active_record/attributes/aliasing.rb
+new file mode 100644
+index 0000000..db77739
+--- /dev/null
++++ b/activerecord/lib/active_record/attributes/aliasing.rb
+@@ -0,0 +1,42 @@
++module ActiveRecord
++  module Attributes
++    module Aliasing
++      # Allows access to keys using aliased names.
++      #
++      # Example:
++      # class Attributes < Hash
++      #   include Aliasing
++      # end
++      #
++      # attributes = Attributes.new
++      # attributes.aliases['id'] = 'fancy_primary_key'
++      # attributes['fancy_primary_key'] = 2020
++      #
++      # attributes['id']
++      # => 2020
++      #
++      # Additionally, symbols are always aliases of strings:
++      # attributes[:fancy_primary_key]
++      # => 2020
++      #
++      def [](key)
++        super(unalias(key))
++      end
++
++      def []=(key, value)
++        super(unalias(key), value)
++      end
++
++      def aliases
++        @aliases ||= {}
++      end
++
++      def unalias(key)
++        key = key.to_s
++        aliases[key] || key
++      end
++
++    end
++  end
++end
++
+diff --git a/activerecord/lib/active_record/attributes/store.rb b/activerecord/lib/active_record/attributes/store.rb
+new file mode 100644
+index 0000000..61109f4
+--- /dev/null
++++ b/activerecord/lib/active_record/attributes/store.rb
+@@ -0,0 +1,15 @@
++module ActiveRecord
++  module Attributes
++    class Store < Hash
++      include ActiveRecord::Attributes::Typecasting
++      include ActiveRecord::Attributes::Aliasing
++
++      # Attributes not mapped to a column are handled using Type::Unknown,
++      # which enables boolean typecasting for unmapped keys.
++      def types
++        @types ||= Hash.new(Type::Unknown.new)
++      end
++
++    end
++  end
++end
+diff --git a/activerecord/lib/active_record/attributes/typecasting.rb b/activerecord/lib/active_record/attributes/typecasting.rb
+new file mode 100644
+index 0000000..de36a29
+--- /dev/null
++++ b/activerecord/lib/active_record/attributes/typecasting.rb
+@@ -0,0 +1,111 @@
++module ActiveRecord
++  module Attributes
++    module Typecasting
++      # Typecasts values during access based on their key mapping to a Type.
++      #
++      # Example:
++      # class Attributes < Hash
++      #   include Typecasting
++      # end
++      #
++      # attributes = Attributes.new
++      # attributes.types['comments_count'] = Type::Integer
++      # attributes['comments_count'] = '5'
++      #
++      # attributes['comments_count']
++      # => 5
++      #
++      # To support keys not mapped to a typecaster, add a default to types.
++      # attributes.types.default = Type::Unknown
++      # attributes['age'] = '25'
++      # attributes['age']
++      # => '25'
++      #
++      # A valid type supports #cast, #precast, #boolean, and #appendable? methods.
++      #
++      def [](key)
++        value = super(key)
++        typecast_read(key, value)
++      end
++
++      def []=(key, value)
++        super(key, typecast_write(key, value))
++      end
++
++      def to_h
++        hash = {}
++        hash.merge!(self)
++        hash
++      end
++
++      # Provides a duplicate with typecasting disabled.
++      #
++      # Example:
++      # attributes = Attributes.new
++      # attributes.types['comments_count'] = Type::Integer
++      # attributes['comments_count'] = '5'
++      #
++      # attributes.without_typecast['comments_count']
++      # => '5'
++      #
++      def without_typecast
++        dup.without_typecast!
++      end
++
++      def without_typecast!
++        types.clear
++        self
++      end
++
++      def typecast!
++        keys.each { |key| self[key] = self[key] }
++        self
++      end
++
++      # Check if key has a value that typecasts to true.
++      #
++      # attributes = Attributes.new
++      # attributes.types['comments_count'] = Type::Integer
++      #
++      # attributes['comments_count'] = 0
++      # attributes.has?('comments_count')
++      # => false
++      #
++      # attributes['comments_count'] = 1
++      # attributes.has?('comments_count')
++      # => true
++      #
++      def has?(key)
++        value = self[key]
++        boolean_typecast(key, value)
++      end
++
++      def types
++        @types ||= {}
++      end
++
++      protected
++
++      def types=(other_types)
++        @types = other_types
++      end
++
++      def boolean_typecast(key, value)
++        value ? types[key].boolean(value) : false
++      end
++
++      def typecast_read(key, value)
++        type  = types[key]
++        value = type.cast(value)
++        self[key] = value if type.appendable? && !frozen?
++
++        value
++      end
++
++      def typecast_write(key, value)
++        types[key].precast(value)
++      end
++
++    end
++  end
++end
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 76dbd00..4274df5 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1644,7 +1644,7 @@ module ActiveRecord #:nodoc:
+         def instantiate(record)
+           object = find_sti_class(record[inheritance_column]).allocate
+ 
+-          object.instance_variable_set(:'@attributes', record)
++          object.send(:initialize_attribute_store, record)
+           object.instance_variable_set(:'@attributes_cache', {})
+ 
+           object.send(:_run_find_callbacks)
+@@ -2415,7 +2415,7 @@ module ActiveRecord #:nodoc:
+       # In both instances, valid attribute keys are determined by the column names of the associated table --
+       # hence you can't have attributes that aren't part of the table columns.
+       def initialize(attributes = nil)
+-        @attributes = attributes_from_column_definition
++        initialize_attribute_store(attributes_from_column_definition)
+         @attributes_cache = {}
+         @new_record = true
+         ensure_proper_type
+@@ -2441,7 +2441,7 @@ module ActiveRecord #:nodoc:
+         callback(:after_initialize) if respond_to_without_attributes?(:after_initialize)
+         cloned_attributes = other.clone_attributes(:read_attribute_before_type_cast)
+         cloned_attributes.delete(self.class.primary_key)
+-        @attributes = cloned_attributes
++        initialize_attribute_store(cloned_attributes)
+         clear_aggregation_cache
+         @attributes_cache = {}
+         @new_record = true
+@@ -2667,7 +2667,7 @@ module ActiveRecord #:nodoc:
+       def reload(options = nil)
+         clear_aggregation_cache
+         clear_association_cache
+-        @attributes.update(self.class.find(self.id, options).instance_variable_get('@attributes'))
++        _attributes.update(self.class.find(self.id, options).instance_variable_get('@attributes'))
+         @attributes_cache = {}
+         self
+       end
+@@ -2764,16 +2764,6 @@ module ActiveRecord #:nodoc:
+         !value.blank?
+       end
+ 
+-      # Returns true if the given attribute is in the attributes hash
+-      def has_attribute?(attr_name)
+-        @attributes.has_key?(attr_name.to_s)
+-      end
+-
+-      # Returns an array of names for the attributes available on this object sorted alphabetically.
+-      def attribute_names
+-        @attributes.keys.sort
+-      end
+-
+       # Returns the column object for the named attribute.
+       def column_for_attribute(name)
+         self.class.columns_hash[name.to_s]
+@@ -2897,18 +2887,6 @@ module ActiveRecord #:nodoc:
+         end
+       end
+ 
+-      def convert_number_column_value(value)
+-        if value == false
+-          0
+-        elsif value == true
+-          1
+-        elsif value.is_a?(String) && value.blank?
+-          nil
+-        else
+-          value
+-        end
+-      end
+-
+       def remove_attributes_protected_from_mass_assignment(attributes)
+         safe_attributes =
+           if self.class.accessible_attributes.nil? && self.class.protected_attributes.nil?
+@@ -3027,7 +3005,7 @@ module ActiveRecord #:nodoc:
+       end
+ 
+       def instantiate_time_object(name, values)
+-        if self.class.send(:create_time_zone_conversion_attribute?, name, column_for_attribute(name))
++        if self.class.send(:time_zone_aware?, name)
+           Time.zone.local(*values)
+         else
+           Time.time_with_datetime_fallback(@@default_timezone, *values)
+@@ -3114,10 +3092,6 @@ module ActiveRecord #:nodoc:
+         comma_pair_list(quote_columns(quoter, hash))
+       end
+ 
+-      def object_from_yaml(string)
+-        return string unless string.is_a?(String) && string =~ /^---/
+-        YAML::load(string) rescue string
+-      end
+   end
+ 
+   Base.class_eval do
+@@ -3132,6 +3106,7 @@ module ActiveRecord #:nodoc:
+     include AttributeMethods::PrimaryKey
+     include AttributeMethods::TimeZoneConversion
+     include AttributeMethods::Dirty
++    include Attributes, Types
+     include Callbacks, ActiveModel::Observing, Timestamp
+     include Associations, AssociationPreload, NamedScope
+     include ActiveModel::Conversion
+@@ -3141,6 +3116,7 @@ module ActiveRecord #:nodoc:
+     include AutosaveAssociation, NestedAttributes
+ 
+     include Aggregations, Transactions, Reflection, Batches, Calculations, Serialization
++
+   end
+ end
+ 
+diff --git a/activerecord/lib/active_record/types.rb b/activerecord/lib/active_record/types.rb
+new file mode 100644
+index 0000000..74f5693
+--- /dev/null
++++ b/activerecord/lib/active_record/types.rb
+@@ -0,0 +1,38 @@
++module ActiveRecord
++  module Types
++    extend ActiveSupport::Concern
++
++    module ClassMethods
++
++      def attribute_types
++        attribute_types = {}
++        columns.each do |column|
++          options = {}
++          options[:time_zone_aware] = time_zone_aware?(column.name)
++          options[:serialize]       = serialized_attributes[column.name]
++
++          attribute_types[column.name] = to_type(column, options)
++        end
++        attribute_types
++      end
++
++      private
++
++      def to_type(column, options = {})
++        type_class = if options[:time_zone_aware]
++          Type::TimeWithZone
++        elsif options[:serialize]
++          Type::Serialize
++        elsif [ :integer, :float, :decimal ].include?(column.type)
++          Type::Number
++        else
++          Type::Object
++        end
++
++        type_class.new(column, options)
++      end
++
++    end
++
++  end
++end
+diff --git a/activerecord/lib/active_record/types/number.rb b/activerecord/lib/active_record/types/number.rb
+new file mode 100644
+index 0000000..cfbe877
+--- /dev/null
++++ b/activerecord/lib/active_record/types/number.rb
+@@ -0,0 +1,30 @@
++module ActiveRecord
++  module Type
++    class Number < Object
++
++      def boolean(value)
++        value = cast(value)
++        !(value.nil? || value.zero?)
++      end
++
++      def precast(value)
++        convert_number_column_value(value)
++      end
++
++      private
++
++      def convert_number_column_value(value)
++        if value == false
++          0
++        elsif value == true
++          1
++        elsif value.is_a?(String) && value.blank?
++          nil
++        else
++          value
++        end
++      end
++
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/types/object.rb b/activerecord/lib/active_record/types/object.rb
+new file mode 100644
+index 0000000..ec3f861
+--- /dev/null
++++ b/activerecord/lib/active_record/types/object.rb
+@@ -0,0 +1,37 @@
++module ActiveRecord
++  module Type
++    module Casting
++
++       def cast(value)
++         typecaster.type_cast(value)
++       end
++
++       def precast(value)
++         value
++       end
++
++       def boolean(value)
++         cast(value).present?
++       end
++
++       # Attributes::Typecasting stores appendable? types (e.g. serialized Arrays) when typecasting reads.
++       def appendable?
++         false
++       end
++
++    end
++
++    class Object
++      include Casting
++
++      attr_reader :name, :options
++      attr_reader :typecaster
++
++      def initialize(typecaster = nil, options = {})
++        @typecaster, @options = typecaster, options
++      end
++
++    end
++
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/types/serialize.rb b/activerecord/lib/active_record/types/serialize.rb
+new file mode 100644
+index 0000000..7b6af19
+--- /dev/null
++++ b/activerecord/lib/active_record/types/serialize.rb
+@@ -0,0 +1,33 @@
++module ActiveRecord
++  module Type
++    class Serialize < Object
++
++      def cast(value)
++        unserialize(value)
++      end
++
++      def appendable?
++        true
++      end
++
++      protected
++
++      def unserialize(value)
++        unserialized_object = object_from_yaml(value)
++
++        if unserialized_object.is_a?(@options[:serialize]) || unserialized_object.nil?
++          unserialized_object
++        else
++          raise SerializationTypeMismatch,
++            "#{name} was supposed to be a #{@options[:serialize]}, but was a #{unserialized_object.class.to_s}"
++        end
++      end
++
++      def object_from_yaml(string)
++        return string unless string.is_a?(String) && string =~ /^---/
++        YAML::load(string) rescue string
++      end
++
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/types/time_with_zone.rb b/activerecord/lib/active_record/types/time_with_zone.rb
+new file mode 100644
+index 0000000..3a8b929
+--- /dev/null
++++ b/activerecord/lib/active_record/types/time_with_zone.rb
+@@ -0,0 +1,20 @@
++module ActiveRecord
++  module Type
++    class TimeWithZone < Object
++
++      def cast(time)
++        time = super(time)
++        time.acts_like?(:time) ? time.in_time_zone : time
++      end
++
++      def precast(time)
++        unless time.acts_like?(:time)
++          time = time.is_a?(String) ? ::Time.zone.parse(time) : time.to_time rescue time
++        end
++        time = time.in_time_zone rescue nil if time
++        super(time)
++      end
++
++    end
++  end
++end
+diff --git a/activerecord/lib/active_record/types/unknown.rb b/activerecord/lib/active_record/types/unknown.rb
+new file mode 100644
+index 0000000..f832c7b
+--- /dev/null
++++ b/activerecord/lib/active_record/types/unknown.rb
+@@ -0,0 +1,37 @@
++module ActiveRecord
++  module Type
++    # Useful for handling attributes not mapped to types. Performs some boolean typecasting,
++    # but otherwise leaves the value untouched.
++    class Unknown
++
++      def cast(value)
++        value
++      end
++
++      def precast(value)
++        value
++      end
++
++      # Attempts typecasting to handle numeric, false and blank values.
++      def boolean(value)
++        empty = (numeric?(value) && value.to_i.zero?) || false?(value) || value.blank?
++        !empty
++      end
++
++      def appendable?
++        false
++      end
++
++      protected
++
++      def false?(value)
++        ActiveRecord::ConnectionAdapters::Column::FALSE_VALUES.include?(value)
++      end
++
++      def numeric?(value)
++        Numeric === value || value !~ /[^0-9]/
++      end
++
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/attributes/aliasing_test.rb b/activerecord/test/cases/attributes/aliasing_test.rb
+new file mode 100644
+index 0000000..7ee2577
+--- /dev/null
++++ b/activerecord/test/cases/attributes/aliasing_test.rb
+@@ -0,0 +1,20 @@
++require "cases/helper"
++
++class AliasingTest < ActiveRecord::TestCase
++
++  class AliasingAttributes < Hash
++    include ActiveRecord::Attributes::Aliasing
++  end
++
++  test "attribute access with aliasing" do
++    attributes = AliasingAttributes.new
++    attributes[:name] = 'Batman'
++    attributes.aliases['nickname'] = 'name'
++
++    assert_equal 'Batman', attributes[:name], "Symbols should point to Strings"
++    assert_equal 'Batman', attributes['name']
++    assert_equal 'Batman', attributes['nickname']
++    assert_equal 'Batman', attributes[:nickname]
++  end
++
++end
+diff --git a/activerecord/test/cases/attributes/typecasting_test.rb b/activerecord/test/cases/attributes/typecasting_test.rb
+new file mode 100644
+index 0000000..c712f22
+--- /dev/null
++++ b/activerecord/test/cases/attributes/typecasting_test.rb
+@@ -0,0 +1,118 @@
++require "cases/helper"
++
++class TypecastingTest < ActiveRecord::TestCase
++
++  class TypecastingAttributes < Hash
++    include ActiveRecord::Attributes::Typecasting
++  end
++
++  module MockType
++    class Object
++
++      def cast(value)
++        value
++      end
++
++      def precast(value)
++        value
++      end
++
++      def boolean(value)
++        !value.blank?
++      end
++
++      def appendable?
++        false
++      end
++
++    end
++
++    class Integer < Object
++
++      def cast(value)
++        value.to_i
++      end
++
++      def precast(value)
++        value ? value : 0
++      end
++
++      def boolean(value)
++        !Float(value).zero?
++      end
++
++    end
++
++    class Serialize < Object
++
++      def cast(value)
++        YAML::load(value) rescue value
++      end
++
++      def precast(value)
++        value
++      end
++
++      def appendable?
++        true
++      end
++
++    end
++  end
++
++  def setup
++    @attributes = TypecastingAttributes.new
++    @attributes.types.default = MockType::Object.new
++    @attributes.types['comments_count'] = MockType::Integer.new
++  end
++
++  test "typecast on read" do
++    attributes = @attributes.merge('comments_count' => '5')
++    assert_equal 5, attributes['comments_count']
++  end
++
++  test "typecast on write" do
++    @attributes['comments_count'] = false
++
++    assert_equal 0, @attributes.to_h['comments_count']
++  end
++
++  test "serialized objects" do
++    attributes = @attributes.merge('tags' => [ 'peanut butter' ].to_yaml)
++    attributes.types['tags'] = MockType::Serialize.new
++    attributes['tags'] << 'jelly'
++
++    assert_equal [ 'peanut butter', 'jelly' ], attributes['tags']
++  end
++
++  test "without typecasting" do
++    attributes = @attributes.without_typecast
++    attributes['comments_count'] = '5'
++
++    assert_equal '5', attributes['comments_count']
++  end
++
++  test "typecast all attributes" do
++    attributes = @attributes.merge('title' => 'I love sandwiches', 'comments_count' => '5')
++    attributes.typecast!
++
++    assert_equal({ 'title' => 'I love sandwiches', 'comments_count' => 5 }, attributes)
++  end
++
++  test "query for has? value" do
++    attributes = @attributes.merge('comments_count' => '1')
++
++    assert_equal true,  attributes.has?('comments_count')
++    attributes['comments_count'] = '0'
++    assert_equal false,  attributes.has?('comments_count')
++  end
++
++  test "attributes to Hash" do
++    attributes_hash = { 'title' => 'I love sandwiches', 'comments_count' => '5' }
++    attributes = @attributes.merge(attributes_hash)
++
++    assert_equal Hash, attributes.to_h.class
++    assert_equal attributes_hash, attributes.to_h
++  end
++
++end
+diff --git a/activerecord/test/cases/types/number_test.rb b/activerecord/test/cases/types/number_test.rb
+new file mode 100644
+index 0000000..ee7216a
+--- /dev/null
++++ b/activerecord/test/cases/types/number_test.rb
+@@ -0,0 +1,30 @@
++require "cases/helper"
++
++class NumberTest < ActiveRecord::TestCase
++
++  def setup
++    @column = ActiveRecord::ConnectionAdapters::Column.new('comments_count', 0, 'integer')
++    @number = ActiveRecord::Type::Number.new(@column)
++  end
++
++  test "typecast" do
++    assert_equal 1, @number.cast(1)
++    assert_equal 1, @number.cast('1')
++    assert_equal 0, @number.cast('')
++
++    assert_equal 0,   @number.precast(false)
++    assert_equal 1,   @number.precast(true)
++    assert_equal nil, @number.precast('')
++    assert_equal 0,   @number.precast(0)
++  end
++
++  test "cast as boolean" do
++    assert_equal true, @number.boolean('1')
++    assert_equal true, @number.boolean(1)
++
++    assert_equal false, @number.boolean(0)
++    assert_equal false, @number.boolean('0')
++    assert_equal false, @number.boolean(nil)
++  end
++
++end
+diff --git a/activerecord/test/cases/types/object_test.rb b/activerecord/test/cases/types/object_test.rb
+new file mode 100644
+index 0000000..f2667a9
+--- /dev/null
++++ b/activerecord/test/cases/types/object_test.rb
+@@ -0,0 +1,24 @@
++require "cases/helper"
++
++class ObjectTest < ActiveRecord::TestCase
++
++  def setup
++    @column = ActiveRecord::ConnectionAdapters::Column.new('name', '', 'date')
++    @object = ActiveRecord::Type::Object.new(@column)
++  end
++
++  test "typecast with column" do
++    date = Date.new(2009, 7, 10)
++    assert_equal date, @object.cast('10-07-2009')
++    assert_equal nil,  @object.cast('')
++
++    assert_equal date, @object.precast(date)
++  end
++
++  test "cast as boolean" do
++    assert_equal false, @object.boolean(nil)
++    assert_equal false, @object.boolean('false')
++    assert_equal true,  @object.boolean('10-07-2009')
++  end
++
++end
+diff --git a/activerecord/test/cases/types/serialize_test.rb b/activerecord/test/cases/types/serialize_test.rb
+new file mode 100644
+index 0000000..e9423a5
+--- /dev/null
++++ b/activerecord/test/cases/types/serialize_test.rb
+@@ -0,0 +1,20 @@
++require "cases/helper"
++
++class SerializeTest < ActiveRecord::TestCase
++
++  test "typecast" do
++    serializer = ActiveRecord::Type::Serialize.new(column = nil, :serialize => Array)
++
++    assert_equal [],    serializer.cast([].to_yaml)
++    assert_equal ['1'], serializer.cast(['1'].to_yaml)
++    assert_equal nil,   serializer.cast(nil.to_yaml)
++  end
++
++  test "cast as boolean" do
++    serializer = ActiveRecord::Type::Serialize.new(column = nil, :serialize => Array)
++
++    assert_equal true,  serializer.boolean(['1'].to_yaml)
++    assert_equal false, serializer.boolean([].to_yaml)
++  end
++
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/types/time_with_zone_test.rb b/activerecord/test/cases/types/time_with_zone_test.rb
+new file mode 100644
+index 0000000..1bc5b40
+--- /dev/null
++++ b/activerecord/test/cases/types/time_with_zone_test.rb
+@@ -0,0 +1,42 @@
++require "cases/helper"
++
++class TimeWithZoneTest < ActiveRecord::TestCase
++
++  def setup
++    @column = ActiveRecord::ConnectionAdapters::Column.new('created_at', 0, 'datetime')
++    @time_with_zone = ActiveRecord::Type::TimeWithZone.new(@column)
++  end
++
++  test "typecast" do
++    Time.use_zone("Pacific Time (US & Canada)") do
++      time_string = "2009-10-07 21:29:10"
++      time = Time.zone.parse(time_string)
++
++      assert_equal time, @time_with_zone.cast(time_string)
++      assert_equal nil, @time_with_zone.cast('')
++      assert_equal nil, @time_with_zone.cast(nil)
++
++      assert_equal time, @time_with_zone.precast(time)
++      assert_equal time, @time_with_zone.precast(time_string)
++      assert_equal time, @time_with_zone.precast(time.to_time)
++      assert_equal "#{time.to_date.to_s} 00:00:00 -0700", @time_with_zone.precast(time.to_date).to_s
++    end
++  end
++
++  test "cast as boolean" do
++    Time.use_zone('Central Time (US & Canada)') do
++      time = Time.zone.now
++
++      assert_equal true, @time_with_zone.boolean(time)
++      assert_equal true, @time_with_zone.boolean(time.to_date)
++      assert_equal true, @time_with_zone.boolean(time.to_time)
++
++      assert_equal true, @time_with_zone.boolean(time.to_s)
++      assert_equal true, @time_with_zone.boolean(time.to_date.to_s)
++      assert_equal true, @time_with_zone.boolean(time.to_time.to_s)
++
++      assert_equal false, @time_with_zone.boolean('')
++    end
++  end
++
++end
+diff --git a/activerecord/test/cases/types/unknown_test.rb b/activerecord/test/cases/types/unknown_test.rb
+new file mode 100644
+index 0000000..230d67b
+--- /dev/null
++++ b/activerecord/test/cases/types/unknown_test.rb
+@@ -0,0 +1,29 @@
++require "cases/helper"
++
++class UnknownTest < ActiveRecord::TestCase
++
++  test "typecast attributes does't modify values" do
++    unkown = ActiveRecord::Type::Unknown.new
++    person = { 'name' => '0' }
++
++    assert_equal person['name'], unkown.cast(person['name'])
++    assert_equal person['name'], unkown.precast(person['name'])
++  end
++
++  test "cast as boolean" do
++    person =  { 'id' => 0, 'name' => ' ', 'admin' => 'false', 'votes' => '0' }
++    unkown = ActiveRecord::Type::Unknown.new
++
++    assert_equal false, unkown.boolean(person['votes'])
++    assert_equal false, unkown.boolean(person['admin'])
++    assert_equal false, unkown.boolean(person['name'])
++    assert_equal false, unkown.boolean(person['id'])
++
++    person = { 'id' => 5, 'name' => 'Eric', 'admin' => 'true', 'votes' => '25' }
++    assert_equal true, unkown.boolean(person['votes'])
++    assert_equal true, unkown.boolean(person['admin'])
++    assert_equal true, unkown.boolean(person['name'])
++    assert_equal true, unkown.boolean(person['id'])
++  end
++
++end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/types_test.rb b/activerecord/test/cases/types_test.rb
+new file mode 100644
+index 0000000..403a9a6
+--- /dev/null
++++ b/activerecord/test/cases/types_test.rb
+@@ -0,0 +1,32 @@
++require "cases/helper"
++require 'models/topic'
++
++class TypesTest < ActiveRecord::TestCase
++
++  test "attribute types from columns" do
++    begin
++    ActiveRecord::Base.time_zone_aware_attributes = true
++    attribute_type_classes = {}
++    Topic.attribute_types.each { |key, type| attribute_type_classes[key] = type.class }
++
++    expected = { "id"            => ActiveRecord::Type::Number,
++                  "replies_count" => ActiveRecord::Type::Number,
++                  "parent_id"     => ActiveRecord::Type::Number,
++                  "content"       => ActiveRecord::Type::Serialize,
++                  "written_on"    => ActiveRecord::Type::TimeWithZone,
++                  "title"         => ActiveRecord::Type::Object,
++                  "author_name"   => ActiveRecord::Type::Object,
++                  "approved"      => ActiveRecord::Type::Object,
++                  "parent_title"  => ActiveRecord::Type::Object,
++                  "bonus_time"    => ActiveRecord::Type::Object,
++                  "type"          => ActiveRecord::Type::Object,
++                  "last_read"     => ActiveRecord::Type::Object,
++                  "author_email_address" => ActiveRecord::Type::Object }
++
++    assert_equal expected, attribute_type_classes
++   ensure
++     ActiveRecord::Base.time_zone_aware_attributes = false
++   end
++  end
++
++end
+-- 
+1.6.4.4
+

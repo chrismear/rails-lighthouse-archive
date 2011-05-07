@@ -1,0 +1,725 @@
+From 88a0f6332ce9c1a9829d202d4020ea7de6ea079c Mon Sep 17 00:00:00 2001
+From: Gregg Kellogg <gregg@Gregg-Kelloggs-MacBook-Pro-24.local>
+Date: Tue, 13 Jan 2009 11:00:32 -0800
+Subject: [PATCH] Address problems related to http://github.com/rails/rails/commit/c99ef814b0ce5d6b6a677ee6116edac03c8a35b3
+
+---
+ actionpack/lib/action_controller/base.rb           |    4 +-
+ .../lib/action_controller/http_authentication.rb   |  184 +++++++++++++++++++-
+ actionpack/lib/action_controller/integration.rb    |   82 +++++++++
+ actionpack/test/controller/integration_test.rb     |   88 ++++++++++
+ 4 files changed, 354 insertions(+), 4 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index e221141..3d15d33 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -1352,8 +1352,8 @@ module ActionController #:nodoc:
+   Base.class_eval do
+     [ Filters, Layout, Benchmarking, Rescue, Flash, MimeResponds, Helpers,
+       Cookies, Caching, Verification, Streaming, SessionManagement,
+-      HttpAuthentication::Basic::ControllerMethods, RecordIdentifier,
+-      RequestForgeryProtection, Translation
++      HttpAuthentication::Basic::ControllerMethods, HttpAuthentication::Digest::ControllerMethods,
++      RecordIdentifier, RequestForgeryProtection, Translation
+     ].each do |mod|
+       include mod
+     end
+diff --git a/actionpack/lib/action_controller/http_authentication.rb b/actionpack/lib/action_controller/http_authentication.rb
+index 2ed810d..1ca7f00 100644
+--- a/actionpack/lib/action_controller/http_authentication.rb
++++ b/actionpack/lib/action_controller/http_authentication.rb
+@@ -55,7 +55,31 @@ module ActionController
+     #       end
+     #   end
+     # 
+-    # 
++    # Simple Digest example. Note the block must return the user's password so the framework 
++    # can appropriately hash it to check the user's credentials. Returning nil will cause authentication to fail. 
++    #  
++    #   class PostsController < ApplicationController 
++    #     Users = {"dhh" => "secret"} 
++    #    
++    #     before_filter :authenticate, :except => [ :index ] 
++    #    
++    #     def index 
++    #       render :text => "Everyone can see me!" 
++    #     end 
++    #    
++    #     def edit 
++    #       render :text => "I'm only accessible if you know the password" 
++    #     end 
++    #    
++    #     private 
++    #       def authenticate 
++    #         authenticate_or_request_with_http_digest(realm) do |user_name|  
++    #           Users[user_name] 
++    #         end 
++    #       end 
++    #   end
++    #
++    #
+     # In your integration tests, you can do something like this:
+     # 
+     #   def test_access_granted_from_xml
+@@ -108,7 +132,10 @@ module ActionController
+       end
+     
+       def decode_credentials(request)
+-        ActiveSupport::Base64.decode64(authorization(request).split.last || '')
++        # Properly decode credentials spanning a new-line
++        auth = authorization(request)
++        auth.slice!('Basic ')
++        ActiveSupport::Base64.decode64(auth || '')
+       end
+ 
+       def encode_credentials(user_name, password)
+@@ -120,5 +147,158 @@ module ActionController
+         controller.__send__ :render, :text => "HTTP Basic: Access denied.\n", :status => :unauthorized
+       end
+     end
++    
++    module Digest
++      extend self
++    
++      module ControllerMethods
++        def authenticate_or_request_with_http_digest(realm = "Application", &password_procedure)
++          authenticate_with_http_digest(realm, &password_procedure) || request_http_digest_authentication(realm)
++        end
++
++        # Authenticate using HTTP Digest, throwing ActionController::HttpAuthentication::Error on failure.
++        # This allows more detailed analysis of authentication failures
++        # to be relayed to the client.
++        def authenticate_with_http_digest!(realm = "Application", &login_procedure)
++            HttpAuthentication::Digest.authenticate(self, realm, &login_procedure)
++        end
++
++        # Authenticate with HTTP Digest, returns true or false
++        def authenticate_with_http_digest(realm = "Application", &login_procedure)
++          HttpAuthentication::Digest.authenticate(self, realm, &login_procedure) rescue false
++        end
++
++        # Render output including the HTTP Digest authentication header
++        def request_http_digest_authentication(realm = "Application", message = nil)
++          HttpAuthentication::Digest.authentication_request(self, realm, message)
++        end
++        
++        # Add HTTP Digest authentication header to result headers
++        def http_digest_authentication_header(realm = "Application")
++          HttpAuthentication::Digest.authentication_header(self, realm)
++        end
++      end
++
++      # Raises error unless authentictaion succeeds, returns true otherwise
++      def authenticate(controller, realm, &password_procedure)
++        raise Error.new(false), "No authorization header found" unless authorization(controller.request)
++        validate_digest_response(controller, realm, &password_procedure)
++        true
++      end
++
++      def authorization(request)
++        request.env['HTTP_AUTHORIZATION']   ||
++        request.env['X-HTTP_AUTHORIZATION'] ||
++        request.env['X_HTTP_AUTHORIZATION'] ||
++        request.env['REDIRECT_X_HTTP_AUTHORIZATION']
++      end
++
++      # Raises error unless the request credentials response value matches the expected value.
++      def validate_digest_response(controller, realm, &password_procedure) 
++        credentials = decode_credentials(controller.request) 
++
++        # Check the nonce, opaque and realm.
++        # Ignore nc, as we have no way to validate the number of times this nonce has been used
++        validate_nonce(controller.request, credentials[:nonce])
++        raise Error.new(false, realm, credentials[:realm]), "Realm doesn't match" unless realm == credentials[:realm]
++        raise Error.new(true, opaque(controller.request), credentials[:opaque]),"Opaque doesn't match" unless opaque(controller.request) == credentials[:opaque]
++
++        password = password_procedure.call(credentials[:username])
++        raise Error.new(false), "No password" if password.nil?
++        expected = expected_response(controller.request.env['REQUEST_METHOD'], controller.request.url, credentials, password)
++        raise Error.new(false, expected, credentials[:response]), "Invalid response" unless expected == credentials[:response]
++      end 
++
++      # Returns the expected response for a request of +http_method+ to +uri+ with the decoded +credentials+ and the expected +password+ 
++      def expected_response(http_method, uri, credentials, password) 
++        ha1 = ::Digest::MD5.hexdigest([credentials[:username], credentials[:realm], password].join(':')) 
++        ha2 = ::Digest::MD5.hexdigest([http_method.to_s.upcase,uri].join(':')) 
++        ::Digest::MD5.hexdigest([ha1,credentials[:nonce], credentials[:nc], credentials[:cnonce],credentials[:qop],ha2].join(':')) 
++      end  
++
++      def encode_credentials(http_method, credentials, password) 
++        credentials[:response] = expected_response(http_method, credentials[:uri], credentials, password) 
++        "Digest " + credentials.sort_by {|x| x[0].to_s }.inject([]) {|a, v| a << "#{v[0]}='#{v[1]}'" }.join(', ') 
++      end 
++
++      def decode_credentials(request) 
++        authorization(request).to_s.gsub(/^Digest\s+/,'').split(',').inject({}) do |hash, pair| 
++          key, value = pair.split('=', 2) 
++          hash[key.strip.to_sym] = value.to_s.gsub(/^"|"$/,'').gsub(/'/, '') 
++          hash 
++        end 
++      end 
++
++      def authentication_header(controller, realm)
++        controller.headers["WWW-Authenticate"] = %(Digest realm="#{realm}", qop="auth", algorithm=MD5, nonce="#{nonce(controller.request)}", opaque="#{opaque(controller.request)}") 
++      end
++
++      def authentication_request(controller, realm, message = "HTTP Digest: Access denied")
++        authentication_header(controller, realm)
++        controller.__send__ :render, :text => message, :status => :unauthorized
++      end
++
++      # Uses an MD5 digest based on time to generate a value to be used only once.
++      #
++      # A server-specified data string which should be uniquely generated each time a 401 response is made.
++      # It is recommended that this string be base64 or hexadecimal data.
++      # Specifically, since the string is passed in the header lines as a quoted string, the double-quote character is not allowed.
++      #
++      # The contents of the nonce are implementation dependent.
++      # The quality of the implementation depends on a good choice.
++      # A nonce might, for example, be constructed as the base 64 encoding of
++      #
++      # => time-stamp H(time-stamp ":" ETag ":" private-key)
++      #
++      # where time-stamp is a server-generated time or other non-repeating value,
++      # ETag is the value of the HTTP ETag header associated with the requested entity,
++      # and private-key is data known only to the server.
++      # With a nonce of this form a server would recalculate the hash portion after receiving the client authentication header and
++      # reject the request if it did not match the nonce from that header or
++      # if the time-stamp value is not recent enough. In this way the server can limit the time of the nonce's validity.
++      # The inclusion of the ETag prevents a replay request for an updated version of the resource.
++      # (Note: including the IP address of the client in the nonce would appear to offer the server the ability
++      # to limit the reuse of the nonce to the same client that originally got it.
++      # However, that would break proxy farms, where requests from a single user often go through different proxies in the farm.
++      # Also, IP address spoofing is not that hard.)
++      #
++      # An implementation might choose not to accept a previously used nonce or a previously used digest, in order to
++      # protect against a replay attack. Or, an implementation might choose to use one-time nonces or digests for
++      # POST or PUT requests and a time-stamp for GET requests. For more details on the issues involved see Section 4
++      # of this document.
++      #
++      # The nonce is opaque to the client.
++      def nonce(request, time = Time.now)
++        session_id = request.is_a?(String) ? request : request.session.session_id
++        t = time.to_i
++        hashed = [t, session_id]
++        digest = ::Digest::MD5.hexdigest(hashed.join(":"))
++        Base64.encode64("#{t}:#{digest}").gsub("\n", '')
++      end
++
++      def validate_nonce(request, value)
++        t = Base64.decode64(value).split(":").first.to_i
++        raise Error.new(true), "Stale Nonce" if (t - Time.now.to_i).abs > 10 * 60
++        n = nonce(request, t)
++        raise Error.new(true, value, n), "Bad Nonce" unless n == value
++      end
++
++      # Opaque based on digest of session_id
++      def opaque(request)
++        session_id = request.is_a?(String) ? request : request.session.session_id
++        @opaque ||= Base64.encode64(::Digest::MD5::hexdigest(session_id)).gsub("\n", '')
++      end
++    end
++
++    class Error < RuntimeError
++      attr_accessor :expected, :was
++      def initialize(fatal = false, expected = nil, was = nil)
++        @fatal = fatal
++        @expected = expected
++        @was = was
++      end
++
++      def fatal?; @fatal; end
++    end
+   end
+ end
+diff --git a/actionpack/lib/action_controller/integration.rb b/actionpack/lib/action_controller/integration.rb
+index 163ba84..fd2e352 100644
+--- a/actionpack/lib/action_controller/integration.rb
++++ b/actionpack/lib/action_controller/integration.rb
+@@ -57,6 +57,15 @@ module ActionController
+       # A running counter of the number of requests processed.
+       attr_accessor :request_count
+ 
++      # Nonce value for Digest Authentication, implicitly set on response with WWW-Authentication
++      attr_accessor :nonce
++
++      # Opaque value for Digest Authentication, implicitly set on response with WWW-Authentication
++      attr_accessor :opaque
++
++      # Opaque value for Authentication, implicitly set on response with WWW-Authentication
++      attr_accessor :realm
++
+       class MultiPartNeededException < Exception
+       end
+ 
+@@ -232,6 +241,53 @@ module ActionController
+       end
+       alias xhr :xml_http_request
+ 
++      def request_with_noauth(http_method, uri, parameters, headers) 
++        process_with_auth http_method, uri, parameters, headers
++      end 
++
++      # Performs a request with the given http_method and parameters, including HTTP Basic authorization headers. 
++      # See get() for more details on paramters and headers. 
++      # 
++      # You can perform GET, POST, PUT, DELETE, and HEAD requests with #get_with_basic, #post_with_basic, 
++      # #put_with_basic, #delete_with_basic, and #head_with_basic. 
++      def request_with_basic(http_method, uri, parameters, headers, user_name, password) 
++        process_with_auth http_method, uri, parameters, headers.merge(:authorization => ActionController::HttpAuthentication::Basic.encode_credentials(user_name, password)) 
++      end 
++
++      # Performs a request with the given http_method and parameters, including HTTP Digest authorization headers. 
++      # See get() for more details on paramters and headers. 
++      # 
++      # You can perform GET, POST, PUT, DELETE, and HEAD requests with #get_with_digest, #post_with_digest, 
++      # #put_with_digest, #delete_with_digest, and #head_with_digest. 
++      def request_with_digest(http_method, uri, parameters, headers, user_name, password) 
++        # Realm, Nonce, and Opaque taken from previoius 401 response
++        
++        credentials = {
++          :username => user_name,
++          :realm    => @realm,
++          :nonce    => @nonce,
++          :qop      => "auth",
++          :nc       => "00000001",
++          :cnonce   => "0a4f113b",
++          :opaque   => @opaque,
++          :uri      => uri
++        }
++        
++        raise "Digest request without previous 401 response" if @opaque.nil?
++ 
++        process_with_auth http_method, uri, parameters, headers.merge(:authorization => ActionController::HttpAuthentication::Digest.encode_credentials(http_method, credentials, password)) 
++      end 
++
++      # def get_with_basic, def post_with_basic, def put_with_basic, def delete_with_basic, def head_with_basic 
++      # def get_with_digest, def post_with_digest, def put_with_digest, def delete_with_digest, def head_with_digest 
++      [:get, :post, :put, :delete, :head].each do |method| 
++        [:noauth, :basic, :digest].each do |auth_type| 
++          define_method("#{method}_with_#{auth_type}") do |uri, parameters, headers, *auth| 
++            send("request_with_#{auth_type}", method, uri, parameters, headers, *auth) 
++          end 
++        end 
++      end
++
+       # Returns the URL for the given options, according to the rules specified
+       # in the application's routes.
+       def url_for(options)
+@@ -356,6 +412,32 @@ module ActionController
+           return status
+         end
+ 
++        # Same as process, but handles authentication returns to perform
++        # Basic or Digest authentication
++        def process_with_auth(method, path, parameters = nil, headers = nil)
++          status = process(method, path, parameters, headers)
++
++          if status == 401
++            # Extract authentication information from response
++            auth_data = @response.headers['WWW-Authenticate']
++            if /^Basic /.match(auth_data)
++              # extract realm, to be used in subsequent request
++              @realm = auth_header.split(' ')[1]
++            elsif /^Digest/.match(auth_data)
++              creds = auth_data.to_s.gsub(/^Digest\s+/,'').split(',').inject({}) do |hash, pair| 
++                key, value = pair.split('=', 2) 
++                hash[key.strip.to_sym] = value.to_s.gsub(/^"|"$/,'').gsub(/'/, '') 
++                hash 
++              end 
++              @realm = creds[:realm]
++              @nonce = creds[:nonce]
++              @opaque = creds[:opaque]
++            end
++          end
++
++          return status
++        end
++
+         # Encode the cookies hash in a format suitable for passing to a
+         # request.
+         def encode_cookies
+diff --git a/actionpack/test/controller/integration_test.rb b/actionpack/test/controller/integration_test.rb
+index 4f07cbe..7ac9d97 100644
+--- a/actionpack/test/controller/integration_test.rb
++++ b/actionpack/test/controller/integration_test.rb
+@@ -8,7 +8,25 @@ class SessionTest < Test::Unit::TestCase
+   }
+ 
+   def setup
++    @credentials = {
++      :username => "username",
++      :realm    => "MyApp",
++      :nonce    => ActionController::HttpAuthentication::Digest.nonce("session_id"),
++      :qop      => "auth",
++      :nc       => "00000001",
++      :cnonce   => "0a4f113b",
++      :opaque   => ActionController::HttpAuthentication::Digest.opaque("session_id"),
++      :uri      => "/index"
++    }
++
+     @session = ActionController::Integration::Session.new(StubApp)
++    @session.nonce = @credentials[:nonce]
++    @session.opaque = @credentials[:opaque]
++    @session.realm = @credentials[:realm]
++  end
++
++  def encoded_credentials(method)
++    ActionController::HttpAuthentication::Digest.encode_credentials(method, @credentials, "password")
+   end
+ 
+   def test_https_bang_works_and_sets_truth_by_default
+@@ -132,6 +150,76 @@ class SessionTest < Test::Unit::TestCase
+     @session.head(path,params,headers)
+   end
+ 
++  def test_get_with_basic 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => "Basic dXNlcm5hbWU6cGFzc3dvcmQ=\n")  
++    @session.expects(:process).with(:get,path,params,expected_headers) 
++    @session.get_with_basic(path,params,headers,'username','password') 
++  end 
++ 
++  def test_post_with_basic 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => "Basic dXNlcm5hbWU6cGFzc3dvcmQ=\n")  
++    @session.expects(:process).with(:post,path,params,expected_headers) 
++    @session.post_with_basic(path,params,headers,'username','password') 
++  end 
++ 
++  def test_put_with_basic 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => "Basic dXNlcm5hbWU6cGFzc3dvcmQ=\n")  
++    @session.expects(:process).with(:put,path,params,expected_headers) 
++    @session.put_with_basic(path,params,headers,'username','password') 
++  end 
++ 
++  def test_delete_with_basic 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => "Basic dXNlcm5hbWU6cGFzc3dvcmQ=\n")  
++    @session.expects(:process).with(:delete,path,params,expected_headers) 
++    @session.delete_with_basic(path,params,headers,'username','password') 
++  end 
++ 
++  def test_head_with_basic 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => "Basic dXNlcm5hbWU6cGFzc3dvcmQ=\n")  
++    @session.expects(:process).with(:head,path,params,expected_headers) 
++    @session.head_with_basic(path,params,headers,'username','password') 
++  end 
++ 
++  def test_get_with_digest 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => encoded_credentials(:get))
++    @session.expects(:process).with(:get,path,params,expected_headers) 
++    @session.get_with_digest(path,params,headers,'username','password') 
++  end 
++ 
++  def test_post_with_digest 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => encoded_credentials(:post))
++    @session.expects(:process).with(:post,path,params,expected_headers) 
++    @session.post_with_digest(path,params,headers,'username','password') 
++  end 
++ 
++  def test_put_with_digest 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => encoded_credentials(:put)) 
++    @session.expects(:process).with(:put,path,params,expected_headers) 
++    @session.put_with_digest(path,params,headers,'username','password') 
++  end 
++ 
++  def test_delete_with_digest 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => encoded_credentials(:delete))
++    @session.expects(:process).with(:delete,path,params,expected_headers) 
++    @session.delete_with_digest(path,params,headers,'username','password') 
++  end 
++ 
++  def test_head_with_digest 
++    path = "/index"; params = "blah"; headers = {:location => 'blah'} 
++    expected_headers = headers.merge(:authorization => encoded_credentials(:head)) 
++    @session.expects(:process).with(:head,path,params,expected_headers) 
++    @session.head_with_digest(path,params,headers,'username','password') 
++  end 
++
+   def test_xml_http_request_get
+     path = "/index"; params = "blah"; headers = {:location => 'blah'}
+     headers_after_xhr = headers.merge(
+-- 
+1.5.3.1
+
+
+From bb30b5ee21c39b7ee9cf761faeb15066816bf23a Mon Sep 17 00:00:00 2001
+From: Gregg Kellogg <gregg@Gregg-Kelloggs-MacBook-Pro-24.local>
+Date: Tue, 13 Jan 2009 21:11:15 -0800
+Subject: [PATCH] Remove exception usage from digest. Added http_digest_authentication_response_detail to find out why digest fails
+
+---
+ .../lib/action_controller/http_authentication.rb   |   50 +++++++------------
+ 1 files changed, 19 insertions(+), 31 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/http_authentication.rb b/actionpack/lib/action_controller/http_authentication.rb
+index 1ca7f00..b821cec 100644
+--- a/actionpack/lib/action_controller/http_authentication.rb
++++ b/actionpack/lib/action_controller/http_authentication.rb
+@@ -156,16 +156,9 @@ module ActionController
+           authenticate_with_http_digest(realm, &password_procedure) || request_http_digest_authentication(realm)
+         end
+ 
+-        # Authenticate using HTTP Digest, throwing ActionController::HttpAuthentication::Error on failure.
+-        # This allows more detailed analysis of authentication failures
+-        # to be relayed to the client.
+-        def authenticate_with_http_digest!(realm = "Application", &login_procedure)
+-            HttpAuthentication::Digest.authenticate(self, realm, &login_procedure)
+-        end
+-
+         # Authenticate with HTTP Digest, returns true or false
+         def authenticate_with_http_digest(realm = "Application", &login_procedure)
+-          HttpAuthentication::Digest.authenticate(self, realm, &login_procedure) rescue false
++          HttpAuthentication::Digest.authenticate(self, realm, &login_procedure)
+         end
+ 
+         # Render output including the HTTP Digest authentication header
+@@ -173,17 +166,21 @@ module ActionController
+           HttpAuthentication::Digest.authentication_request(self, realm, message)
+         end
+         
++        # Response detail. Returns nil if response if valid, otherwise an indication of the failure reason
++        def http_digest_authentication_response_detail(realm = "Application", &login_procedure)
++          return "No authorization header found" unless HttpAuthentication::Digest.authorization(controller.request)
++          HttpAuthentication::Digest.validate_digest_response(controller, realm, &password_procedure) == nil
++        end
++
+         # Add HTTP Digest authentication header to result headers
+         def http_digest_authentication_header(realm = "Application")
+           HttpAuthentication::Digest.authentication_header(self, realm)
+         end
+       end
+ 
+-      # Raises error unless authentictaion succeeds, returns true otherwise
++      # Returns false on a valid response, true otherwise
+       def authenticate(controller, realm, &password_procedure)
+-        raise Error.new(false), "No authorization header found" unless authorization(controller.request)
+-        validate_digest_response(controller, realm, &password_procedure)
+-        true
++        authorization(controller.request) && validate_digest_response(controller, realm, &password_procedure)
+       end
+ 
+       def authorization(request)
+@@ -199,14 +196,18 @@ module ActionController
+ 
+         # Check the nonce, opaque and realm.
+         # Ignore nc, as we have no way to validate the number of times this nonce has been used
+-        validate_nonce(controller.request, credentials[:nonce])
+-        raise Error.new(false, realm, credentials[:realm]), "Realm doesn't match" unless realm == credentials[:realm]
+-        raise Error.new(true, opaque(controller.request), credentials[:opaque]),"Opaque doesn't match" unless opaque(controller.request) == credentials[:opaque]
++        return false unless validate_nonce(controller.request, credentials[:nonce])
++        
++        # Realm doesn't match
++        return false unless realm == credentials[:realm]
++        
++        # Opaque doesn't match
++        return false unless opaque(controller.request) == credentials[:opaque]
+ 
+         password = password_procedure.call(credentials[:username])
+-        raise Error.new(false), "No password" if password.nil?
++        
+         expected = expected_response(controller.request.env['REQUEST_METHOD'], controller.request.url, credentials, password)
+-        raise Error.new(false, expected, credentials[:response]), "Invalid response" unless expected == credentials[:response]
++        expected == credentials[:response]
+       end 
+ 
+       # Returns the expected response for a request of +http_method+ to +uri+ with the decoded +credentials+ and the expected +password+ 
+@@ -278,9 +279,7 @@ module ActionController
+ 
+       def validate_nonce(request, value)
+         t = Base64.decode64(value).split(":").first.to_i
+-        raise Error.new(true), "Stale Nonce" if (t - Time.now.to_i).abs > 10 * 60
+-        n = nonce(request, t)
+-        raise Error.new(true, value, n), "Bad Nonce" unless n == value
++        nonce(request, t) == value && (t - Time.now.to_i).abs <= 10 * 60
+       end
+ 
+       # Opaque based on digest of session_id
+@@ -289,16 +288,5 @@ module ActionController
+         @opaque ||= Base64.encode64(::Digest::MD5::hexdigest(session_id)).gsub("\n", '')
+       end
+     end
+-
+-    class Error < RuntimeError
+-      attr_accessor :expected, :was
+-      def initialize(fatal = false, expected = nil, was = nil)
+-        @fatal = fatal
+-        @expected = expected
+-        @was = was
+-      end
+-
+-      def fatal?; @fatal; end
+-    end
+   end
+ end
+-- 
+1.5.3.1
+
+
+From 5e1f908a6b70b731ecfe5cbfbb181d498461d776 Mon Sep 17 00:00:00 2001
+From: Gregg Kellogg <gregg@Gregg-Kelloggs-MacBook-Pro-24.local>
+Date: Tue, 13 Jan 2009 21:20:32 -0800
+Subject: [PATCH] Remove exception usage from digest. Added http_digest_authentication_response_detail to find out why digest fails
+
+---
+ .../lib/action_controller/http_authentication.rb   |   22 ++++++++++----------
+ 1 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/http_authentication.rb b/actionpack/lib/action_controller/http_authentication.rb
+index b821cec..d1c6c56 100644
+--- a/actionpack/lib/action_controller/http_authentication.rb
++++ b/actionpack/lib/action_controller/http_authentication.rb
+@@ -161,17 +161,17 @@ module ActionController
+           HttpAuthentication::Digest.authenticate(self, realm, &login_procedure)
+         end
+ 
+-        # Render output including the HTTP Digest authentication header
+-        def request_http_digest_authentication(realm = "Application", message = nil)
+-          HttpAuthentication::Digest.authentication_request(self, realm, message)
+-        end
+-        
+         # Response detail. Returns nil if response if valid, otherwise an indication of the failure reason
+         def http_digest_authentication_response_detail(realm = "Application", &login_procedure)
+           return "No authorization header found" unless HttpAuthentication::Digest.authorization(controller.request)
+-          HttpAuthentication::Digest.validate_digest_response(controller, realm, &password_procedure) == nil
++          HttpAuthentication::Digest.validate_digest_response(controller, realm, &password_procedure)
+         end
+ 
++        # Render output including the HTTP Digest authentication header
++        def request_http_digest_authentication(realm = "Application", message = nil)
++          HttpAuthentication::Digest.authentication_request(self, realm, message)
++        end
++        
+         # Add HTTP Digest authentication header to result headers
+         def http_digest_authentication_header(realm = "Application")
+           HttpAuthentication::Digest.authentication_header(self, realm)
+@@ -180,7 +180,7 @@ module ActionController
+ 
+       # Returns false on a valid response, true otherwise
+       def authenticate(controller, realm, &password_procedure)
+-        authorization(controller.request) && validate_digest_response(controller, realm, &password_procedure)
++        authorization(controller.request) && validate_digest_response(controller, realm, &password_procedure) == nil
+       end
+ 
+       def authorization(request)
+@@ -196,18 +196,18 @@ module ActionController
+ 
+         # Check the nonce, opaque and realm.
+         # Ignore nc, as we have no way to validate the number of times this nonce has been used
+-        return false unless validate_nonce(controller.request, credentials[:nonce])
++        return "Invalid nonce" unless validate_nonce(controller.request, credentials[:nonce])
+         
+         # Realm doesn't match
+-        return false unless realm == credentials[:realm]
++        return "Realm doesn't match" unless realm == credentials[:realm]
+         
+         # Opaque doesn't match
+-        return false unless opaque(controller.request) == credentials[:opaque]
++        return "Opaque doesn't match" unless opaque(controller.request) == credentials[:opaque]
+ 
+         password = password_procedure.call(credentials[:username])
+         
+         expected = expected_response(controller.request.env['REQUEST_METHOD'], controller.request.url, credentials, password)
+-        expected == credentials[:response]
++        expected == credentials[:response] ? nil : "Invalid response"
+       end 
+ 
+       # Returns the expected response for a request of +http_method+ to +uri+ with the decoded +credentials+ and the expected +password+ 
+-- 
+1.5.3.1
+
+
+From 50b0d30ecbac574eec72397ee4a03728078afc6d Mon Sep 17 00:00:00 2001
+From: Gregg Kellogg <gregg@Gregg-Kelloggs-MacBook-Pro-24.local>
+Date: Tue, 13 Jan 2009 21:30:36 -0800
+Subject: [PATCH] Add digest tests
+
+---
+ .../controller/http_digest_authentication_test.rb  |   67 ++++++++++++++++++++
+ 1 files changed, 67 insertions(+), 0 deletions(-)
+ create mode 100644 actionpack/test/controller/http_digest_authentication_test.rb
+
+diff --git a/actionpack/test/controller/http_digest_authentication_test.rb b/actionpack/test/controller/http_digest_authentication_test.rb
+new file mode 100644
+index 0000000..b4b2b19
+--- /dev/null
++++ b/actionpack/test/controller/http_digest_authentication_test.rb
+@@ -0,0 +1,67 @@
++require 'abstract_unit'
++
++class HttpDigestAuthenticationTest < Test::Unit::TestCase
++  include ActionController::HttpAuthentication::Digest
++  
++  class DummyController
++    attr_accessor :headers, :renders, :request, :response
++
++    def initialize
++      @headers, @renders = {}, []
++      @request = ActionController::TestRequest.new
++      @response = ActionController::TestResponse.new
++      request.session.session_id = "test_session"
++    end
++    
++    def render(options)
++      self.renderers << options
++    end
++  end
++  
++  def setup
++    @controller = DummyController.new
++    @credentials = {
++      :username => "dhh",
++      :realm    => "testrealm@host.com",
++      :nonce    => ActionController::HttpAuthentication::Digest.nonce(@controller.request),
++      :qop      => "auth",
++      :nc       => "00000001",
++      :cnonce   => "0a4f113b",
++      :opaque   => ActionController::HttpAuthentication::Digest.opaque(@controller.request),
++      :uri      => "http://test.host/"
++    }
++    set_password
++  end
++
++  def test_decode_credentials
++    assert_equal @credentials, decode_credentials(@controller.request) 
++    assert_nil validate_digest_response(@controller, @credentials[:realm]) { |user| user == "dhh" && "secret" }
++  end 
++    
++  def test_nonce_format
++    assert validate_nonce(@controller.request, nonce(@controller.request))
++    assert_nil validate_digest_response(@controller, @credentials[:realm]) { |user| user == "dhh" && "secret" }
++  end
++  
++  def test_authenticate_should_fail_on_nil_password
++    set_password nil
++    assert !authenticate(@controller, @credentials[:realm]) { |user| user == "dhh" && "secret" }
++    assert_equal "Invalid response", validate_digest_response(@controller, @credentials[:realm]) { |user| user == "dhh" && "secret" }
++  end 
++  
++  def test_authenticate_should_fail_on_incorrect_password 
++    assert !authenticate(@controller, @credentials[:realm]) { |user| user == "dhh" && "bad password" }
++    assert_equal "Invalid response", validate_digest_response(@controller, @credentials[:realm]) { |user| user == "dhh" && "bad password" }
++  end 
++ 
++  def test_should_authenticate 
++    assert authenticate(@controller, @credentials[:realm]) { |user| user == "dhh" && "secret" }
++  end 
++
++  private
++    def set_password(password = "secret")
++      value = ActionController::HttpAuthentication::Digest.encode_credentials("GET", @credentials, password)
++      @controller.request.env['HTTP_AUTHORIZATION'] = value
++      @controller.request.env["REQUEST_METHOD"] =  "GET"
++    end
++end
+-- 
+1.5.3.1
+

@@ -1,0 +1,401 @@
+From 6a4a8836be2b5f0ffbd7231f61f4f472c61ef472 Mon Sep 17 00:00:00 2001
+From: Tekin Suleyman <tekin@tekin.co.uk>
+Date: Wed, 28 Jan 2009 22:26:37 +0000
+Subject: [PATCH] Enhance option tag helpers to support disabled options
+
+---
+ .../lib/action_view/helpers/form_options_helper.rb |   35 ++++-
+ .../test/template/form_options_helper_test.rb      |  179 +++++++++++---------
+ 2 files changed, 129 insertions(+), 85 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_options_helper.rb b/actionpack/lib/action_view/helpers/form_options_helper.rb
+index 3991c5c..aa163e4 100644
+--- a/actionpack/lib/action_view/helpers/form_options_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_options_helper.rb
+@@ -189,11 +189,13 @@ module ActionView
+       # NOTE: Only the option tags are returned, you have to wrap this call in a regular HTML select tag.
+       def options_for_select(container, selected = nil)
+         container = container.to_a if Hash === container
++        selected, disabled = extract_selected_and_disabled(selected)
+ 
+         options_for_select = container.inject([]) do |options, element|
+           text, value = option_text_and_value(element)
+           selected_attribute = ' selected="selected"' if option_value_selected?(value, selected)
+-          options << %(<option value="#{html_escape(value.to_s)}"#{selected_attribute}>#{html_escape(text.to_s)}</option>)
++          disabled_attribute = ' disabled="disabled"' if disabled && option_value_selected?(value, disabled)
++          options << %(<option value="#{html_escape(value.to_s)}"#{selected_attribute}#{disabled_attribute}>#{html_escape(text.to_s)}</option>)
+         end
+ 
+         options_for_select.join("\n")
+@@ -220,7 +222,12 @@ module ActionView
+         options = collection.map do |element|
+           [element.send(text_method), element.send(value_method)]
+         end
+-        options_for_select(options, selected)
++        selected, disabled = extract_selected_and_disabled(selected)
++        select_deselect = {}              
++        select_deselect[:selected] = extract_values_from_collection(collection, value_method, selected)
++        select_deselect[:disabled] = extract_values_from_collection(collection, value_method, disabled)
++
++        options_for_select(options, select_deselect)
+       end
+ 
+       # Returns a string of <tt><option></tt> tags, like <tt>options_from_collection_for_select</tt>, but
+@@ -332,6 +339,24 @@ module ActionView
+             value == selected
+           end
+         end
++
++        def extract_selected_and_disabled(selected)
++          if selected.is_a?(Hash)
++            [selected[:selected], selected[:disabled]]
++          else
++            [selected, nil]
++          end        
++        end
++
++        def extract_values_from_collection(collection, value_method, selected)
++          if selected.is_a?(Proc)
++            collection.map do |element|
++              element.send(value_method) if selected.call(element) 
++            end.compact
++          else
++            selected
++          end
++        end
+     end
+ 
+     class InstanceTag #:nodoc:
+@@ -342,16 +367,18 @@ module ActionView
+         add_default_name_and_id(html_options)
+         value = value(object)
+         selected_value = options.has_key?(:selected) ? options[:selected] : value
+-        content_tag("select", add_options(options_for_select(choices, selected_value), options, selected_value), html_options)
++        disabled_value = options.has_key?(:disabled) ? options[:disabled] : nil
++        content_tag("select", add_options(options_for_select(choices, :selected => selected_value, :disabled => disabled_value), options, selected_value), html_options)
+       end
+ 
+       def to_collection_select_tag(collection, value_method, text_method, options, html_options)
+         html_options = html_options.stringify_keys
+         add_default_name_and_id(html_options)
+         value = value(object)
++        disabled_value = options.has_key?(:disabled) ? options[:disabled] : nil
+         selected_value = options.has_key?(:selected) ? options[:selected] : value
+         content_tag(
+-          "select", add_options(options_from_collection_for_select(collection, value_method, text_method, selected_value), options, value), html_options
++          "select", add_options(options_from_collection_for_select(collection, value_method, text_method, :selected => selected_value, :disabled => disabled_value), options, value), html_options
+         )
+       end
+ 
+diff --git a/actionpack/test/template/form_options_helper_test.rb b/actionpack/test/template/form_options_helper_test.rb
+index 7854886..1a8c620 100644
+--- a/actionpack/test/template/form_options_helper_test.rb
++++ b/actionpack/test/template/form_options_helper_test.rb
+@@ -25,43 +25,60 @@ uses_mocha "FormOptionsHelperTest" do
+     end
+ 
+     def test_collection_options
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       assert_dom_equal(
+         "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\">Babe went home</option>\n<option value=\"Cabe\">Cabe went home</option>",
+-        options_from_collection_for_select(@posts, "author_name", "title")
++        options_from_collection_for_select(dummy_posts, "author_name", "title")
+       )
+     end
+ 
+ 
+     def test_collection_options_with_preselected_value
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       assert_dom_equal(
+         "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" selected=\"selected\">Babe went home</option>\n<option value=\"Cabe\">Cabe went home</option>",
+-        options_from_collection_for_select(@posts, "author_name", "title", "Babe")
++        options_from_collection_for_select(dummy_posts, "author_name", "title", "Babe")
+       )
+     end
+ 
+     def test_collection_options_with_preselected_value_array
+-        @posts = [
+-          Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-          Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-          Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-        ]
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" selected=\"selected\">Babe went home</option>\n<option value=\"Cabe\" selected=\"selected\">Cabe went home</option>",
++        options_from_collection_for_select(dummy_posts, "author_name", "title", [ "Babe", "Cabe" ])
++      )
++    end
+ 
+-        assert_dom_equal(
+-          "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" selected=\"selected\">Babe went home</option>\n<option value=\"Cabe\" selected=\"selected\">Cabe went home</option>",
+-          options_from_collection_for_select(@posts, "author_name", "title", [ "Babe", "Cabe" ])
+-        )
++    def test_collection_options_with_proc_for_selected
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" selected=\"selected\">Babe went home</option>\n<option value=\"Cabe\">Cabe went home</option>",
++        options_from_collection_for_select(dummy_posts, "author_name", "title", lambda{|p| p.author_name == 'Babe' })
++      )
++    end
++
++    def test_collection_options_with_disabled_value
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" disabled=\"disabled\">Babe went home</option>\n<option value=\"Cabe\">Cabe went home</option>",
++        options_from_collection_for_select(dummy_posts, "author_name", "title", :disabled => "Babe")
++      )
++    end
++
++    def test_collection_options_with_disabled_array
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" disabled=\"disabled\">Babe went home</option>\n<option value=\"Cabe\" disabled=\"disabled\">Cabe went home</option>",
++        options_from_collection_for_select(dummy_posts, "author_name", "title", :disabled => [ "Babe", "Cabe" ])
++      )
++    end
++
++    def test_collection_options_with_preselected_and_disabled_value
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" disabled=\"disabled\">Babe went home</option>\n<option value=\"Cabe\" selected=\"selected\">Cabe went home</option>",
++        options_from_collection_for_select(dummy_posts, "author_name", "title", :selected => "Cabe", :disabled => "Babe")
++      )
++    end
++
++    def test_collection_options_with_proc_for_disabled
++      assert_dom_equal(
++        "<option value=\"&lt;Abe&gt;\">&lt;Abe&gt; went home</option>\n<option value=\"Babe\" disabled=\"disabled\">Babe went home</option>\n<option value=\"Cabe\" disabled=\"disabled\">Cabe went home</option>",
++        options_from_collection_for_select(dummy_posts, "author_name", "title", :disabled => lambda{|p| %w(Babe Cabe).include? p.author_name })
++      )
+     end
+ 
+     def test_array_options_for_select
+@@ -85,6 +102,27 @@ uses_mocha "FormOptionsHelperTest" do
+         )
+     end
+ 
++    def test_array_options_for_select_with_disabled_value
++      assert_dom_equal(
++        "<option value=\"Denmark\">Denmark</option>\n<option value=\"&lt;USA&gt;\" disabled=\"disabled\">&lt;USA&gt;</option>\n<option value=\"Sweden\">Sweden</option>",
++        options_for_select([ "Denmark", "<USA>", "Sweden" ], :disabled => "<USA>")
++      )
++    end
++
++    def test_array_options_for_select_with_disabled_array
++      assert_dom_equal(
++        "<option value=\"Denmark\">Denmark</option>\n<option value=\"&lt;USA&gt;\" disabled=\"disabled\">&lt;USA&gt;</option>\n<option value=\"Sweden\" disabled=\"disabled\">Sweden</option>",
++        options_for_select([ "Denmark", "<USA>", "Sweden" ], :disabled => ["<USA>", "Sweden"])
++      )
++    end
++
++    def test_array_options_for_select_with_selection_and_disabled_value
++      assert_dom_equal(
++        "<option value=\"Denmark\" selected=\"selected\">Denmark</option>\n<option value=\"&lt;USA&gt;\" disabled=\"disabled\">&lt;USA&gt;</option>\n<option value=\"Sweden\">Sweden</option>",
++        options_for_select([ "Denmark", "<USA>", "Sweden" ], :selected => "Denmark", :disabled => "<USA>")
++      )
++    end
++
+     def test_array_options_for_string_include_in_other_string_bug_fix
+         assert_dom_equal(
+           "<option value=\"ruby\">ruby</option>\n<option value=\"rubyonrails\" selected=\"selected\">rubyonrails</option>",
+@@ -323,7 +361,16 @@ uses_mocha "FormOptionsHelperTest" do
+         select("post", "category", %w( abe <mus> hest ), :selected => 'abe')
+       )
+     end
+-  
++
++    def test_select_with_disabled_value
++      @post = Post.new
++      @post.category = "<mus>"
++      assert_dom_equal(
++        "<select id=\"post_category\" name=\"post[category]\"><option value=\"abe\">abe</option>\n<option value=\"&lt;mus&gt;\" selected=\"selected\">&lt;mus&gt;</option>\n<option value=\"hest\" disabled=\"disabled\">hest</option></select>",
++        select("post", "category", %w( abe <mus> hest ), :disabled => 'hest')
++      )
++    end
++
+     def test_select_with_index_option
+       @album = Album.new
+       @album.id = 1
+@@ -346,33 +393,21 @@ uses_mocha "FormOptionsHelperTest" do
+     end
+ 
+     def test_collection_select
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+ 
+       assert_dom_equal(
+         "<select id=\"post_author_name\" name=\"post[author_name]\"><option value=\"&lt;Abe&gt;\">&lt;Abe&gt;</option>\n<option value=\"Babe\" selected=\"selected\">Babe</option>\n<option value=\"Cabe\">Cabe</option></select>",
+-        collection_select("post", "author_name", @posts, "author_name", "author_name")
++        collection_select("post", "author_name", dummy_posts, "author_name", "author_name")
+       )
+     end
+ 
+     def test_collection_select_under_fields_for
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+ 
+       fields_for :post, @post do |f|
+-        concat f.collection_select(:author_name, @posts, :author_name, :author_name)
++        concat f.collection_select(:author_name, dummy_posts, :author_name, :author_name)
+       end
+     
+       assert_dom_equal(
+@@ -382,17 +417,11 @@ uses_mocha "FormOptionsHelperTest" do
+     end
+ 
+     def test_collection_select_under_fields_for_with_index
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+ 
+       fields_for :post, @post, :index => 815 do |f|
+-        concat f.collection_select(:author_name, @posts, :author_name, :author_name)
++        concat f.collection_select(:author_name, dummy_posts, :author_name, :author_name)
+       end
+ 
+       assert_dom_equal(
+@@ -402,18 +431,12 @@ uses_mocha "FormOptionsHelperTest" do
+     end
+ 
+     def test_collection_select_under_fields_for_with_auto_index
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+       def @post.to_param; 815; end
+ 
+       fields_for "post[]", @post do |f|
+-        concat f.collection_select(:author_name, @posts, :author_name, :author_name)
++        concat f.collection_select(:author_name, dummy_posts, :author_name, :author_name)
+       end
+ 
+       assert_dom_equal(
+@@ -423,69 +446,55 @@ uses_mocha "FormOptionsHelperTest" do
+     end
+ 
+     def test_collection_select_with_blank_and_style
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+ 
+       assert_dom_equal(
+         "<select id=\"post_author_name\" name=\"post[author_name]\" style=\"width: 200px\"><option value=\"\"></option>\n<option value=\"&lt;Abe&gt;\">&lt;Abe&gt;</option>\n<option value=\"Babe\" selected=\"selected\">Babe</option>\n<option value=\"Cabe\">Cabe</option></select>",
+-        collection_select("post", "author_name", @posts, "author_name", "author_name", { :include_blank => true }, "style" => "width: 200px")
++        collection_select("post", "author_name", dummy_posts, "author_name", "author_name", { :include_blank => true }, "style" => "width: 200px")
+       )
+     end
+ 
+     def test_collection_select_with_blank_as_string_and_style
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+ 
+       assert_dom_equal(
+         "<select id=\"post_author_name\" name=\"post[author_name]\" style=\"width: 200px\"><option value=\"\">No Selection</option>\n<option value=\"&lt;Abe&gt;\">&lt;Abe&gt;</option>\n<option value=\"Babe\" selected=\"selected\">Babe</option>\n<option value=\"Cabe\">Cabe</option></select>",
+-        collection_select("post", "author_name", @posts, "author_name", "author_name", { :include_blank => 'No Selection' }, "style" => "width: 200px")
++        collection_select("post", "author_name", dummy_posts, "author_name", "author_name", { :include_blank => 'No Selection' }, "style" => "width: 200px")
+       )
+     end
+ 
+     def test_collection_select_with_multiple_option_appends_array_brackets
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+ 
+       expected = "<select id=\"post_author_name\" name=\"post[author_name][]\" multiple=\"multiple\"><option value=\"\"></option>\n<option value=\"&lt;Abe&gt;\">&lt;Abe&gt;</option>\n<option value=\"Babe\" selected=\"selected\">Babe</option>\n<option value=\"Cabe\">Cabe</option></select>"
+ 
+       # Should suffix default name with [].
+-      assert_dom_equal expected, collection_select("post", "author_name", @posts, "author_name", "author_name", { :include_blank => true }, :multiple => true)
++      assert_dom_equal expected, collection_select("post", "author_name", dummy_posts, "author_name", "author_name", { :include_blank => true }, :multiple => true)
+ 
+       # Shouldn't suffix custom name with [].
+-      assert_dom_equal expected, collection_select("post", "author_name", @posts, "author_name", "author_name", { :include_blank => true, :name => 'post[author_name][]' }, :multiple => true)
++      assert_dom_equal expected, collection_select("post", "author_name", dummy_posts, "author_name", "author_name", { :include_blank => true, :name => 'post[author_name][]' }, :multiple => true)
+     end
+ 
+     def test_collection_select_with_blank_and_selected
+-      @posts = [
+-        Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
+-        Post.new("Babe went home", "Babe", "To a little house", "shh!"),
+-        Post.new("Cabe went home", "Cabe", "To a little house", "shh!")
+-      ]
+-
+       @post = Post.new
+       @post.author_name = "Babe"
+ 
+       assert_dom_equal(
+         %{<select id="post_author_name" name="post[author_name]"><option value=""></option>\n<option value="&lt;Abe&gt;" selected="selected">&lt;Abe&gt;</option>\n<option value="Babe">Babe</option>\n<option value="Cabe">Cabe</option></select>},
+-        collection_select("post", "author_name", @posts, "author_name", "author_name", {:include_blank => true, :selected => "<Abe>"})
++        collection_select("post", "author_name", dummy_posts, "author_name", "author_name", {:include_blank => true, :selected => "<Abe>"})
++      )
++    end
++
++    def test_collection_select_with_disabled
++      @post = Post.new
++      @post.author_name = "Babe"
++
++      assert_dom_equal(
++        "<select id=\"post_author_name\" name=\"post[author_name]\"><option value=\"&lt;Abe&gt;\">&lt;Abe&gt;</option>\n<option value=\"Babe\" selected=\"selected\">Babe</option>\n<option value=\"Cabe\" disabled=\"disabled\">Cabe</option></select>",
++        collection_select("post", "author_name", dummy_posts, "author_name", "author_name", :disabled => 'Cabe')
+       )
+     end
+ 
+@@ -697,6 +706,14 @@ uses_mocha "FormOptionsHelperTest" do
+                      "</select>",
+                      html
+     end
++    
++    private
++        
++      def dummy_posts
++        [ Post.new("<Abe> went home", "<Abe>", "To a little house", "shh!"),
++          Post.new("Babe went home", "Babe", "To a little house", "shh!"),
++          Post.new("Cabe went home", "Cabe", "To a little house", "shh!") ]
++      end
+ 
+   end
+ end
+-- 
+1.5.5.4
+

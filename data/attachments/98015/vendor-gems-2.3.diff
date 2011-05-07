@@ -1,0 +1,564 @@
+From 37c450e12530399d2c711a92e10871ca7b86101f Mon Sep 17 00:00:00 2001
+From: David Dollar <ddollar@gmail.com>
+Date: Tue, 10 Mar 2009 10:44:24 -0400
+Subject: [PATCH] Fixes a lot of brokenness in the gems rake tasks.
+
+  * Fixes the chicken/egg problem present in the current gem system when
+    gems are defined in the config that are not yet installed.
+
+  * Makes the gem system understand development vs. runtime dependencies,
+    removing the need to have hoe as a dependency of your production app.
+
+  * Makes the gem 'unpacking' system a lot less fragile.
+
+  * Significantly cleans up the code associated with the gem system, making
+    it much less opaque.
+
+  * Deprecates the rake tasks gems:install:dependencies and
+    gems:unpack:dependencies. The recursiveness is default in gems:install
+    and gems:unpack now.
+---
+ railties/lib/rails/gem_dependency.rb               |  219 +++++++++++---------
+ railties/lib/rails/vendor_gem_source_index.rb      |    4 +-
+ railties/lib/tasks/gems.rake                       |   85 ++++-----
+ railties/test/gem_dependency_test.rb               |   17 +-
+ .../vendor/gems/dummy-gem-g-1.0.0/.specification   |    2 +-
+ 5 files changed, 172 insertions(+), 155 deletions(-)
+
+diff --git a/railties/lib/rails/gem_dependency.rb b/railties/lib/rails/gem_dependency.rb
+index 2dd6590..fc3e0cd 100644
+--- a/railties/lib/rails/gem_dependency.rb
++++ b/railties/lib/rails/gem_dependency.rb
+@@ -1,3 +1,4 @@
++require 'rails/gem_builder'
+ require 'rails/vendor_gem_source_index'
+ 
+ module Gem
+@@ -7,8 +8,8 @@ module Gem
+ end
+ 
+ module Rails
+-  class GemDependency
+-    attr_accessor :lib, :source
++  class GemDependency < Gem::Dependency
++    attr_accessor :lib, :source, :dep
+ 
+     def self.unpacked_path
+       @unpacked_path ||= File.join(RAILS_ROOT, 'vendor', 'gems')
+@@ -29,18 +30,6 @@ module Rails
+       end
+     end
+ 
+-    def framework_gem?
+-      @@framework_gems.has_key?(name)
+-    end
+-
+-    def vendor_rails?
+-      Gem.loaded_specs.has_key?(name) && Gem.loaded_specs[name].loaded_from.empty?
+-    end
+-
+-    def vendor_gem?
+-      Gem.loaded_specs.has_key?(name) && Gem.loaded_specs[name].loaded_from.include?(self.class.unpacked_path)
+-    end
+-
+     def initialize(name, options = {})
+       require 'rubygems' unless Object.const_defined?(:Gem)
+ 
+@@ -52,10 +41,11 @@ module Rails
+         req = Gem::Requirement.default
+       end
+ 
+-      @dep = Gem::Dependency.new(name, req)
+       @lib      = options[:lib]
+       @source   = options[:source]
+       @loaded   = @frozen = @load_paths_added = false
++
++      super(name, req)
+     end
+ 
+     def add_load_paths
+@@ -65,52 +55,78 @@ module Rails
+         @load_paths_added = @loaded = @frozen = true
+         return
+       end
+-      gem @dep
++      gem self
+       @spec = Gem.loaded_specs[name]
+       @frozen = @spec.loaded_from.include?(self.class.unpacked_path) if @spec
+       @load_paths_added = true
+     rescue Gem::LoadError
+     end
+ 
+-    def dependencies(options = {})
+-      return [] if framework_gem? || specification.nil?
+-
+-      all_dependencies = specification.dependencies.map do |dependency|
++    def dependencies
++      return [] if framework_gem?
++      return [] unless installed?
++      specification.dependencies.reject do |dependency|
++        dependency.type == :development
++      end.map do |dependency|
+         GemDependency.new(dependency.name, :requirement => dependency.version_requirements)
+       end
++    end
+ 
+-      all_dependencies += all_dependencies.map { |d| d.dependencies(options) }.flatten if options[:flatten]
+-      all_dependencies.uniq
++    def specification
++      # code repeated from Gem.activate. Find a matching spec, or the currently loaded version.
++      # error out if loaded version and requested version are incompatible.
++      @spec ||= begin
++        matches = Gem.source_index.search(self)
++        matches << @@framework_gems[name] if framework_gem?
++        if Gem.loaded_specs[name] then
++          # This gem is already loaded.  If the currently loaded gem is not in the
++          # list of candidate gems, then we have a version conflict.
++          existing_spec = Gem.loaded_specs[name]
++          unless matches.any? { |spec| spec.version == existing_spec.version } then
++            raise Gem::Exception,
++                  "can't activate #{@dep}, already activated #{existing_spec.full_name}"
++          end
++          # we're stuck with it, so change to match
++          version_requirements = Gem::Requirement.create("=#{existing_spec.version}")
++          existing_spec
++        else
++          # new load
++          matches.last
++        end
++      end
+     end
+ 
+-    def gem_dir(base_directory)
+-      File.join(base_directory, specification.full_name)
++    def requirement
++      r = version_requirements
++      (r == Gem::Requirement.default) ? nil : r
+     end
+ 
+-    def spec_filename(base_directory)
+-      File.join(gem_dir(base_directory), '.specification')
++    def built?
++      return false unless frozen?
++      specification.extensions.each do |ext|
++        return false unless File.exists?(File.join(unpacked_gem_directory, 
++                                           File.dirname(ext), 'Makefile'))
++      end
++      true
+     end
+ 
+-    def load
+-      return if @loaded || @load_paths_added == false
+-      require(@lib || name) unless @lib == false
+-      @loaded = true
+-    rescue LoadError
+-      puts $!.to_s
+-      $!.backtrace.each { |b| puts b }
++    def framework_gem?
++      @@framework_gems.has_key?(name)
+     end
+ 
+-    def name
+-      @dep.name.to_s
++    def frozen?
++      @frozen ||= vendor_rails? || vendor_gem?
+     end
+ 
+-    def requirement
+-      r = @dep.version_requirements
+-      (r == Gem::Requirement.default) ? nil : r
++    def installed?
++      Gem.loaded_specs.keys.include?(name)
+     end
+ 
+-    def frozen?
+-      @frozen ||= vendor_rails? || vendor_gem?
++    def load_paths_added?
++      # always try to add load paths - even if a gem is loaded, it may not
++      # be a compatible version (ie random_gem 0.4 is loaded and a later spec
++      # needs >= 0.5 - gem 'random_gem' will catch this and error out)
++      @load_paths_added
+     end
+ 
+     def loaded?
+@@ -136,48 +152,49 @@ module Rails
+       end
+     end
+ 
+-    def load_paths_added?
+-      # always try to add load paths - even if a gem is loaded, it may not
+-      # be a compatible version (ie random_gem 0.4 is loaded and a later spec
+-      # needs >= 0.5 - gem 'random_gem' will catch this and error out)
+-      @load_paths_added
++    def vendor_rails?
++      Gem.loaded_specs.has_key?(name) && Gem.loaded_specs[name].loaded_from.empty?
+     end
+ 
+-    def install
+-      cmd = "#{gem_command} #{install_command.join(' ')}"
+-      puts cmd
+-      puts %x(#{cmd})
++    def vendor_gem?
++      specification && File.exists?(unpacked_gem_directory)
+     end
+ 
+-    def unpack_to(directory)
+-      return if specification.nil? || File.directory?(gem_dir(directory)) || framework_gem?
+-
+-      FileUtils.mkdir_p directory
+-      Dir.chdir directory do
+-        Gem::GemRunner.new.run(unpack_command)
++    def build
++      unless built?
++        return unless File.exists?(unpacked_specification_filename)
++        spec = YAML::load_file(unpacked_specification_filename)
++        Rails::GemBuilder.new(spec, unpacked_gem_directory).build_extensions
++        puts "Built gem: '#{unpacked_gem_directory}'"
+       end
+-
+-      # Gem.activate changes the spec - get the original
+-      real_spec = Gem::Specification.load(specification.loaded_from)
+-      write_spec(directory, real_spec)
+-
++      dependencies.each { |dep| dep.build }
+     end
+ 
+-    def write_spec(directory, spec)
+-      # copy the gem's specification into GEMDIR/.specification so that
+-      # we can access information about the gem on deployment systems
+-      # without having the gem installed
+-      File.open(spec_filename(directory), 'w') do |file|
+-        file.puts spec.to_yaml
++    def install
++      unless installed?
++        cmd = "#{gem_command} #{install_command.join(' ')}"
++        puts cmd
++        puts %x(#{cmd})
+       end
++      dependencies.each { |dep| dep.install }
+     end
+ 
+-    def refresh_spec(directory)
++    def load
++      return if @loaded || @load_paths_added == false
++      require(@lib || name) unless @lib == false
++      @loaded = true
++    rescue LoadError
++      puts $!.to_s
++      $!.backtrace.each { |b| puts b }
++    end
++
++    def refresh
++      Rails::VendorGemSourceIndex.silence_spec_warnings = true
+       real_gems = Gem.source_index.installed_source_index
+       exact_dep = Gem::Dependency.new(name, "= #{specification.version}")
+       matches = real_gems.search(exact_dep)
+       installed_spec = matches.first
+-      if File.exist?(File.dirname(spec_filename(directory)))
++      if frozen?
+         if installed_spec
+           # we have a real copy
+           # get a fresh spec - matches should only have one element
+@@ -185,11 +202,11 @@ module Rails
+           # spec is the same as the copy from real_gems - Gem.activate changes
+           # some of the fields
+           real_spec = Gem::Specification.load(matches.first.loaded_from)
+-          write_spec(directory, real_spec)
++          write_specification(real_spec)
+           puts "Reloaded specification for #{name} from installed gems."
+         else
+           # the gem isn't installed locally - write out our current specs
+-          write_spec(directory, specification)
++          write_specification(specification)
+           puts "Gem #{name} not loaded locally - writing out current spec."
+         end
+       else
+@@ -201,40 +218,35 @@ module Rails
+       end
+     end
+ 
+-    def ==(other)
+-      self.name == other.name && self.requirement == other.requirement
++    def unpack
++      unless frozen?
++        FileUtils.mkdir_p unpack_base
++        Dir.chdir unpack_base do
++          Gem::GemRunner.new.run(unpack_command)
++        end
++        # Gem.activate changes the spec - get the original
++        real_spec = Gem::Specification.load(specification.loaded_from)
++        write_specification(real_spec)
++      end
++      dependencies.each { |dep| dep.unpack }
+     end
+-    alias_method :"eql?", :"=="
+ 
+-    def hash
+-      @dep.hash
++    def write_specification(spec)
++      # copy the gem's specification into GEMDIR/.specification so that
++      # we can access information about the gem on deployment systems
++      # without having the gem installed
++      File.open(unpacked_specification_filename, 'w') do |file|
++        file.puts spec.to_yaml
++      end
+     end
+ 
+-    def specification
+-      # code repeated from Gem.activate. Find a matching spec, or the currently loaded version.
+-      # error out if loaded version and requested version are incompatible.
+-      @spec ||= begin
+-        matches = Gem.source_index.search(@dep)
+-        matches << @@framework_gems[name] if framework_gem?
+-        if Gem.loaded_specs[name] then
+-          # This gem is already loaded.  If the currently loaded gem is not in the
+-          # list of candidate gems, then we have a version conflict.
+-          existing_spec = Gem.loaded_specs[name]
+-          unless matches.any? { |spec| spec.version == existing_spec.version } then
+-            raise Gem::Exception,
+-                  "can't activate #{@dep}, already activated #{existing_spec.full_name}"
+-          end
+-          # we're stuck with it, so change to match
+-          @dep.version_requirements = Gem::Requirement.create("=#{existing_spec.version}")
+-          existing_spec
+-        else
+-          # new load
+-          matches.last
+-        end
+-      end
++    def ==(other)
++      self.name == other.name && self.requirement == other.requirement
+     end
++    alias_method :"eql?", :"=="
+ 
+     private
++
+       def gem_command
+         RUBY_PLATFORM =~ /win32/ ? 'gem.bat' : 'gem'
+       end
+@@ -251,5 +263,18 @@ module Rails
+         cmd << "--version" << "= "+specification.version.to_s if requirement
+         cmd
+       end
++
++      def unpack_base
++        Rails::GemDependency.unpacked_path
++      end
++
++      def unpacked_gem_directory
++        File.join(unpack_base, specification.full_name)
++      end
++
++      def unpacked_specification_filename
++        File.join(unpacked_gem_directory, '.specification')
++      end
++
+   end
+ end
+diff --git a/railties/lib/rails/vendor_gem_source_index.rb b/railties/lib/rails/vendor_gem_source_index.rb
+index 5b7721f..b19b891 100644
+--- a/railties/lib/rails/vendor_gem_source_index.rb
++++ b/railties/lib/rails/vendor_gem_source_index.rb
+@@ -54,7 +54,7 @@ module Rails
+               # but it's better than breaking apps. Complain to remind users to get correct specs.
+               # use ActiveSupport::Deprecation.warn, as the logger is not set yet
+               $stderr.puts("config.gem: Unpacked gem #{dir_name} in vendor/gems has a mismatched specification file."+
+-                           " Run 'rake gems:refresh_specs' to fix this.") unless @@silence_spec_warnings
++                           " Run 'rake gems:refresh' to fix this.") unless @@silence_spec_warnings
+               spec.version = dir_version
+             else
+               $stderr.puts("config.gem: Unpacked gem #{dir_name} in vendor/gems is not in a versioned directory"+
+@@ -66,7 +66,7 @@ module Rails
+           # no spec - produced by early-2008 unpack code
+           # emulate old behavior, and complain.
+           $stderr.puts("config.gem: Unpacked gem #{dir_name} in vendor/gems has no specification file."+
+-                       " Run 'rake gems:refresh_specs' to fix this.") unless @@silence_spec_warnings
++                       " Run 'rake gems:refresh' to fix this.") unless @@silence_spec_warnings
+           if dir_version
+             spec = Gem::Specification.new
+             spec.version = dir_version
+diff --git a/railties/lib/tasks/gems.rake b/railties/lib/tasks/gems.rake
+index 0932ba7..81a52b6 100644
+--- a/railties/lib/tasks/gems.rake
++++ b/railties/lib/tasks/gems.rake
+@@ -9,71 +9,60 @@ task :gems => 'gems:base' do
+   puts "R = Framework (loaded before rails starts)"
+ end
+ 
+-def print_gem_status(gem, indent=1)
+-  code = gem.loaded? ? (gem.frozen? ? (gem.framework_gem? ? "R" : "F") : "I") : " "
+-  puts "   "*(indent-1)+" - [#{code}] #{gem.name} #{gem.requirement.to_s}"
+-  gem.dependencies.each { |g| print_gem_status(g, indent+1)} if gem.loaded?
+-end
+-
+ namespace :gems do
+   task :base do
+     $gems_rake_task = true
++    require 'rubygems'
++    require 'rubygems/gem_runner'
+     Rake::Task[:environment].invoke
+   end
+ 
+   desc "Build any native extensions for unpacked gems"
+-  task :build do
+-    $gems_rake_task = true
+-    require 'rails/gem_builder'
+-    Dir[File.join(Rails::GemDependency.unpacked_path, '*')].each do |gem_dir|
+-      spec_file = File.join(gem_dir, '.specification')
+-      next unless File.exists?(spec_file)
+-      specification = YAML::load_file(spec_file)
+-      next unless ENV['GEM'].blank? || ENV['GEM'] == specification.name
+-      Rails::GemBuilder.new(specification, gem_dir).build_extensions
+-      puts "Built gem: '#{gem_dir}'"
+-    end
++  task :build => :unpack do
++    Rails.configuration.gems.each { |gem| gem.build }
+   end
+ 
+-  desc "Installs all required gems for this application."
++  desc "Installs all required gems."
+   task :install => :base do
+-    require 'rubygems'
+-    require 'rubygems/gem_runner'
+-    Rails.configuration.gems.each { |gem| gem.install unless gem.loaded? }
++    Rails.configuration.gems.each { |gem| gem.install }
+   end
+ 
+-  desc "Unpacks the specified gem into vendor/gems."
+-  task :unpack => :base do
+-    require 'rubygems'
+-    require 'rubygems/gem_runner'
+-    Rails.configuration.gems.each do |gem|
+-      next unless ENV['GEM'].blank? || ENV['GEM'] == gem.name
+-      gem.unpack_to(Rails::GemDependency.unpacked_path)
++  desc "Unpacks all required gems into vendor/gems."
++  task :unpack => :install do
++    Rails.configuration.gems.each { |gem| gem.unpack }
++  end
++
++  desc "Regenerate gem specifications in correct format."
++  task :refresh => :base do
++    Rails.configuration.gems.each { |gem| gem.refresh }
++  end
++
++  # deprecated
++  namespace :install do
++    task :dependencies do
++      puts "DEPRECATED: gems:install:dependencies is no longer necessary."
++      puts "  Use gems:install instead."
++      Rake::Task['gems:install'].invoke
+     end
+   end
+ 
++  # deprecated
+   namespace :unpack do
+-    desc "Unpacks the specified gems and its dependencies into vendor/gems"
+-    task :dependencies => :unpack do
+-      require 'rubygems'
+-      require 'rubygems/gem_runner'
+-      Rails.configuration.gems.each do |gem|
+-        next unless ENV['GEM'].blank? || ENV['GEM'] == gem.name
+-        gem.dependencies(:flatten => true).each do |dependency|
+-          dependency.unpack_to(Rails::GemDependency.unpacked_path)
+-        end
+-      end
++    task :dependencies do
++      puts "DEPRECATED: gems:unpack:dependencies is no longer necessary."
++      puts "  Use gems:unpack instead."
++      Rake::Task['gems:unpack'].invoke
+     end
+   end
++end
+ 
+-  desc "Regenerate gem specifications in correct format."
+-  task :refresh_specs => :base do
+-    require 'rubygems'
+-    require 'rubygems/gem_runner'
+-    Rails::VendorGemSourceIndex.silence_spec_warnings = true
+-    Rails.configuration.gems.each do |gem|
+-      next unless gem.frozen? && (ENV['GEM'].blank? || ENV['GEM'] == gem.name)
+-      gem.refresh_spec(Rails::GemDependency.unpacked_path) if gem.loaded?
+-    end
++def print_gem_status(gem, indent=1)
++  code = case
++    when gem.framework_gem? then 'R'
++    when gem.frozen?        then 'F'
++    when gem.installed?     then 'I'
++    else                         ' '
+   end
+-end
+\ No newline at end of file
++  puts "   "*(indent-1)+" - [#{code}] #{gem.name} #{gem.requirement.to_s}"
++  gem.dependencies.each { |g| print_gem_status(g, indent+1) }
++end
+diff --git a/railties/test/gem_dependency_test.rb b/railties/test/gem_dependency_test.rb
+index 8b761c4..189ad02 100644
+--- a/railties/test/gem_dependency_test.rb
++++ b/railties/test/gem_dependency_test.rb
+@@ -46,31 +46,34 @@ class GemDependencyTest < Test::Unit::TestCase
+   end
+ 
+   def test_gem_adds_load_paths
+-    @gem.expects(:gem).with(Gem::Dependency.new(@gem.name, nil))
++    @gem.expects(:gem).with(@gem)
+     @gem.add_load_paths
+   end
+ 
+   def test_gem_with_version_adds_load_paths
+-    @gem_with_version.expects(:gem).with(Gem::Dependency.new(@gem_with_version.name, @gem_with_version.requirement.to_s))
++    @gem_with_version.expects(:gem).with(@gem_with_version)
+     @gem_with_version.add_load_paths
++    assert @gem_with_version.load_paths_added?
+   end
+ 
+   def test_gem_loading
+-    @gem.expects(:gem).with(Gem::Dependency.new(@gem.name, nil))
++    @gem.expects(:gem).with(@gem)
+     @gem.expects(:require).with(@gem.name)
+     @gem.add_load_paths
+     @gem.load
++    assert @gem.loaded?
+   end
+ 
+   def test_gem_with_lib_loading
+-    @gem_with_lib.expects(:gem).with(Gem::Dependency.new(@gem_with_lib.name, nil))
++    @gem_with_lib.expects(:gem).with(@gem_with_lib)
+     @gem_with_lib.expects(:require).with(@gem_with_lib.lib)
+     @gem_with_lib.add_load_paths
+     @gem_with_lib.load
++    assert @gem_with_lib.loaded?
+   end
+ 
+   def test_gem_without_lib_loading
+-    @gem_without_load.expects(:gem).with(Gem::Dependency.new(@gem_without_load.name, nil))
++    @gem_without_load.expects(:gem).with(@gem_without_load)
+     @gem_without_load.expects(:require).with(@gem_without_load.lib).never
+     @gem_without_load.add_load_paths
+     @gem_without_load.load
+@@ -132,8 +135,8 @@ class GemDependencyTest < Test::Unit::TestCase
+     dummy_gem = Rails::GemDependency.new "dummy-gem-g"
+     dummy_gem.add_load_paths
+     dummy_gem.load
+-    assert dummy_gem.loaded?
+-    assert_equal 2, dummy_gem.dependencies(:flatten => true).size
++    assert_equal 1, dummy_gem.dependencies.size
++    assert_equal 1, dummy_gem.dependencies.first.dependencies.size
+     assert_nothing_raised do
+       dummy_gem.dependencies.each do |g|
+         g.dependencies
+diff --git a/railties/test/vendor/gems/dummy-gem-g-1.0.0/.specification b/railties/test/vendor/gems/dummy-gem-g-1.0.0/.specification
+index 5483048..27e2991 100644
+--- a/railties/test/vendor/gems/dummy-gem-g-1.0.0/.specification
++++ b/railties/test/vendor/gems/dummy-gem-g-1.0.0/.specification
+@@ -9,7 +9,7 @@ date: 2008-10-03 00:00:00 -04:00
+ dependencies:
+ - !ruby/object:Gem::Dependency
+   name: dummy-gem-f
+-  type: :development
++  type: :runtime
+   version_requirement:
+   version_requirements: !ruby/object:Gem::Requirement
+     requirements:
+-- 
+1.6.0.4
+

@@ -1,0 +1,737 @@
+From beba653b94337644805ffaeabec8a48c0d436d2e Mon Sep 17 00:00:00 2001
+From: Elad Meidar <elad@eizesus.com>
+Date: Sun, 25 Oct 2009 00:14:38 -0400
+Subject: [PATCH] Added FormBuilder#current_child_index to enable access to current child index while iterating over a nested attributes collection
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb  |   14 ++++++++++++--
+ .../fixtures/layout_tests/abs_path_layout.rhtml    |    1 +
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+ create mode 100644 actionpack/test/fixtures/layout_tests/abs_path_layout.rhtml
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 0e097e6..8d98734 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -924,7 +924,7 @@ module ActionView
+       class_inheritable_accessor :field_helpers
+       self.field_helpers = (FormHelper.instance_methods - ['form_for'])
+ 
+-      attr_accessor :object_name, :object, :options
++      attr_accessor :object_name, :object, :options, :association_name
+ 
+       def initialize(object_name, object, template, options, proc)
+         @nested_child_index = {}
+@@ -1011,6 +1011,10 @@ module ActionView
+         @template.submit_tag(value, options.reverse_merge(:id => "#{object_name}_submit"))
+       end
+ 
++      def current_child_index(name = self.association_name)
++        unobtrusive_nested_child_index(name)
++      end
++      
+       private
+         def objectify_options(options)
+           @default_options.merge(options.merge(:object => @object))
+@@ -1021,6 +1025,8 @@ module ActionView
+         end
+ 
+         def fields_for_with_nested_attributes(association_name, args, block)
++          
++          self.association_name = association_name
+           name = "#{object_name}[#{association_name}_attributes]"
+           association = args.first
+ 
+@@ -1050,7 +1056,11 @@ module ActionView
+             end
+           end
+         end
+-
++        
++        def unobtrusive_nested_child_index(name)
++          @nested_child_index[name] || 0
++        end
++        
+         def nested_child_index(name)
+           @nested_child_index[name] ||= -1
+           @nested_child_index[name] += 1
+diff --git a/actionpack/test/fixtures/layout_tests/abs_path_layout.rhtml b/actionpack/test/fixtures/layout_tests/abs_path_layout.rhtml
+new file mode 100644
+index 0000000..8ba6e70
+--- /dev/null
++++ b/actionpack/test/fixtures/layout_tests/abs_path_layout.rhtml
+@@ -0,0 +1 @@
++abs_path_layout.rhtml <%= yield %>
+\ No newline at end of file
+-- 
+1.6.0.2
+
+
+From 51c45842fb63b7d1eb456d95fd39fe5ef343bd01 Mon Sep 17 00:00:00 2001
+From: Elad Meidar <elad@eizesus.com>
+Date: Sun, 25 Oct 2009 19:28:17 -0400
+Subject: [PATCH] FormBuilder#current_child_index tests and fixes
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb |   59 +++-
+ actionpack/test/template/form_helper_test.rb      |  360 ++++++++++++++++++++-
+ 2 files changed, 402 insertions(+), 17 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 8d98734..523093d 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -90,6 +90,7 @@ module ActionView
+     # link:classes/ActionView/Helpers/DateHelper.html, and
+     # link:classes/ActionView/Helpers/ActiveRecordHelper.html
+     module FormHelper
++      
+       # Creates a form and a scope around a specific model object that is used
+       # as a base for questioning about values for the fields.
+       #
+@@ -485,7 +486,7 @@ module ActionView
+       def fields_for(record_or_name_or_array, *args, &block)
+         raise ArgumentError, "Missing block" unless block_given?
+         options = args.extract_options!
+-
++        
+         case record_or_name_or_array
+         when String, Symbol
+           object_name = record_or_name_or_array
+@@ -496,6 +497,17 @@ module ActionView
+         end
+ 
+         builder = options[:builder] || ActionView::Base.default_form_builder
++        
++        if args.last.is_a?(Hash)
++          if args.last.has_key?(:current_child_index)
++            options.merge({:current_child_index => args.last[:current_child_index]})
++          elsif args.last.has_key?(:index)
++            options.merge({:current_child_index => args.last[:index]})
++          else
++            options.merge({:current_child_index => 0})
++          end
++        end
++        
+         yield builder.new(object_name, object, self, options, block)
+       end
+ 
+@@ -924,12 +936,17 @@ module ActionView
+       class_inheritable_accessor :field_helpers
+       self.field_helpers = (FormHelper.instance_methods - ['form_for'])
+ 
+-      attr_accessor :object_name, :object, :options, :association_name
++      attr_accessor :object_name, :object, :options, :current_nested_child_index
+ 
+       def initialize(object_name, object, template, options, proc)
+         @nested_child_index = {}
+         @object_name, @object, @template, @options, @proc = object_name, object, template, options, proc
+         @default_options = @options ? @options.slice(:index) : {}
++        
++        if options.has_key?(:current_child_index)
++          self.current_nested_child_index = options[:current_child_index]
++        end
++        
+         if @object_name.to_s.match(/\[\]$/)
+           if object ||= @template.instance_variable_get("@#{Regexp.last_match.pre_match}") and object.respond_to?(:to_param)
+             @auto_index = object.to_param
+@@ -953,20 +970,23 @@ module ActionView
+       end
+ 
+       def fields_for(record_or_name_or_array, *args, &block)
++        
+         if options.has_key?(:index)
+           index = "[#{options[:index]}]"
++          self.current_nested_child_index = options[:index]
+         elsif defined?(@auto_index)
+           self.object_name = @object_name.to_s.sub(/\[\]$/,"")
+           index = "[#{@auto_index}]"
++          self.current_nested_child_index = @auto_index
+         else
+           index = ""
+         end
+-
++        
+         if options[:builder]
+           args << {} unless args.last.is_a?(Hash)
+           args.last[:builder] ||= options[:builder]
+         end
+-
++        
+         case record_or_name_or_array
+         when String, Symbol
+           if nested_attributes_association?(record_or_name_or_array)
+@@ -983,7 +1003,6 @@ module ActionView
+           name = "#{object_name}#{index}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
+           args.unshift(object)
+         end
+-
+         @template.fields_for(name, *args, &block)
+       end
+ 
+@@ -1011,8 +1030,8 @@ module ActionView
+         @template.submit_tag(value, options.reverse_merge(:id => "#{object_name}_submit"))
+       end
+ 
+-      def current_child_index(name = self.association_name)
+-        unobtrusive_nested_child_index(name)
++      def current_child_index
++        self.current_nested_child_index || 0
+       end
+       
+       private
+@@ -1026,7 +1045,6 @@ module ActionView
+ 
+         def fields_for_with_nested_attributes(association_name, args, block)
+           
+-          self.association_name = association_name
+           name = "#{object_name}[#{association_name}_attributes]"
+           association = args.first
+ 
+@@ -1037,33 +1055,46 @@ module ActionView
+           end
+ 
+           if association.is_a?(Array)
++            
+             explicit_child_index = args.last[:child_index] if args.last.is_a?(Hash)
+             association.map do |child|
+-              fields_for_nested_model("#{name}[#{explicit_child_index || nested_child_index(name)}]", child, args, block)
++              self.current_nested_child_index = explicit_child_index || nested_child_index(name)
++              args << {:current_child_index => self.current_nested_child_index}
++              fields_for_nested_model("#{name}[#{self.current_nested_child_index}]", child, args, block)
+             end.join
+           elsif association
++            
+             fields_for_nested_model(name, association, args, block)
+           end
+         end
+ 
+         def fields_for_nested_model(name, object, args, block)
++          
+           if object.new_record?
+             @template.fields_for(name, object, *args, &block)
+           else
+             @template.fields_for(name, object, *args) do |builder|
++              
++              if args.last.is_a?(Hash)
++                if args.last.has_key?(:current_child_index)
++                  builder.current_nested_child_index = args.last[:current_child_index]
++                elsif args.last.has_key?(:index)
++                  builder.current_nested_child_index = args.last[:index]
++                else
++                  builder.current_nested_child_index = 0
++                end
++              end
++              
+               @template.concat builder.hidden_field(:id)
+               block.call(builder)
+             end
+           end
+         end
+-        
+-        def unobtrusive_nested_child_index(name)
+-          @nested_child_index[name] || 0
+-        end
+-        
++                
+         def nested_child_index(name)
+           @nested_child_index[name] ||= -1
+           @nested_child_index[name] += 1
++          self.current_nested_child_index = @nested_child_index[name]
+         end
+     end
+   end
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 41e1583..0a72a88 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -534,6 +534,22 @@ class FormHelperTest < ActionView::TestCase
+ 
+     assert_dom_equal expected, output_buffer
+   end
++  
++  def test_nested_fields_for_with_child_index
++    form_for(:post, @post) do |f|
++      f.fields_for(:comment, @post) do |c|
++        concat c.text_field(:title)
++        concat "<div>" + c.current_child_index.to_s + "</div>"
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[comment][title]' size='30' type='text' id='post_comment_title' value='Hello World' />" +
++               "<div>0</div>" +
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
+ 
+   def test_nested_fields_for_with_nested_collections
+     form_for('post[]', @post) do |f|
+@@ -551,6 +567,24 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_nested_collections_and_child_index
++    form_for('post[]', @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for('comment[]', @comment) do |c|
++        concat c.text_field(:name)
++        concat "<div>" + c.current_child_index.to_s + "</div>" 
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[123][title]' size='30' type='text' id='post_123_title' value='Hello World' />" +
++               "<input name='post[123][comment][][name]' size='30' type='text' id='post_123_comment__name' value='new comment' />" +
++               "<div>0</div>" +
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_with_index_and_parent_fields
+     form_for('post', @post, :index => 1) do |c|
+       concat c.text_field(:title)
+@@ -567,6 +601,24 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_index_and_parent_fields_and_child_index
++    form_for('post', @post, :index => 1) do |c|
++      concat c.text_field(:title)
++      c.fields_for('comment', @comment, :index => 1) do |r|
++        concat r.text_field(:name)
++        concat "<div>" + c.current_child_index.to_s + "</div>" 
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[1][title]' size='30' type='text' id='post_1_title' value='Hello World' />" +
++               "<input name='post[1][comment][1][name]' size='30' type='text' id='post_1_comment_1_name' value='new comment' />" +
++               "<div>1</div>"
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_form_for_with_index_and_nested_fields_for
+     form_for(:post, @post, :index => 1) do |f|
+       f.fields_for(:comment, @post) do |c|
+@@ -581,6 +633,22 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_form_for_with_index_and_nested_fields_for_and_child_index
++    form_for(:post, @post, :index => 1) do |f|
++      f.fields_for(:comment, @post) do |c|
++        concat c.text_field(:title)
++        concat "<div class='child_index'>#{c.current_child_index}</div>"
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[1][comment][title]' size='30' type='text' id='post_1_comment_title' value='Hello World' />" +
++               "<div class='child_index'>0</div>" + 
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_with_index_on_both
+     form_for(:post, @post, :index => 1) do |f|
+       f.fields_for(:comment, @post, :index => 5) do |c|
+@@ -595,6 +663,22 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_index_on_both_and_child_index
++    form_for(:post, @post, :index => 1) do |f|
++      f.fields_for(:comment, @post, :index => 5) do |c|
++        concat c.text_field(:title)
++        concat "<div>" + c.current_child_index.to_s + "</div>" 
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[1][comment][5][title]' size='30' type='text' id='post_1_comment_5_title' value='Hello World' />" +
++               "<div>0</div>"
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_with_auto_index
+     form_for("post[]", @post) do |f|
+       f.fields_for(:comment, @post) do |c|
+@@ -729,6 +813,33 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_existing_records_on_a_nested_attributes_collection_association_with_child_index
++    @post.comments = Array.new(2) { |id| Comment.new(id + 1) }
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      @post.comments.each do |comment|
++        f.fields_for(:comments, comment) do |cf|
++          concat cf.text_field(:name)
++          concat "<div>" + cf.current_child_index.to_s + "</div>"
++        end
++      end
++    end
++    
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_0_id" name="post[comments_attributes][0][id]" type="hidden" value="1" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #1" />' +
++               "<div>0</div>" +
++               '<input id="post_comments_attributes_1_id" name="post[comments_attributes][1][id]" type="hidden" value="2" />' +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="comment #2" />' +
++               "<div>1</div>"
++               '</form>'
++
++    
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_with_new_records_on_a_nested_attributes_collection_association
+     @post.comments = [Comment.new, Comment.new]
+ 
+@@ -750,9 +861,34 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_new_records_on_a_nested_attributes_collection_association_with_child_index
++    @post.comments = [Comment.new, Comment.new]
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      @post.comments.each do |comment|
++        f.fields_for(:comments, comment) do |cf|
++          concat cf.text_field(:name)
++          concat "<div>#{cf.current_child_index}</div>"
++        end
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="new comment" />' +
++               "<div>0</div>" +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="new comment" />' +
++               "<div>1</div>" +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_with_existing_and_new_records_on_a_nested_attributes_collection_association
+     @post.comments = [Comment.new(321), Comment.new]
+ 
++    
+     form_for(:post, @post) do |f|
+       concat f.text_field(:title)
+       @post.comments.each do |comment|
+@@ -762,16 +898,44 @@ class FormHelperTest < ActionView::TestCase
+       end
+     end
+ 
++
+     expected = '<form action="http://www.example.com" method="post">' +
+                '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
+                '<input id="post_comments_attributes_0_id" name="post[comments_attributes][0][id]" type="hidden" value="321" />' +
+                '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #321" />' +
+                '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="new comment" />' +
+                '</form>'
+-
++                              
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_existing_and_new_records_on_a_nested_attributes_collection_association_with_child_index
++    @post.comments = [Comment.new(321), Comment.new]
++
++    
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      @post.comments.each do |comment|
++        f.fields_for(:comments, comment) do |cf|
++          concat cf.text_field(:name)
++          concat "<div>#{cf.current_child_index}</div>"
++        end
++      end
++    end
++
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_0_id" name="post[comments_attributes][0][id]" type="hidden" value="321" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #321" />' +
++               "<div>0</div>" +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="new comment" />' +
++               "<div>1</div>" +
++               '</form>'
++                              
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_with_an_empty_supplied_attributes_collection
+     form_for(:post, @post) do |f|
+       concat f.text_field(:title)
+@@ -787,6 +951,22 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_an_empty_supplied_attributes_collection_with_child_index
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for(:comments, []) do |cf|
++        concat cf.text_field(:name)
++        concat "<div>#{cf.current_child_index}</div>"
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_with_existing_records_on_a_supplied_nested_attributes_collection
+     @post.comments = Array.new(2) { |id| Comment.new(id + 1) }
+ 
+@@ -808,6 +988,30 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_existing_records_on_a_supplied_nested_attributes_collection_with_child_index
++    @post.comments = Array.new(2) { |id| Comment.new(id + 1) }
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for(:comments, @post.comments) do |cf|
++        concat cf.text_field(:name)
++        concat "<div>#{cf.current_child_index}</div>"
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_0_id" name="post[comments_attributes][0][id]" type="hidden" value="1" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #1" />' +
++               "<div>0</div>" +
++               '<input id="post_comments_attributes_1_id" name="post[comments_attributes][1][id]" type="hidden" value="2" />' +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="comment #2" />' +
++               "<div>1</div>" +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_for_on_a_nested_attributes_collection_association_yields_only_builder
+     @post.comments = [Comment.new(321), Comment.new]
+     yielded_comments = []
+@@ -831,6 +1035,32 @@ class FormHelperTest < ActionView::TestCase
+     assert_equal yielded_comments, @post.comments
+   end
+ 
++  def test_nested_fields_for_on_a_nested_attributes_collection_association_yields_only_builder_with_child_index
++    @post.comments = [Comment.new(321), Comment.new]
++    yielded_comments = []
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for(:comments) do |cf|
++        concat cf.text_field(:name)
++        concat "<div>#{cf.current_child_index}</div>"
++        yielded_comments << cf.object
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_0_id" name="post[comments_attributes][0][id]" type="hidden" value="321" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #321" />' +
++               "<div>0</div>" +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="new comment" />' +
++               "<div>1</div>" +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++    assert_equal yielded_comments, @post.comments
++  end
++  
+   def test_nested_fields_for_with_child_index_option_override_on_a_nested_attributes_collection_association
+     @post.comments = []
+ 
+@@ -848,6 +1078,25 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_child_index_option_override_on_a_nested_attributes_collection_association_with_child_index
++    @post.comments = []
++
++    form_for(:post, @post) do |f|
++      f.fields_for(:comments, Comment.new(321), :child_index => 'abc') do |cf|
++        concat cf.text_field(:name)
++        concat "<div>#{cf.current_child_index}</div>"
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input id="post_comments_attributes_abc_id" name="post[comments_attributes][abc][id]" type="hidden" value="321" />' +
++               '<input id="post_comments_attributes_abc_name" name="post[comments_attributes][abc][name]" size="30" type="text" value="comment #321" />' +
++               "<div>abc</div>"
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_nested_fields_uses_unique_indices_for_different_collection_associations
+     @post.comments = [Comment.new(321)]
+     @post.tags = [Tag.new(123), Tag.new(456)]
+@@ -893,6 +1142,57 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_uses_unique_indices_for_different_collection_associations_with_child_index
++    @post.comments = [Comment.new(321)]
++    @post.tags = [Tag.new(123), Tag.new(456)]
++    @post.comments[0].relevances = []
++    @post.tags[0].relevances = []
++    @post.tags[1].relevances = []
++    form_for(:post, @post) do |f|
++      f.fields_for(:comments, @post.comments[0]) do |cf|
++        concat cf.text_field(:name)
++        cf.fields_for(:relevances, CommentRelevance.new(314)) do |crf|
++          concat crf.text_field(:value)
++          concat "<div>#{crf.current_child_index}</div>"
++        end
++      end
++      f.fields_for(:tags, @post.tags[0]) do |tf|
++        concat tf.text_field(:value)
++        tf.fields_for(:relevances, TagRelevance.new(3141)) do |trf|
++          concat trf.text_field(:value)
++          concat "<div>#{trf.current_child_index}</div>"
++        end
++      end
++      f.fields_for('tags', @post.tags[1]) do |tf|
++        concat tf.text_field(:value)
++        tf.fields_for(:relevances, TagRelevance.new(31415)) do |trf|
++          concat trf.text_field(:value)
++          concat "<div>#{trf.current_child_index}</div>"
++        end
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input id="post_comments_attributes_0_id" name="post[comments_attributes][0][id]" type="hidden" value="321" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #321" />' +
++               '<input id="post_comments_attributes_0_relevances_attributes_0_id" name="post[comments_attributes][0][relevances_attributes][0][id]" type="hidden" value="314" />' +
++               '<input id="post_comments_attributes_0_relevances_attributes_0_value" name="post[comments_attributes][0][relevances_attributes][0][value]" size="30" type="text" value="commentrelevance #314" />' +
++               "<div>0</div>" +
++               '<input id="post_tags_attributes_0_id" name="post[tags_attributes][0][id]" type="hidden" value="123" />' +
++               '<input id="post_tags_attributes_0_value" name="post[tags_attributes][0][value]" size="30" type="text" value="tag #123" />' +
++               '<input id="post_tags_attributes_0_relevances_attributes_0_id" name="post[tags_attributes][0][relevances_attributes][0][id]" type="hidden" value="3141" />' +
++               '<input id="post_tags_attributes_0_relevances_attributes_0_value" name="post[tags_attributes][0][relevances_attributes][0][value]" size="30" type="text" value="tagrelevance #3141" />' +
++               "<div>0</div>" +
++               '<input id="post_tags_attributes_1_id" name="post[tags_attributes][1][id]" type="hidden" value="456" />' +
++               '<input id="post_tags_attributes_1_value" name="post[tags_attributes][1][value]" size="30" type="text" value="tag #456" />' +
++               '<input id="post_tags_attributes_1_relevances_attributes_0_id" name="post[tags_attributes][1][relevances_attributes][0][id]" type="hidden" value="31415" />' +
++               '<input id="post_tags_attributes_1_relevances_attributes_0_value" name="post[tags_attributes][1][relevances_attributes][0][value]" size="30" type="text" value="tagrelevance #31415" />' +
++               "<div>0</div>" +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_fields_for
+     fields_for(:post, @post) do |f|
+       concat f.text_field(:title)
+@@ -909,6 +1209,24 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_fields_for_with_child_index
++    fields_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      concat f.text_area(:body)
++      concat f.check_box(:secret)
++      concat "<div>#{f.current_child_index}</div>"
++    end
++
++    expected =
++      "<input name='post[title]' size='30' type='text' id='post_title' value='Hello World' />" +
++      "<textarea name='post[body]' id='post_body' rows='20' cols='40'>Back to the hill and over it again!</textarea>" +
++      "<input name='post[secret]' type='hidden' value='0' />" +
++      "<input name='post[secret]' checked='checked' type='checkbox' id='post_secret' value='1' />" +
++      "<div>0</div>"
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_fields_for_with_index
+     fields_for("post[]", @post) do |f|
+       concat f.text_field(:title)
+@@ -920,11 +1238,29 @@ class FormHelperTest < ActionView::TestCase
+       "<input name='post[123][title]' size='30' type='text' id='post_123_title' value='Hello World' />" +
+       "<textarea name='post[123][body]' id='post_123_body' rows='20' cols='40'>Back to the hill and over it again!</textarea>" +
+       "<input name='post[123][secret]' type='hidden' value='0' />" +
+-      "<input name='post[123][secret]' checked='checked' type='checkbox' id='post_123_secret' value='1' />"
+-
++      "<input name='post[123][secret]' checked='checked' type='checkbox' id='post_123_secret' value='1' />" 
++      
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_fields_for_with_index_and_child_index
++    fields_for("post[]", @post) do |f|
++      concat f.text_field(:title)
++      concat f.text_area(:body)
++      concat f.check_box(:secret)
++      concat "<div>#{f.current_child_index}</div>"
++    end
++
++    expected =
++      "<input name='post[123][title]' size='30' type='text' id='post_123_title' value='Hello World' />" +
++      "<textarea name='post[123][body]' id='post_123_body' rows='20' cols='40'>Back to the hill and over it again!</textarea>" +
++      "<input name='post[123][secret]' type='hidden' value='0' />" +
++      "<input name='post[123][secret]' checked='checked' type='checkbox' id='post_123_secret' value='1' />" +
++      "<div>0</div>"
++      
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_fields_for_with_nil_index_option_override
+     fields_for("post[]", @post, :index => nil) do |f|
+       concat f.text_field(:title)
+@@ -941,6 +1277,24 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_fields_for_with_nil_index_option_override_and_child_index
++    fields_for("post[]", @post, :index => nil) do |f|
++      concat f.text_field(:title)
++      concat f.text_area(:body)
++      concat f.check_box(:secret)
++      concat "<div>#{f.current_child_index}</div>"
++    end
++
++    expected =
++      "<input name='post[][title]' size='30' type='text' id='post__title' value='Hello World' />" +
++      "<textarea name='post[][body]' id='post__body' rows='20' cols='40'>Back to the hill and over it again!</textarea>" +
++      "<input name='post[][secret]' type='hidden' value='0' />" +
++      "<input name='post[][secret]' checked='checked' type='checkbox' id='post__secret' value='1' />" +
++      "<div>0</div>"
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_fields_for_with_index_option_override
+     fields_for("post[]", @post, :index => "abc") do |f|
+       concat f.text_field(:title)
+-- 
+1.6.0.2
+

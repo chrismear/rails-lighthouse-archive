@@ -1,0 +1,243 @@
+From bf712e648e57807b3fdd159cd09eaf75c0d134c1 Mon Sep 17 00:00:00 2001
+From: Fred Wu <ifredwu@gmail.com>
+Date: Wed, 25 Aug 2010 08:24:37 +1000
+Subject: [PATCH] Added ':model_callbacks' and ':validate_callbacks' options. model_callbacks option triggers callbacks on :save, :update, :destroy and :touch, and validate_callbacks option triggers varies validation callbacks. These options by default are set to true, so that backward compatibility is maintained.
+
+---
+ activemodel/lib/active_model/validations.rb        |   12 ++++--
+ .../lib/active_model/validations/callbacks.rb      |    4 +-
+ activerecord/lib/active_record/callbacks.rb        |   30 ++++++++++-----
+ activerecord/lib/active_record/persistence.rb      |   12 +++---
+ activerecord/lib/active_record/validations.rb      |    7 ++--
+ activerecord/test/cases/callbacks_test.rb          |   39 ++++++++++++++++++++
+ 6 files changed, 79 insertions(+), 25 deletions(-)
+
+diff --git a/activemodel/lib/active_model/validations.rb b/activemodel/lib/active_model/validations.rb
+index cd37925..9e57233 100644
+--- a/activemodel/lib/active_model/validations.rb
++++ b/activemodel/lib/active_model/validations.rb
+@@ -161,10 +161,10 @@ module ActiveModel
+     # Runs all the specified validations and returns true if no errors were added
+     # otherwise false. Context can optionally be supplied to define which callbacks
+     # to test against (the context is defined on the validations using :on).
+-    def valid?(context = nil)
++    def valid?(context = nil, options={})
+       current_context, self.validation_context = validation_context, context
+       errors.clear
+-      run_validations!
++      run_validations!(options)
+     ensure
+       self.validation_context = current_context
+     end
+@@ -196,10 +196,14 @@ module ActiveModel
+ 
+   protected
+ 
+-    def run_validations!
+-      _run_validate_callbacks
++    def run_validations!(options={})
++      _run_validate_callbacks if perform_callbacks?(options)
+       errors.empty?
+     end
++
++    def perform_callbacks?(options={})
++      options.key?(:validate_callbacks) ? !!options[:validate_callbacks] : true
++    end
+   end
+ end
+ 
+diff --git a/activemodel/lib/active_model/validations/callbacks.rb b/activemodel/lib/active_model/validations/callbacks.rb
+index 621518d..230eacd 100644
+--- a/activemodel/lib/active_model/validations/callbacks.rb
++++ b/activemodel/lib/active_model/validations/callbacks.rb
+@@ -49,8 +49,8 @@ module ActiveModel
+     protected
+ 
+       # Overwrite run validations to include callbacks.
+-      def run_validations!
+-        _run_validation_callbacks { super }
++      def run_validations!(options={})
++        perform_callbacks?(options) ? _run_validation_callbacks { super } : super
+       end
+     end
+   end
+diff --git a/activerecord/lib/active_record/callbacks.rb b/activerecord/lib/active_record/callbacks.rb
+index a31973d..6c80cb2 100644
+--- a/activerecord/lib/active_record/callbacks.rb
++++ b/activerecord/lib/active_record/callbacks.rb
+@@ -256,12 +256,16 @@ module ActiveRecord
+       end
+     end
+ 
+-    def destroy #:nodoc:
+-      _run_destroy_callbacks { super }
++    def save(*args)
++      super
+     end
+ 
+-    def touch(*) #:nodoc:
+-      _run_touch_callbacks { super }
++    def destroy(options={}) #:nodoc:
++      perform_model_callbacks?(options) ? _run_destroy_callbacks { super() } : super()
++    end
++
++    def touch(options={}) #:nodoc:
++      perform_model_callbacks?(options) ? _run_touch_callbacks { super() } : super()
+     end
+ 
+     def deprecated_callback_method(symbol) #:nodoc:
+@@ -271,18 +275,24 @@ module ActiveRecord
+       end
+     end
+ 
++  protected
++
++    def perform_model_callbacks?(options={})
++      options.key?(:model_callbacks) ? !!options[:model_callbacks] : true
++    end
++
+   private
+ 
+-    def create_or_update #:nodoc:
+-      _run_save_callbacks { super }
++    def create_or_update(options={}) #:nodoc:
++      perform_model_callbacks?(options) ? _run_save_callbacks { super() } : super()
+     end
+ 
+-    def create #:nodoc:
+-      _run_create_callbacks { super }
++    def create(options={}) #:nodoc:
++      perform_model_callbacks?(options) ? _run_create_callbacks { super() } : super()
+     end
+ 
+-    def update(*) #:nodoc:
+-      _run_update_callbacks { super }
++    def update(attribute_names = @attributes.keys, options={}) #:nodoc:
++      perform_model_callbacks?(options) ? _run_update_callbacks { super(attribute_names) } : super(attribute_names)
+     end
+   end
+ end
+diff --git a/activerecord/lib/active_record/persistence.rb b/activerecord/lib/active_record/persistence.rb
+index c5c40d1..7e57df2 100644
+--- a/activerecord/lib/active_record/persistence.rb
++++ b/activerecord/lib/active_record/persistence.rb
+@@ -35,8 +35,8 @@ module ActiveRecord
+     # <tt>before_*</tt> callbacks return +false+ the action is cancelled and
+     # +save+ returns +false+. See ActiveRecord::Callbacks for further
+     # details.
+-    def save(*)
+-      create_or_update
++    def save(*args)
++      create_or_update(*args)
+     end
+ 
+     # Saves the model.
+@@ -52,8 +52,8 @@ module ActiveRecord
+     # the <tt>before_*</tt> callbacks return +false+ the action is cancelled
+     # and <tt>save!</tt> raises ActiveRecord::RecordNotSaved. See
+     # ActiveRecord::Callbacks for further details.
+-    def save!(*)
+-      create_or_update || raise(RecordNotSaved)
++    def save!(*args)
++      create_or_update(*args) || raise(RecordNotSaved)
+     end
+ 
+     # Deletes the record in the database and freezes this instance to
+@@ -110,11 +110,11 @@ module ActiveRecord
+     # * updated_at/updated_on column is updated if that column is available.
+     # * Updates all the attributes that are dirty in this object.
+     #
+-    def update_attribute(name, value)
++    def update_attribute(name, value, options={})
+       name = name.to_s
+       raise ActiveRecordError, "#{name} is marked as readonly" if self.class.readonly_attributes.include?(name)
+       send("#{name}=", value)
+-      save(:validate => false)
++      save({ :validate => false }.merge!(options))
+     end
+ 
+     # Updates the attributes of the model from the passed-in hash and saves the
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index b98fd35..b25ca38 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -50,9 +50,9 @@ module ActiveRecord
+     end
+ 
+     # Runs all the specified validations and returns true if no errors were added otherwise false.
+-    def valid?(context = nil)
++    def valid?(context = nil, options={})
+       context ||= (new_record? ? :create : :update)
+-      output = super(context)
++      output = super(context, options)
+ 
+       deprecated_callback_method(:validate)
+       deprecated_callback_method(:"validate_on_#{context}")
+@@ -72,7 +72,8 @@ module ActiveRecord
+       end
+ 
+       if perform_validation
+-        valid?(options.is_a?(Hash) ? options[:context] : nil)
++        context = options.is_a?(Hash) ? options[:context] : nil
++        valid?(context, options)
+       else
+         true
+       end
+diff --git a/activerecord/test/cases/callbacks_test.rb b/activerecord/test/cases/callbacks_test.rb
+index 8a84f19..eb2a08b 100644
+--- a/activerecord/test/cases/callbacks_test.rb
++++ b/activerecord/test/cases/callbacks_test.rb
+@@ -87,6 +87,11 @@ class ImmutableDeveloper < ActiveRecord::Base
+   before_save :cancel
+   before_destroy :cancel
+ 
++  def initialize
++    super
++    @cancelled ||= false
++  end
++
+   def cancelled?
+     @cancelled == true
+   end
+@@ -482,4 +487,38 @@ class CallbacksTest < ActiveRecord::TestCase
+     assert child.after_save_called
+   end
+ 
++  def test_model_callbacks_enabled
++    david = ImmutableDeveloper.new
++    david.save
++    assert_equal true, david.cancelled?
++  end
++
++  def test_model_callbacks_enabled_with_set_options
++    david = ImmutableDeveloper.new
++    david.save(:model_callbacks => true)
++    assert_equal true, david.cancelled?
++  end
++
++  def test_model_callbacks_disabled
++    david = ImmutableDeveloper.new
++    david.save(:model_callbacks => false)
++    assert_equal false, david.cancelled?
++  end
++
++  def test_callbacks_for_validations_enabled
++    david = ParentDeveloper.new
++    david.save
++    assert_equal true, david.after_save_called
++  end
++
++  def test_callbacks_for_validations_disabled
++    david = ParentDeveloper.new
++    david.save(:model_callbacks => false)
++    assert_equal true, david.after_save_called
++    
++    fred = ParentDeveloper.new
++    fred.save(:validate_callbacks => false)
++    assert_equal nil, fred.after_save_called
++  end
++
+ end
+-- 
+1.6.4.2
+

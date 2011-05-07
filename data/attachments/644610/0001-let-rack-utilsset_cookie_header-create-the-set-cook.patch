@@ -1,0 +1,195 @@
+From ac3f4382c9472e976ab62894f30fbdc8d2002d36 Mon Sep 17 00:00:00 2001
+From: Pascal Friederich <paukul@gmail.com>
+Date: Wed, 25 Aug 2010 17:19:58 +0200
+Subject: [PATCH 1/1] Let Rack::Utils.set_cookie_header! create the Set-Cookie header instead of manually fiddling with the response headers [#4941 state:resolved]
+
+---
+ .../action_controller/session/abstract_store.rb    |   18 +--------
+ .../lib/action_controller/session/cookie_store.rb  |   38 +++----------------
+ actionpack/test/controller/integration_test.rb     |   25 +++++++++++++
+ .../test/controller/session/cookie_store_test.rb   |    6 ++--
+ 4 files changed, 36 insertions(+), 51 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/session/abstract_store.rb b/actionpack/lib/action_controller/session/abstract_store.rb
+index 11cb6c2..b26f91c 100644
+--- a/actionpack/lib/action_controller/session/abstract_store.rb
++++ b/actionpack/lib/action_controller/session/abstract_store.rb
+@@ -189,22 +189,8 @@ module ActionController
+           end
+ 
+           if (env["rack.request.cookie_hash"] && env["rack.request.cookie_hash"][@key] != sid) || options[:expire_after]
+-            cookie = Rack::Utils.escape(@key) + '=' + Rack::Utils.escape(sid)
+-            cookie << "; domain=#{options[:domain]}" if options[:domain]
+-            cookie << "; path=#{options[:path]}" if options[:path]
+-            if options[:expire_after]
+-              expiry = Time.now + options[:expire_after]
+-              cookie << "; expires=#{expiry.httpdate}"
+-            end
+-            cookie << "; Secure" if options[:secure]
+-            cookie << "; HttpOnly" if options[:httponly]
+-
+-            headers = response[1]
+-            unless headers[SET_COOKIE].blank?
+-              headers[SET_COOKIE] << "\n#{cookie}"
+-            else
+-              headers[SET_COOKIE] = cookie
+-            end
++            cookie = {:value => sid}
++            Rack::Utils.set_cookie_header!(response[1], @key, cookie.merge(options))
+           end
+         end
+ 
+diff --git a/actionpack/lib/action_controller/session/cookie_store.rb b/actionpack/lib/action_controller/session/cookie_store.rb
+index 313307c..83e39fc 100644
+--- a/actionpack/lib/action_controller/session/cookie_store.rb
++++ b/actionpack/lib/action_controller/session/cookie_store.rb
+@@ -50,10 +50,6 @@ module ActionController
+         :httponly     => true
+       }.freeze
+ 
+-      ENV_SESSION_KEY = "rack.session".freeze
+-      ENV_SESSION_OPTIONS_KEY = "rack.session.options".freeze
+-      HTTP_SET_COOKIE = "Set-Cookie".freeze
+-
+       # Raised when storing more than 4K of session data.
+       class CookieOverflow < StandardError; end
+ 
+@@ -99,8 +95,8 @@ module ActionController
+         
+         status, headers, body = @app.call(env)
+ 
+-        session_data = env[ENV_SESSION_KEY]
+-        options = env[ENV_SESSION_OPTIONS_KEY]
++        session_data = env[AbstractStore::ENV_SESSION_KEY]
++        options = env[AbstractStore::ENV_SESSION_OPTIONS_KEY]
+ 
+         if !session_data.is_a?(AbstractStore::SessionHash) || session_data.loaded? || options[:expire_after]
+           session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) && !session_data.loaded?
+@@ -115,9 +111,7 @@ module ActionController
+             cookie[:expires] = Time.now + options[:expire_after]
+           end
+ 
+-          cookie = build_cookie(@key, cookie.merge(options))
+-          headers[HTTP_SET_COOKIE] = [] if headers[HTTP_SET_COOKIE].blank?
+-          headers[HTTP_SET_COOKIE] << cookie
++          Rack::Utils.set_cookie_header!(headers, @key, cookie.merge(options))
+         end
+ 
+         [status, headers, body]
+@@ -126,28 +120,8 @@ module ActionController
+       private
+       
+         def prepare!(env)
+-          env[ENV_SESSION_KEY] = AbstractStore::SessionHash.new(self, env)
+-          env[ENV_SESSION_OPTIONS_KEY] = AbstractStore::OptionsHash.new(self, env, @default_options)
+-        end
+-      
+-        # Should be in Rack::Utils soon
+-        def build_cookie(key, value)
+-          case value
+-          when Hash
+-            domain  = "; domain="  + value[:domain] if value[:domain]
+-            path    = "; path="    + value[:path]   if value[:path]
+-            # According to RFC 2109, we need dashes here.
+-            # N.B.: cgi.rb uses spaces...
+-            expires = "; expires=" + value[:expires].clone.gmtime.
+-              strftime("%a, %d-%b-%Y %H:%M:%S GMT") if value[:expires]
+-            secure = "; secure" if value[:secure]
+-            httponly = "; HttpOnly" if value[:httponly]
+-            value = value[:value]
+-          end
+-          value = [value] unless Array === value
+-          cookie = Rack::Utils.escape(key) + "=" +
+-            value.map { |v| Rack::Utils.escape(v) }.join("&") +
+-            "#{domain}#{path}#{expires}#{secure}#{httponly}"
++          env[AbstractStore::ENV_SESSION_KEY] = AbstractStore::SessionHash.new(self, env)
++          env[AbstractStore::ENV_SESSION_OPTIONS_KEY] = AbstractStore::OptionsHash.new(self, env, @default_options)
+         end
+ 
+         def load_session(env)
+@@ -166,7 +140,7 @@ module ActionController
+         end
+ 
+         def current_session_id(env)
+-          env[ENV_SESSION_OPTIONS_KEY][:id]
++          env[AbstractStore::ENV_SESSION_OPTIONS_KEY][:id]
+         end
+ 
+         def exists?(env)
+diff --git a/actionpack/test/controller/integration_test.rb b/actionpack/test/controller/integration_test.rb
+index 609fbb5..f3ecf55 100644
+--- a/actionpack/test/controller/integration_test.rb
++++ b/actionpack/test/controller/integration_test.rb
+@@ -287,6 +287,15 @@ class IntegrationProcessTest < ActionController::IntegrationTest
+     def redirect
+       redirect_to :action => "get"
+     end
++
++    def set_session_value_and_redirect
++      session[:foo] = "bar"
++      redirect_to :action => "print_session_value"
++    end
++
++    def print_session_value
++      render :text => session[:foo], :status => 200
++    end
+   end
+ 
+   FILES_DIR = File.dirname(__FILE__) + '/../fixtures/multipart'
+@@ -443,6 +452,22 @@ class IntegrationProcessTest < ActionController::IntegrationTest
+     end
+   end
+ 
++  def test_session_preserved_between_requests
++    cookie_store_app = ActionController::Session::CookieStore.new(ActionController::Dispatcher.new, :key => "_foo_session_key", :secret => "x" * 30)
++    @integration_session = open_session(cookie_store_app)
++
++    with_test_route_set do
++      get '/set_session_value_and_redirect'
++      assert_equal 302, status
++
++      follow_redirect!
++      assert_equal '/print_session_value', path
++      assert_equal 200, status
++      assert_equal "bar", body
++    end
++  end
++
++
+   private
+     def with_test_route_set
+       with_routing do |set|
+diff --git a/actionpack/test/controller/session/cookie_store_test.rb b/actionpack/test/controller/session/cookie_store_test.rb
+index f157ae4..7625039 100644
+--- a/actionpack/test/controller/session/cookie_store_test.rb
++++ b/actionpack/test/controller/session/cookie_store_test.rb
+@@ -111,7 +111,7 @@ class CookieStoreTest < ActionController::IntegrationTest
+     with_test_route_set do
+       get '/set_session_value'
+       assert_response :success
+-      assert_equal ["_myapp_session=#{response.body}; path=/; HttpOnly"],
++      assert_equal "_myapp_session=#{response.body}; path=/; HttpOnly",
+         headers['Set-Cookie']
+    end
+   end
+@@ -183,7 +183,7 @@ class CookieStoreTest < ActionController::IntegrationTest
+       get '/set_session_value'
+       assert_response :success
+       session_payload = response.body
+-      assert_equal ["_myapp_session=#{response.body}; path=/; HttpOnly"],
++      assert_equal "_myapp_session=#{response.body}; path=/; HttpOnly",
+         headers['Set-Cookie']
+ 
+       get '/call_reset_session'
+@@ -202,7 +202,7 @@ class CookieStoreTest < ActionController::IntegrationTest
+       get '/set_session_value'
+       assert_response :success
+       session_payload = response.body
+-      assert_equal ["_myapp_session=#{response.body}; path=/; HttpOnly"],
++      assert_equal "_myapp_session=#{response.body}; path=/; HttpOnly",
+         headers['Set-Cookie']
+ 
+       get '/call_session_clear'
+-- 
+1.7.1
+

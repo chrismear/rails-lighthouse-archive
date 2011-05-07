@@ -1,0 +1,123 @@
+From a45d8d961a5f5738f8103444f01e3ef7f1bfe022 Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Sun, 4 Apr 2010 01:26:11 +0100
+Subject: [PATCH] Backport of lazy evaluation of has_many ..., :dependent => :___
+
+---
+ activerecord/lib/active_record/associations.rb     |   40 +++++++------------
+ activerecord/lib/active_record/reflection.rb       |   11 +++++
+ .../associations/has_many_associations_test.rb     |   18 +++++++++
+ 3 files changed, 44 insertions(+), 25 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index eeaccd9..a79f270 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1415,14 +1415,6 @@ module ActiveRecord
+         # finder conditions.
+         def configure_dependency_for_has_many(reflection, extra_conditions = nil)
+           if reflection.options.include?(:dependent)
+-            # Add polymorphic type if the :as option is present
+-            dependent_conditions = []
+-            dependent_conditions << "#{reflection.primary_key_name} = \#{record.#{reflection.name}.send(:owner_quoted_id)}"
+-            dependent_conditions << "#{reflection.options[:as]}_type = '#{base_class.name}'" if reflection.options[:as]
+-            dependent_conditions << sanitize_sql(reflection.options[:conditions], reflection.quoted_table_name) if reflection.options[:conditions]
+-            dependent_conditions << extra_conditions if extra_conditions
+-            dependent_conditions = dependent_conditions.collect {|where| "(#{where})" }.join(" AND ")
+-            dependent_conditions = dependent_conditions.gsub('@', '\@')
+             case reflection.options[:dependent]
+               when :destroy
+                 method_name = "has_many_dependent_destroy_for_#{reflection.name}".to_sym
+@@ -1431,24 +1423,22 @@ module ActiveRecord
+                 end
+                 before_destroy method_name
+               when :delete_all
+-                module_eval %Q{
+-                  before_destroy do |record|                  # before_destroy do |record|
+-                    delete_all_has_many_dependencies(record,  #   delete_all_has_many_dependencies(record,
+-                      "#{reflection.name}",                   #     "posts",
+-                      #{reflection.class_name},               #     Post,
+-                      %@#{dependent_conditions}@)             #     %@...@) # this is a string literal like %(...)
+-                  end                                         # end
+-                }
++                before_destroy do |record|
++                  record.class.send(:delete_all_has_many_dependencies,
++                  record,
++                  reflection.name,
++                  reflection.klass,
++                  reflection.dependent_conditions(record, self.class, extra_conditions))
++                end
+               when :nullify
+-                module_eval %Q{
+-                  before_destroy do |record|                  # before_destroy do |record|
+-                    nullify_has_many_dependencies(record,     #   nullify_has_many_dependencies(record,
+-                      "#{reflection.name}",                   #     "posts",
+-                      #{reflection.class_name},               #     Post,
+-                      "#{reflection.primary_key_name}",       #     "user_id",
+-                      %@#{dependent_conditions}@)             #     %@...@) # this is a string literal like %(...)
+-                  end                                         # end
+-                }
++                before_destroy do |record|
++                  record.class.send(:nullify_has_many_dependencies,
++                  record,
++                  reflection.name,
++                  reflection.klass,
++                  reflection.primary_key_name,
++                  reflection.dependent_conditions(record, self.class, extra_conditions))
++                end
+               else
+                 raise ArgumentError, "The :dependent option expects either :destroy, :delete_all, or :nullify (#{reflection.options[:dependent].inspect})"
+             end
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 4fcb8b3..13bcb8b 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -277,6 +277,17 @@ module ActiveRecord
+         !options[:validate].nil? ? options[:validate] : (options[:autosave] == true || macro == :has_many)
+       end
+ 
++      def dependent_conditions(record, base_class, extra_conditions)
++        dependent_conditions = []
++        dependent_conditions << "#{primary_key_name} = #{record.send(name).send(:owner_quoted_id)}"
++        dependent_conditions << "#{options[:as]}_type = '#{base_class.name}'" if options[:as]
++        dependent_conditions << klass.send(:sanitize_sql, options[:conditions]) if options[:conditions]
++        dependent_conditions = dependent_conditions.collect {|where| "(#{where})" }.join(" AND ")
++        dependent_conditions << extra_conditions if extra_conditions
++        dependent_conditions = dependent_conditions.gsub('@', '\@')
++        dependent_conditions
++      end
++
+       private
+         def derive_class_name
+           class_name = name.to_s.camelize
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 2d1a42e..403eeef 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1138,5 +1138,23 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+   def test_instance_eval_in_association_proxy
+     assert_equal 'Welcome to the weblog', Comment.all.map { |comment| comment.post }.sort_by(&:id).first.instance_eval{title}
+   end
++
++  def test_defining_has_many_association_with_delete_all_dependency_lazily_evaluates_target_class
++    ActiveRecord::Reflection::AssociationReflection.any_instance.expects(:class_name).never
++    class_eval <<-EOF
++      class DeleteAllModel < ActiveRecord::Base
++        has_many :nonentities, :dependent => :delete_all
++      end
++    EOF
++  end
++
++  def test_defining_has_many_association_with_nullify_dependency_lazily_evaluates_target_class
++    ActiveRecord::Reflection::AssociationReflection.any_instance.expects(:class_name).never
++    class_eval <<-EOF
++      class NullifyModel < ActiveRecord::Base
++        has_many :nonentities, :dependent => :nullify
++      end
++    EOF
++  end
+ end
+ 
+-- 
+1.6.4.4
+

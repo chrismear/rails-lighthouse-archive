@@ -1,0 +1,145 @@
+From 8a8258d1a6431b193acc062c7cc1d4e369b43f12 Mon Sep 17 00:00:00 2001
+From: Luca Guidi <guidi.luca@gmail.com>
+Date: Fri, 6 Mar 2009 02:18:09 +0100
+Subject: [PATCH] Make sure autosaved associations run callbacks
+
+---
+ .../lib/active_record/autosave_association.rb      |   20 +++++++++++-
+ activerecord/test/cases/nested_attributes_test.rb  |   35 ++++++++++++++++++++
+ activerecord/test/models/pirate.rb                 |   33 ++++++++++++++++++
+ 3 files changed, 87 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index 1c3d056..7ade8a5 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -283,7 +283,7 @@ module ActiveRecord
+         if records = associated_records_to_validate_or_save(association, @new_record_before_save, autosave)
+           records.each do |record|
+             if autosave && record.marked_for_destruction?
+-              record.destroy
++              with_reflection_callbacks(record, reflection) { record.destroy }
+             elsif @new_record_before_save || record.new_record?
+               if autosave
+                 association.send(:insert_record, record, false, false)
+@@ -345,5 +345,23 @@ module ActiveRecord
+         end
+       end
+     end
++    
++    private
++      def with_reflection_callbacks(record, reflection)
++        run_reflection_callbacks(record, reflection.options[:before_remove]) if reflection.options[:before_remove]
++        yield
++        run_reflection_callbacks(record, reflection.options[:after_remove]) if reflection.options[:after_remove]
++      end
++    
++      def run_reflection_callbacks(record, *callbacks)
++        callbacks.each do |callback|
++          case callback
++          when Proc
++            callback.call(self, record)
++          when Symbol
++            self.send(callback, record)
++          end
++        end
++      end
+   end
+ end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index cd6277c..fd026bd 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -58,6 +58,41 @@ class TestNestedAttributesInGeneral < ActiveRecord::TestCase
+     assert !ship._delete
+     ship.mark_for_destruction
+     assert ship._delete
++  end  
++end
++
++class TestNestedAttributesMethodCallbacks < ActiveRecord::TestCase
++  def test_should_run_adding_callbacks
++    pirate = Pirate.new(:catchphrase => "Arr", :birds_with_method_callbacks_attributes => [{:name => "Crowe the One-Eyed"}])
++    assert_equal ["before_adding_method<new>", "after_adding_method<new>"], pirate.ship_log
++  end
++  
++  def test_should_run_removing_callbacks
++    pirate = Pirate.create!(:catchphrase => "Arr Arr")
++    bird = Bird.create!(:name => "Frank Big-hearted")
++    pirate.birds_with_method_callbacks << bird
++    pirate.ship_log.clear
++
++    pirate.update_attributes :birds_with_method_callbacks_attributes => [{:id => bird.id, :_delete => true}]
++    assert_equal ["before_removing_method#{bird.id}", "after_removing_method#{bird.id}"], pirate.ship_log
++  end
++end
++
++class TestNestedAttributesProcCallbacks < ActiveRecord::TestCase
++  def test_should_run_adding_callbacks
++    pirate = Pirate.new(:catchphrase => "To arr is pirate",
++      :birds_with_proc_callbacks_attributes => [{:name => "General Lee"}])
++    assert_equal ["before_adding_proc<new>", "after_adding_proc<new>"], pirate.ship_log
++  end
++
++  def test_should_run_removing_callbacks
++    pirate = Pirate.create!(:catchphrase => "To err is human, to arr is pirate")
++    bird = Bird.create!(:name => "Glowering Maggie")
++    pirate.birds_with_proc_callbacks << bird
++    pirate.ship_log.clear
++
++    pirate.update_attributes :birds_with_proc_callbacks_attributes => [{:id => bird.id, :_delete => true}]
++    assert_equal ["before_removing_proc#{bird.id}", "after_removing_proc#{bird.id}"], pirate.ship_log
+   end
+ end
+ 
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index 7bc50e0..a72e438 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -8,9 +8,42 @@ class Pirate < ActiveRecord::Base
+   # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
+   has_one :ship
+   has_many :birds
++  has_many :birds_with_method_callbacks, :class_name => "Bird",
++    :before_add    => :log_before_add,
++    :after_add     => :log_after_add,
++    :before_remove => :log_before_remove,
++    :after_remove  => :log_after_remove
++  has_many :birds_with_proc_callbacks, :class_name => "Bird",
++    :before_add     => proc {|p,b| p.ship_log << "before_adding_proc#{b.id || '<new>'}"},
++    :after_add      => proc {|p,b| p.ship_log << "after_adding_proc#{b.id || '<new>'}"},
++    :before_remove  => proc {|p,b| p.ship_log << "before_removing_proc#{b.id}"},
++    :after_remove   => proc {|p,b| p.ship_log << "after_removing_proc#{b.id}"}
+ 
+   accepts_nested_attributes_for :parrots, :birds, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+   accepts_nested_attributes_for :ship, :allow_destroy => true, :reject_if => proc { |attributes| attributes.empty? }
+ 
++  accepts_nested_attributes_for :birds_with_method_callbacks, :birds_with_proc_callbacks, :allow_destroy => true
++
+   validates_presence_of :catchphrase
++
++  def ship_log
++    @ship_log ||= []
++  end
++
++  private
++    def log_before_add(record)
++      ship_log << "before_adding_method#{record.id || '<new>'}"
++    end
++
++    def log_after_add(record)
++      ship_log << "after_adding_method#{record.id || '<new>'}"
++    end
++
++    def log_before_remove(record)
++      ship_log << "before_removing_method#{record.id}"
++    end
++
++    def log_after_remove(record)
++      ship_log << "after_removing_method#{record.id}"
++    end
+ end
+-- 
+1.5.4.5
+

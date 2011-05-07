@@ -1,0 +1,128 @@
+From 3aa60b2d4cdc3a78b65db59ef4aa879cc7373d96 Mon Sep 17 00:00:00 2001
+From: Jeff Dean <jeff@zilkey.com>
+Date: Sat, 3 Jul 2010 23:54:52 -0400
+Subject: [PATCH] Setting the id of a belongs_to object updates all referenced objects  [#2989 state:resolved]
+
+---
+ activerecord/lib/active_record/associations.rb     |   37 ++++++++++++++++++++
+ .../associations/belongs_to_associations_test.rb   |   36 +++++++++++++++++++
+ 2 files changed, 73 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 4caa434..a898390 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1134,12 +1134,14 @@ module ActiveRecord
+ 
+         if reflection.options[:polymorphic]
+           association_accessor_methods(reflection, BelongsToPolymorphicAssociation)
++          association_foreign_type_setter_method(reflection)
+         else
+           association_accessor_methods(reflection, BelongsToAssociation)
+           association_constructor_method(:build,  reflection, BelongsToAssociation)
+           association_constructor_method(:create, reflection, BelongsToAssociation)
+         end
+ 
++        association_foreign_key_setter_method(reflection)
+         add_counter_cache_callbacks(reflection)          if options[:counter_cache]
+         add_touch_callbacks(reflection, options[:touch]) if options[:touch]
+ 
+@@ -1384,6 +1386,41 @@ module ActiveRecord
+           end
+         end
+ 
++        def association_foreign_key_setter_method(reflection)
++          setters = reflect_on_all_associations(:belongs_to).map do |belongs_to_reflection|
++            if belongs_to_reflection.primary_key_name == reflection.primary_key_name
++              "association_instance_set(:#{belongs_to_reflection.name}, nil);"
++            end
++          end.compact.join
++
++          class_eval <<-FILE, __FILE__, __LINE__ + 1
++            def #{reflection.primary_key_name}=(new_id)
++              write_attribute :#{reflection.primary_key_name}, new_id
++              if #{reflection.primary_key_name}_changed?
++                #{ setters }
++              end
++            end
++          FILE
++        end
++
++        def association_foreign_type_setter_method(reflection)
++          setters = reflect_on_all_associations(:belongs_to).map do |belongs_to_reflection|
++            if belongs_to_reflection.options[:foreign_type] == reflection.options[:foreign_type]
++              "association_instance_set(:#{belongs_to_reflection.name}, nil);"
++            end
++          end.compact.join
++
++          field = reflection.options[:foreign_type]
++          class_eval <<-FILE, __FILE__, __LINE__ + 1
++            def #{field}=(new_id)
++              write_attribute :#{field}, new_id
++              if #{field}_changed?
++                #{ setters }
++              end
++            end
++          FILE
++        end
++
+         def collection_reader_method(reflection, association_proxy_class)
+           define_method(reflection.name) do |*params|
+             force_reload = params.first unless params.empty?
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index fb1e6e7..caf15ac 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -302,6 +302,21 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal Firm.find(:first, :order => "id"), c.firm_with_basic_id
+   end
+ 
++  def test_reassigning_the_parent_id_updates_the_object
++    original_parent = Firm.create! :name => "original"
++    updated_parent = Firm.create! :name => "updated"
++
++    client = Client.new("client_of" => original_parent.id)
++    assert_equal original_parent, client.firm
++    assert_equal original_parent, client.firm_with_condition
++    assert_equal original_parent, client.firm_with_other_name
++
++    client.client_of = updated_parent.id
++    assert_equal updated_parent, client.firm
++    assert_equal updated_parent, client.firm_with_condition
++    assert_equal updated_parent, client.firm_with_other_name
++  end
++
+   def test_forgetting_the_load_when_foreign_key_enters_late
+     c = Client.new
+     assert_nil c.firm_with_basic_id
+@@ -410,6 +425,27 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_nil sponsor.sponsorable_id
+   end
+ 
++  def test_polymorphic_reassignment_of_associated_id_updates_the_object
++    member1 = Member.create!
++    member2 = Member.create!
++
++    sponsor = Sponsor.new("sponsorable_type" => "Member", "sponsorable_id" => member1.id)
++    assert_equal member1, sponsor.sponsorable
++
++    sponsor.sponsorable_id = member2.id
++    assert_equal member2, sponsor.sponsorable
++  end
++
++  def test_polymorphic_reassignment_of_associated_type_updates_the_object
++    member1 = Member.create!
++
++    sponsor = Sponsor.new("sponsorable_type" => "Member", "sponsorable_id" => member1.id)
++    assert_equal member1, sponsor.sponsorable
++
++    sponsor.sponsorable_type = "Firm"
++    assert_not_equal member1, sponsor.sponsorable
++  end
++
+   def test_polymorphic_assignment_with_primary_key_updates_foreign_id_field_for_new_and_saved_records
+     essay = Essay.new
+     saved_writer = Author.create(:name => "David")
+-- 
+1.7.0.4
+

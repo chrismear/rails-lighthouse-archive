@@ -1,0 +1,154 @@
+From 318d03d056315256e29ec85928a48425cb6e64f2 Mon Sep 17 00:00:00 2001
+From: Brian Durand <brian@embellishedvisions.com>
+Date: Tue, 7 Dec 2010 16:11:26 -0600
+Subject: [PATCH] Change the ActiveRecord after_commit and after_rollback logic to only keep track of objects that can be affected by these callbacks to reduce memory bloat seen with large transactions involving many records.
+
+---
+ activerecord/activerecord.gemspec                  |    1 +
+ .../abstract/database_statements.rb                |   18 +++++-
+ .../test/cases/transaction_callbacks_test.rb       |   61 ++++++++++++++++++++
+ 3 files changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/activerecord/activerecord.gemspec b/activerecord/activerecord.gemspec
+index b1df248..78ca038 100644
+--- a/activerecord/activerecord.gemspec
++++ b/activerecord/activerecord.gemspec
+@@ -25,4 +25,5 @@ Gem::Specification.new do |s|
+   s.add_dependency('activemodel',   version)
+   s.add_dependency('arel',          '~> 2.0.2')
+   s.add_dependency('tzinfo',        '~> 0.3.23')
++  s.add_dependency('ref',           '~> 1.0.0')
+ end
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+index 01e53b4..17b2535 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+@@ -1,4 +1,5 @@
+ require 'active_support/core_ext/module/deprecation'
++require 'ref'
+ 
+ module ActiveRecord
+   module ConnectionAdapters # :nodoc:
+@@ -209,8 +210,11 @@ module ActiveRecord
+       # Register a record with the current transaction so that its after_commit and after_rollback callbacks
+       # can be called.
+       def add_transaction_record(record)
++        # Use a weak reference unless transaction based callbacks are defined to prevent large transactions
++        # from balooning the heap.
++        ref_class = record._commit_callbacks.empty? && record._rollback_callbacks.empty? ? Ref::WeakReference : Ref::StrongReference
+         last_batch = @_current_transaction_records.last
+-        last_batch << record if last_batch
++        last_batch << ref_class.new(record) if last_batch
+       end
+ 
+       # Begins the transaction (and turns off auto-committing).
+@@ -318,10 +322,10 @@ module ActiveRecord
+         # is false, only rollback records since the last save point.
+         def rollback_transaction_records(rollback) #:nodoc
+           if rollback
+-            records = @_current_transaction_records.flatten
++            records = _dereference_transaction_records(@_current_transaction_records)
+             @_current_transaction_records.clear
+           else
+-            records = @_current_transaction_records.pop
++            records = _dereference_transaction_records(@_current_transaction_records.pop)
+           end
+ 
+           unless records.blank?
+@@ -337,7 +341,7 @@ module ActiveRecord
+ 
+         # Send a commit message to all records after they have been committed.
+         def commit_transaction_records #:nodoc
+-          records = @_current_transaction_records.flatten
++          records = _dereference_transaction_records(@_current_transaction_records)
+           @_current_transaction_records.clear
+           unless records.blank?
+             records.uniq.each do |record|
+@@ -349,6 +353,12 @@ module ActiveRecord
+             end
+           end
+         end
++
++        # Flatten and dereference weak references to transaction records. Any garbage collected
++        # weak references will be removed.
++        def _dereference_transaction_records(references) #:nodoc
++          references.flatten.collect{|ref| ref.object}.compact
++        end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/transaction_callbacks_test.rb b/activerecord/test/cases/transaction_callbacks_test.rb
+index 85f222b..afc2478 100644
+--- a/activerecord/test/cases/transaction_callbacks_test.rb
++++ b/activerecord/test/cases/transaction_callbacks_test.rb
+@@ -244,6 +244,67 @@ class TransactionCallbacksTest < ActiveRecord::TestCase
+     assert_equal :rollback, @first.last_after_transaction_error
+     assert_equal [:after_rollback], @second.history
+   end
++
++  def test_transaction_records_only_held_if_referenced_or_callbacks_defined_on_rollback
++    Ref::Mock.use do
++      topic_1 = TopicWithCallbacks.new
++      topic_2 = Topic.new
++      topic_3 = TopicWithCallbacks.new
++      topic_4 = Topic.new
++      Topic.transaction do
++        [topic_1, topic_2, topic_3, topic_4].each_with_index do |topic, index|
++          topic.id = index + 1
++          def topic.rolledback!(*args)
++            @rolledback_flag = true
++          end
++          def topic.rolledback?
++            @rolledback_flag if instance_variable_defined?(:@rolledback_flag)
++          end
++          topic.add_to_transaction
++        end
++        # Fake garbage collection to release weak references to topic_3 and topic_4
++        Ref::Mock.gc(topic_3, topic_4)
++        raise ActiveRecord::Rollback
++      end
++      # Expected behavior is that the object without a hard reference and that doesn't implement
++      # after transaction callbacks will not be retained by the garbage collector and won't get
++      # the rolledback! message.
++      assert topic_1.rolledback?
++      assert topic_2.rolledback?
++      assert topic_3.rolledback?
++      assert !topic_4.rolledback?
++    end
++  end
++
++  def test_transaction_records_only_held_if_referenced_or_callbacks_defined_on_commit
++    Ref::Mock.use do
++      topic_1 = TopicWithCallbacks.new
++      topic_2 = Topic.new
++      topic_3 = TopicWithCallbacks.new
++      topic_4 = Topic.new
++      Topic.transaction do
++        [topic_1, topic_2, topic_3, topic_4].each_with_index do |topic, index|
++          topic.id = index + 1
++          def topic.committed!(*args)
++            @commit_flag = true
++          end
++          def topic.committed?
++            @commit_flag if instance_variable_defined?(:@commit_flag)
++          end
++          topic.add_to_transaction
++        end
++        # Fake garbage collection to release weak references to topic_3 and topic_4
++        Ref::Mock.gc(topic_3, topic_4)
++      end
++      # Expected behavior is that the object without a hard reference and that doesn't implement
++      # after transaction callbacks will not be retained by the garbage collector and won't get
++      # the rolledback! message.
++      assert topic_1.committed?
++      assert topic_2.committed?
++      assert topic_3.committed?
++      assert !topic_4.committed?
++    end
++  end
+ end
+ 
+ 
+-- 
+1.7.3.4
+

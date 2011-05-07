@@ -1,0 +1,453 @@
+From 142777648f0e423c0a13393fcf4e08ed5738e515 Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Mon, 2 Mar 2009 20:25:56 +1100
+Subject: [PATCH 1/6] Updated for better add_column support.
+
+Existing code was using "ALTER TABLE ADD COLUMN" for all sqlite3 - but
+the command was only introduced in v3.1.6.
+
+Existing code was using VACUUM in order to let pre 3.1.4 engines read
+DBs altered with the 3.1.6 "ALTER TABLE ADD COLUMN" statements, but this
+was at the cost of DDL transactions and 3.1.4 was released in March
+2005, so not vacuuming is very unlikely to cause a problem, and those
+small percentage of people taking >=3.1.6 DBs that have had columns
+added and running them on <=3.1.3 engines can just run VACUUM manually.
+---
+ .../connection_adapters/sqlite_adapter.rb          |   30 ++++++-------------
+ 1 files changed, 10 insertions(+), 20 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 6077ddc..0f64336 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -88,6 +88,10 @@ module ActiveRecord
+       def requires_reloading?
+         true
+       end
++
++      def supports_add_column?
++        sqlite_version >= '3.1.6'
++      end
+  
+       def disconnect!
+         super
+@@ -219,13 +223,13 @@ module ActiveRecord
+       end
+ 
+       def add_column(table_name, column_name, type, options = {}) #:nodoc:
+-        if @connection.respond_to?(:transaction_active?) && @connection.transaction_active?
+-          raise StatementInvalid, 'Cannot add columns to a SQLite database while inside a transaction'
++        if supports_add_column?
++          super(table_name, column_name, type, options)
++        else
++          alter_table(table_name) do |definition|
++            definition.column(column_name, type, options)
++          end
+         end
+-        
+-        super(table_name, column_name, type, options)
+-        # See last paragraph on http://www.sqlite.org/lang_altertable.html
+-        execute "VACUUM"
+       end
+ 
+       def remove_column(table_name, *column_names) #:nodoc:
+@@ -398,23 +402,9 @@ module ActiveRecord
+     end
+ 
+     class SQLite2Adapter < SQLiteAdapter # :nodoc:
+-      def supports_count_distinct? #:nodoc:
+-        false
+-      end
+-
+       def rename_table(name, new_name)
+         move_table(name, new_name)
+       end
+-
+-      def add_column(table_name, column_name, type, options = {}) #:nodoc:
+-        if @connection.respond_to?(:transaction_active?) && @connection.transaction_active?
+-          raise StatementInvalid, 'Cannot add columns to a SQLite database while inside a transaction'
+-        end
+-
+-        alter_table(table_name) do |definition|
+-          definition.column(column_name, type, options)
+-        end
+-      end
+     end
+ 
+     class DeprecatedSQLiteAdapter < SQLite2Adapter # :nodoc:
+-- 
+1.6.1
+
+
+From a04fe35005a9c115e146f9fe86c7d55b7798e139 Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Mon, 2 Mar 2009 21:54:56 +1100
+Subject: [PATCH 2/6] More changes
+
+---
+ .../connection_adapters/sqlite_adapter.rb          |   32 +++++++++++++++++++-
+ activerecord/test/cases/transactions_test.rb       |   11 ++++---
+ 2 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 0f64336..4bcc219 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -72,6 +72,16 @@ module ActiveRecord
+     #
+     # * <tt>:database</tt> - Path to the database file.
+     class SQLiteAdapter < AbstractAdapter
++			class Version
++				include Comparable
++				def initialize(vs)
++					@v = vs.split('.').map(&:to_i)
++				end
++				def <=>(rhs)
++					@v <=> rhs.split('.').map(&:to_i)
++				end
++			end
++
+       def initialize(connection, logger, config)
+         super(connection, logger)
+         @config = config
+@@ -81,6 +91,14 @@ module ActiveRecord
+         'SQLite'
+       end
+ 
++      def supports_ddl_transactions?
++				sqlite_version >= '2.0.0'
++      end
++
++      def supports_savepoints?
++				sqlite_version >= '3.6.8'
++      end
++
+       def supports_migrations? #:nodoc:
+         true
+       end
+@@ -173,6 +191,18 @@ module ActiveRecord
+         catch_schema_changes { @connection.rollback }
+       end
+ 
++      def create_savepoint
++        execute("SAVEPOINT #{current_savepoint_name}")
++      end
++
++      def rollback_to_savepoint
++        execute("ROLLBACK TO SAVEPOINT #{current_savepoint_name}")
++      end
++
++      def release_savepoint
++        execute("RELEASE SAVEPOINT #{current_savepoint_name}")
++      end
++
+ 
+       # SELECT ... FOR UPDATE is redundant since the table is locked.
+       def add_lock!(sql, options) #:nodoc:
+@@ -389,7 +419,7 @@ module ActiveRecord
+         end
+ 
+         def sqlite_version
+-          @sqlite_version ||= select_value('select sqlite_version(*)')
++          @sqlite_version ||= SQLiteAdapter::Version.new(select_value('select sqlite_version(*)'))
+         end
+ 
+         def default_primary_key_type
+diff --git a/activerecord/test/cases/transactions_test.rb b/activerecord/test/cases/transactions_test.rb
+index f9ae511..a932730 100644
+--- a/activerecord/test/cases/transactions_test.rb
++++ b/activerecord/test/cases/transactions_test.rb
+@@ -349,7 +349,7 @@ class TransactionTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  def test_sqlite_add_column_in_transaction_raises_statement_invalid
++  def test_sqlite_add_column_in_transaction
+     return true unless current_adapter?(:SQLite3Adapter, :SQLiteAdapter)
+ 
+     # Test first if column creation/deletion works correctly when no
+@@ -368,10 +368,11 @@ class TransactionTest < ActiveRecord::TestCase
+       assert !Topic.column_names.include?('stuff')
+     end
+ 
+-    # Test now inside a transaction: add_column should raise a StatementInvalid
+-    Topic.transaction do
+-      assert_raise(ActiveRecord::StatementInvalid) { Topic.connection.add_column('topics', 'stuff', :string) }
+-      raise ActiveRecord::Rollback
++    # Test now inside a transaction: add_column should not raise any exception
++    assert_nothing_raised do
++      Topic.transaction do
++        Topic.connection.add_column('topics', 'stuff', :string)
++      end
+     end
+   end
+ 
+-- 
+1.6.1
+
+
+From 08b691abb5d9395ad353a4aade66bc819253d7a0 Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Thu, 12 Mar 2009 03:23:08 +1100
+Subject: [PATCH 3/6] Detabbing.
+
+---
+ .../connection_adapters/sqlite_adapter.rb          |   22 ++++++++++----------
+ 1 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 4bcc219..1d14f19 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -72,15 +72,15 @@ module ActiveRecord
+     #
+     # * <tt>:database</tt> - Path to the database file.
+     class SQLiteAdapter < AbstractAdapter
+-			class Version
+-				include Comparable
+-				def initialize(vs)
+-					@v = vs.split('.').map(&:to_i)
+-				end
+-				def <=>(rhs)
+-					@v <=> rhs.split('.').map(&:to_i)
+-				end
+-			end
++      class Version
++        include Comparable
++        def initialize(vs)
++          @v = vs.split('.').map(&:to_i)
++        end
++        def <=>(rhs)
++          @v <=> rhs.split('.').map(&:to_i)
++        end
++      end
+ 
+       def initialize(connection, logger, config)
+         super(connection, logger)
+@@ -92,11 +92,11 @@ module ActiveRecord
+       end
+ 
+       def supports_ddl_transactions?
+-				sqlite_version >= '2.0.0'
++        sqlite_version >= '2.0.0'
+       end
+ 
+       def supports_savepoints?
+-				sqlite_version >= '3.6.8'
++        sqlite_version >= '3.6.8'
+       end
+ 
+       def supports_migrations? #:nodoc:
+-- 
+1.6.1
+
+
+From 2910611ebac296cf30e66e15ff9204019e04a38d Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Fri, 13 Mar 2009 22:28:50 +1100
+Subject: [PATCH 4/6] Closes #1651: ALTER TABLE adding PRIMARY KEY col.
+
+As per http://tinyurl.com/ymm73p the ALTER TABLE statement in SQLite
+cannot contain a PRIMARY KEY constraint.
+
+Also can't contain UNIQUE or certain time functions as default.  Rails
+doesn't support doing those things in change_table though.
+
+Also can't add add NOT NULL constraints when DEFAULT is NULL - but
+that's already taken care of in
+ActiveRecord::ConnectionAdapters::SchemaStatements.options_include_default?
+---
+ .../connection_adapters/sqlite_adapter.rb          |    8 +++++-
+ activerecord/test/cases/migration_test.rb          |   27 +++++++++++++++++++-
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 1d14f19..780e5f6 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -252,8 +252,14 @@ module ActiveRecord
+         execute "ALTER TABLE #{name} RENAME TO #{new_name}"
+       end
+ 
++      # See: http://www.sqlite.org/lang_altertable.html
++      # SQLite has an additional restriction on the ALTER TABLE statement
++      def valid_alter_table_options( type, options)
++        type.to_sym != :primary_key
++      end
++
+       def add_column(table_name, column_name, type, options = {}) #:nodoc:
+-        if supports_add_column?
++        if supports_add_column? && valid_alter_table_options( type, options )
+           super(table_name, column_name, type, options)
+         else
+           alter_table(table_name) do |definition|
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index 50d039e..11aad05 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -93,6 +93,29 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def testing_table_with_only_foo_attribute 
++      Person.connection.create_table :testings, :id => false do |t| 
++        t.column :foo, :string 
++      end 
++      yield Person.connection 
++    ensure 
++      Person.connection.drop_table :testings rescue nil 
++    end 
++    protected :testing_table_with_only_foo_attribute 
++
++    def test_create_table_without_id 
++      testing_table_with_only_foo_attribute do |connection| 
++        assert_equal connection.columns(:testings).size, 1 
++      end 
++    end 
++
++    def test_add_column_with_primary_key_attribute 
++      testing_table_with_only_foo_attribute do |connection| 
++        assert_nothing_raised { connection.add_column :testings, :id, :primary_key } 
++        assert_equal connection.columns(:testings).size, 2       
++      end 
++    end 
++
+     def test_create_table_adds_id
+       Person.connection.create_table :testings do |t|
+         t.column :foo, :string
+@@ -928,7 +951,9 @@ if ActiveRecord::Base.connection.supports_migrations?
+       assert_equal(0, ActiveRecord::Migrator.current_version)
+     end
+ 
+-    if current_adapter?(:PostgreSQLAdapter)
++    # this should now include all Postgres and later versions of SQLite (not all
++    # though which is why we don't use a plain current_adapter?() call)
++    if ActiveRecord::Base.connection.supports_ddl_transactions?
+       def test_migrator_one_up_with_exception_and_rollback
+         assert !Person.column_methods_hash.include?(:last_name)
+ 
+-- 
+1.6.1
+
+
+From 37927d7f5a83c3efd98c021c0d3c1c54318f4b0a Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Sat, 14 Mar 2009 23:29:10 +1100
+Subject: [PATCH 5/6] Pulling out the savepoint stuff for now.
+
+Seems some tests are triggering the savepoint stuff inadvertently and
+without the supports_savepoints? check wrapping the tests, meaning that
+pre 3.6.8 versions of SQLite throw heaps of errors in the test cases.
+So, for now, just pulling the savepoint stuff out of the adapter.
+
+Will revisit post 2.3.
+---
+ .../connection_adapters/sqlite_adapter.rb          |   17 -----------------
+ 1 files changed, 0 insertions(+), 17 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 780e5f6..1803e5a 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -95,10 +95,6 @@ module ActiveRecord
+         sqlite_version >= '2.0.0'
+       end
+ 
+-      def supports_savepoints?
+-        sqlite_version >= '3.6.8'
+-      end
+-
+       def supports_migrations? #:nodoc:
+         true
+       end
+@@ -191,19 +187,6 @@ module ActiveRecord
+         catch_schema_changes { @connection.rollback }
+       end
+ 
+-      def create_savepoint
+-        execute("SAVEPOINT #{current_savepoint_name}")
+-      end
+-
+-      def rollback_to_savepoint
+-        execute("ROLLBACK TO SAVEPOINT #{current_savepoint_name}")
+-      end
+-
+-      def release_savepoint
+-        execute("RELEASE SAVEPOINT #{current_savepoint_name}")
+-      end
+-
+-
+       # SELECT ... FOR UPDATE is redundant since the table is locked.
+       def add_lock!(sql, options) #:nodoc:
+         sql
+-- 
+1.6.1
+
+
+From e753675a41deddf0f8f3fae9dcf4ffefb277009a Mon Sep 17 00:00:00 2001
+From: Jason King <jk@silentcow.com>
+Date: Sat, 14 Mar 2009 23:32:44 +1100
+Subject: [PATCH 6/6] Squashing some trailing whitespace
+
+---
+ activerecord/test/cases/migration_test.rb |   44 ++++++++++++++--------------
+ 1 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index 11aad05..7660cf7 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -93,28 +93,28 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
+-    def testing_table_with_only_foo_attribute 
+-      Person.connection.create_table :testings, :id => false do |t| 
+-        t.column :foo, :string 
+-      end 
+-      yield Person.connection 
+-    ensure 
+-      Person.connection.drop_table :testings rescue nil 
+-    end 
+-    protected :testing_table_with_only_foo_attribute 
+-
+-    def test_create_table_without_id 
+-      testing_table_with_only_foo_attribute do |connection| 
+-        assert_equal connection.columns(:testings).size, 1 
+-      end 
+-    end 
+-
+-    def test_add_column_with_primary_key_attribute 
+-      testing_table_with_only_foo_attribute do |connection| 
+-        assert_nothing_raised { connection.add_column :testings, :id, :primary_key } 
+-        assert_equal connection.columns(:testings).size, 2       
+-      end 
+-    end 
++    def testing_table_with_only_foo_attribute
++      Person.connection.create_table :testings, :id => false do |t|
++        t.column :foo, :string
++      end
++      yield Person.connection
++    ensure
++      Person.connection.drop_table :testings rescue nil
++    end
++    protected :testing_table_with_only_foo_attribute
++
++    def test_create_table_without_id
++      testing_table_with_only_foo_attribute do |connection|
++        assert_equal connection.columns(:testings).size, 1
++      end
++    end
++
++    def test_add_column_with_primary_key_attribute
++      testing_table_with_only_foo_attribute do |connection|
++        assert_nothing_raised { connection.add_column :testings, :id, :primary_key }
++        assert_equal connection.columns(:testings).size, 2
++      end
++    end
+ 
+     def test_create_table_adds_id
+       Person.connection.create_table :testings do |t|
+-- 
+1.6.1
+

@@ -1,0 +1,212 @@
+From 413aac579562519f2684c1ff9bdb087650991157 Mon Sep 17 00:00:00 2001
+From: Ruy Asan <ruyasan@gmail.com>
+Date: Wed, 9 Jul 2008 17:13:33 -0700
+Subject: [PATCH] Implemented :args option for run_callbacks which will pass the provided arguments onto the callback proc or method, IFF it's arity expects them.
+
+---
+ activesupport/lib/active_support/callbacks.rb |   26 +++++--
+ activesupport/test/callbacks_test.rb          |   91 +++++++++++++++++++++++++
+ 2 files changed, 109 insertions(+), 8 deletions(-)
+
+diff --git a/activesupport/lib/active_support/callbacks.rb b/activesupport/lib/active_support/callbacks.rb
+index 9c59b7a..8f44fd5 100644
+--- a/activesupport/lib/active_support/callbacks.rb
++++ b/activesupport/lib/active_support/callbacks.rb
+@@ -85,12 +85,12 @@ module ActiveSupport
+ 
+       def run(object, options = {}, &terminator)
+         enumerator = options[:enumerator] || :each
+-
++        args = options[:args] || []
+         unless block_given?
+-          send(enumerator) { |callback| callback.call(object) }
++          send(enumerator) { |callback| callback.call(object, *args) }
+         else
+           send(enumerator) do |callback|
+-            result = callback.call(object)
++            result = callback.call(object, *args)
+             break result if terminator.call(result, object)
+           end
+         end
+@@ -167,17 +167,20 @@ module ActiveSupport
+ 
+       private
+         def evaluate_method(method, *args, &block)
++          object = args.shift
+           case method
+             when Symbol
+-              object = args.shift
++              args = adjust_for_arity(args, object.method(method).arity)
+               object.send(method, *args, &block)
+             when String
+-              eval(method, args.first.instance_eval { binding })
++              eval(method, object.instance_eval { binding })
+             when Proc, Method
+-              method.call(*args, &block)
++              args = adjust_for_arity(args, method.arity-1)
++              method.call(object, *args, &block)
+             else
+               if method.respond_to?(kind)
+-                method.send(kind, *args, &block)
++                args = adjust_for_arity(args, method.method(kind).arity-1)
++                method.send(kind, object, *args, &block)
+               else
+                 raise ArgumentError,
+                   "Callbacks must be a symbol denoting the method to call, a string to be evaluated, " +
+@@ -185,7 +188,14 @@ module ActiveSupport
+               end
+             end
+         end
+-
++        
++        def adjust_for_arity(args, arity)
++          if arity < 0
++            args
++          else
++            args[0...arity]
++          end
++        end
+         def should_run_callback?(*args)
+           if options[:if]
+             evaluate_method(options[:if], *args)
+diff --git a/activesupport/test/callbacks_test.rb b/activesupport/test/callbacks_test.rb
+index 7f71ca2..c300f37 100644
+--- a/activesupport/test/callbacks_test.rb
++++ b/activesupport/test/callbacks_test.rb
+@@ -64,6 +64,71 @@ class ConditionalPerson < Record
+   end
+ end
+ 
++class ArgumentativePerson < Record
++  before_save :check_no_args, :check_first_arg, :check_first_two_args, :check_all_args, :check_first_and_any_args, :check_any_args
++  
++  def check_no_args
++    history << [:no]
++  end
++
++  def check_first_arg(a)
++    history << [:first, a]
++  end
++  
++  def check_first_two_args(a,b)
++    history << [:first_two, a, b]
++  end
++  
++  def check_all_args(a,b,c,d)
++    history << [:all, a, b, c, d]
++  end
++
++  def check_first_and_any_args(a, *args)
++    history << [:first_and_any, a, *args]
++  end
++  
++  def check_any_args(*args)
++    history << [:any, *args]
++  end
++  
++  before_save "history << [:string_callback]"
++  
++  before_save { |record|          record.history << [:no] }
++  before_save { |record, a|       record.history << [:first, a] }
++  before_save { |record, a,b|     record.history << [:first_two, a, b] }
++  before_save { |record, a,b,c,d| record.history << [:all, a, b, c, d] }
++  before_save { |record, a,*args| record.history << [:first_and_any, a, *args] }
++  before_save { |record, *args|   record.history << [:any, *args] }
++  
++  class NoArgObserver
++    def before_save(record)
++      record.history << [:no]
++    end
++  end
++  
++  class TwoArgObserver
++    def before_save(record, a,b)
++      record.history << [:two, a,b]
++    end
++  end
++  
++  class FirstAndAnyObserver
++    def before_save(record, a, *args)
++      record.history << [:first_and_any, a,*args]
++    end
++  end
++  
++  before_save NoArgObserver.new
++  before_save TwoArgObserver.new
++  before_save FirstAndAnyObserver.new
++    
++
++  def save
++    run_callbacks(:before_save, :args=>[1,2,3,4])
++    run_callbacks(:after_save)
++  end
++end
++
+ class CallbacksTest < Test::Unit::TestCase
+   def test_save_person
+     person = Person.new
+@@ -146,3 +211,29 @@ class CallbackChainTest < Test::Unit::TestCase
+     assert_equal [:lettuce, :tomato], @chain.map(&:method)
+   end
+ end
++
++class CallbackWithArgumentsTest < Test::Unit::TestCase
++  def test_callbaks_with_arguments
++    person = ArgumentativePerson.new
++    assert_equal [], person.history
++    person.save
++    assert_equal [
++      [:no              ],
++      [:first,          1],
++      [:first_two,      1,2],
++      [:all,            1,2,3,4],
++      [:first_and_any,  1,2,3,4],
++      [:any,            1,2,3,4],
++      [:string_callback ],
++      [:no              ],
++      [:first,          1],
++      [:first_two,      1,2],
++      [:all,            1,2,3,4],
++      [:first_and_any,  1,2,3,4],
++      [:any,            1,2,3,4],
++      [:no              ],
++      [:two,            1,2],
++      [:first_and_any,  1,2,3,4],
++    ], person.history    
++  end
++end
+-- 
+1.5.5.1
+
+
+From b480de6a91cb4c6bb4ecf931d8aaef4da3f8a87a Mon Sep 17 00:00:00 2001
+From: Ruy Asan <ruyasan@gmail.com>
+Date: Wed, 9 Jul 2008 17:22:30 -0700
+Subject: [PATCH] Added documentation for the new run_callbacks :args option (and documented :enumeratoroption since I was at it.)
+
+---
+ activesupport/lib/active_support/callbacks.rb |    8 ++++++++
+ 1 files changed, 8 insertions(+), 0 deletions(-)
+
+diff --git a/activesupport/lib/active_support/callbacks.rb b/activesupport/lib/active_support/callbacks.rb
+index 8f44fd5..4d25423 100644
+--- a/activesupport/lib/active_support/callbacks.rb
++++ b/activesupport/lib/active_support/callbacks.rb
+@@ -236,6 +236,14 @@ module ActiveSupport
+ 
+     # Runs all the callbacks defined for the given options.
+     #
++    # Expected options are:
++    #   * +:args+ - Pass the provided arguments array to each callback method or proc.
++    #     Arguments that exeed the arity of the callback method/proc will be silently
++    #     discarded rather then generate a warning. String callbacks cannot receieve
++    #     arguments. (default: +[]+ i.e. no arguments will be passed)
++    #   * +:enumerator* - Provide an alternative enumeration method to execute the
++    #     callback chain. E.g. +:reverse_each+ (default: +:each+)
++    #
+     # If a block is given it will be called after each callback receiving as arguments:
+     #
+     #  * the result from the callback
+-- 
+1.5.5.1
+

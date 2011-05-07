@@ -1,0 +1,138 @@
+From 7181689c5c7c456e57e72a90eb780bccb64f3691 Mon Sep 17 00:00:00 2001
+From: Mike Perham <mperham@gmail.com>
+Date: Sun, 25 May 2008 20:06:55 -0500
+Subject: [PATCH] MySQL lock debugging support
+
+Update the MySQL adapter to capture any deadlock or lock timeout
+errors.  When this happens the adapter will log the results of
+SHOW INNODB STATUS to facilitate debugging.  If the current connection
+does not have the SUPER permission required to run the command, nothing
+will be logged.
+---
+ .../connection_adapters/mysql_adapter.rb           |   23 ++++++-
+ activerecord/test/cases/connection_test_mysql.rb   |   70 ++++++++++++++++++++
+ 2 files changed, 92 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index f00a2c8..3d8412b 100755
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -296,7 +296,16 @@ module ActiveRecord
+       end
+ 
+       def execute(sql, name = nil) #:nodoc:
+-        log(sql, name) { @connection.query(sql) }
++        log(sql, name) do
++          begin
++            @connection.query(sql)
++          rescue Mysql::Error => my
++            if @logger && my.message =~ /try restarting transaction/
++              log_innodb_status
++            end
++            raise
++          end
++        end
+       rescue ActiveRecord::StatementInvalid => exception
+         if exception.message.split(":").first =~ /Packets out of order/
+           raise ActiveRecord::StatementInvalid, "'Packets out of order' error was received from the database. Please update your mysql bindings (gem install mysql) and read http://dev.mysql.com/doc/mysql/en/password-hashing.html for more information.  If you're on Windows, use the Instant Rails installer to get the updated mysql bindings."
+@@ -305,6 +314,18 @@ module ActiveRecord
+         end
+       end
+ 
++      def log_innodb_status
++        @connection.query_with_result = true
++        msg = nil
++        result = @connection.query("show innodb status")
++        result.each { |row| msg = row[0] }
++        result.free
++        @logger.error "MySQL locking exception detected: SHOW INNODB STATUS"
++        @logger.error msg
++      rescue Mysql::Error
++        # Access denied, ignore
++      end
++
+       def insert_sql(sql, name = nil, pk = nil, id_value = nil, sequence_name = nil) #:nodoc:
+         super sql, name
+         id_value || @connection.insert_id
+diff --git a/activerecord/test/cases/connection_test_mysql.rb b/activerecord/test/cases/connection_test_mysql.rb
+index 1adbf18..8f1e5c9 100644
+--- a/activerecord/test/cases/connection_test_mysql.rb
++++ b/activerecord/test/cases/connection_test_mysql.rb
+@@ -27,4 +27,74 @@ class MysqlConnectionTest < ActiveRecord::TestCase
+     @connection.verify!(0)
+     assert @connection.active?
+   end
++
++  uses_mocha "print innodb status if lock error is raised" do
++    def test_print_innodb_status_if_lock_error_is_raised
++      expected_output = ["\n=====================================\n080525 10:02:30 INNODB MONITOR OUTPUT\n=====================================\nPer second averages calculated from the last 59 seconds\n----------\nSEMAPHORES\n----------\nOS WAIT ARRAY INFO: reservation count 1485, signal count 1483\nMutex spin waits 0, rounds 14428, OS waits 237\nRW-shared spins 2330, OS waits 1158; RW-excl spins 82, OS waits 41\n------------------------\nLATEST FOREIGN KEY ERROR\n------------------------\n080522 19:25:02  Cannot drop table `sequel_test/users`\nbecause it is referenced by `sequel_test/projects`\n------------\nTRANSACTIONS\n------------\nTrx id counter 0 12383616\nPurge done for trx's n:o < 0 12383604 undo n:o < 0 0\nHistory list length 13\nTotal number of lock structs in row lock hash table 0\nLIST OF TRANSACTIONS FOR EACH SESSION:\n---TRANSACTION 0 0, not started, OS thread id 2955325440\nMySQL thread id 5352, query id 534752 localhost root\nSHOW INNODB STATUS\n--------\nFILE I/O\n--------\nI/O thread 0 state: waiting for i/o request (insert buffer thread)\nI/O thread 1 state: waiting for i/o request (log thread)\nI/O thread 2 state: waiting for i/o request (read thread)\nI/O thread 3 state: waiting for i/o request (write thread)\nPending normal aio reads: 0, aio writes: 0,\n ibuf aio reads: 0, log i/o's: 0, sync i/o's: 0\nPending flushes (fsync) log: 0; buffer pool: 0\n1280 OS file reads, 36286 OS file writes, 25120 OS fsyncs\n0.00 reads/s, 0 avg bytes/read, 0.00 writes/s, 0.00 fsyncs/s\n-------------------------------------\nINSERT BUFFER AND ADAPTIVE HASH INDEX\n-------------------------------------\nIbuf: size 1, free list len 0, seg size 2,\n436 inserts, 436 merged recs, 7 merges\nHash table size 69257, used cells 18818, node heap has 23 buffer(s)\n0.00 hash searches/s, 0.00 non-hash searches/s\n---\nLOG\n---\nLog sequence number 1 752593225\nLog flushed up to   1 752593225\nLast checkpoint at  1 752593225\n0 pending log writes, 0 pending chkp writes\n21654 log i/o's done, 0.00 log i/o's/second\n----------------------\nBUFFER POOL AND MEMORY\n----------------------\nTotal memory allocated 35327982; in additional pool allocated 2097152\nBuffer pool size   1024\nFree buffers       1\nDatabase pages     1000\nModified db pages  0\nPending reads 0\nPending writes: LRU 0, flush list 0, single page 0\nPages read 1347, created 7752, written 26179\n0.00 reads/s, 0.00 creates/s, 0.00 writes/s\nNo buffer pool page gets since the last printout\n--------------\nROW OPERATIONS\n--------------\n0 queries inside InnoDB, 0 queries in queue\n1 read views open inside InnoDB\nMain thread id 2957045760, state: waiting for server activity\nNumber of rows inserted 756717, updated 27077, deleted 20525, read 558422\n0.00 inserts/s, 0.00 updates/s, 0.00 deletes/s, 0.00 reads/s\n----------------------------\nEND OF INNODB MONITOR OUTPUT\n============================\n"]
++
++      result_mock = mock()
++      result_mock.expects(:each).once.yields(expected_output)
++      result_mock.expects(:free)
++      #@connection.instance_variable_set(:@logger, Logger.new(STDOUT))
++
++      raw_connection_mock = mock()
++      raw_connection_mock.expects(:query_with_result=)
++      raw_connection_mock.expects(:query).with('select 1').once.raises(Mysql::Error, 'Deadlock detected; try restarting transaction')
++      raw_connection_mock.expects(:query).with('show innodb status').once.returns(result_mock)
++
++      logger_mock = mock()
++      logger_mock.expects(:debug?).times(2).returns(false)
++      logger_mock.expects(:error).times(2)
++
++      with_mocked_logger(logger_mock) do
++        with_mocked_connection(raw_connection_mock) do
++          assert_raises ActiveRecord::StatementInvalid do
++            @connection.execute('select 1')
++          end
++        end
++      end
++    end
++  end
++
++  uses_mocha "doesn't print innodb status if access denied" do
++    def test_dont_print_innodb_status_if_access_denied
++      raw_connection_mock = mock()
++      raw_connection_mock.expects(:query_with_result=)
++      raw_connection_mock.expects(:query).with('select 1').once.raises(Mysql::Error, 'Deadlock detected; try restarting transaction')
++      raw_connection_mock.expects(:query).with('show innodb status').once.raises(Mysql::Error, "Access denied; you need the SUPER privilege for this operation")
++
++      logger_mock = mock()
++      logger_mock.expects(:debug?).times(2).returns(false)
++
++      with_mocked_logger(logger_mock) do
++        with_mocked_connection(raw_connection_mock) do
++          assert_raises ActiveRecord::StatementInvalid do
++            @connection.execute('select 1')
++          end
++        end
++      end
++    end
++  end
++
++  private
++
++  def with_mocked_logger(mock)
++    real_logger = @connection.instance_variable_get(:@logger)
++    @connection.instance_variable_set(:@logger, mock)
++    begin
++      yield
++    ensure
++      @connection.instance_variable_set(:@logger, real_logger)
++    end
++  end
++
++  def with_mocked_connection(mock)
++    real_connection = @connection.raw_connection
++    @connection.instance_variable_set(:@connection, mock)
++    begin
++      yield
++    ensure
++      @connection.instance_variable_set(:@connection, real_connection)
++    end
++  end
+ end
+-- 
+1.5.3.3
+

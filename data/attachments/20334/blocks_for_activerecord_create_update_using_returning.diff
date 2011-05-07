@@ -1,0 +1,193 @@
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 8bef5ed..f1579a0 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -595,15 +595,27 @@ module ActiveRecord #:nodoc:
+       # ==== Examples
+       #   # Create a single new object
+       #   User.create(:first_name => 'Jamie')
++      #
+       #   # Create an Array of new objects
+       #   User.create([{:first_name => 'Jamie'}, {:first_name => 'Jeremy'}])
+-      def create(attributes = nil)
++      #
++      #   # Create a single object and pass it into a block to set other attributes.
++      #   User.create(:first_name => 'Jamie') do |u|
++      #     u.is_admin = false
++      #   end
++      #
++      #   # Creating an Array of new objects using a block, where the block is executed for each object:
++      #   User.create([{:first_name => 'Jamie'}, {:first_name => 'Jeremy'}]) do |u|
++      #     u.is_admin = false
++      #   end 
++      def create(attributes = nil, &block)
+         if attributes.is_a?(Array)
+-          attributes.collect { |attr| create(attr) }
++          attributes.collect { |attr| create(attr, &block) }
+         else
+-          object = new(attributes)
+-          object.save
+-          object
++          returning new(attributes) do |object|
++            yield(object) if block_given?
++            object.save
++          end
+         end
+       end
+ 
+@@ -623,16 +635,28 @@ module ActiveRecord #:nodoc:
+       #   # Updating multiple records:
+       #   people = { 1 => { "first_name" => "David" }, 2 => { "first_name" => "Jeremy"} }
+       #   Person.update(people.keys, people.values)
+-      def update(id, attributes)
++      #
++      #   # Updating one record using a block:
++      #   Person.update(15, {:user_name => 'Samuel'}) do |p|
++      #     p.group = "expert"
++      #   end
++      #
++      #   # Updating multiple records using a block, where the block is executed for each record:
++      #   Person.update(people.keys, people.values) do |p|
++      #     p.group = "expert"
++      #   end
++      def update(id, attributes, &block)
+         if id.is_a?(Array)
+           idx = -1
+-          id.collect { |one_id| idx += 1; update(one_id, attributes[idx]) }
++          id.collect { |id| idx += 1; update(id, attributes[idx], &block) }
+         else
+-          object = find(id)
+-          object.update_attributes(attributes)
+-          object
++          returning find(id) do |object|
++            object.attributes = attributes
++            yield(object) if block_given?
++            object.save
++          end          
+         end
+-      end
++      end      
+ 
+       # Delete an object (or multiple objects) where the +id+ given matches the primary_key.  A SQL +DELETE+ command
+       # is executed on the database which means that no callbacks are fired off running this.  This is an efficient method
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index 1d12ea8..814b692 100755
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -873,13 +873,14 @@ module ActiveRecord
+ 
+       # Creates an object just like Base.create but calls save! instead of save
+       # so an exception is raised if the record is invalid.
+-      def create!(attributes = nil)
++      def create!(attributes = nil, &block)
+         if attributes.is_a?(Array)
+-          attributes.collect { |attr| create!(attr) }
++          attributes.collect { |attr| create!(attr, &block) }
+         else
+-          object = new(attributes)
+-          object.save!
+-          object
++          returning new(attributes) do |object|
++            yield(object) if block_given?
++            object.save!
++          end
+         end
+       end
+ 
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 45d4783..f4c2f2a 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -251,6 +251,27 @@ class BasicsTest < ActiveRecord::TestCase
+     topic = Topic.create("title" => "New Topic")
+     topicReloaded = Topic.find(topic.id)
+     assert_equal(topic, topicReloaded)
++  end  
++
++  def test_create_through_factory_with_block
++    topic = Topic.create("title" => "New Topic") do |t|
++      t.author_name = "David"
++    end
++    topicReloaded = Topic.find(topic.id)
++    assert_equal("New Topic", topic.title)
++    assert_equal("David", topic.author_name)
++  end
++
++  def test_create_many_through_factory_with_block
++    topics = Topic.create([ { "title" => "first" }, { "title" => "second" }]) do |t|
++      t.author_name = "David"
++    end
++    assert_equal 2, topics.size
++    topic1, topic2 = Topic.find(topics[0].id), Topic.find(topics[1].id)
++    assert_equal "first", topic1.title
++    assert_equal "David", topic1.author_name
++    assert_equal "second", topic2.title
++    assert_equal "David", topic2.author_name
+   end
+ 
+   def test_update
+@@ -633,6 +654,16 @@ class BasicsTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_update_with_block
++    topic = Topic.update(1, { "content" => "updated" }) do |t|
++      t.approved = true
++    end
++    
++    topicReloaded = Topic.find(1)
++    assert_equal "updated", topicReloaded.content
++    assert topicReloaded.approved
++  end
++
+   def test_update_many
+     topic_data = { 1 => { "content" => "1 updated" }, 2 => { "content" => "2 updated" } }
+     updated = Topic.update(topic_data.keys, topic_data.values)
+@@ -641,6 +672,20 @@ class BasicsTest < ActiveRecord::TestCase
+     assert_equal "1 updated", Topic.find(1).content
+     assert_equal "2 updated", Topic.find(2).content
+   end
++  
++  def test_update_many_with_block
++    topic_data = { 1 => { "content" => "1 updated" }, 2 => { "content" => "2 updated" } }
++    updated = Topic.update(topic_data.keys, topic_data.values) do |t|
++      t.approved = true
++    end
++
++    assert_equal 2, updated.size
++    topic1, topic2 = Topic.find(1), Topic.find(2)
++    assert_equal "1 updated", topic1.content
++    assert topic1.approved
++    assert_equal "2 updated", topic2.content
++    assert topic2.approved
++  end
+ 
+   def test_delete_all
+     assert Topic.count > 0
+diff --git a/activerecord/test/cases/validations_test.rb b/activerecord/test/cases/validations_test.rb
+index ca36ad3..e3ca866 100755
+--- a/activerecord/test/cases/validations_test.rb
++++ b/activerecord/test/cases/validations_test.rb
+@@ -133,6 +133,22 @@ class ValidationsTest < ActiveRecord::TestCase
+       Reply.create!([ { "title" => "OK" }, { "title" => "Wrong Create" }])
+     end
+   end
++  
++  def test_exception_on_create_bang_with_block
++    assert_raises(ActiveRecord::RecordInvalid) do
++      Reply.create!({ "title" => "OK" }) do |r|
++        r.content = nil
++      end
++    end
++  end
++  
++  def test_exception_on_create_bang_many_with_block
++    assert_raises(ActiveRecord::RecordInvalid) do
++      Reply.create!([{ "title" => "OK" }, { "title" => "Wrong Create" }]) do |r|
++        r.content = nil
++      end
++    end
++  end
+ 
+   def test_scoped_create_without_attributes
+     Reply.with_scope(:create => {}) do

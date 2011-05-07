@@ -1,0 +1,161 @@
+From 06a904e9e68978379a44abd2fe57963daf091582 Mon Sep 17 00:00:00 2001
+From: mark <mark@looking-glass.com>
+Date: Wed, 10 Dec 2008 15:11:07 -0500
+Subject: [PATCH] knowledge is power!
+
+---
+ .../assertions/response_assertions.rb              |   46 ++++++++++++++++----
+ actionpack/lib/action_controller/test_process.rb   |    6 ++-
+ actionpack/lib/action_view/base.rb                 |    1 +
+ actionpack/lib/action_view/renderable.rb           |    9 +++-
+ actionpack/test/controller/render_test.rb          |    6 +++
+ 5 files changed, 55 insertions(+), 13 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/assertions/response_assertions.rb b/actionpack/lib/action_controller/assertions/response_assertions.rb
+index 7ab2438..a31a043 100644
+--- a/actionpack/lib/action_controller/assertions/response_assertions.rb
++++ b/actionpack/lib/action_controller/assertions/response_assertions.rb
+@@ -75,22 +75,50 @@ module ActionController
+         end
+       end
+ 
+-      # Asserts that the request was rendered with the appropriate template file.
++      # Asserts that the request was rendered with the appropriate template file or partials
+       #
+       # ==== Examples
+       #
+       #   # assert that the "new" view template was rendered
+       #   assert_template "new"
+       #
+-      def assert_template(expected = nil, message=nil)
++      #   # assert that the "_customer" partial was rendered twice
++      #   assert_template :partial => '_customer', :count => 2
++      #
++      #   # assert that no partials were rendered
++      #   assert_template :partial => false
++      #
++      def assert_template(options = {}, message=nil)
+         clean_backtrace do
+-          rendered = @response.rendered_template.to_s
+-          msg = build_message(message, "expecting <?> but rendering with <?>", expected, rendered)
+-          assert_block(msg) do
+-            if expected.nil?
+-              @response.rendered_template.blank?
+-            else
+-              rendered.to_s.match(expected)
++          case options
++          
++           when NilClass,String 
++            rendered = @response.rendered_template.to_s
++            msg = build_message(message, "expecting <?> but rendering with <?>", options, rendered)
++            assert_block(msg) do
++              if options.nil?
++                @response.rendered_template.blank?
++              else
++                rendered.to_s.match(options)
++              end
++            end
++          when Hash
++            if options.has_key?(:partial)
++              if(options[:partial].is_a?(String))
++                if(options[:count])
++                  # There's almost certainly a better way to do this..
++                  found = @response.rendered_partials.select{ |p,_| p.to_s.match(options[:partial]) }.first
++                  real_count = found.nil? ? 0 : found.second
++                  unless real_count == options[:count].to_i
++                    flunk build_message(message, "expecting ? to be rendered ? time(s) but rendered ? time(s)", options[:partial], options[:count].to_i, real_count)
++                  end
++                else
++                  msg = build_message(message, "expecting partial <?> but action rendered <?>", options[:partial], @response.rendered_partials.keys)
++                  assert(@response.rendered_partials.any?{|p,_| p.to_s.match(options[:partial]) },msg)
++                end
++              elsif(options[:partial] == false)
++                flunk "Expected no partials to be rendered" if !@response.rendered_partials.empty?    
++              end   
+             end
+           end
+         end
+diff --git a/actionpack/lib/action_controller/test_process.rb b/actionpack/lib/action_controller/test_process.rb
+index cd3914f..05249f0 100644
+--- a/actionpack/lib/action_controller/test_process.rb
++++ b/actionpack/lib/action_controller/test_process.rb
+@@ -222,7 +222,11 @@ module ActionController #:nodoc:
+     # Returns the template of the file which was used to
+     # render this response (or nil)
+     def rendered_template
+-      template.instance_variable_get(:@_first_render)
++      template.instance_variable_get(:@_rendered)[:template]
++    end
++    
++    def rendered_partials
++      template.instance_variable_get(:@_rendered)[:partials]
+     end
+ 
+     # A shortcut to the flash. Returns an empty hash if no session flash exists.
+diff --git a/actionpack/lib/action_view/base.rb b/actionpack/lib/action_view/base.rb
+index 33517ff..5404024 100644
+--- a/actionpack/lib/action_view/base.rb
++++ b/actionpack/lib/action_view/base.rb
+@@ -227,6 +227,7 @@ module ActionView #:nodoc:
+       @assigns = assigns_for_first_render
+       @assigns_added = nil
+       @_render_stack = []
++      @_rendered = {:template => nil, :partials => Hash.new(0)}
+       @controller = controller
+       @helpers = ProxyModule.new(self)
+       self.view_paths = view_paths
+diff --git a/actionpack/lib/action_view/renderable.rb b/actionpack/lib/action_view/renderable.rb
+index 7258ad0..202930a 100644
+--- a/actionpack/lib/action_view/renderable.rb
++++ b/actionpack/lib/action_view/renderable.rb
+@@ -28,9 +28,12 @@ module ActionView
+       stack = view.instance_variable_get(:@_render_stack)
+       stack.push(self)
+ 
+-      # This is only used for TestResponse to set rendered_template
+-      unless is_a?(InlineTemplate) || view.instance_variable_get(:@_first_render)
+-        view.instance_variable_set(:@_first_render, self)
++      # These are only used for TestResponse
++      if(self.respond_to?(:path) && !is_a?(InlineTemplate))
++        rendered = view.instance_variable_get(:@_rendered)        
++        rendered[:partials][self.to_s] += 1 if is_a?(RenderablePartial) 
++        rendered[:template] = self.to_s unless rendered[:template]
++        view.instance_variable_set(:@_rendered, rendered) 
+       end
+ 
+       view.send(:_evaluate_assigns_and_ivars)
+diff --git a/actionpack/test/controller/render_test.rb b/actionpack/test/controller/render_test.rb
+index c5496a9..6db7948 100644
+--- a/actionpack/test/controller/render_test.rb
++++ b/actionpack/test/controller/render_test.rb
+@@ -1310,21 +1310,27 @@ class RenderTest < ActionController::TestCase
+   def test_partial_collection_with_spacer
+     get :partial_collection_with_spacer
+     assert_equal "Hello: davidonly partialHello: mary", @response.body
++    assert_template :partial => 'test/_partial_only'
++    assert_template :partial => '_customer'
+   end
+ 
+   def test_partial_collection_shorthand_with_locals
+     get :partial_collection_shorthand_with_locals
+     assert_equal "Bonjour: davidBonjour: mary", @response.body
++    assert_template :partial => 'customers/_customer', :count => 2
+   end
+ 
+   def test_partial_collection_shorthand_with_different_types_of_records
+     get :partial_collection_shorthand_with_different_types_of_records
+     assert_equal "Bonjour bad customer: mark0Bonjour good customer: craig1Bonjour bad customer: john2Bonjour good customer: zach3Bonjour good customer: brandon4Bonjour bad customer: dan5", @response.body
++    assert_template :partial => 'good_customers/_good_customer', :count => 3
++    assert_template :partial => 'bad_customers/_bad_customer', :count => 3
+   end
+ 
+   def test_empty_partial_collection
+     get :empty_partial_collection
+     assert_equal " ", @response.body
++    assert_template :partial => false
+   end
+ 
+   def test_partial_with_hash_object
+-- 
+1.5.6.1
+

@@ -1,0 +1,312 @@
+From 4a1a0a4c402540154d96c4d9f1e04cdfc119d9f0 Mon Sep 17 00:00:00 2001
+From: Norman Clarke <norman@njclarke.com>
+Date: Wed, 30 Jun 2010 16:08:43 -0300
+Subject: [PATCH] Improve bang method defs, make slice! operate in-place, update guide. [#5028 state:resolved]
+
+---
+ .../active_support/core_ext/string/multibyte.rb    |    2 +-
+ .../lib/active_support/multibyte/chars.rb          |   26 +---
+ activesupport/test/multibyte_chars_test.rb         |   41 ++++---
+ railties/guides/source/initialization.textile      |  137 ++++++++++++--------
+ 4 files changed, 114 insertions(+), 92 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/string/multibyte.rb b/activesupport/lib/active_support/core_ext/string/multibyte.rb
+index 3dfe996..16ccd36 100644
+--- a/activesupport/lib/active_support/core_ext/string/multibyte.rb
++++ b/activesupport/lib/active_support/core_ext/string/multibyte.rb
+@@ -2,7 +2,7 @@
+ require 'active_support/multibyte'
+
+ class String
+-  if '1.9'.respond_to?(:force_encoding)
++  if RUBY_VERSION >= "1.9"
+     # == Multibyte proxy
+     #
+     # +mb_chars+ is a multibyte safe proxy for string methods.
+diff --git a/activesupport/lib/active_support/multibyte/chars.rb b/activesupport/lib/active_support/multibyte/chars.rb
+index 8823e4a..51c2a0e 100644
+--- a/activesupport/lib/active_support/multibyte/chars.rb
++++ b/activesupport/lib/active_support/multibyte/chars.rb
+@@ -325,18 +325,6 @@ module ActiveSupport #:nodoc:
+       end
+       alias_method :[], :slice
+
+-      # Like <tt>String#slice!</tt>, except instead of byte offsets you specify character offsets.
+-      #
+-      # Example:
+-      #   s = 'こんにちは'
+-      #   s.mb_chars.slice!(2..3).to_s #=> "にち"
+-      #   s #=> "こんは"
+-      def slice!(*args)
+-        slice = self[*args]
+-        self[*args] = ''
+-        slice
+-      end
+-
+       # Limit the byte size of the string to a number of bytes without breaking characters. Usable
+       # when the storage for a string is limited for some reason.
+       #
+@@ -425,14 +413,14 @@ module ActiveSupport #:nodoc:
+         chars(Unicode.tidy_bytes(@wrapped_string, force))
+       end
+
+-      %w(lstrip rstrip strip reverse upcase downcase tidy_bytes capitalize).each do |method|
+-        define_method("#{method}!") do |*args|
+-          unless args.nil?
+-            @wrapped_string = send(method, *args).to_s
+-          else
+-            @wrapped_string = send(method).to_s
++       %w(capitalize downcase lstrip reverse rstrip slice strip tidy_bytes upcase).each do |method|
++        # Only define a corresponding bang method for methods defined in the proxy; On 1.9 the proxy will
++        # exclude lstrip!, rstrip! and strip! because they are already work as expected on multibyte strings.
++        if public_method_defined?(method)
++          define_method("#{method}!") do |*args|
++            @wrapped_string = send(args.nil? ? method : method, *args).to_s
++            self
+           end
+-          self
+         end
+       end
+
+diff --git a/activesupport/test/multibyte_chars_test.rb b/activesupport/test/multibyte_chars_test.rb
+index 610295f..78232d8 100644
+--- a/activesupport/test/multibyte_chars_test.rb
++++ b/activesupport/test/multibyte_chars_test.rb
+@@ -123,22 +123,30 @@ class MultibyteCharsUTF8BehaviourTest < Test::Unit::TestCase
+     assert_equal 'こに わ', @chars
+   end
+
+-  def test_overridden_bang_methods_return_self
+-    [:rstrip!, :lstrip!, :strip!, :reverse!, :upcase!, :downcase!, :capitalize!].each do |method|
+-      assert_equal @chars.object_id, @chars.send(method).object_id
+-    end
++  %w{capitalize downcase lstrip reverse rstrip strip upcase}.each do |method|
++    class_eval(<<-EOTESTS)
++      def test_#{method}_bang_should_return_self
++        assert_equal @chars.object_id, @chars.send("#{method}!").object_id
++      end
++
++      def test_#{method}_bang_should_change_wrapped_string
++        original = ' él piDió Un bUen café '
++        proxy = chars(original.dup)
++        proxy.send("#{method}!")
++        assert_not_equal original, proxy.to_s
++      end
++    EOTESTS
+   end
+
+-  def test_overridden_bang_methods_change_wrapped_string
+-    [:rstrip!, :lstrip!, :strip!, :reverse!, :upcase!, :downcase!].each do |method|
+-      original = ' Café '
+-      proxy = chars(original.dup)
+-      proxy.send(method)
+-      assert_not_equal original, proxy.to_s
+-    end
+-    proxy = chars('òu')
+-    proxy.capitalize!
+-    assert_equal 'Òu', proxy.to_s
++  def test_tidy_bytes_bang_should_return_self
++    assert_equal @chars.object_id, @chars.tidy_bytes!.object_id
++  end
++
++  def test_tidy_bytes_bang_should_change_wrapped_string
++    original = " Un bUen café \x92"
++    proxy = chars(original.dup)
++    proxy.tidy_bytes!
++    assert_not_equal original, proxy.to_s
+   end
+
+   if RUBY_VERSION >= '1.9'
+@@ -417,8 +425,9 @@ class MultibyteCharsUTF8BehaviourTest < Test::Unit::TestCase
+   end
+
+   def test_slice_bang_removes_the_slice_from_the_receiver
+-    @chars.slice!(1..2)
+-    assert_equal 'こわ', @chars
++    chars = 'úüù'.mb_chars
++    chars.slice!(0,2)
++    assert_equal 'úü', chars
+   end
+
+   def test_slice_should_throw_exceptions_on_invalid_arguments
+diff --git a/railties/guides/source/initialization.textile b/railties/guides/source/initialization.textile
+index e458413..8ef391c 100644
+--- a/railties/guides/source/initialization.textile
++++ b/railties/guides/source/initialization.textile
+@@ -3588,28 +3588,24 @@ h3. Appendix A
+
+ This file is _activesupport/lib/active_support/inflector/inflections.rb_ and defines the +ActiveSupport::Inflector::Inflections+ class which defines the +singularize+, +pluralize+, +humanize+, +tableize+, +titleize+ and +classify+ methods as well as the code to defining how to work out the irregular, singular, plural and human versions of words. These methods are called +irregular+, +singular+, +plural+ and +human+ respectively, as is the Rails way.
+
+-This file is _activesupport/lib/active_support/inflector/transliterate.rb_ and defines two methods, +transliterate+ and +parameterize+. What +transliterate+ does depends on your Ruby version. If you have something greater than 1.9 installed it will just print out a warning message using the +Kernel#warn+ method (simply called using +warn+) reading "Ruby 1.9 doesn't support Unicode normalization yet". If you're running something that's not 1.9 it will attempt to convert +"föö"+ to +foo+ and if that fails then it'll redefine it.
++This file is _activesupport/lib/active_support/inflector/transliterate.rb_ and defines two methods, +transliterate+ and +parameterize+.
+
+-This file first makes a require to _activesupport/lib/active_support/core_ext/string/multibyte.rb_ which then goes on to require _activesupport/lib/active_support/multibyte.rb_ and that requires _activesupport/core_ext/module/attribute_accessors.rb_. The _attribute_accessors.rb_ file is used to gain access to the +mattr_accessor+ (module attribute accessor) method which is called in _active_suport/multibyte.rb_. Also in _active_support/multibyte.rb_ there's a couple of autoloaded classes:
++This file first requires _activesupport/lib/active_support/core_ext/string/multibyte.rb_, which requires _activesupport/lib/active_support/multibyte.rb_, which subsequently requires _activesupport/core_ext/module/attribute_accessors.rb_. The _attribute_accessors.rb_ file is needed to gain access to the +mattr_accessor+ (module attribute accessor) method, which is called in _active_suport/multibyte.rb_. The file _active_support/multibyte.rb_ also autoloads three other classes:
+
+ <ruby>
+ module ActiveSupport #:nodoc:
+   module Multibyte
+     autoload :EncodingError, 'active_support/multibyte/exceptions'
+     autoload :Chars, 'active_support/multibyte/chars'
+-    autoload :UnicodeDatabase, 'active_support/multibyte/unicode_database'
+-    autoload :Codepoint, 'active_support/multibyte/unicode_database'
+-    autoload :UCD, 'active_support/multibyte/unicode_database'
+-  ...
++    autoload :Unicode, 'active_support/multibyte/unicode'
++    ...
+   end
+ end
+ </ruby>
+
+-There's also these method definitions:
++There are also these method definitions:
+
+ <ruby>
+-  self.default_normalization_form = :kc
+-
+   # The proxy class returned when calling mb_chars. You can use this accessor to configure your own proxy
+   # class so you can support other encodings. See the ActiveSupport::Multibyte::Chars implementation for
+   # an example how to do this.
+@@ -3628,63 +3624,92 @@ There's also these method definitions:
+
+ These methods are used in _activesupport/lib/active_support/core_ext/string/multibyte.rb_.
+
+-If we go back to _activesupport/lib/active_support/core_ext/string/multibyte.rb_, this file makes a couple of extensions to the +String+ class based on if your version of Ruby's +String+ class responds to the +force_encoding+ method. This method was introduced in Ruby 1.9. If you're using 1.9 the methods are defined like this:
+-
+-<ruby>
+-  def mb_chars #:nodoc
+-    self
+-  end
+-
+-  def is_utf8? #:nodoc
+-    case encoding
+-    when Encoding::UTF_8
+-      valid_encoding?
+-    when Encoding::ASCII_8BIT, Encoding::US_ASCII
+-      dup.force_encoding(Encoding::UTF_8).valid_encoding?
+-    else
+-      false
+-    end
+-  end
+-</ruby>
+-
+-You can see that calling +mb_chars+ on a +String+ instance in Ruby 1.9 will simply return that +String+ object. +String+ objects in Ruby 1.9 are already multibyte strings, so Rails does not need to do any conversion on them.
+-
+-The second method, +is_utf8?+ return +true+ if the +String+ object is of the UTF8 encoding or if it's able to be forced into that encoding and +false+ if it can't force its encoding or if the encoding of the string is neither +UTF8+, +ASCII_8BIT+ or +US_ASCII+.
+-
+-If you're using a Ruby version less than 1.9 there are 3 methods defined instead of 2, and they are defined like this:
++The file _activesupport/lib/active_support/core_ext/string/chars.rb_  defines the default proxy class that will be returned by +mb_chars+.
++
++Because Ruby 1.9's +String+ class has support for multibyte encodings, some methods are defined only for Ruby 1.8:
++
++* +self.wants?+
++* +++
++* +=~+
++* +=~+
++* +center+
++* +include?+
++* +index+
++* +insert+
++* +ljust+
++* +lstrip+, +lstrip!+
++* +ord+
++* +rindex+
++* +rjust+
++* +rstrip+, +rstrip!+
++* +size+
++* +strip+, +strip!+
++
++However, Ruby 1.9 lacks support for some needed operations, so the following methods are defined for both Ruby 1.8 and Ruby 1.9:
++
++* +<=>+
++* +[]=+
++* +capitalize+, +capitalize!+
++* +compose+
++* +decompose+
++* +downcase+, +downcase!+
++* +g_length+
++* +limit+
++* +normalize+
++* +reverse+, +reverse+!
++* +slice+, +slice!+
++* +split+
++* +tidy_bytes+, +tidy_bytes!+
++* +titleize+
++* +upcase+, +upcase!+
++
++<ruby>
++  class String
++    if RUBY_VERSION >= "1.9"
++      def mb_chars
++        if ActiveSupport::Multibyte.proxy_class.consumes?(self)
++          ActiveSupport::Multibyte.proxy_class.new(self)
++        else
++          self
++        end
++      end
+
+-<ruby>
+-  def mb_chars
+-    if ActiveSupport::Multibyte.proxy_class.wants?(self)
+-      ActiveSupport::Multibyte.proxy_class.new(self)
++      def is_utf8? #:nodoc
++        case encoding
++        when Encoding::UTF_8
++          valid_encoding?
++        when Encoding::ASCII_8BIT, Encoding::US_ASCII
++          dup.force_encoding(Encoding::UTF_8).valid_encoding?
++        else
++          false
++        end
++      end
+     else
+-      self
+-    end
+-  end
+-
+-  # Returns true if the string has UTF-8 semantics (a String used for purely byte resources is unlikely to have
+-  # them), returns false otherwise.
+-  def is_utf8?
+-    ActiveSupport::Multibyte::Chars.consumes?(self)
+-  end
++      def mb_chars
++        if ActiveSupport::Multibyte.proxy_class.wants?(self)
++          ActiveSupport::Multibyte.proxy_class.new(self)
++        else
++          self
++        end
++      end
+
+-  unless '1.8.7 and later'.respond_to?(:chars)
+-    def chars
+-      ActiveSupport::Deprecation.warn('String#chars has been deprecated in favor of String#mb_chars.', caller)
+-      mb_chars
++      # Returns true if the string has UTF-8 semantics (a String used for purely byte resources is unlikely to have
++      # them), returns false otherwise.
++      def is_utf8?
++        ActiveSupport::Multibyte::Chars.consumes?(self)
++      end
+     end
+-  end
+-
+ </ruby>
+
++As you can see, +mb_chars+ is where the +proxy_class+ property comes in handy. This method will create a new instance of the configured proxy class using the instance of +String+ as a constructor argument. By default, the new +String+-like object will be an instance of the proxy class +ActiveSupport::Multibyte::Chars+. You can use +ActiveSupport::Multibyte.proxy_class=+ to set a different proxy class if you wish.
+
+-As you can see, +mb_chars+ is where the +proxy_class+ method comes in handy. This will create a new instance of that class and pass in the +String+ object in order to make it multibyte-compatible. In this case the new +String+ object will be an instance of the +ActiveSupport::Multibyte::Chars+ class. You can use +ActiveSupport::Multibyte.proxy_class=+ to set this to be a different class if you're that way inclined.
+-
+-Here, +is_utf8?+ calls a +consumes+ method on the not-yet-loaded +ActiveSupport::Multibyte::Chars+ class. The keen-eye would have seen this was specified as an auto-load earlier, so that is what is going to happen if we call this method or +mb_chars+. This means that it'll require the file located at _activesupport/lib/active_support/multibyte/chars.rb_. This file includes _activesupport/lib/active_support/string/access.rb_ which defines methods such as +at+, +from+, +to+, +first+ and +last+. These methods will return parts of the string depending on what is passed to them and they are defined differently depending on if you're using Ruby 1.9 or not. The second file included is _activesupport/lib/active_support/string/behaviour.rb_ which defines a single method +acts_like_string?+ on +String+ which always returns +true+. This method is used through the +acts_like?+ method which is passed a single argument representing the downcased and symbolised version of the class you want to know if it acts like. In this case the code would be +acts_like?(:string)+.
++Here, +mb_chars+ invokes +is_utf8?+ to checks if the string can be treated as UTF-8. On 1.9, the string's +encoding+ property is checked. On 1.8, +wants?+ checks to see if +$KCODE+ is "UTF-8" and, and +consumes?+ checks whether the string can be unpacked as UTF-8 without raising an error.
+
+-The +Chars+ class defines, along with +consumes?+, other methods such as the "spaceship" method +<=>+. This method is referenced by the methods defined in the included +Comparable+ module and will return either +-1+, +0+ or +1+ depending on if the word is before, identical or after the compared word. For example, +'é'.mb_chars <=> 'ü'.mb_chars+ returns +-1+ as e comes before u in the alphabet. Other methods are the commonly used +split+, +=~+, +insert+ and +include?+.
++The keen eye will have seen +ActiveSupport::Multibyte::Chars+ was specified as an +autoload+ earlier: _activesupport/lib/active_support/multibyte/chars.rb_ will be loaded without an explicit +require+ when we call +is_utf8+ on 1.8, or +mb_chars+ on any Ruby version. This file includes _activesupport/lib/active_support/string/access.rb_ which defines methods such as +at+, +from+, +to+, +first+ and +last+. These methods will return parts of the string depending on what is passed to them.
+
++The second file included is _activesupport/lib/active_support/string/behavior.rb_ which only defines  +acts_like_string?+ on +String+, a method which always returns +true+. This method is used by +Object#acts_like?+, which accepts a single argument representing the downcased and symbolised version of a class, and returns true if the object's behavior is like that class. In this case the code would be +acts_like?(:string)+.
+
++The +Chars+ class also defines other important methods such as the "spaceship" method +<=>+, which is needed by the +Comparable+ module, in order to allow UTF-8-aware sorting.
+
+ h3. Common Includes
+
+--
+1.7.1
+

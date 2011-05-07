@@ -1,0 +1,655 @@
+From a3d6c969ae0de9464011d34ac9612d5344b62a5b Mon Sep 17 00:00:00 2001
+From: Nick Muerdter <spam@nickm.org>
+Date: Tue, 8 Feb 2011 20:27:00 -0700
+Subject: [PATCH] Use multipart forms to handle requests containing files. A new option,
+ ActiveResource::Base.payload_encoding may be set to :form to enable
+ this. Otherwise, payload_encoding defaults to :serialized for the
+ previous default behavior of PUTing and POSTing data as serialized XML
+ or JSON.
+
+---
+ actionpack/lib/action_dispatch/http/upload.rb      |    4 +
+ actionpack/test/dispatch/uploaded_file_test.rb     |    6 +
+ activeresource/activeresource.gemspec              |    1 +
+ activeresource/lib/active_resource/base.rb         |   73 ++++++++-
+ activeresource/lib/active_resource/connection.rb   |   47 ++++--
+ .../lib/active_resource/custom_methods.rb          |   20 +-
+ activeresource/lib/active_resource/http_mock.rb    |   15 +-
+ activeresource/test/cases/payload_encoding_test.rb |  181 ++++++++++++++++++++
+ activeresource/test/connection_test.rb             |    8 +-
+ activeresource/test/fixtures/foo.jpg               |  Bin 0 -> 2029 bytes
+ 10 files changed, 318 insertions(+), 37 deletions(-)
+ create mode 100644 activeresource/test/cases/payload_encoding_test.rb
+ create mode 100644 activeresource/test/fixtures/foo.jpg
+
+diff --git a/actionpack/lib/action_dispatch/http/upload.rb b/actionpack/lib/action_dispatch/http/upload.rb
+index 37effad..cf283b1 100644
+--- a/actionpack/lib/action_dispatch/http/upload.rb
++++ b/actionpack/lib/action_dispatch/http/upload.rb
+@@ -15,6 +15,10 @@ module ActionDispatch
+         @tempfile.open
+       end
+ 
++      def close
++        @tempfile.close
++      end
++
+       def path
+         @tempfile.path
+       end
+diff --git a/actionpack/test/dispatch/uploaded_file_test.rb b/actionpack/test/dispatch/uploaded_file_test.rb
+index e2a7f1b..7437fdd 100644
+--- a/actionpack/test/dispatch/uploaded_file_test.rb
++++ b/actionpack/test/dispatch/uploaded_file_test.rb
+@@ -40,6 +40,12 @@ module ActionDispatch
+       assert_equal 'thunderhorse', uf.open
+     end
+ 
++    def test_delegates_close_to_tempfile
++      tf = Class.new { def close; 'thunderhorse' end }
++      uf = Http::UploadedFile.new(:tempfile => tf.new)
++      assert_equal 'thunderhorse', uf.close
++    end
++
+     def test_delegates_to_tempfile
+       tf = Class.new { def read; 'thunderhorse' end }
+       uf = Http::UploadedFile.new(:tempfile => tf.new)
+diff --git a/activeresource/activeresource.gemspec b/activeresource/activeresource.gemspec
+index a711687..6e204b2 100644
+--- a/activeresource/activeresource.gemspec
++++ b/activeresource/activeresource.gemspec
+@@ -23,4 +23,5 @@ Gem::Specification.new do |s|
+ 
+   s.add_dependency('activesupport', version)
+   s.add_dependency('activemodel',   version)
++  s.add_dependency('rest-client',   '~> 1.6.1')
+ end
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index 46a14b4..27b87fd 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -1,5 +1,6 @@
+ require 'active_support'
+ require 'active_support/core_ext/class/attribute_accessors'
++require 'active_support/core_ext/class/attribute'
+ require 'active_support/core_ext/class/inheritable_attributes'
+ require 'active_support/core_ext/hash/indifferent_access'
+ require 'active_support/core_ext/kernel/reporting'
+@@ -251,6 +252,8 @@ module ActiveResource
+     # The logger for diagnosing and tracing Active Resource calls.
+     cattr_accessor :logger
+ 
++    class_attribute :_payload_encoding
++
+     class << self
+       # Creates a schema for this resource - setting the attributes that are
+       # known prior to fetching an instance from the remote system.
+@@ -489,6 +492,35 @@ module ActiveResource
+         read_inheritable_attribute(:format) || ActiveResource::Formats::XmlFormat
+       end
+ 
++      # Sets how attributes will be encoded when making a request to a remote
++      # service.
++      #
++      # To send attributes containing files, use <tt>:form</tt> to send all the
++      # attributes and files as multi-part form data.
++      #
++      # Default format is <tt>:serialized</tt>.
++      #
++      # ==== Examples
++      #   Person.payload_encoding = :serialized
++      #   Person.create(:name => 'Theodore Roosevelt')
++      #   # => POST /people.xml
++      #   # => <person><name>Theodore Roosevelt</name></person>
++      #
++      #   Person.payload_encoding = :form
++      #   Person.create(:name => 'Theodore Roosevelt')
++      #   # => POST /people.xml
++      #   # => person[name]=Theodore%20Roosevelt
++      def payload_encoding=(encoding)
++        self._payload_encoding = encoding
++        connection.payload_encoding = encoding if site
++      end
++
++      # Returns the current encoding method used when encoding attributes for
++      # remote requests. Default is <tt>:serialized</tt>.
++      def payload_encoding
++        self._payload_encoding || :serialized
++      end
++
+       # Sets the number of seconds after which requests to the REST API should time out.
+       def timeout=(timeout)
+         @connection = nil
+@@ -534,7 +566,7 @@ module ActiveResource
+       # or not (defaults to <tt>false</tt>).
+       def connection(refresh = false)
+         if defined?(@connection) || superclass == Object
+-          @connection = Connection.new(site, format) if refresh || @connection.nil?
++          @connection = Connection.new(site, format, payload_encoding) if refresh || @connection.nil?
+           @connection.proxy = proxy if proxy
+           @connection.user = user if user
+           @connection.password = password if password
+@@ -1170,6 +1202,22 @@ module ActiveResource
+       !new? && self.class.exists?(to_param, :params => prefix_options)
+     end
+ 
++    # Returns the data representation of the resource used when making requests
++    # to the remote server.
++    #
++    # When ActiveResource::Base.payload_encoding is <tt>:serialized</tt> (the
++    # default), this will return the serialized XML or JSON returned by
++    # <tt>encode</tt>. When payload_encoding is <tt>:form</tt>, this will
++    # return a serializable hash that will be encoded as a form or multipart
++    # request.
++    def payload(options = {})
++      if(self.class.payload_encoding == :form)
++        payload_hash(options)
++      else
++        encode(options)
++      end
++    end
++
+     # Returns the serialized string representation of the resource in the configured
+     # serialization format specified in ActiveResource::Base.format. The options
+     # applicable depend on the configured encoding format.
+@@ -1177,6 +1225,25 @@ module ActiveResource
+       send("to_#{self.class.format.extension}", options)
+     end
+ 
++    # Returns the data of this resource as a serializable hash. This is used
++    # when as the resource's payload when <tt>:form</tt> is chosen for the
++    # <tt>payload_encoding</tt> method.
++    def payload_hash(options = {})
++        root = options.delete(:root) || self.class.element_name
++        { root => payload_serialized_hash(options) }
++    end
++
++    def payload_serialized_hash(options = {}) #:nodoc:
++      hash = serializable_hash(options)
++      hash.each do |attribute, value|
++        if value.respond_to?(:payload_serialized_hash)
++          hash[attribute] = value.payload_serialized_hash(options)
++        end
++      end
++
++      hash
++    end
++
+     # A method to \reload the attributes of this object from the remote web service.
+     #
+     # ==== Examples
+@@ -1304,14 +1371,14 @@ module ActiveResource
+ 
+       # Update the resource on the remote service.
+       def update
+-        connection.put(element_path(prefix_options), encode, self.class.headers).tap do |response|
++        connection.put(element_path(prefix_options), payload, self.class.headers).tap do |response|
+           load_attributes_from_response(response)
+         end
+       end
+ 
+       # Create (i.e., \save to the remote service) the \new resource.
+       def create
+-        connection.post(collection_path, encode, self.class.headers).tap do |response|
++        connection.post(collection_path, payload, self.class.headers).tap do |response|
+           self.id = id_from_response(response)
+           load_attributes_from_response(response)
+         end
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index b7befe1..ae1f096 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -1,5 +1,6 @@
+ require 'active_support/core_ext/benchmark'
+ require 'net/https'
++require 'restclient/payload'
+ require 'date'
+ require 'time'
+ require 'uri'
+@@ -18,7 +19,7 @@ module ActiveResource
+     }
+ 
+     attr_reader :site, :user, :password, :auth_type, :timeout, :proxy, :ssl_options
+-    attr_accessor :format
++    attr_accessor :format, :payload_encoding
+ 
+     class << self
+       def requests
+@@ -28,12 +29,13 @@ module ActiveResource
+ 
+     # The +site+ parameter is required and will set the +site+
+     # attribute to the URI for the remote resource service.
+-    def initialize(site, format = ActiveResource::Formats::XmlFormat)
++    def initialize(site, format = ActiveResource::Formats::XmlFormat, payload_encoding = :serialized)
+       raise ArgumentError, 'Missing site URI' unless site
+       @user = @password = nil
+       @uri_parser = URI.const_defined?(:Parser) ? URI::Parser.new : URI
+       self.site = site
+       self.format = format
++      self.payload_encoding = payload_encoding
+     end
+ 
+     # Set URI for remote service.
+@@ -76,41 +78,52 @@ module ActiveResource
+     # Executes a GET request.
+     # Used to get (find) resources.
+     def get(path, headers = {})
+-      with_auth { format.decode(request(:get, path, build_request_headers(headers, :get, self.site.merge(path))).body) }
++      with_auth { format.decode(request(:get, path, :headers => build_request_headers(headers, :get, self.site.merge(path))).body) }
+     end
+ 
+     # Executes a DELETE request (see HTTP protocol documentation if unfamiliar).
+     # Used to delete resources.
+     def delete(path, headers = {})
+-      with_auth { request(:delete, path, build_request_headers(headers, :delete, self.site.merge(path))) }
++      with_auth { request(:delete, path, :headers => build_request_headers(headers, :delete, self.site.merge(path))) }
+     end
+ 
+     # Executes a PUT request (see HTTP protocol documentation if unfamiliar).
+     # Used to update resources.
+-    def put(path, body = '', headers = {})
+-      with_auth { request(:put, path, body.to_s, build_request_headers(headers, :put, self.site.merge(path))) }
++    def put(path, payload = nil, headers = {})
++      with_auth { request(:put, path, :payload => payload, :headers => build_request_headers(headers, :put, self.site.merge(path))) }
+     end
+ 
+     # Executes a POST request.
+     # Used to create new resources.
+-    def post(path, body = '', headers = {})
+-      with_auth { request(:post, path, body.to_s, build_request_headers(headers, :post, self.site.merge(path))) }
++    def post(path, payload = nil, headers = {})
++      with_auth { request(:post, path, :payload => payload, :headers => build_request_headers(headers, :post, self.site.merge(path))) }
+     end
+ 
+     # Executes a HEAD request.
+     # Used to obtain meta-information about resources, such as whether they exist and their size (via response headers).
+     def head(path, headers = {})
+-      with_auth { request(:head, path, build_request_headers(headers, :head, self.site.merge(path))) }
++      with_auth { request(:head, path, :headers => build_request_headers(headers, :head, self.site.merge(path))) }
+     end
+ 
+     private
+       # Makes a request to the remote service.
+-      def request(method, path, *arguments)
+-        result = ActiveSupport::Notifications.instrument("request.active_resource") do |payload|
+-          payload[:method]      = method
+-          payload[:request_uri] = "#{site.scheme}://#{site.host}:#{site.port}#{path}"
+-          payload[:result]      = http.send(method, path, *arguments)
++      def request(method, path, options = {})
++        payload = RestClient::Payload.generate(options[:payload])
++        if payload
++          options[:headers].merge!(payload.headers)
+         end
++
++        result = ActiveSupport::Notifications.instrument("request.active_resource") do |notify|
++          notify[:method]      = method
++          notify[:request_uri] = "#{site.scheme}://#{site.host}:#{site.port}#{path}"
++
++          if(options.has_key?(:payload))
++            notify[:result]      = http.send(method, path, payload.to_s, options[:headers])
++          else
++            notify[:result]      = http.send(method, path, options[:headers])
++          end
++        end
++
+         handle_response(result)
+       rescue Timeout::Error => e
+         raise TimeoutError.new(e.message)
+@@ -271,7 +284,11 @@ module ActiveResource
+       end
+ 
+       def http_format_header(http_method)
+-        {HTTP_FORMAT_HEADER_NAMES[http_method] => format.mime_type}
++        if payload_encoding == :form
++          { 'Accept' => format.mime_type }
++        else
++          {HTTP_FORMAT_HEADER_NAMES[http_method] => format.mime_type}
++        end
+       end
+ 
+       def legitimize_auth_type(auth_type)
+diff --git a/activeresource/lib/active_resource/custom_methods.rb b/activeresource/lib/active_resource/custom_methods.rb
+index dd3e35d..80aaf7f 100644
+--- a/activeresource/lib/active_resource/custom_methods.rb
++++ b/activeresource/lib/active_resource/custom_methods.rb
+@@ -57,12 +57,12 @@ module ActiveResource
+           connection.get(custom_method_collection_url(custom_method_name, options), headers)
+         end
+ 
+-        def post(custom_method_name, options = {}, body = '')
+-          connection.post(custom_method_collection_url(custom_method_name, options), body, headers)
++        def post(custom_method_name, options = {}, payload = nil)
++          connection.post(custom_method_collection_url(custom_method_name, options), payload, headers)
+         end
+ 
+-        def put(custom_method_name, options = {}, body = '')
+-          connection.put(custom_method_collection_url(custom_method_name, options), body, headers)
++        def put(custom_method_name, options = {}, payload = nil)
++          connection.put(custom_method_collection_url(custom_method_name, options), payload, headers)
+         end
+ 
+         def delete(custom_method_name, options = {})
+@@ -88,17 +88,17 @@ module ActiveResource
+         connection.get(custom_method_element_url(method_name, options), self.class.headers)
+       end
+ 
+-      def post(method_name, options = {}, body = nil)
+-        request_body = body.blank? ? encode : body
++      def post(method_name, options = {}, request_payload = nil)
++        request_payload = payload if(request_payload.blank?)
+         if new?
+-          connection.post(custom_method_new_element_url(method_name, options), request_body, self.class.headers)
++          connection.post(custom_method_new_element_url(method_name, options), request_payload, self.class.headers)
+         else
+-          connection.post(custom_method_element_url(method_name, options), request_body, self.class.headers)
++          connection.post(custom_method_element_url(method_name, options), request_payload, self.class.headers)
+         end
+       end
+ 
+-      def put(method_name, options = {}, body = '')
+-        connection.put(custom_method_element_url(method_name, options), body, self.class.headers)
++      def put(method_name, options = {}, payload = '')
++        connection.put(custom_method_element_url(method_name, options), payload, self.class.headers)
+       end
+ 
+       def delete(method_name, options = {})
+diff --git a/activeresource/lib/active_resource/http_mock.rb b/activeresource/lib/active_resource/http_mock.rb
+index ddd3fb1..72d4ce8 100644
+--- a/activeresource/lib/active_resource/http_mock.rb
++++ b/activeresource/lib/active_resource/http_mock.rb
+@@ -240,13 +240,18 @@ module ActiveResource
+     private
+ 
+     def headers_match?(req)
+-      # Ignore format header on equality if it's not defined
+       format_header = ActiveResource::Connection::HTTP_FORMAT_HEADER_NAMES[method]
+-      if headers[format_header].present? || req.headers[format_header].blank?
+-        headers == req.headers
+-      else
+-        headers.dup.merge(format_header => req.headers[format_header]) == req.headers
++      request_headers = req.headers.dup
++
++      # Ignore some headers unless they're explicitly given to match.
++      ignore_undefined_headers = ["Content-Length", format_header]
++      ignore_undefined_headers.each do |header|
++        if headers[header].blank?
++          request_headers.delete(header)
++        end
+       end
++
++      headers == request_headers
+     end
+   end
+ 
+diff --git a/activeresource/test/cases/payload_encoding_test.rb b/activeresource/test/cases/payload_encoding_test.rb
+new file mode 100644
+index 0000000..3e04c56
+--- /dev/null
++++ b/activeresource/test/cases/payload_encoding_test.rb
+@@ -0,0 +1,181 @@
++require "abstract_unit"
++require "fixtures/person"
++require "fixtures/street_address"
++require "action_dispatch/http/upload"
++require "stringio"
++
++class PayloadEncodingTest < Test::Unit::TestCase
++  def setup
++    @matz  = { :id => 1, :name => "Matz" }.to_xml(:root => "person")
++    @david = { :id => 2, :name => "David" }.to_xml(:root => "person")
++
++    # Force a non-random multipart boundary inside RestClient.
++    @multipart_boundary = "StubbedBoundary"
++    RestClient::Payload::Multipart.any_instance.stubs(:boundary).returns(@multipart_boundary)
++
++    form_headers = { "Content-Type" => "application/x-www-form-urlencoded", "Accept" => "application/xml" }
++    multipart_headers = { "Content-Type" => "multipart/form-data; boundary=#{@multipart_boundary}", "Accept" => "application/xml" }
++
++    ActiveResource::HttpMock.respond_to do |mock|
++      mock.get    "/people/1.xml", {}, @matz
++      mock.get    "/people/2.xml", {}, @david
++      mock.put    "/people/sort.xml?by=name", form_headers, nil, 204
++      mock.put    "/people/1.xml", multipart_headers, nil, 201
++      mock.put    "/people/2.xml", form_headers, nil, 204
++      mock.post   "/people.xml", multipart_headers, nil, 201, "Location" => "/people/5.xml"
++      mock.post   "/people/1/register.xml", form_headers, @matz, 201
++    end
++  end
++
++  def test_form_payload
++    using_payload_encoding(Person, :form) do
++      matz = Person.find(1)
++
++      payload = matz.payload
++      expected_payload = { "person" => { "name" => "Matz", "id" => 1 }}
++
++      assert_equal payload, expected_payload
++    end
++  end
++
++  def test_form_payload_with_element_name
++    old_elem_name = Person.element_name
++
++    using_payload_encoding(Person, :form) do
++      matz = Person.find(1)
++      Person.element_name = 'ruby_creator'
++
++      payload = matz.payload
++      expected_payload = { "ruby_creator" => { "name" => "Matz", "id" => 1 }}
++
++      assert_equal payload, expected_payload
++    end
++  ensure
++    Person.element_name = old_elem_name
++  end
++
++  def test_serialized_payload
++    using_payload_encoding(Person, :serialized) do
++      matz = Person.find(1)
++
++      payload = matz.payload
++      expected_payload = matz.to_xml
++
++      assert_equal payload, expected_payload
++      assert payload.include?('<?xml version="1.0" encoding="UTF-8"?>')
++      assert payload.include?('<name>Matz</name>')
++      assert payload.include?('<id type="integer">1</id>')
++    end
++  end
++
++  def test_form_params
++    using_payload_encoding(Person, :form) do
++      david = Person.find(2)
++      david.address = StreetAddress.new({ :street => "12345 Street", :zip => "27519" })
++
++      expected_payload = RestClient::Payload.generate(david.payload).to_s
++
++      assert david.save
++
++      request = ActiveResource::HttpMock.requests.last
++
++      assert_equal expected_payload, request.body
++      assert request.body.include?("person[address][street]=12345%20Street")
++      assert request.body.include?("person[address][zip]=27519")
++      assert request.body.include?("person[name]=David")
++    end
++  end
++
++  def test_multipart_params
++    using_payload_encoding(Person, :form) do
++      file_path = File.expand_path("#{File.dirname(__FILE__)}/../fixtures/foo.jpg")
++
++      rick = Person.new({
++        :name => "Rick",
++        :age => 25,
++        :address => StreetAddress.new({
++          :street => "12345 Street",
++          :map => File.new(file_path, "rb"),
++        }),
++      })
++
++      assert rick.save
++      assert_equal "5", rick.id
++
++      request = ActiveResource::HttpMock.requests.last
++
++      assert request.body.include? <<-EOS
++--#{@multipart_boundary}\r
++Content-Disposition: form-data; name="person[name]"\r
++\r
++Rick\r
++--#{@multipart_boundary}\r
++      EOS
++
++      assert request.body.include? <<-EOS
++--#{@multipart_boundary}\r
++Content-Disposition: form-data; name="person[address][map]"; filename="foo.jpg"\r
++Content-Type: image/jpeg\r
++\r
++#{IO.read(file_path)}\r
++--#{@multipart_boundary}\r
++      EOS
++    end
++  end
++
++  def test_uploaded_file
++    using_payload_encoding(Person, :form) do
++      matz = Person.find(1)
++      matz.attachment = ActionDispatch::Http::UploadedFile.new(:filename => 'foo', :tempfile => StringIO.new("Attachment Content"))
++
++      assert matz.save
++
++      request = ActiveResource::HttpMock.requests.last
++
++      assert request.body.include? <<-EOS
++--#{@multipart_boundary}\r
++Content-Disposition: form-data; name="person[attachment]"; filename="foo"\r
++Content-Type: \r
++\r
++Attachment Content\r
++--#{@multipart_boundary}\r
++      EOS
++    end
++  end
++
++  def test_custom_collection_put_method
++    using_payload_encoding(Person, :form) do
++      Person.put(:sort, { :by => "name" }, { :form_param => "value" })
++      request = ActiveResource::HttpMock.requests.last
++      assert_equal request.body, "form_param=value"
++    end
++  end
++
++  def test_custom_element_post_method
++    using_payload_encoding(Person, :form) do
++      matz = Person.find(1)
++      matz.post(:register)
++      request = ActiveResource::HttpMock.requests.last
++      assert request.body.include?("person[name]=Matz")
++      assert request.body.include?("person[id]=1")
++    end
++  end
++
++  def test_setting_payload_encoding_before_site
++    resource = Class.new(ActiveResource::Base)
++    resource.payload_encoding = :form
++    resource.site = 'http://37s.sunrise.i:3000'
++    assert_equal :form, resource.connection.payload_encoding
++  end
++
++  private
++
++  def using_payload_encoding(klass, encoding)
++    previous_encoding = klass.payload_encoding
++    klass.payload_encoding = encoding
++
++    yield
++  ensure
++    klass.payload_encoding = previous_encoding
++  end
++end
+diff --git a/activeresource/test/connection_test.rb b/activeresource/test/connection_test.rb
+index 1b4b618..cbcc16a 100644
+--- a/activeresource/test/connection_test.rb
++++ b/activeresource/test/connection_test.rb
+@@ -22,11 +22,11 @@ class ConnectionTest < Test::Unit::TestCase
+       mock.get    "/people_empty_elements.xml", {}, @people_empty
+       mock.get    "/people/1.xml", {}, @matz
+       mock.put    "/people/1.xml", {}, nil, 204
+-      mock.put    "/people/2.xml", {}, @header, 204
++      mock.put    "/people/2.xml", @header, nil, 204
+       mock.delete "/people/1.xml", {}, nil, 200
+       mock.delete "/people/2.xml", @header, nil, 200
+       mock.post   "/people.xml",   {}, nil, 201, 'Location' => '/people/5.xml'
+-      mock.post   "/members.xml",  {}, @header, 201, 'Location' => '/people/6.xml'
++      mock.post   "/members.xml",  @header, nil, 201, 'Location' => '/people/6.xml'
+       mock.head   "/people/1.xml", {}, nil, 200
+     end
+   end
+@@ -157,7 +157,7 @@ class ConnectionTest < Test::Unit::TestCase
+   end
+ 
+   def test_post_with_header
+-    response = @conn.post("/members.xml", @header)
++    response = @conn.post("/members.xml", nil, @header)
+     assert_equal "/people/6.xml", response["Location"]
+   end
+ 
+@@ -167,7 +167,7 @@ class ConnectionTest < Test::Unit::TestCase
+   end
+ 
+   def test_put_with_header
+-    response = @conn.put("/people/2.xml", @header)
++    response = @conn.put("/people/2.xml", nil, @header)
+     assert_equal 204, response.code
+   end
+ 
+diff --git a/activeresource/test/fixtures/foo.jpg b/activeresource/test/fixtures/foo.jpg
+new file mode 100644
+index 0000000000000000000000000000000000000000..b976fe5e002bf58f55dedbf9a147aa6df9bf39b5
+GIT binary patch
+literal 2029
+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
+byIhVj-iS)$Q858g9Rv}WnzjIqz{Gz5qc95o
+
+literal 0
+HcmV?d00001
+
+-- 
+1.7.4
+

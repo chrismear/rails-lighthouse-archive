@@ -1,0 +1,175 @@
+From 7f062fb5487bfa713454e8d5f254e58799675a4b Mon Sep 17 00:00:00 2001
+From: Bruce Krysiak <bruce@socialpl.us>
+Date: Mon, 8 Dec 2008 16:38:04 -0800
+Subject: [PATCH] Added a :camelize option to ActiveRecord and Hash to_xml serialization and from_xml deserialization
+
+---
+ .../active_record/serializers/xml_serializer.rb    |   23 +++++++++++++------
+ activerecord/test/cases/xml_serialization_test.rb  |    7 ++++++
+ .../active_support/core_ext/hash/conversions.rb    |   20 +++++++++++------
+ activesupport/test/core_ext/hash_ext_test.rb       |    7 ++++++
+ 4 files changed, 43 insertions(+), 14 deletions(-)
+
+diff --git a/activerecord/lib/active_record/serializers/xml_serializer.rb b/activerecord/lib/active_record/serializers/xml_serializer.rb
+index d171b74..e00406b 100644
+--- a/activerecord/lib/active_record/serializers/xml_serializer.rb
++++ b/activerecord/lib/active_record/serializers/xml_serializer.rb
+@@ -23,11 +23,12 @@ module ActiveRecord #:nodoc:
+     #   </topic>
+     #
+     # This behavior can be controlled with <tt>:only</tt>, <tt>:except</tt>,
+-    # <tt>:skip_instruct</tt>, <tt>:skip_types</tt> and <tt>:dasherize</tt>.
++    # <tt>:skip_instruct</tt>, <tt>:skip_types</tt>, <tt>:dasherize</tt> and <tt>:camelize</tt> .
+     # The <tt>:only</tt> and <tt>:except</tt> options are the same as for the
+     # +attributes+ method. The default is to dasherize all column names, but you
+-    # can disable this setting <tt>:dasherize</tt> to +false+. To not have the
+-    # column type included in the XML output set <tt>:skip_types</tt> to +true+.
++    # can disable this setting <tt>:dasherize</tt> to +false+. Setting <tt>:camelize</tt>
++    # to +true+ will camelize all column names - this also overrides <tt>:dasherize</tt>.
++    # To not have the column type included in the XML output set <tt>:skip_types</tt> to +true+.
+     #
+     # For instance:
+     #
+@@ -178,13 +179,22 @@ module ActiveRecord #:nodoc:
+ 
+     def root
+       root = (options[:root] || @record.class.to_s.underscore).to_s
+-      dasherize? ? root.dasherize : root
++      reformat_name(root)
+     end
+ 
+     def dasherize?
+       !options.has_key?(:dasherize) || options[:dasherize]
+     end
+ 
++    def camelize?
++      options.has_key?(:camelize) && options[:camelize]
++    end
++    
++    def reformat_name(name)
++      name = name.camelize if camelize?
++      dasherize? ? name.dasherize : name
++    end
++
+     def serializable_attributes
+       serializable_attribute_names.collect { |name| Attribute.new(name, @record) }
+     end
+@@ -212,7 +222,7 @@ module ActiveRecord #:nodoc:
+ 
+     def add_tag(attribute)
+       builder.tag!(
+-        dasherize? ? attribute.name.dasherize : attribute.name,
++        reformat_name(attribute.name),
+         attribute.value.to_s,
+         attribute.decorations(!options[:skip_types])
+       )
+@@ -220,8 +230,7 @@ module ActiveRecord #:nodoc:
+ 
+     def add_associations(association, records, opts)
+       if records.is_a?(Enumerable)
+-        tag = association.to_s
+-        tag = tag.dasherize if dasherize?
++        tag = reformat_name(association.to_s)
+         if records.empty?
+           builder.tag!(tag, :type => :array)
+         else
+diff --git a/activerecord/test/cases/xml_serialization_test.rb b/activerecord/test/cases/xml_serialization_test.rb
+index 63f4886..39c6ea8 100644
+--- a/activerecord/test/cases/xml_serialization_test.rb
++++ b/activerecord/test/cases/xml_serialization_test.rb
+@@ -31,6 +31,13 @@ class XmlSerializationTest < ActiveRecord::TestCase
+     assert_match %r{<created_at},     @xml
+   end
+ 
++  def test_should_allow_camelized_tags
++    @xml = Contact.new.to_xml :root => 'xml_contact', :camelize => true
++    assert_match %r{^<XmlContact>},  @xml
++    assert_match %r{</XmlContact>$}, @xml
++    assert_match %r{<CreatedAt},    @xml
++  end
++
+   def test_should_include_yielded_additions
+     @xml = Contact.new.to_xml do |xml|
+       xml.creator "David"
+diff --git a/activesupport/lib/active_support/core_ext/hash/conversions.rb b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+index 437b44c..5b31ce6 100644
+--- a/activesupport/lib/active_support/core_ext/hash/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+@@ -94,8 +94,7 @@ module ActiveSupport #:nodoc:
+           options.reverse_merge!({ :builder => Builder::XmlMarkup.new(:indent => options[:indent]),
+                                    :root => "hash" })
+           options[:builder].instruct! unless options.delete(:skip_instruct)
+-          dasherize = !options.has_key?(:dasherize) || options[:dasherize]
+-          root = dasherize ? options[:root].to_s.dasherize : options[:root].to_s
++          root = rename_key(options[:root].to_s, options)
+ 
+           options[:builder].__send__(:method_missing, root) do
+             each do |key, value|
+@@ -122,7 +121,7 @@ module ActiveSupport #:nodoc:
+                   else
+                     type_name = XML_TYPE_NAMES[value.class.name]
+ 
+-                    key = dasherize ? key.to_s.dasherize : key.to_s
++                    key = rename_key(key.to_s, options)
+ 
+                     attributes = options[:skip_types] || value.nil? || type_name.nil? ? { } : { :type => type_name }
+                     if value.nil?
+@@ -141,10 +140,17 @@ module ActiveSupport #:nodoc:
+           end
+ 
+         end
++          
++        def rename_key(key, options = {})
++          camelize = options.has_key?(:camelize) && options[:camelize]
++          dasherize = !options.has_key?(:dasherize) || options[:dasherize]
++          key = key.camelize if camelize
++          dasherize ? key.dasherize : key
++        end
+ 
+         module ClassMethods
+           def from_xml(xml)
+-            typecast_xml_value(undasherize_keys(XmlMini.parse(xml)))
++            typecast_xml_value(unrename_keys(XmlMini.parse(xml)))
+           end
+ 
+           private
+@@ -210,15 +216,15 @@ module ActiveSupport #:nodoc:
+               end
+             end
+ 
+-            def undasherize_keys(params)
++            def unrename_keys(params)
+               case params.class.to_s
+                 when "Hash"
+                   params.inject({}) do |h,(k,v)|
+-                    h[k.to_s.tr("-", "_")] = undasherize_keys(v)
++                    h[k.to_s.underscore.tr("-", "_")] = unrename_keys(v)
+                     h
+                   end
+                 when "Array"
+-                  params.map { |v| undasherize_keys(v) }
++                  params.map { |v| unrename_keys(v) }
+                 else
+                   params
+               end
+diff --git a/activesupport/test/core_ext/hash_ext_test.rb b/activesupport/test/core_ext/hash_ext_test.rb
+index 30cbba2..63ccb5a 100644
+--- a/activesupport/test/core_ext/hash_ext_test.rb
++++ b/activesupport/test/core_ext/hash_ext_test.rb
+@@ -403,6 +403,13 @@ class HashToXmlTest < Test::Unit::TestCase
+     assert xml.include?(%(<name>David</name>))
+   end
+ 
++  def test_one_level_camelize_true
++    xml = { :name => "David", :street_name => "Paulina" }.to_xml(@xml_options.merge(:camelize => true))
++    assert_equal "<Person>", xml.first(8)
++    assert xml.include?(%(<StreetName>Paulina</StreetName>))
++    assert xml.include?(%(<Name>David</Name>))
++  end
++
+   def test_one_level_with_types
+     xml = { :name => "David", :street => "Paulina", :age => 26, :age_in_millis => 820497600000, :moved_on => Date.new(2005, 11, 15), :resident => :yes }.to_xml(@xml_options)
+     assert_equal "<person>", xml.first(8)
+-- 
+1.6.0.4
+

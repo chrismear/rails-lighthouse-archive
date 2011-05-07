@@ -1,0 +1,103 @@
+From f56f0a952e78d21ba6a3493b63a0bf8bc20d1bc7 Mon Sep 17 00:00:00 2001
+From: Victor Nawothnig <Victor.Nawothnig@gmail.com>
+Date: Thu, 21 May 2009 22:59:49 +0200
+Subject: [PATCH] Replaced hazardous code in disable_referential_integrity and replaced supports_disable_referential_integrity?() with a more detailed method
+
+---
+ .../connection_adapters/postgresql_adapter.rb      |   78 ++++++++++++++++----
+ 1 files changed, 64 insertions(+), 14 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 002696d..fb71b19 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -429,22 +429,72 @@ module ActiveRecord
+ 
+       # REFERENTIAL INTEGRITY ====================================
+ 
+-      def supports_disable_referential_integrity?() #:nodoc:
+-        version = query("SHOW server_version")[0][0].split('.')
+-        (version[0].to_i >= 8 && version[1].to_i >= 1) ? true : false
+-      rescue
+-        return false
++      # Returns false if we cannot reliably disable the trigger.
++      # Otherwise returns :bool if a boolean value is expected (8.1 and 8.2)
++      # or :char for a character value (8.3).
++      def pg_trigger_tgenabled_type()
++        begin
++          # We can query the datatype directly, but since we must ensure that
++          # the version is 8.1 or newer anyway, we may as well do it via the
++          # version.
++          version = query("SHOW server_version")[0][0].split('.').map{ |e|
++            e.to_i
++          }
++
++          if version[0] == 8
++            case version[1]
++              when 0 then return false
++              when 1 then return :bool
++              when 2 then return :bool
++              else return :char
++            end
++          else
++            return false
++          end
++        rescue
++          return false
++        end
+       end
+ 
+-      def disable_referential_integrity(&block) #:nodoc:
+-        if supports_disable_referential_integrity?() then
+-          execute(tables.collect { |name| "ALTER TABLE #{quote_table_name(name)} DISABLE TRIGGER ALL" }.join(";"))
+-        end
+-        yield
+-      ensure
+-        if supports_disable_referential_integrity?() then
+-          execute(tables.collect { |name| "ALTER TABLE #{quote_table_name(name)} ENABLE TRIGGER ALL" }.join(";"))
+-        end
++      # This method disables referential integrity, yields the block and then
++      # enables them again. The affected tables can be specified in an optional
++      # argument which must be an array of the tablenames (symbols or strings).
++      # If omitted all tables are assumed.
++      # This method automatically puts everything into a database transaction
++      # and acquires SHARE ROW EXCLUSIVE locks on all affected tables.
++      def disable_referential_integrity(v_tables=tables(), &block) #:nodoc:
++        version = server_version()
++        yield and return unless (tg_typ = pg_trigger_tgenabled_type())
++
++        # pg_trigger.tgenabled expects either a character or a boolean value,
++        # depending on the version.
++        v_enable, v_disable = tg_typ == :char ? %w{'O' 'D'} : %w{true false}
++
++        foo = v_tables.map { |relname| "'#{relname}'"}.join(", ")
++
++        execute("BEGIN;")
++
++          # Lock will be released automatically at the end of the transaction.
++          execute("LOCK #{v_tables.join(", ")} IN SHARE ROW EXCLUSIVE MODE;")
++          execute(<<SQL)
++UPDATE pg_trigger t SET tgenabled = #{v_disable}
++FROM pg_trigger pt
++  INNER JOIN pg_class pc ON pt.tgrelid = pc.oid
++WHERE t.oid = pt.oid
++  AND pt.tgconstrrelid IS NOT NULL
++  AND pc.relname IN (#{foo});
++SQL
++            yield
++          execute(<<SQL)
++UPDATE pg_trigger t SET tgenabled = #{v_enable}
++FROM pg_trigger pt
++  INNER JOIN pg_class pc ON pt.tgrelid = pc.oid
++WHERE t.oid = pt.oid
++  AND pt.tgconstrrelid IS NOT NULL
++  AND pc.relname IN (#{foo});
++SQL
++
++        execute("COMMIT;")
+       end
+ 
+       # DATABASE STATEMENTS ======================================
+-- 
+1.5.4.3
+

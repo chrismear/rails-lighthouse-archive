@@ -1,0 +1,315 @@
+From ba931959c7bc2093e1ca3ee27c014d38d01b94bc Mon Sep 17 00:00:00 2001
+From: Brian Durand <bdurand@bdurand.local>
+Date: Tue, 3 Mar 2009 17:37:59 -0600
+Subject: [PATCH] Put pseudo_cursors logic into batch finder
+
+---
+ activerecord/lib/active_record/batches.rb |   46 +++++++++++------------
+ activerecord/test/cases/batches_test.rb   |   58 +++++++++++++++++++----------
+ 2 files changed, 60 insertions(+), 44 deletions(-)
+
+diff --git a/activerecord/lib/active_record/batches.rb b/activerecord/lib/active_record/batches.rb
+index 9e9c8fb..7c05fb9 100644
+--- a/activerecord/lib/active_record/batches.rb
++++ b/activerecord/lib/active_record/batches.rb
+@@ -22,21 +22,12 @@ module ActiveRecord
+         find_in_batches(options) do |records|
+           records.each { |record| yield record }
+         end
+-
+-        self
+       end
+ 
+       # Yields each batch of records that was found by the find +options+ as an array. The size of each batch is
+       # set by the +batch_size+ option; the default is 1000.
+       #
+-      # You can control the starting point for the batch processing by supplying the +start+ option. This is especially
+-      # useful if you want multiple workers dealing with the same processing queue. You can make worker 1 handle all the
+-      # records between id 0 and 10,000 and worker 2 handle from 10,000 and beyond (by setting the +start+ option on that
+-      # worker).
+-      #
+-      # It's not possible to set the order. That is automatically set to ascending on the primary key ("id ASC") 
+-      # to make the batch ordering work. This also mean that this method only works with integer-based primary keys.
+-      # You can't set the limit either, that's used to control the the batch sizes.
++      # You can pass all the same options that can be passed to the find including +offset+, +limit+, and +order+.
+       #
+       # Example:
+       #
+@@ -45,26 +36,33 @@ module ActiveRecord
+       #     group.each { |person| person.party_all_night! }
+       #   end
+       def find_in_batches(options = {})
+-        raise "You can't specify an order, it's forced to be #{batch_order}" if options[:order]
+-        raise "You can't specify a limit, it's forced to be the batch_size"  if options[:limit]
+-
+-        start = options.delete(:start).to_i
++        batch_size = options.delete(:batch_size) || 1000
++        batch_size = batch_size.to_i
++        raise "batch_size can't be less than 1" if batch_size < 1
+ 
+-        with_scope(:find => options.merge(:order => batch_order, :limit => options.delete(:batch_size) || 1000)) do
+-          records = find(:all, :conditions => [ "#{table_name}.#{primary_key} >= ?", start ])
+-
+-          while records.any?
++        select_batch_ids(options).in_groups_of(batch_size, false) do |row_ids|
++          records = find(:all, :conditions => {primary_key => row_ids})
++          unless records.empty?
++            sort_batch_rows!(records, row_ids) if options[:order]
+             yield records
+-            records = find(:all, :conditions => [ "#{table_name}.#{primary_key} > ?", records.last.id ])
+           end
+         end
++        self # return self so you don't get a huge print out of ids when running in the console.
+       end
+-      
+-      
++
+       private
+-        def batch_order
+-          "#{table_name}.#{primary_key} ASC"
+-        end
++
++      def sort_batch_rows! (records, row_ids)
++        sort_hash = {}
++        row_ids.each_with_index{|row_id, i| sort_hash[row_id] = i}
++        records.sort!{|a, b| sort_hash[a.id] <=> sort_hash[b.id]}
++      end
++
++      def select_batch_ids (options)
++        ids_sql = construct_finder_sql(options.merge(:select => "#{table_name}.#{primary_key}"))
++        ids = connection.select_all(ids_sql, "#{table_name} pseudo cursor").collect{|row| row['id'].to_i}
++        return ids
++      end
+     end
+   end
+ end
+\ No newline at end of file
+diff --git a/activerecord/test/cases/batches_test.rb b/activerecord/test/cases/batches_test.rb
+index 108d679..2b5fe06 100644
+--- a/activerecord/test/cases/batches_test.rb
++++ b/activerecord/test/cases/batches_test.rb
+@@ -5,45 +5,63 @@ class EachTest < ActiveRecord::TestCase
+   fixtures :posts
+ 
+   def setup
+-    @posts = Post.all(:order => "id asc")
++    @posts = Post.all
+     @total = Post.count
+   end
+   
+-  def test_each_should_excecute_one_query_per_batch
+-    assert_queries(Post.count + 1) do
+-      Post.each(:batch_size => 1) do |post| 
++  def test_each_should_execute_one_query_per_batch
++    assert_queries(((@total + 1) / 2) + 1) do
++      Post.each(:batch_size => 2) do |post| 
+         assert_kind_of Post, post
+       end
+     end
+   end
+ 
+-  def test_each_should_raise_if_the_order_is_set
+-    assert_raise(RuntimeError) do
+-      Post.each(:order => "title") { |post| post }
++  def test_find_in_batches_should_return_batches
++    assert_queries(((@total + 1) / 2) + 1) do
++      Post.find_in_batches(:batch_size => 2) do |batch|
++        assert_kind_of Array, batch
++        assert_kind_of Post, batch.first
++      end
+     end
+   end
+ 
+-  def test_each_should_raise_if_the_limit_is_set
+-    assert_raise(RuntimeError) do
+-      Post.each(:limit => 1) { |post| post }
+-    end
+-  end
+-  
+-  def test_find_in_batches_should_return_batches
+-    assert_queries(Post.count + 1) do
+-      Post.find_in_batches(:batch_size => 1) do |batch|
++  def test_find_in_batches_should_start_from_the_offset_option
++    assert_queries(@total) do
++      Post.find_in_batches(:batch_size => 1, :offset => 1, :limit => @total) do |batch|
+         assert_kind_of Array, batch
+         assert_kind_of Post, batch.first
+       end
+     end
+   end
+-
+-  def test_find_in_batches_should_start_from_the_start_option
+-    assert_queries(Post.count) do
+-      Post.find_in_batches(:batch_size => 1, :start => 2) do |batch|
++  
++  def test_find_in_batches_should_limit_with_the_limit_option
++    assert_queries(@posts.size) do
++      Post.find_in_batches(:batch_size => 1, :limit => @total - 1) do |batch|
+         assert_kind_of Array, batch
+         assert_kind_of Post, batch.first
+       end
+     end
+   end
++  
++  def test_find_in_batches_should_return_records_in_the_order_specified
++    posts = []
++    Post.find_in_batches(:batch_size => 5, :order => "id DESC") do |batch|
++      posts.concat(batch)
++    end
++    assert_equal posts, @posts.sort{|a,b| b.id <=> a.id}
++  end
++  
++  def test_find_in_batches_should_return_self
++    assert_equal Post, Post.find_in_batches{|batch|}
++  end
++  
++  def test_find_in_batches_should_honor_finder_scopes
++    containing_a = Post.containing_the_letter_a.all
++    posts = []
++    Post.containing_the_letter_a.find_in_batches(:batch_size => 1) do |batch|
++      posts.concat(batch)
++    end
++    assert_equal posts.sort{|a,b| a.id <=> b.id}, containing_a.sort{|a,b| a.id <=> b.id}
++  end
+ end
+\ No newline at end of file
+-- 
+1.6.0.5
+
+
+From 8be641a9afc5f9d662ab09e40351cae071608975 Mon Sep 17 00:00:00 2001
+From: Brian Durand <bdurand@bdurand.local>
+Date: Tue, 3 Mar 2009 17:41:14 -0600
+Subject: [PATCH] Remove trailing spaces
+
+---
+ activerecord/test/cases/batches_test.rb |   12 ++++++------
+ 1 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/test/cases/batches_test.rb b/activerecord/test/cases/batches_test.rb
+index 2b5fe06..257e4bb 100644
+--- a/activerecord/test/cases/batches_test.rb
++++ b/activerecord/test/cases/batches_test.rb
+@@ -8,10 +8,10 @@ class EachTest < ActiveRecord::TestCase
+     @posts = Post.all
+     @total = Post.count
+   end
+-  
++
+   def test_each_should_execute_one_query_per_batch
+     assert_queries(((@total + 1) / 2) + 1) do
+-      Post.each(:batch_size => 2) do |post| 
++      Post.each(:batch_size => 2) do |post|
+         assert_kind_of Post, post
+       end
+     end
+@@ -34,7 +34,7 @@ class EachTest < ActiveRecord::TestCase
+       end
+     end
+   end
+-  
++
+   def test_find_in_batches_should_limit_with_the_limit_option
+     assert_queries(@posts.size) do
+       Post.find_in_batches(:batch_size => 1, :limit => @total - 1) do |batch|
+@@ -43,7 +43,7 @@ class EachTest < ActiveRecord::TestCase
+       end
+     end
+   end
+-  
++
+   def test_find_in_batches_should_return_records_in_the_order_specified
+     posts = []
+     Post.find_in_batches(:batch_size => 5, :order => "id DESC") do |batch|
+@@ -51,11 +51,11 @@ class EachTest < ActiveRecord::TestCase
+     end
+     assert_equal posts, @posts.sort{|a,b| b.id <=> a.id}
+   end
+-  
++
+   def test_find_in_batches_should_return_self
+     assert_equal Post, Post.find_in_batches{|batch|}
+   end
+-  
++
+   def test_find_in_batches_should_honor_finder_scopes
+     containing_a = Post.containing_the_letter_a.all
+     posts = []
+-- 
+1.6.0.5
+
+
+From d7f01b5199c693e3aba77d0e694e2a9c12e0dfbb Mon Sep 17 00:00:00 2001
+From: Brian Durand <bdurand@bdurand.local>
+Date: Thu, 5 Mar 2009 11:29:04 -0600
+Subject: [PATCH] fixes to batches
+
+---
+ activerecord/lib/active_record/batches.rb |    9 ++++++---
+ 1 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/batches.rb b/activerecord/lib/active_record/batches.rb
+index 7c05fb9..68d83c2 100644
+--- a/activerecord/lib/active_record/batches.rb
++++ b/activerecord/lib/active_record/batches.rb
+@@ -52,15 +52,18 @@ module ActiveRecord
+ 
+       private
+ 
+-      def sort_batch_rows! (records, row_ids)
++      # Sort the records returned into the order of the original ids
++      def sort_batch_rows! (records, row_ids) #:nodoc:
+         sort_hash = {}
+         row_ids.each_with_index{|row_id, i| sort_hash[row_id] = i}
+         records.sort!{|a, b| sort_hash[a.id] <=> sort_hash[b.id]}
+       end
+ 
+-      def select_batch_ids (options)
++      # Select just the ids for the record in the query and return them as an array
++      def select_batch_ids (options) #:nodoc:
+         ids_sql = construct_finder_sql(options.merge(:select => "#{table_name}.#{primary_key}"))
+-        ids = connection.select_all(ids_sql, "#{table_name} pseudo cursor").collect{|row| row['id'].to_i}
++        primary_key_column = columns_hash[primary_key]
++        ids = connection.select_all(ids_sql, "#{table_name} pseudo cursor").collect{|row| primary_key_column.type_cast(row['id'])}
+         return ids
+       end
+     end
+-- 
+1.6.0.5
+
+
+From a6a9e79fae871ef870403c4d6ab57ef57cb3dca5 Mon Sep 17 00:00:00 2001
+From: Brian Durand <bdurand@bdurand.local>
+Date: Thu, 5 Mar 2009 11:32:40 -0600
+Subject: [PATCH] fixes to batches
+
+---
+ activerecord/lib/active_record/batches.rb |    2 +-
+ activerecord/test/cases/batches_test.rb   |    2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/activerecord/lib/active_record/batches.rb b/activerecord/lib/active_record/batches.rb
+index 68d83c2..f3d4c91 100644
+--- a/activerecord/lib/active_record/batches.rb
++++ b/activerecord/lib/active_record/batches.rb
+@@ -68,4 +68,4 @@ module ActiveRecord
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/cases/batches_test.rb b/activerecord/test/cases/batches_test.rb
+index 257e4bb..efc9c09 100644
+--- a/activerecord/test/cases/batches_test.rb
++++ b/activerecord/test/cases/batches_test.rb
+@@ -64,4 +64,4 @@ class EachTest < ActiveRecord::TestCase
+     end
+     assert_equal posts.sort{|a,b| a.id <=> b.id}, containing_a.sort{|a,b| a.id <=> b.id}
+   end
+-end
+\ No newline at end of file
++end
+-- 
+1.6.0.5
+

@@ -1,0 +1,158 @@
+From be3846af80724cf33d2e4659d9bc4e3cbe128d21 Mon Sep 17 00:00:00 2001
+From: Yaroslav Markin <yaroslav@markin.net>
+Date: Thu, 1 Jan 2009 21:29:11 +0300
+Subject: [PATCH] number_to_human_size helper: now using pluralization properly, storage unit translations moved to "number.human.storage_units.units" (see translation table). "number.human.storage_units.format" I18n property introduced for languages that do not follow "{{number}} {{unit}}" format (Japanese). NOTE: I18n table changed, you will need to update your translations.
+
+---
+ .../lib/action_view/helpers/number_helper.rb       |   45 ++++++++++++-------
+ actionpack/lib/action_view/locale/en.yml           |   13 +++++-
+ .../test/template/number_helper_i18n_test.rb       |   24 ++++++++--
+ 3 files changed, 59 insertions(+), 23 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/number_helper.rb b/actionpack/lib/action_view/helpers/number_helper.rb
+index 3e734cc..73d82d5 100644
+--- a/actionpack/lib/action_view/helpers/number_helper.rb
++++ b/actionpack/lib/action_view/helpers/number_helper.rb
+@@ -220,6 +220,8 @@ module ActionView
+         end
+       end
+ 
++      STORAGE_UNITS = [:byte, :kb, :mb, :gb, :tb].freeze
++
+       # Formats the bytes in +size+ into a more understandable representation
+       # (e.g., giving it 1500 yields 1.5 KB). This method is useful for
+       # reporting file sizes to users. This method returns nil if
+@@ -247,7 +249,7 @@ module ActionView
+       #  number_to_human_size(1234567, 2)    # => 1.18 MB
+       #  number_to_human_size(483989, 0)     # => 473 KB
+       def number_to_human_size(number, *args)
+-        return number.nil? ? nil : pluralize(number.to_i, "Byte") if number.to_i < 1024
++        return nil if number.nil?
+ 
+         options = args.extract_options!
+         options.symbolize_keys!
+@@ -255,7 +257,6 @@ module ActionView
+         defaults = I18n.translate(:'number.format', :locale => options[:locale], :raise => true) rescue {}
+         human    = I18n.translate(:'number.human.format', :locale => options[:locale], :raise => true) rescue {}
+         defaults = defaults.merge(human)
+-        storage_units = I18n.translate(:'number.human.storage_units', :locale => options[:locale], :raise => true)
+ 
+         unless args.empty?
+           ActiveSupport::Deprecation.warn('number_to_human_size takes an option hash ' +
+@@ -267,22 +268,32 @@ module ActionView
+         separator ||= (options[:separator] || defaults[:separator])
+         delimiter ||= (options[:delimiter] || defaults[:delimiter])
+ 
+-        max_exp  = storage_units.size - 1
+-        number   = Float(number)
+-        exponent = (Math.log(number) / Math.log(1024)).to_i # Convert to base 1024
+-        exponent = max_exp if exponent > max_exp # we need this to avoid overflow for the highest unit
+-        number  /= 1024 ** exponent
+-        unit     = storage_units[exponent]
++        storage_units_format = I18n.translate(:'number.human.storage_units.format', :locale => options[:locale], :raise => true)
++        
++        if number.to_i < 1024
++          unit = I18n.translate(:'number.human.storage_units.units.byte', :locale => options[:locale], :count => number.to_i, :raise => true)
++          storage_units_format.gsub(/%n/, number.to_i.to_s).gsub(/%u/, unit)
++        else
++          max_exp  = STORAGE_UNITS.size - 1
++          number   = Float(number)
++          exponent = (Math.log(number) / Math.log(1024)).to_i # Convert to base 1024
++          exponent = max_exp if exponent > max_exp # we need this to avoid overflow for the highest unit
++          number  /= 1024 ** exponent
+ 
+-        begin
+-          escaped_separator = Regexp.escape(separator)
+-          number_with_precision(number,
+-            :precision => precision,
+-            :separator => separator,
+-            :delimiter => delimiter
+-          ).sub(/(\d)(#{escaped_separator}[1-9]*)?0+\z/, '\1\2').sub(/#{escaped_separator}\z/, '') + " #{unit}"
+-        rescue
+-          number
++          unit_key = STORAGE_UNITS[exponent]
++          unit = I18n.translate(:"number.human.storage_units.units.#{unit_key}", :locale => options[:locale], :count => number, :raise => true)
++
++          begin
++            escaped_separator = Regexp.escape(separator)
++            formatted_number = number_with_precision(number,
++              :precision => precision,
++              :separator => separator,
++              :delimiter => delimiter
++            ).sub(/(\d)(#{escaped_separator}[1-9]*)?0+\z/, '\1\2').sub(/#{escaped_separator}\z/, '')
++            storage_units_format.gsub(/%n/, formatted_number).gsub(/%u/, unit)
++          rescue
++            number
++          end
+         end
+       end
+     end
+diff --git a/actionpack/lib/action_view/locale/en.yml b/actionpack/lib/action_view/locale/en.yml
+index a880fd8..295d108 100644
+--- a/actionpack/lib/action_view/locale/en.yml
++++ b/actionpack/lib/action_view/locale/en.yml
+@@ -44,7 +44,18 @@
+         # separator: 
+         delimiter: ""
+         precision: 1
+-      storage_units: [Bytes, KB, MB, GB, TB]
++      storage_units:
++        # Storage units output formatting. 
++        # %u is the storage unit, %n is the number (default: 2 MB)
++        format: "%n %u"
++        units:
++          byte:
++            one:   "Byte"
++            other: "Bytes"
++          kb: "KB"
++          mb: "MB"
++          gb: "GB"
++          tb: "TB"
+ 
+   # Used in distance_of_time_in_words(), distance_of_time_in_words_to_now(), time_ago_in_words()
+   datetime:
+diff --git a/actionpack/test/template/number_helper_i18n_test.rb b/actionpack/test/template/number_helper_i18n_test.rb
+index 2528bea..f5bd11f 100644
+--- a/actionpack/test/template/number_helper_i18n_test.rb
++++ b/actionpack/test/template/number_helper_i18n_test.rb
+@@ -10,7 +10,9 @@ class NumberHelperI18nTests < Test::Unit::TestCase
+       @number_defaults = { :precision => 3, :delimiter => ',', :separator => '.' }
+       @currency_defaults = { :unit => '$', :format => '%u%n', :precision => 2 }
+       @human_defaults = { :precision => 1 }
+-      @human_storage_units_defaults = %w(Bytes KB MB GB TB)
++      @human_storage_units_format_default = "%n %u"
++      @human_storage_units_units_byte_other = "Bytes"
++      @human_storage_units_units_kb_other = "KB"
+       @percentage_defaults = { :delimiter => '' }
+       @precision_defaults = { :delimiter => '' }
+ 
+@@ -48,10 +50,22 @@ class NumberHelperI18nTests < Test::Unit::TestCase
+       I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
+       I18n.expects(:translate).with(:'number.human.format', :locale => 'en',
+                                     :raise => true).returns(@human_defaults)
+-      I18n.expects(:translate).with(:'number.human.storage_units', :locale => 'en',
+-                                    :raise => true).returns(@human_storage_units_defaults)
+-      # can't be called with 1 because this directly returns without calling I18n.translate
+-      number_to_human_size(1025, :locale => 'en')
++      I18n.expects(:translate).with(:'number.human.storage_units.format', :locale => 'en',
++                                    :raise => true).returns(@human_storage_units_format_default)
++      I18n.expects(:translate).with(:'number.human.storage_units.units.kb', :locale => 'en', :count => 2,
++                                    :raise => true).returns(@human_storage_units_units_kb_other)
++      # 2KB
++      number_to_human_size(2048, :locale => 'en')
++      
++      I18n.expects(:translate).with(:'number.format', :locale => 'en', :raise => true).returns(@number_defaults)
++      I18n.expects(:translate).with(:'number.human.format', :locale => 'en',
++                                    :raise => true).returns(@human_defaults)
++      I18n.expects(:translate).with(:'number.human.storage_units.format', :locale => 'en',
++                                    :raise => true).returns(@human_storage_units_format_default)
++      I18n.expects(:translate).with(:'number.human.storage_units.units.byte', :locale => 'en', :count => 42,
++                                    :raise => true).returns(@human_storage_units_units_byte_other)
++      # 42 Bytes
++      number_to_human_size(42, :locale => 'en')
+     end
+   end
+ end
+-- 
+1.6.1
+

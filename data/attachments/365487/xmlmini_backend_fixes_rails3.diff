@@ -1,0 +1,320 @@
+From 45807e5a705f847085363554ff43b90be7a493f9 Mon Sep 17 00:00:00 2001
+From: Willem van Bergen <willem@vanbergen.org>
+Date: Fri, 1 Jan 2010 10:12:30 +0100
+Subject: [PATCH] Code cleanup, bugfixes and speed improvements for the Nokogiri and LibXML XmlMini backends
+
+---
+ .../lib/active_support/xml_mini/libxml.rb          |  108 ++++----------------
+ .../lib/active_support/xml_mini/nokogiri.rb        |   50 +++++-----
+ activesupport/test/xml_mini/libxml_engine_test.rb  |    9 ++
+ .../test/xml_mini/nokogiri_engine_test.rb          |   40 +++++++-
+ 4 files changed, 95 insertions(+), 112 deletions(-)
+
+diff --git a/activesupport/lib/active_support/xml_mini/libxml.rb b/activesupport/lib/active_support/xml_mini/libxml.rb
+index 0f7ba19..67bc81e 100644
+--- a/activesupport/lib/active_support/xml_mini/libxml.rb
++++ b/activesupport/lib/active_support/xml_mini/libxml.rb
+@@ -12,7 +12,7 @@ module ActiveSupport
+       if !data.respond_to?(:read)
+         data = StringIO.new(data || '')
+       end
+-      
++
+       char = data.getc
+       if char.nil?
+         {}
+@@ -34,106 +34,42 @@ module LibXML #:nodoc:
+     end
+ 
+     module Node #:nodoc:
+-      CONTENT_ROOT = '__content__'
+-      LIB_XML_LIMIT = 30000000 # Hardcoded LibXML limit
++      CONTENT_ROOT = '__content__'.freeze
+ 
+       # Convert XML document to hash
+       #
+       # hash::
+       #   Hash to merge the converted element into.
+       def to_hash(hash={})
+-        if text? || cdata?
+-          raise LibXML::XML::Error if hash[CONTENT_ROOT].to_s.length + content.length >= LIB_XML_LIMIT
+-          hash[CONTENT_ROOT] = hash[CONTENT_ROOT].to_s + content
+-        else
+-          sub_hash = insert_name_into_hash(hash, name)
+-          attributes_to_hash(sub_hash)
+-          if array?
+-            children_array_to_hash(sub_hash)
+-          elsif yaml?
+-            children_yaml_to_hash(sub_hash)
+-          else
+-            children_to_hash(sub_hash)
+-          end
+-        end
+-        hash
+-      end
++        node_hash = {}
+ 
+-      protected
+-
+-        # Insert name into hash
+-        #
+-        # hash::
+-        #   Hash to merge the converted element into.
+-        # name::
+-        #   name to to merge into hash
+-        def insert_name_into_hash(hash, name)
+-          sub_hash = {}
+-          if hash[name]
+-            if !hash[name].kind_of? Array
+-              hash[name] = [hash[name]]
+-            end
+-            hash[name] << sub_hash
+-          else
+-            hash[name] = sub_hash
+-          end
+-          sub_hash
++        # Insert node hash into parent hash correctly.
++        case hash[name]
++          when Array then hash[name] << node_hash
++          when Hash  then hash[name] = [hash[name], node_hash]
++          when nil   then hash[name] = node_hash
+         end
+ 
+-        # Insert children into hash
+-        #
+-        # hash::
+-        #   Hash to merge the children into.
+-        def children_to_hash(hash={})
+-          each { |child| child.to_hash(hash) }
+-
+-          if hash.length > 1 && hash[CONTENT_ROOT].blank?
+-            hash.delete(CONTENT_ROOT)
++        # Handle child elements
++        each_child do |c|
++          if c.element?
++            c.to_hash(node_hash)
++          elsif c.text? || c.cdata?
++            node_hash[CONTENT_ROOT] ||= ''
++            node_hash[CONTENT_ROOT] << c.content
+           end
+-
+-          attributes_to_hash(hash)
+-          hash
+         end
+ 
+-        # Convert xml attributes to hash
+-        #
+-        # hash::
+-        #   Hash to merge the attributes into
+-        def attributes_to_hash(hash={})
+-          each_attr { |attr| hash[attr.name] = attr.value }
+-          hash
++        # Remove content node if it is blank
++        if node_hash.length > 1 && node_hash[CONTENT_ROOT].blank?
++          node_hash.delete(CONTENT_ROOT)
+         end
+ 
+-        # Convert array into hash
+-        #
+-        # hash::
+-        #   Hash to merge the array into
+-        def children_array_to_hash(hash={})
+-          hash[child.name] = map do |child|
+-            returning({}) { |sub_hash| child.children_to_hash(sub_hash) }
+-          end
+-          hash
+-        end
+-
+-        # Convert yaml into hash
+-        #
+-        # hash::
+-        #   Hash to merge the yaml into
+-        def children_yaml_to_hash(hash = {})
+-          hash[CONTENT_ROOT] = content unless content.blank?
+-          hash
+-        end
+-
+-        # Check if child is of type array
+-        def array?
+-          child? && child.next? && child.name == child.next.name
+-        end
+-
+-        # Check if child is of type yaml
+-        def yaml?
+-          attributes.collect{|x| x.value}.include?('yaml')
+-        end
++        # Handle attributes
++        each_attr { |a| node_hash[a.name] = a.value }
+ 
++        hash
++      end
+     end
+   end
+ end
+diff --git a/activesupport/lib/active_support/xml_mini/nokogiri.rb b/activesupport/lib/active_support/xml_mini/nokogiri.rb
+index 17bacd8..e312a02 100644
+--- a/activesupport/lib/active_support/xml_mini/nokogiri.rb
++++ b/activesupport/lib/active_support/xml_mini/nokogiri.rb
+@@ -12,13 +12,13 @@ module ActiveSupport
+       if !data.respond_to?(:read)
+         data = StringIO.new(data || '')
+       end
+-      
++
+       char = data.getc
+       if char.nil?
+         {}
+       else
+         data.ungetc(char)
+-        doc = Nokogiri::XML(data) { |cfg| cfg.noblanks }
++        doc = Nokogiri::XML(data)
+         raise doc.errors.first if doc.errors.length > 0
+         doc.to_hash
+       end
+@@ -32,39 +32,41 @@ module ActiveSupport
+       end
+ 
+       module Node #:nodoc:
+-        CONTENT_ROOT = '__content__'
++        CONTENT_ROOT = '__content__'.freeze
+ 
+         # Convert XML document to hash
+         #
+         # hash::
+         #   Hash to merge the converted element into.
+-        def to_hash(hash = {})
+-          attributes = attributes_as_hash
+-          if hash[name]
+-            hash[name] = [hash[name]].flatten
+-            hash[name] << attributes
+-          else
+-            hash[name] ||= attributes
+-          end
++        def to_hash(hash={})
++          node_hash = {}
+ 
+-          children.each { |child|
+-            next if child.blank? && 'file' != self['type']
++          # Insert node hash into parent hash correctly.
++          case hash[name]
++            when Array then hash[name] << node_hash
++            when Hash  then hash[name] = [hash[name], node_hash]
++            when nil   then hash[name] = node_hash
++          end
+ 
+-            if child.text? || child.cdata?
+-              (attributes[CONTENT_ROOT] ||= '') << child.content
+-              next
++          # Handle child elements
++          children.each do |c|
++            if c.element?
++              c.to_hash(node_hash)
++            elsif c.text? || c.cdata?
++              node_hash[CONTENT_ROOT] ||= ''
++              node_hash[CONTENT_ROOT] << c.content
+             end
++          end
+ 
+-            child.to_hash attributes
+-          }
++          # Remove content node if it is blank and there are child tags
++          if node_hash.length > 1 && node_hash[CONTENT_ROOT].blank?
++            node_hash.delete(CONTENT_ROOT)
++          end
+ 
+-          hash
+-        end
++          # Handle attributes
++          attribute_nodes.each { |a| node_hash[a.node_name] = a.value }
+ 
+-        def attributes_as_hash
+-          Hash[*(attribute_nodes.map { |node|
+-            [node.node_name, node.value]
+-          }.flatten)]
++          hash
+         end
+       end
+     end
+diff --git a/activesupport/test/xml_mini/libxml_engine_test.rb b/activesupport/test/xml_mini/libxml_engine_test.rb
+index 900c805..83d03bc 100644
+--- a/activesupport/test/xml_mini/libxml_engine_test.rb
++++ b/activesupport/test/xml_mini/libxml_engine_test.rb
+@@ -184,6 +184,15 @@ class LibxmlEngineTest < Test::Unit::TestCase
+     eoxml
+   end
+ 
++  def test_children_with_blank_text_and_attribute
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products type="file">   </products>
++    </root>
++    eoxml
++  end
++
++
+   private
+   def assert_equal_rexml(xml)
+     hash = XmlMini.with_backend('REXML') { XmlMini.parse(xml) }
+diff --git a/activesupport/test/xml_mini/nokogiri_engine_test.rb b/activesupport/test/xml_mini/nokogiri_engine_test.rb
+index e16f36a..db0d7c5 100644
+--- a/activesupport/test/xml_mini/nokogiri_engine_test.rb
++++ b/activesupport/test/xml_mini/nokogiri_engine_test.rb
+@@ -159,17 +159,53 @@ class NokogiriEngineTest < Test::Unit::TestCase
+     XmlMini.parse(io)
+   end
+ 
+-  def test_children_with_cdata
++  def test_children_with_simple_cdata
+     assert_equal_rexml(<<-eoxml)
+     <root>
+       <products>
+-        hello <![CDATA[everyone]]>
++         <![CDATA[cdatablock]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_multiple_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++         <![CDATA[cdatablock1]]><![CDATA[cdatablock2]]>
++      </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_text_and_cdata
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>
++        hello <![CDATA[cdatablock]]>
+         morning
+       </products>
+     </root>
+     eoxml
+   end
+ 
++  def test_children_with_blank_text
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products>   </products>
++    </root>
++    eoxml
++  end
++
++  def test_children_with_blank_text_and_attribute
++    assert_equal_rexml(<<-eoxml)
++    <root>
++      <products type="file">   </products>
++    </root>
++    eoxml
++  end
++
+   private
+   def assert_equal_rexml(xml)
+     hash = XmlMini.with_backend('REXML') { XmlMini.parse(xml) }
+-- 
+1.6.5.1
+

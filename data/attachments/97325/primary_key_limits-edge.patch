@@ -1,0 +1,190 @@
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index 24c734c..54d54c5 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -274,7 +274,7 @@ module ActiveRecord
+         column_options = {}
+         column_options[:null] = null unless null.nil?
+         column_options[:default] = default unless default.nil?
+-        add_column_options!(column_sql, column_options) unless type.to_sym == :primary_key
++        add_column_options!(column_sql, column_options)
+         column_sql
+       end
+       alias to_s :to_sql
+@@ -318,8 +318,8 @@ module ActiveRecord
+ 
+       # Appends a primary key definition to the table definition.
+       # Can be called multiple times, but this is probably not a good idea.
+-      def primary_key(name)
+-        column(name, :primary_key)
++      def primary_key(name, options = {})
++        column(name, :primary_key, options)
+       end
+ 
+       # Returns a ColumnDefinition for the column with name +name+.
+@@ -341,7 +341,7 @@ module ActiveRecord
+       #
+       # Available options are (none of these exists by default):
+       # * <tt>:limit</tt> -
+-      #   Requests a maximum column length. This is number of characters for <tt>:string</tt> and <tt>:text</tt> columns and number of bytes for :binary and :integer columns.
++      #   Requests a maximum column length. This is number of characters for <tt>:string</tt> and <tt>:text</tt> columns and number of bytes for :binary, :integer and :primary_key columns.
+       # * <tt>:default</tt> -
+       #   The column's default value. Use nil for NULL.
+       # * <tt>:null</tt> -
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 9300df2..a628a29 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -183,7 +183,7 @@ module ActiveRecord
+       QUOTED_TRUE, QUOTED_FALSE = '1'.freeze, '0'.freeze
+ 
+       NATIVE_DATABASE_TYPES = {
+-        :primary_key => "int(11) DEFAULT NULL auto_increment PRIMARY KEY".freeze,
++        :primary_key => { :name => "DEFAULT NULL auto_increment PRIMARY KEY", :limit => 4 },
+         :string      => { :name => "varchar", :limit => 255 },
+         :text        => { :name => "text" },
+         :integer     => { :name => "int", :limit => 4 },
+@@ -524,15 +524,21 @@ module ActiveRecord
+ 
+       # Maps logical Rails types to MySQL-specific data types.
+       def type_to_sql(type, limit = nil, precision = nil, scale = nil)
+-        return super unless type.to_s == 'integer'
+-
+-        case limit
+-        when 1; 'tinyint'
+-        when 2; 'smallint'
+-        when 3; 'mediumint'
+-        when nil, 4, 11; 'int(11)'  # compatibility with MySQL default
+-        when 5..8; 'bigint'
+-        else raise(ActiveRecordError, "No integer type has byte size #{limit}")
++        case type.to_s
++        when 'primary_key':
++          native = native_database_types[:primary_key]
++          return type_to_sql('integer', limit) + ' ' + native[:name]
++        when 'integer':
++          case limit
++          when 1; 'tinyint'
++          when 2; 'smallint'
++          when 3; 'mediumint'
++          when nil, 4, 11; 'int(11)'  # compatibility with MySQL default
++          when 5..8; 'bigint'
++          else raise(ActiveRecordError, "No integer type has byte size #{limit}")
++          end
++        else
++          super
+         end
+       end
+ 
+diff --git a/activerecord/lib/active_record/schema_dumper.rb b/activerecord/lib/active_record/schema_dumper.rb
+index 557a554..f2afe39 100644
+--- a/activerecord/lib/active_record/schema_dumper.rb
++++ b/activerecord/lib/active_record/schema_dumper.rb
+@@ -76,6 +76,7 @@ HEADER
+       def table(table, stream)
+         columns = @connection.columns(table)
+         begin
++          column_specs = columns.dup
+           tbl = StringIO.new
+ 
+           if @connection.respond_to?(:pk_and_sequence_for)
+@@ -84,9 +85,12 @@ HEADER
+           pk ||= 'id'
+ 
+           tbl.print "  create_table #{table.inspect}"
+-          if columns.detect { |c| c.name == pk }
+-            if pk != 'id'
+-              tbl.print %Q(, :primary_key => "#{pk}")
++          if pkc = column_specs.detect { |c| c.name == pk }
++            if pkc.limit != @types[:primary_key][:limit]
++              tbl.print ", :id => false"
++            else
++              column_specs.delete(pkc)
++              tbl.print %Q(, :primary_key => "#{pk}") if pk != 'id'
+             end
+           else
+             tbl.print ", :id => false"
+@@ -94,20 +98,25 @@ HEADER
+           tbl.print ", :force => true"
+           tbl.puts " do |t|"
+ 
+-          column_specs = columns.map do |column|
++          column_specs.map! do |column|
+             raise StandardError, "Unknown type '#{column.sql_type}' for column '#{column.name}'" if @types[column.type].nil?
+-            next if column.name == pk
+             spec = {}
+-            spec[:name]      = column.name.inspect
+-            spec[:type]      = column.type.to_s
+-            spec[:limit]     = column.limit.inspect if column.limit != @types[column.type][:limit] && column.type != :decimal
+-            spec[:precision] = column.precision.inspect if !column.precision.nil?
+-            spec[:scale]     = column.scale.inspect if !column.scale.nil?
+-            spec[:null]      = 'false' if !column.null
+-            spec[:default]   = default_string(column.default) if column.has_default?
++            spec[:name] = column.name.inspect
++            spec[:limit] = column.limit.inspect if column.limit != @types[column.type][:limit] && column.type != :decimal
++
++            if column.name == pk
++              spec[:type]      = 'primary_key'
++            else
++              spec[:type]      = column.type.to_s
++              spec[:precision] = column.precision.inspect if !column.precision.nil?
++              spec[:scale]     = column.scale.inspect if !column.scale.nil?
++              spec[:null]      = 'false' if !column.null
++              spec[:default]   = default_string(column.default) if column.has_default?
++            end
++
+             (spec.keys - [:name, :type]).each{ |k| spec[k].insert(0, "#{k.inspect} => ")}
+             spec
+-          end.compact
++          end
+ 
+           # find all migration keys used in this table
+           keys = [:name, :limit, :precision, :scale, :default, :null] & column_specs.map(&:keys).flatten
+@@ -176,4 +185,4 @@ HEADER
+         end
+       end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/cases/schema_dumper_test.rb b/activerecord/test/cases/schema_dumper_test.rb
+index 17e4c75..50e2d09 100644
+--- a/activerecord/test/cases/schema_dumper_test.rb
++++ b/activerecord/test/cases/schema_dumper_test.rb
+@@ -40,7 +40,7 @@ class SchemaDumperTest < ActiveRecord::TestCase
+       next if column_set.empty?
+ 
+       lengths = column_set.map do |column|
+-        if match = column.match(/t\.(?:integer|decimal|float|datetime|timestamp|time|date|text|binary|string|boolean)\s+"/)
++        if match = column.match(/t\.(?:primary_key|integer|decimal|float|datetime|timestamp|time|date|text|binary|string|boolean)\s+"/)
+           match[0].length
+         end
+       end
+@@ -160,6 +160,13 @@ class SchemaDumperTest < ActiveRecord::TestCase
+       assert_match %r(:primary_key => "movieid"), match[1], "non-standard primary key not preserved"
+     end
+ 
++    def test_mysql_schema_dump_should_honor_primary_keys_limits
++      output = standard_dump
++      match = output.match(%r{create_table "primary_key_limit",.*?:id => false\b.*? do (.*?)\bend$}m)
++      assert_not_nil(match, output)
++      assert_match %r(t.primary_key\s+"id",\s+:limit => \d+$), match[1], "limit option not found on primary key"
++    end
++
+     def test_schema_dump_includes_length_for_mysql_blob_and_text_fields
+       output = standard_dump
+       assert_match %r{t.binary\s+"tiny_blob",\s+:limit => 255$}, output
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 9ebf1d8..d861abe 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -346,6 +346,10 @@ ActiveRecord::Schema.define do
+     t.integer :price
+   end
+ 
++  create_table :primary_key_limit, :force => true, :id => false do |t|
++    t.primary_key :id, :limit => 8
++  end
++
+   create_table :projects, :force => true do |t|
+     t.string :name
+     t.string :type

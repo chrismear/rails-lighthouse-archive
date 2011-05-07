@@ -1,0 +1,100 @@
+From ab3c8bdfc00ef61da8a2d4856329c61a2cf26d25 Mon Sep 17 00:00:00 2001
+From: Curtis Hawthorne <curtis@curtis.hawthorne.name>
+Date: Fri, 13 Feb 2009 22:20:45 -0500
+Subject: [PATCH] destroy now respects optimistic locking
+
+---
+ .../lib/active_record/locking/optimistic.rb        |   33 ++++++++++++++++++++
+ activerecord/test/cases/locking_test.rb            |   18 +++++++++++
+ 2 files changed, 51 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/locking/optimistic.rb b/activerecord/lib/active_record/locking/optimistic.rb
+index ff9899d..5030c6b 100644
+--- a/activerecord/lib/active_record/locking/optimistic.rb
++++ b/activerecord/lib/active_record/locking/optimistic.rb
+@@ -23,6 +23,16 @@ module ActiveRecord
+     #   p2.first_name = "should fail"
+     #   p2.save # Raises a ActiveRecord::StaleObjectError
+     #
++    # Optimistic locking will also check for stale data when objects are destroyed.  Example:
++    #
++    #   p1 = Person.find(1)
++    #   p2 = Person.find(1)
++    #
++    #   p1.first_name = "Michael"
++    #   p1.save
++    #
++    #   p2.destroy # Raises a ActiveRecord::StaleObjectError
++    #
+     # You're then responsible for dealing with the conflict by rescuing the exception and either rolling back, merging,
+     # or otherwise apply the business logic needed to resolve the conflict.
+     #
+@@ -39,6 +49,7 @@ module ActiveRecord
+         base.lock_optimistically = true
+ 
+         base.alias_method_chain :update, :lock
++        base.alias_method_chain :destroy, :lock
+         base.alias_method_chain :attributes_from_column_definition, :lock
+ 
+         class << base
+@@ -98,6 +109,28 @@ module ActiveRecord
+           end
+         end
+ 
++	def destroy_with_lock #:nodoc:
++	  return destroy_without_lock unless locking_enabled?
++
++	  unless new_record?
++	    lock_col = self.class.locking_column
++	    previous_value = send(lock_col).to_i
++
++	    affected_rows = connection.delete(
++	      "DELETE FROM #{self.class.quoted_table_name} " +
++	      "WHERE #{connection.quote_column_name(self.class.primary_key)} = #{quoted_id} " +
++              "AND #{self.class.quoted_locking_column} = #{quote_value(previous_value)}",
++	      "#{self.class.name} Destroy"
++	    )
++
++            unless affected_rows == 1
++              raise ActiveRecord::StaleObjectError, "Attempted to delete a stale object"
++            end
++	  end
++
++	  freeze
++	end
++
+       module ClassMethods
+         DEFAULT_LOCKING_COLUMN = 'lock_version'
+ 
+diff --git a/activerecord/test/cases/locking_test.rb b/activerecord/test/cases/locking_test.rb
+index 077cac7..c6dbd49 100644
+--- a/activerecord/test/cases/locking_test.rb
++++ b/activerecord/test/cases/locking_test.rb
+@@ -38,6 +38,24 @@ class OptimisticLockingTest < ActiveRecord::TestCase
+     assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+   end
+ 
++  def test_lock_destroy
++    p1 = Person.find(1)
++    p2 = Person.find(1)
++    assert_equal 0, p1.lock_version
++    assert_equal 0, p2.lock_version
++
++    p1.first_name = 'stu'
++    p1.save!
++    assert_equal 1, p1.lock_version
++    assert_equal 0, p2.lock_version
++
++    assert_raises(ActiveRecord::StaleObjectError) { p2.destroy }
++
++    assert p1.destroy
++    assert_equal true, p1.frozen?
++    assert_raises(ActiveRecord::RecordNotFound) { Person.find(1) }
++  end
++
+   def test_lock_repeating
+     p1 = Person.find(1)
+     p2 = Person.find(1)
+-- 
+1.5.6.3
+

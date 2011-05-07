@@ -1,0 +1,208 @@
+From 140c140fa671eabee68690bdc5287abcc6299676 Mon Sep 17 00:00:00 2001
+From: Nik Wakelin <nik@codetocustomer.com>
+Date: Wed, 16 Jul 2008 23:44:17 +1200
+Subject: [PATCH] Moved migration timestamp to a class_inhertiable_accessor on ActiveRecord::Migration, created rake:migrations:renumber task. Still sans tests.
+
+---
+ activerecord/lib/active_record/migration.rb        |   64 ++++++++++++++++---
+ railties/lib/rails_generator/commands.rb           |   13 ++++-
+ .../components/migration/migration_generator.rb    |    7 ++
+ .../components/migration/templates/migration.rb    |    3 +
+ railties/lib/tasks/databases.rake                  |    7 ++
+ 5 files changed, 83 insertions(+), 11 deletions(-)
+
+diff --git a/activerecord/lib/active_record/migration.rb b/activerecord/lib/active_record/migration.rb
+index e095b3c..d5bad9b 100644
+--- a/activerecord/lib/active_record/migration.rb
++++ b/activerecord/lib/active_record/migration.rb
+@@ -241,7 +241,9 @@ module ActiveRecord
+   class Migration
+     @@verbose = true
+     cattr_accessor :verbose
+-
++    
++    class_inheritable_accessor :timestamp
++    
+     class << self
+       def up_with_benchmarks #:nodoc:
+         migrate(:up)
+@@ -364,7 +366,11 @@ module ActiveRecord
+       def run(direction, migrations_path, target_version)
+         self.new(direction, migrations_path, target_version).run
+       end
+-
++      
++      def renumber!(migrations_path)
++        self.new(nil, migrations_path).renumber!
++      end
++      
+       def schema_migrations_table_name
+         Base.table_name_prefix + 'schema_migrations' + Base.table_name_suffix
+       end
+@@ -406,6 +412,8 @@ module ActiveRecord
+     end
+ 
+     def migrate
++      renumber! if detect_duplicate_versions
++      
+       current = migrations.detect { |m| m.version == current_version }
+       target = migrations.detect { |m| m.version == @target_version }
+ 
+@@ -435,20 +443,48 @@ module ActiveRecord
+         end
+       end
+     end
++    
++    def renumber!
++      # get a list of migrations sorted by their timestamp
++      migrations_with_timestamps = migrations.reject { |m| m.timestamp.nil? }.sort_by { |m| Time.parse(m.timestamp) }
++
++      # do we still have duplicates in the migrations without timestamps?
++      if (duplicate = detect_duplicate_versions(migrations - migrations_with_timestamps))
++        raise DuplicateMigrationVersionError.new(duplicate)
++      end
++      
++      initial_offset = migrations.first.version
++      migrations_with_timestamps.each_with_index do |migration, index|
++        
++        intended_version = index += initial_offset
++        
++        if migration.version != intended_version
++          move(migration, intended_version)
++        end
++      end
++    end
++    
++    def move(migration, to_version)
++      move_command   = File.exists?(File.join(@migrations_path, ".svn")) ? 'svn mv' : 'mv' 
++       
++      padding        = migration.filename.scan(/[0-9]+/).first.size
++      version_string = ("%.#{padding}d" % to_version)
++      new_filename   = File.join(@migrations_path, "#{version_string}_#{migration.name.underscore}.rb")
++      
++      `#{move_command} #{migration.filename} #{new_filename}`
++      
++      migration.announce("Moved to #{new_filename}")
++    end
+ 
+     def migrations
+       @migrations ||= begin
+-        files = Dir["#{@migrations_path}/[0-9]*_*.rb"]
++        files = Dir[File.join("#{@migrations_path}", "[0-9]*_*.rb")]
+         
+         migrations = files.inject([]) do |klasses, file|
+           version, name = file.scan(/([0-9]+)_([_a-z0-9]*).rb/).first
+           
+           raise IllegalMigrationNameError.new(file) unless version
+           version = version.to_i
+-          
+-          if klasses.detect { |m| m.version == version }
+-            raise DuplicateMigrationVersionError.new(version) 
+-          end
+ 
+           if klasses.detect { |m| m.name == name.camelize }
+             raise DuplicateMigrationNameError.new(name.camelize) 
+@@ -457,8 +493,9 @@ module ActiveRecord
+           load(file)
+           
+           klasses << returning(name.camelize.constantize) do |klass|
+-            class << klass; attr_accessor :version end
+-            klass.version = version
++            class << klass; attr_accessor :version, :filename end
++            klass.version  = version
++            klass.filename = file
+           end
+         end
+         
+@@ -466,7 +503,14 @@ module ActiveRecord
+         down? ? migrations.reverse : migrations
+       end
+     end
+-
++    
++    def detect_duplicate_versions(migrations = nil)
++      migrations ||= @migrations
++      migrations.detect do |first|
++        migrations.detect { |m| m.version == first.version }
++      end
++    end
++  
+     def pending_migrations
+       already_migrated = migrated
+       migrations.reject { |m| already_migrated.include?(m.version.to_i) }
+diff --git a/railties/lib/rails_generator/commands.rb b/railties/lib/rails_generator/commands.rb
+index d258aea..e235871 100644
+--- a/railties/lib/rails_generator/commands.rb
++++ b/railties/lib/rails_generator/commands.rb
+@@ -69,8 +69,19 @@ module Rails
+             not existing_migrations(file_name).empty?
+           end
+ 
++          def current_migration_number
++             Dir.glob("#{RAILS_ROOT}/#{@migration_directory}/[0-9]*_*.rb").inject(0) do |max, file_path|
++               n = File.basename(file_path).split('_', 2).first.to_i
++               if n > max then n else max end
++             end
++           end
++ 
++          def next_migration_number
++            current_migration_number + 1
++          end
++          
+           def next_migration_string(padding = 3)
+-            Time.now.utc.strftime("%Y%m%d%H%M%S")
++            "%.#{padding}d" % next_migration_number
+           end
+ 
+           def gsub_file(relative_destination, regexp, *args, &block)
+diff --git a/railties/lib/rails_generator/generators/components/migration/migration_generator.rb b/railties/lib/rails_generator/generators/components/migration/migration_generator.rb
+index acf41e0..d466fc7 100644
+--- a/railties/lib/rails_generator/generators/components/migration/migration_generator.rb
++++ b/railties/lib/rails_generator/generators/components/migration/migration_generator.rb
+@@ -15,6 +15,13 @@ class MigrationGenerator < Rails::Generator::NamedBase
+         else
+           assigns[:attributes] = []
+         end
++        
++        assigns[:timestamp] = timestamp
+       end
+     end
++    
++    def timestamp
++      Time.now.utc.to_s
++    end
++    
+ end
+diff --git a/railties/lib/rails_generator/generators/components/migration/templates/migration.rb b/railties/lib/rails_generator/generators/components/migration/templates/migration.rb
+index ca35a43..7fed574 100644
+--- a/railties/lib/rails_generator/generators/components/migration/templates/migration.rb
++++ b/railties/lib/rails_generator/generators/components/migration/templates/migration.rb
+@@ -1,4 +1,7 @@
+ class <%= class_name.underscore.camelize %> < ActiveRecord::Migration
++  
++  self.timestamp = "<%= timestamp -%>"
++  
+   def self.up<% attributes.each do |attribute| %>
+     <%= migration_action %>_column :<%= table_name %>, :<%= attribute.name %><% if migration_action == 'add' %>, :<%= attribute.type %><% end -%>
+   <%- end %>
+diff --git a/railties/lib/tasks/databases.rake b/railties/lib/tasks/databases.rake
+index 5ec712a..59fab69 100644
+--- a/railties/lib/tasks/databases.rake
++++ b/railties/lib/tasks/databases.rake
+@@ -123,6 +123,13 @@ namespace :db do
+       Rake::Task["db:schema:dump"].invoke if ActiveRecord::Base.schema_format == :ruby
+     end
+   end
++  
++  namespace :migrations do
++    desc "Renumbers the migrations in UTC timestamp order (if no timestamp is available, they won't be moved)"
++    task :renumber => :environment do 
++      ActiveRecord::Migrator.renumber!("db/migrate/")
++    end
++  end
+ 
+   desc 'Rolls the schema back to the previous version. Specify the number of steps with STEP=n'
+   task :rollback => :environment do
+-- 
+1.5.6.1
+

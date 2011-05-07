@@ -1,0 +1,190 @@
+From 03635df14213eefd4683d9b4605433184a8656e8 Mon Sep 17 00:00:00 2001
+From: W. Andrew Loe III <andrew@andrewloe.com>
+Date: Mon, 13 Sep 2010 16:24:39 -0700
+Subject: [PATCH] Only send secure cookies over SSL.
+
+---
+ .../action_controller/session/abstract_store.rb    |    6 +++-
+ .../lib/action_controller/session/cookie_store.rb  |    5 ++-
+ actionpack/test/controller/cookie_test.rb          |   10 +++++++
+ .../test/controller/session/cookie_store_test.rb   |   28 +++++++++++++++----
+ .../controller/session/mem_cache_store_test.rb     |   15 ++++------
+ 5 files changed, 46 insertions(+), 18 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/session/abstract_store.rb b/actionpack/lib/action_controller/session/abstract_store.rb
+index 3a51994..51acab2 100644
+--- a/actionpack/lib/action_controller/session/abstract_store.rb
++++ b/actionpack/lib/action_controller/session/abstract_store.rb
+@@ -180,6 +180,10 @@ module ActionController
+         options = env[ENV_SESSION_OPTIONS_KEY]
+ 
+         if !session_data.is_a?(AbstractStore::SessionHash) || session_data.loaded? || options[:expire_after]
++          request = ActionController::Request.new(env)
++
++          return response if (options[:secure] && !request.ssl?)
++        
+           session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) && !session_data.loaded?
+ 
+           sid = options[:id] || generate_sid
+@@ -198,7 +202,7 @@ module ActionController
+               expiry = Time.now + options[:expire_after]
+               cookie << "; expires=#{expiry.httpdate}"
+             end
+-            cookie << "; Secure" if options[:secure]
++            cookie << "; secure" if options[:secure]
+             cookie << "; HttpOnly" if options[:httponly]
+ 
+             headers = response[1]
+diff --git a/actionpack/lib/action_controller/session/cookie_store.rb b/actionpack/lib/action_controller/session/cookie_store.rb
+index 313307c..31b6366 100644
+--- a/actionpack/lib/action_controller/session/cookie_store.rb
++++ b/actionpack/lib/action_controller/session/cookie_store.rb
+@@ -101,8 +101,9 @@ module ActionController
+ 
+         session_data = env[ENV_SESSION_KEY]
+         options = env[ENV_SESSION_OPTIONS_KEY]
+-
+-        if !session_data.is_a?(AbstractStore::SessionHash) || session_data.loaded? || options[:expire_after]
++        request = ActionController::Request.new(env)
++        
++        if !(options[:secure] && !request.ssl?) && (!session_data.is_a?(AbstractStore::SessionHash) || session_data.loaded? || options[:expire_after])
+           session_data.send(:load!) if session_data.is_a?(AbstractStore::SessionHash) && !session_data.loaded?
+ 
+           persistent_session_id!(session_data)
+diff --git a/actionpack/test/controller/cookie_test.rb b/actionpack/test/controller/cookie_test.rb
+index 1062b05..a312f7f 100644
+--- a/actionpack/test/controller/cookie_test.rb
++++ b/actionpack/test/controller/cookie_test.rb
+@@ -42,6 +42,10 @@ class CookieTest < ActionController::TestCase
+       cookies["user_name"] = { :value => "david", :httponly => true }
+     end
+     
++    def authenticate_with_secure
++      cookies["user_name"] = { :value => "david", :secure => true }
++    end
++    
+     def set_permanent_cookie
+       cookies.permanent[:user_name] = "Jamie"
+     end
+@@ -94,6 +98,12 @@ class CookieTest < ActionController::TestCase
+     assert_equal ["user_name=david; path=/; HttpOnly"], @response.headers["Set-Cookie"]
+     assert_equal({"user_name" => "david"}, @response.cookies)
+   end
++  
++  def test_setting_cookie_with_secure
++    get :authenticate_with_secure
++    assert_equal ["user_name=david; path=/; secure"], @response.headers["Set-Cookie"]
++    assert_equal({"user_name" => "david"}, @response.cookies)
++  end
+ 
+   def test_multiple_cookies
+     get :set_multiple_cookies
+diff --git a/actionpack/test/controller/session/cookie_store_test.rb b/actionpack/test/controller/session/cookie_store_test.rb
+index f157ae4..d467af7 100644
+--- a/actionpack/test/controller/session/cookie_store_test.rb
++++ b/actionpack/test/controller/session/cookie_store_test.rb
+@@ -6,7 +6,6 @@ class CookieStoreTest < ActionController::IntegrationTest
+   SessionSecret = 'b3c631c314c0bbca50c1b2843150fe33'
+ 
+   DispatcherApp = ActionController::Dispatcher.new
+-  CookieStoreApp = ActionController::Session::CookieStore.new(DispatcherApp, :key => SessionKey, :secret => SessionSecret)
+ 
+   Verifier = ActiveSupport::MessageVerifier.new(SessionSecret, 'SHA1')
+ 
+@@ -62,10 +61,6 @@ class CookieStoreTest < ActionController::IntegrationTest
+     def rescue_action(e) raise end
+   end
+ 
+-  def setup
+-    @integration_session = open_session(CookieStoreApp)
+-  end
+-
+   def test_raises_argument_error_if_missing_session_key
+     assert_raise(ArgumentError, nil.inspect) {
+       ActionController::Session::CookieStore.new(nil,
+@@ -152,6 +147,23 @@ class CookieStoreTest < ActionController::IntegrationTest
+     end
+   end
+ 
++  def test_does_not_set_secure_cookies_over_http
++    with_test_route_set(:secure => true) do
++      get '/set_session_value'
++      assert_response :success
++      assert_equal nil, headers['Set-Cookie']
++    end
++  end
++
++  def test_does_set_secure_cookies_over_https
++    with_test_route_set(:secure => true) do
++      get '/set_session_value', nil, 'HTTPS' => 'on'
++      assert_response :success
++      assert_equal ["_myapp_session=#{response.body}; path=/; secure; HttpOnly"],
++        headers['Set-Cookie']
++    end
++  end
++
+   def test_close_raises_when_data_overflows
+     with_test_route_set do
+       assert_raise(ActionController::Session::CookieStore::CookieOverflow) {
+@@ -272,13 +284,17 @@ class CookieStoreTest < ActionController::IntegrationTest
+   end
+ 
+   private
+-    def with_test_route_set
++    def with_test_route_set(options = {})
+       with_routing do |set|
+         set.draw do |map|
+           map.with_options :controller => "cookie_store_test/test" do |c|
+             c.connect "/:action"
+           end
+         end
++        
++        options = { :key => SessionKey, :secret => SessionSecret }.merge!(options)
++        @integration_session = open_session(ActionController::Session::CookieStore.new(DispatcherApp, options))
++        
+         yield
+       end
+     end
+diff --git a/actionpack/test/controller/session/mem_cache_store_test.rb b/actionpack/test/controller/session/mem_cache_store_test.rb
+index cfb6a18..2714ee5 100644
+--- a/actionpack/test/controller/session/mem_cache_store_test.rb
++++ b/actionpack/test/controller/session/mem_cache_store_test.rb
+@@ -37,13 +37,6 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+ 
+   begin
+     DispatcherApp = ActionController::Dispatcher.new
+-    MemCacheStoreApp = ActionController::Session::MemCacheStore.new(
+-                         DispatcherApp, :key => '_session_id')
+-
+-
+-    def setup
+-      @integration_session = open_session(MemCacheStoreApp)
+-    end
+ 
+     def test_setting_and_getting_session_value
+       with_test_route_set do
+@@ -177,14 +170,18 @@ class MemCacheStoreTest < ActionController::IntegrationTest
+   end
+ 
+   private
+-    def with_test_route_set
++    def with_test_route_set(options = {})
+       with_routing do |set|
+         set.draw do |map|
+           map.with_options :controller => "mem_cache_store_test/test" do |c|
+             c.connect "/:action"
+           end
+         end
++        
++        options = { :key => '_session_id' }.merge!(options)
++        @integration_session = open_session(ActionController::Session::MemCacheStore.new(DispatcherApp, options))
++        
+         yield
+       end
+     end
+-end
++end
+\ No newline at end of file
+-- 
+1.7.2.3
+

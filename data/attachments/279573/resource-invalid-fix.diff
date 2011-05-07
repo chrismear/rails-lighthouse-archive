@@ -1,0 +1,206 @@
+From 47b51f4d34785f93eb4be68d9d6c62b748022340 Mon Sep 17 00:00:00 2001
+From: Jordan Brough <jordan@animoto.com>
+Date: Sat, 26 Sep 2009 05:02:39 -0600
+Subject: [PATCH] Fix for ActiveResource#save! exception raising
+
+It was raising an invalid exception (due to ActiveResource::ResourceInvalid being a ConnectionError).  This patch cleans up the exceptions by splitting the ActiveResource::UnprocessableEntity part out of ActiveResource::ResourceInvalid.
+---
+ activeresource/lib/active_resource/base.rb        |   25 ++++--------------
+ activeresource/lib/active_resource/connection.rb  |    2 +-
+ activeresource/lib/active_resource/exceptions.rb  |    3 ++
+ activeresource/lib/active_resource/validations.rb |   28 ++++++++++++++++++--
+ activeresource/test/cases/base_errors_test.rb     |   16 ++++++++++-
+ activeresource/test/connection_test.rb            |    2 +-
+ 6 files changed, 50 insertions(+), 26 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index e5b8589..65cd8f3 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -13,6 +13,10 @@ require 'uri'
+ require 'active_resource/exceptions'
+ 
+ module ActiveResource
++  # Generic Active Resource exception class.
++  class ActiveResourceError < StandardError
++  end
++
+   # ActiveResource::Base is the main class for mapping RESTful resources as models in a Rails application.
+   #
+   # For an outline of what Active Resource is capable of, see link:files/vendor/rails/activeresource/README.html.
+@@ -165,7 +169,7 @@ module ActiveResource
+   # * 405 - ActiveResource::MethodNotAllowed
+   # * 409 - ActiveResource::ResourceConflict
+   # * 410 - ActiveResource::ResourceGone
+-  # * 422 - ActiveResource::ResourceInvalid (rescued by save as validation errors)
++  # * 422 - ActiveResource::UnprocessableEntity (rescued by save as validation errors)
+   # * 401..499 - ActiveResource::ClientError
+   # * 500..599 - ActiveResource::ServerError
+   # * Other - ActiveResource::ConnectionError
+@@ -177,7 +181,7 @@ module ActiveResource
+   #     ryan = Person.find(my_id)
+   #   rescue ActiveResource::ResourceNotFound
+   #     redirect_to :action => 'not_found'
+-  #   rescue ActiveResource::ResourceConflict, ActiveResource::ResourceInvalid
++  #   rescue ActiveResource::ResourceConflict, ActiveResource::UnprocessableEntity
+   #     redirect_to :action => 'new'
+   #   end
+   #
+@@ -916,23 +920,6 @@ module ActiveResource
+       new? ? create : update
+     end
+     
+-    # Saves the resource.
+-    #
+-    # If the resource is new, it is created via +POST+, otherwise the
+-    # existing resource is updated via +PUT+.
+-    #
+-    # With <tt>save!</tt> validations always run. If any of them fail
+-    # ActiveResource::ResourceInvalid gets raised, and nothing is POSTed to
+-    # the remote system.
+-    # See ActiveResource::Validations for more information. 
+-    #
+-    # There's a series of callbacks associated with <tt>save!</tt>. If any
+-    # of the <tt>before_*</tt> callbacks return +false+ the action is
+-    # cancelled and <tt>save!</tt> raises ActiveResource::ResourceInvalid.
+-    def save!
+-      save || raise(ResourceInvalid.new(self))
+-    end
+-
+     # Deletes the resource from the remote service.
+     #
+     # ==== Examples
+diff --git a/activeresource/lib/active_resource/connection.rb b/activeresource/lib/active_resource/connection.rb
+index 9d551f0..b596f1a 100644
+--- a/activeresource/lib/active_resource/connection.rb
++++ b/activeresource/lib/active_resource/connection.rb
+@@ -134,7 +134,7 @@ module ActiveResource
+           when 410
+             raise(ResourceGone.new(response))
+           when 422
+-            raise(ResourceInvalid.new(response))
++            raise(UnprocessableEntity.new(response))
+           when 401...500
+             raise(ClientError.new(response))
+           when 500...600
+diff --git a/activeresource/lib/active_resource/exceptions.rb b/activeresource/lib/active_resource/exceptions.rb
+index 0631cdc..b44f8d1 100644
+--- a/activeresource/lib/active_resource/exceptions.rb
++++ b/activeresource/lib/active_resource/exceptions.rb
+@@ -54,6 +54,9 @@ module ActiveResource
+   # 410 Gone
+   class ResourceGone < ClientError; end # :nodoc:
+ 
++  # 422 Unprocessable Entity
++  class UnprocessableEntity < ClientError; end # :nodoc:
++
+   # 5xx Server Error
+   class ServerError < ConnectionError; end # :nodoc:
+ 
+diff --git a/activeresource/lib/active_resource/validations.rb b/activeresource/lib/active_resource/validations.rb
+index 67b69fa..0a48298 100644
+--- a/activeresource/lib/active_resource/validations.rb
++++ b/activeresource/lib/active_resource/validations.rb
+@@ -1,7 +1,21 @@
+ require 'active_support/core_ext/array/wrap'
+ 
+ module ActiveResource
+-  class ResourceInvalid < ClientError  #:nodoc:
++  # Raised by <tt>save!</tt> when the resource is invalid.  Use the
++  # +resource+ method to retrieve the resource which did not validate.
++  #   begin
++  #     complex_operation_that_calls_save!_internally
++  #   rescue ActiveResource::ResourceInvalid => invalid
++  #     puts invalid.resource.errors
++  #   end
++  class ResourceInvalid < ActiveResourceError
++    attr_reader :resource
++    def initialize(resource)
++      @resource = resource
++      errors = @resource.errors.full_messages.join(I18n.t('support.array.words_connector', :default => ', '))
++      # TODO: activerecord => activeresource in translation
++      super(I18n.t('activerecord.errors.messages.record_invalid', :errors => errors))
++    end
+   end
+ 
+   # Active Resource validation is reported to and from this object, which is used by Base#save
+@@ -38,7 +52,7 @@ module ActiveResource
+   end
+   
+   # Module to support validation and errors with Active Resource objects. The module overrides
+-  # Base#save to rescue ActiveResource::ResourceInvalid exceptions and parse the errors returned 
++  # Base#save to rescue ActiveResource::UnprocessableEntity exceptions and parse the errors returned
+   # in the web service response. The module also adds an +errors+ collection that mimics the interface 
+   # of the errors provided by ActiveRecord::Errors.
+   #
+@@ -79,7 +93,7 @@ module ActiveResource
+       else
+         false
+       end
+-    rescue ResourceInvalid => error
++    rescue UnprocessableEntity => error
+       # cache the remote errors because every call to <tt>valid?</tt> clears
+       # all errors. We must keep a copy to add these back after local
+       # validations
+@@ -88,6 +102,14 @@ module ActiveResource
+       false
+     end
+ 
++    # Attempts to save the resource just like Base#save but will always run
++    # validations and will raise a ResourceInvalid exception instead of returning
++    # false if the resource is not valid. An invalid resource occurs when local
++    # validations fail or when a 422 Unprocessable Entity response is returned
++    # by the remote server (e.g. when remote validations fail).
++    def save!
++      save_with_validation || raise(ResourceInvalid.new(self))
++    end
+ 
+     # Loads the set of remote errors into the object's Errors based on the
+     # content-type of the error-block received
+diff --git a/activeresource/test/cases/base_errors_test.rb b/activeresource/test/cases/base_errors_test.rb
+index 1eb7765..771c647 100644
+--- a/activeresource/test/cases/base_errors_test.rb
++++ b/activeresource/test/cases/base_errors_test.rb
+@@ -69,12 +69,24 @@ class BaseErrorsTest < Test::Unit::TestCase
+     end
+   end
+ 
++  def test_should_convert_unprocessable_entity_into_resource_invalid
++    [ :json, :xml ].each do |format|
++      assert_raises(ActiveResource::ResourceInvalid) do
++        invalid_user_using_format(format, true)
++      end
++    end
++  end
++
+   private
+-  def invalid_user_using_format(mime_type_reference)
++  def invalid_user_using_format(mime_type_reference, use_bang=false)
+     previous_format = Person.format
+     Person.format = mime_type_reference
+     @person = Person.new(:name => '', :age => '')
+-    assert_equal false, @person.save
++    if use_bang
++      @person.save!
++    else
++      assert_equal false, @person.save
++    end
+ 
+     yield
+   ensure
+diff --git a/activeresource/test/connection_test.rb b/activeresource/test/connection_test.rb
+index d7466c6..437e577 100644
+--- a/activeresource/test/connection_test.rb
++++ b/activeresource/test/connection_test.rb
+@@ -60,7 +60,7 @@ class ConnectionTest < Test::Unit::TestCase
+     assert_response_raises ActiveResource::ResourceGone, 410
+ 
+     # 422 is a validation error
+-    assert_response_raises ActiveResource::ResourceInvalid, 422
++    assert_response_raises ActiveResource::UnprocessableEntity, 422
+ 
+     # 4xx are client errors.
+     [402, 499].each do |code|
+-- 
+1.6.1.2
+

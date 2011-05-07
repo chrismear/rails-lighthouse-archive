@@ -1,0 +1,170 @@
+From 6e222c004a6843f651f469c1398021cae7e347a5 Mon Sep 17 00:00:00 2001
+From: Kevin Glowacz <glowacz@gmail.com>
+Date: Tue, 3 Jun 2008 15:45:45 -0500
+Subject: [PATCH] apply index and auto_index to nested fields for
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb |   26 ++++++--
+ actionpack/test/template/form_helper_test.rb      |   81 +++++++++++++++++++++
+ 2 files changed, 102 insertions(+), 5 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index bafc635..c8cd47a 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -505,7 +505,7 @@ module ActionView
+         @object_name, @method_name = object_name.to_s.dup, method_name.to_s.dup
+         @template_object= template_object
+         @object = object
+-        if @object_name.sub!(/\[\]$/,"")
++        if @object_name.sub!(/\[\]$/,"") || @object_name.sub!(/\[\]\]$/,"]")
+           if object ||= @template_object.instance_variable_get("@#{Regexp.last_match.pre_match}") and object.respond_to?(:to_param)
+             @auto_index = object.to_param
+           else
+@@ -683,7 +683,7 @@ module ActionView
+         end
+ 
+         def sanitized_object_name
+-          @sanitized_object_name ||= @object_name.gsub(/[^-a-zA-Z0-9:.]/, "_").sub(/_$/, "")
++          @sanitized_object_name ||= @object_name.gsub(/\]\[|[^-a-zA-Z0-9:.]/, "_").sub(/_$/, "")
+         end
+ 
+         def sanitized_method_name
+@@ -701,6 +701,13 @@ module ActionView
+       def initialize(object_name, object, template, options, proc)
+         @object_name, @object, @template, @options, @proc = object_name, object, template, options, proc
+         @default_options = @options ? @options.slice(:index) : {}
++        if @object_name.to_s.match(/\[\]$/)
++          if object ||= @template.instance_variable_get("@#{Regexp.last_match.pre_match}") and object.respond_to?(:to_param)
++            @auto_index = object.to_param
++          else
++            raise ArgumentError, "object[] naming but object param and @object var don't exist or don't respond to to_param: #{object.inspect}"
++          end
++        end
+       end
+ 
+       (field_helpers - %w(label check_box radio_button fields_for)).each do |selector|
+@@ -713,16 +720,25 @@ module ActionView
+       end
+ 
+       def fields_for(record_or_name_or_array, *args, &block)
++        if options.has_key?(:index)
++          index = "[#{options[:index]}]"
++        elsif defined?(@auto_index)
++          self.object_name = @object_name.to_s.sub(/\[\]$/,"")
++          index = "[#{@auto_index}]"
++        else
++          index = ""
++        end
++
+         case record_or_name_or_array
+         when String, Symbol
+-          name = "#{object_name}[#{record_or_name_or_array}]"
++          name = "#{object_name}#{index}[#{record_or_name_or_array}]"
+         when Array
+           object = record_or_name_or_array.last
+-          name = "#{object_name}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
++          name = "#{object_name}#{index}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
+           args.unshift(object)
+         else
+           object = record_or_name_or_array
+-          name = "#{object_name}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
++          name = "#{object_name}#{index}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
+           args.unshift(object)
+         end
+ 
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 39649c3..13dcafd 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -447,6 +447,87 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_nested_fields_for_with_index
++    form_for(:post, @post, :index => 1) do |f|
++      f.fields_for(:comment, @post) do |c|
++        concat c.text_field(:title)
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[1][comment][title]' size='30' type='text' id='post_1_comment_title' value='Hello World' />" +
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_index_on_both
++    form_for(:post, @post, :index => 1) do |f|
++      f.fields_for(:comment, @post, :index => 5) do |c|
++        concat c.text_field(:title)
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[1][comment][5][title]' size='30' type='text' id='post_1_comment_5_title' value='Hello World' />" +
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_auto_index
++    form_for("post[]", @post) do |f|
++      f.fields_for(:comment, @post) do |c|
++        concat c.text_field(:title)
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[123][comment][title]' size='30' type='text' id='post_123_comment_title' value='Hello World' />" +
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_auto_index_on_both
++    form_for("post[]", @post) do |f|
++      f.fields_for("comment[]", @post) do |c|
++        concat c.text_field(:title)
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[123][comment][123][title]' size='30' type='text' id='post_123_comment_123_title' value='Hello World' />" +
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++
++  def test_nested_fields_for_with_index_and_auto_index
++    form_for("post[]", @post) do |f|
++      f.fields_for(:comment, @post, :index => 5) do |c|
++        concat c.text_field(:title)
++      end
++    end
++
++    form_for(:post, @post, :index => 1) do |f|
++      f.fields_for("comment[]", @post) do |c|
++        concat c.text_field(:title)
++      end
++    end
++
++    expected = "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[123][comment][5][title]' size='30' type='text' id='post_123_comment_5_title' value='Hello World' />" +
++               "</form>" +
++
++               "<form action='http://www.example.com' method='post'>" +
++               "<input name='post[1][comment][123][title]' size='30' type='text' id='post_1_comment_123_title' value='Hello World' />" +
++               "</form>"
++
++    assert_dom_equal expected, output_buffer
++  end
++
++
+   def test_fields_for
+     fields_for(:post, @post) do |f|
+       concat f.text_field(:title)
+-- 
+1.5.6.2
+

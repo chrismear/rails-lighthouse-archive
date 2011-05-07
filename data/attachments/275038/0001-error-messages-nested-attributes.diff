@@ -1,0 +1,171 @@
+From e5bb4e5b6f7a71b02ccc99f23ad7cc06e69e4ba0 Mon Sep 17 00:00:00 2001
+From: =?utf-8?q?Jos=C3=A9=20Valim?= <jose.valim@gmail.com>
+Date: Tue, 22 Sep 2009 09:44:30 -0300
+Subject: [PATCH] Fix nested attributes error messages which is broken in 2.3.4. It still copies the message from child to parent, but does the lookup in the child, not in the parent, avoiding error messages duplication (as happened in 2.3.3).
+
+---
+ .../lib/active_record/autosave_association.rb      |    7 ++--
+ activerecord/lib/active_record/validations.rb      |   32 +++++++-------------
+ .../test/cases/autosave_association_test.rb        |   18 +++++-----
+ 3 files changed, 23 insertions(+), 34 deletions(-)
+
+diff --git a/activerecord/lib/active_record/autosave_association.rb b/activerecord/lib/active_record/autosave_association.rb
+index d7fdb0b..049fb6e 100644
+--- a/activerecord/lib/active_record/autosave_association.rb
++++ b/activerecord/lib/active_record/autosave_association.rb
+@@ -256,9 +256,8 @@ module ActiveRecord
+       unless valid = association.valid?
+         if reflection.options[:autosave]
+           association.errors.each_error do |attribute, error|
+-            error = error.dup
+-            error.attribute = "#{reflection.name}_#{attribute}"
+-            errors.add(error) unless errors.on(error.attribute)
++            attribute = "#{reflection.name}.#{attribute}"
++            errors.add(attribute, error.dup) unless errors.on(attribute)
+           end
+         else
+           errors.add(reflection.name)
+@@ -362,4 +361,4 @@ module ActiveRecord
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index a7c49a0..33fc09c 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -22,16 +22,21 @@ module ActiveRecord
+       self.base      = base
+       self.attribute = attribute
+       self.type      = type || :invalid
+-      self.options   = options
+       self.message   = options.delete(:message) || self.type
++      self.options   = {
++        :scope => [:activerecord, :errors],
++        :model => @base.class.human_name,
++        :attribute => @base.class.human_attribute_name(attribute.to_s),
++        :value => value
++      }.merge!(options)
+     end
+ 
+     def message
+-      generate_message(@message, default_options)
++      generate_message(@message, options.dup)
+     end
+ 
+     def full_message
+-      attribute.to_s == 'base' ? message : generate_full_message(message, default_options)
++      attribute.to_s == 'base' ? message : generate_full_message(message, options.dup)
+     end
+ 
+     alias :to_s :message
+@@ -113,15 +118,6 @@ module ActiveRecord
+         options.merge!(:default => keys, :message => self.message)
+         I18n.translate(keys.shift, options)
+       end
+-
+-      # Return user options with default options.
+-      #
+-      def default_options
+-        options.reverse_merge :scope => [:activerecord, :errors],
+-                              :model => @base.class.human_name,
+-                              :attribute => @base.class.human_attribute_name(attribute.to_s),
+-                              :value => value
+-      end
+   end
+ 
+   # Active Record validation is reported to and from this object, which is used by Base#save to
+@@ -154,16 +150,10 @@ module ActiveRecord
+     # error can be added to the same +attribute+ in which case an array will be returned on a call to <tt>on(attribute)</tt>.
+     # If no +messsage+ is supplied, :invalid is assumed.
+     # If +message+ is a Symbol, it will be translated, using the appropriate scope (see translate_error).
+-    # def add(attribute, message = nil, options = {})
+-    #   message ||= :invalid
+-    #   message = generate_message(attribute, message, options)) if message.is_a?(Symbol)
+-    #   @errors[attribute.to_s] ||= []
+-    #   @errors[attribute.to_s] << message
+-    # end
+-
+-    def add(error_or_attr, message = nil, options = {})
+-      error, attribute = error_or_attr.is_a?(Error) ? [error_or_attr, error_or_attr.attribute] : [nil, error_or_attr]
++    #
++    def add(attribute, message = nil, options = {})
+       options[:message] = options.delete(:default) if options.has_key?(:default)
++      error, message = message, nil if message.is_a?(Error)
+ 
+       @errors[attribute.to_s] ||= []
+       @errors[attribute.to_s] << (error || Error.new(@base, attribute, message, options))
+diff --git a/activerecord/test/cases/autosave_association_test.rb b/activerecord/test/cases/autosave_association_test.rb
+index d91f90a..bd55bc5 100644
+--- a/activerecord/test/cases/autosave_association_test.rb
++++ b/activerecord/test/cases/autosave_association_test.rb
+@@ -750,15 +750,15 @@ class TestAutosaveAssociationOnAHasOneAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @pirate.ship.name = ''
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
++    assert_equal "can't be blank", @pirate.errors.on(:"ship.name")
+   end
+ 
+   def test_should_merge_errors_on_the_associated_models_onto_the_parent_even_if_it_is_not_valid
+     @pirate.ship.name   = nil
+     @pirate.catchphrase = nil
+     assert !@pirate.valid?
+-    assert !@pirate.errors.on(:ship_name).blank?
+-    assert !@pirate.errors.on(:catchphrase).blank?
++    assert @pirate.errors.full_messages.include?("Name can't be blank")
++    assert @pirate.errors.full_messages.include?("Catchphrase can't be blank")
+   end
+ 
+   def test_should_still_allow_to_bypass_validations_on_the_associated_model
+@@ -840,15 +840,15 @@ class TestAutosaveAssociationOnABelongsToAssociation < ActiveRecord::TestCase
+   def test_should_automatically_validate_the_associated_model
+     @ship.pirate.catchphrase = ''
+     assert !@ship.valid?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert_equal "can't be blank", @ship.errors.on(:"pirate.catchphrase")
+   end
+ 
+   def test_should_merge_errors_on_the_associated_model_onto_the_parent_even_if_it_is_not_valid
+     @ship.name = nil
+     @ship.pirate.catchphrase = nil
+     assert !@ship.valid?
+-    assert !@ship.errors.on(:name).blank?
+-    assert !@ship.errors.on(:pirate_catchphrase).blank?
++    assert @ship.errors.full_messages.include?("Name can't be blank")
++    assert @ship.errors.full_messages.include?("Catchphrase can't be blank")
+   end
+ 
+   def test_should_still_allow_to_bypass_validations_on_the_associated_model
+@@ -910,7 +910,7 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.send(@association_name).each { |child| child.name = '' }
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert @pirate.errors.full_messages.include?("Name can't be blank")
+     assert @pirate.errors.on(@association_name).blank?
+   end
+ 
+@@ -918,7 +918,7 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.send(@association_name).build(:name => '')
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}.name")
+     assert @pirate.errors.on(@association_name).blank?
+   end
+ 
+@@ -927,7 +927,7 @@ module AutosaveAssociationOnACollectionAssociationTests
+     @pirate.catchphrase = nil
+ 
+     assert !@pirate.valid?
+-    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}_name")
++    assert_equal "can't be blank", @pirate.errors.on("#{@association_name}.name")
+     assert !@pirate.errors.on(:catchphrase).blank?
+   end
+ 
+-- 
+1.5.4.3
+

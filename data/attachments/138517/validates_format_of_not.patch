@@ -1,0 +1,133 @@
+From c08c6bdfc23876a16c2083f1617bb5c2f70c12f3 Mon Sep 17 00:00:00 2001
+From: Elliot Winkler <elliot.winkler@gmail.com>
+Date: Sun, 28 Jun 2009 23:06:43 -0500
+Subject: [PATCH] Add :not option to validates_format_of
+
+---
+ activerecord/lib/active_record/validations.rb |   35 ++++++++++++++++++++-----
+ activerecord/test/cases/validations_test.rb   |   31 ++++++++++++++++++++-
+ 2 files changed, 57 insertions(+), 9 deletions(-)
+
+diff --git a/activerecord/lib/active_record/validations.rb b/activerecord/lib/active_record/validations.rb
+index d2d12b8..2e79086 100644
+--- a/activerecord/lib/active_record/validations.rb
++++ b/activerecord/lib/active_record/validations.rb
+@@ -763,22 +763,32 @@ module ActiveRecord
+       end
+ 
+ 
+-      # Validates whether the value of the specified attribute is of the correct form by matching it against the regular expression
+-      # provided.
++      # Validates whether the value of the specified attribute is of the correct form, going by the regular expression provided.
++      # You can require that the attribute matches the regular expression:
+       #
+       #   class Person < ActiveRecord::Base
+       #     validates_format_of :email, :with => /\A([^@\s]+)@((?:[-a-z0-9]+\.)+[a-z]{2,})\Z/i, :on => :create
+       #   end
+       #
++      # Alternatively, you can require that the specified attribute does _not_ match the regular expression:
++      #
++      #   class Person < ActiveRecord::Base
++      #     validates_format_of :email, :not => /NOSPAM/
++      #   end
++      #
+       # Note: use <tt>\A</tt> and <tt>\Z</tt> to match the start and end of the string, <tt>^</tt> and <tt>$</tt> match the start/end of a line.
+       #
+-      # A regular expression must be provided or else an exception will be raised.
++      # You must pass either <tt>:with</tt> or <tt>:not</tt> as an option. In addition, both must be a regular expression,
++      # or else an exception will be raised.
+       #
+       # Configuration options:
+       # * <tt>:message</tt> - A custom error message (default is: "is invalid").
+       # * <tt>:allow_nil</tt> - If set to true, skips this validation if the attribute is +nil+ (default is +false+).
+       # * <tt>:allow_blank</tt> - If set to true, skips this validation if the attribute is blank (default is +false+).
+-      # * <tt>:with</tt> - The regular expression used to validate the format with (note: must be supplied!).
++      # * <tt>:with</tt> - Regular expression that if the attribute matches will result in a successful validation 
++      #   (note: must be supplied if :not is not supplied!).
++      # * <tt>:not</tt> - Regular expression that if the attribute does not match will result in a successful validation 
++      #   (note: must be supplied if :with is not supplied!).
+       # * <tt>:on</tt> - Specifies when this validation is active (default is <tt>:save</tt>, other options <tt>:create</tt>, <tt>:update</tt>).
+       # * <tt>:if</tt> - Specifies a method, proc or string to call to determine if the validation should
+       #   occur (e.g. <tt>:if => :allow_validation</tt>, or <tt>:if => Proc.new { |user| user.signup_step > 2 }</tt>).  The
+@@ -787,15 +797,26 @@ module ActiveRecord
+       #   not occur (e.g. <tt>:unless => :skip_validation</tt>, or <tt>:unless => Proc.new { |user| user.signup_step <= 2 }</tt>).  The
+       #   method, proc or string should return or evaluate to a true or false value.
+       def validates_format_of(*attr_names)
+-        configuration = { :on => :save, :with => nil }
++        configuration = { :on => :save }
+         configuration.update(attr_names.extract_options!)
+ 
+-        raise(ArgumentError, "A regular expression must be supplied as the :with option of the configuration hash") unless configuration[:with].is_a?(Regexp)
++        unless configuration.include?(:with) ^ configuration.include?(:not)  # ^ == xor, or "exclusive or"
++          raise ArgumentError, "Either :with or :not must be supplied (but not both)"
++        end
++        if configuration[:with] && !configuration[:with].is_a?(Regexp)
++          raise(ArgumentError, "A regular expression must be supplied as the :with option of the configuration hash") 
++        end
++        if configuration[:not] && !configuration[:not].is_a?(Regexp)
++          raise(ArgumentError, "A regular expression must be supplied as the :not option of the configuration hash") 
++        end
+ 
+         validates_each(attr_names, configuration) do |record, attr_name, value|
+-          unless value.to_s =~ configuration[:with]
++          if configuration[:with] && value.to_s !~ configuration[:with]
+             record.errors.add(attr_name, :invalid, :default => configuration[:message], :value => value) 
+           end
++          if configuration[:not] && value.to_s =~ configuration[:not]
++            record.errors.add(attr_name, :invalid, :default => configuration[:message], :value => value)
++          end
+         end
+       end
+ 
+diff --git a/activerecord/test/cases/validations_test.rb b/activerecord/test/cases/validations_test.rb
+index c20f5ae..69e8db7 100644
+--- a/activerecord/test/cases/validations_test.rb
++++ b/activerecord/test/cases/validations_test.rb
+@@ -581,8 +581,6 @@ class ValidationsTest < ActiveRecord::TestCase
+ 
+     assert t.save
+     assert_nil t.errors.on(:title)
+-
+-    assert_raise(ArgumentError) { Topic.validates_format_of(:title, :content) }
+   end
+ 
+   def test_validate_format_with_allow_blank
+@@ -626,6 +624,35 @@ class ValidationsTest < ActiveRecord::TestCase
+     t = Topic.create(:title => 'Invalid title')
+     assert_equal "can't be Invalid title", t.errors.on(:title)
+   end
++  
++  def test_validate_format_with_not_option
++    Topic.validates_format_of(:title, :not => /foo/, :message => "should not contain foo")
++    t = Topic.new
++    
++    t.title = "foobar"
++    t.valid?
++    assert_equal "should not contain foo", t.errors.on(:title)
++    
++    t.title = "something else"
++    t.valid?
++    assert_nil t.errors.on(:title)
++  end
++  
++  def test_validate_format_of_without_any_regexp_should_raise_error
++    assert_raise(ArgumentError) { Topic.validates_format_of(:title) }
++  end
++  
++  def test_validates_format_of_with_both_regexps_should_raise_error
++    assert_raise(ArgumentError) { Topic.validates_format_of(:title, :with => /this/, :not => /that/) }
++  end
++  
++  def test_validates_format_of_when_with_isnt_a_regexp_should_raise_error
++    assert_raise(ArgumentError) { Topic.validates_format_of(:title, :with => "clearly not a regexp") }
++  end
++  
++  def test_validates_format_of_when_not_isnt_a_regexp_should_raise_error
++    assert_raise(ArgumentError) { Topic.validates_format_of(:title, :not => "clearly not a regexp") }
++  end
+ 
+   def test_validates_inclusion_of
+     Topic.validates_inclusion_of( :title, :in => %w( a b c d e f g ) )
+-- 
+1.5.5
+

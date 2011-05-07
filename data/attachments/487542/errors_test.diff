@@ -1,0 +1,332 @@
+From 0317fec1af1d5142f963862c72e09e6968b8739b Mon Sep 17 00:00:00 2001
+From: Iain Hecker <iain@iain.nl>
+Date: Mon, 19 Apr 2010 15:55:58 +0200
+Subject: [PATCH] Formalize ActiveModel::Errors API by writing tests, and fix a minor issue concerning add(:base, :translatable)
+
+---
+ activemodel/lib/active_model/errors.rb     |    8 +-
+ activemodel/test/cases/errors_test.rb      |  198 ++++++++++++++++++++++++++++
+ activemodel/test/cases/validations_test.rb |   51 -------
+ 3 files changed, 202 insertions(+), 55 deletions(-)
+ create mode 100644 activemodel/test/cases/errors_test.rb
+
+diff --git a/activemodel/lib/active_model/errors.rb b/activemodel/lib/active_model/errors.rb
+index e6c86c7..6231dc5 100644
+--- a/activemodel/lib/active_model/errors.rb
++++ b/activemodel/lib/active_model/errors.rb
+@@ -91,7 +91,7 @@ module ActiveModel
+     #   p.errors[:name] = "must be set"
+     #   p.errors[:name] #=> ['must be set']
+     def []=(attribute, error)
+-      self[attribute.to_sym] << error
++      add(attribute, error)
+     end
+ 
+     # Iterates through each error key, value pair in the error messages hash.
+@@ -99,12 +99,12 @@ module ActiveModel
+     # has more than one error message, yields once for each error message.
+     # 
+     #   p.errors.add(:name, "can't be blank")
+-    #   p.errors.each do |attribute, errors_array|
++    #   p.errors.each do |attribute, error_message|
+     #     # Will yield :name and "can't be blank"
+     #   end
+     # 
+     #   p.errors.add(:name, "must be specified")
+-    #   p.errors.each do |attribute, errors_array|
++    #   p.errors.each do |attribute, error_message|
+     #     # Will yield :name and "can't be blank"
+     #     # then yield :name and "must be specified"
+     #   end
+@@ -271,7 +271,7 @@ module ActiveModel
+       defaults.flatten!
+ 
+       key = defaults.shift
+-      value = @base.send(:read_attribute_for_validation, attribute)
++      value = @base.send(:read_attribute_for_validation, attribute) if @base.respond_to?(attribute)
+ 
+       options = {
+         :default => defaults,
+diff --git a/activemodel/test/cases/errors_test.rb b/activemodel/test/cases/errors_test.rb
+new file mode 100644
+index 0000000..936c1a2
+--- /dev/null
++++ b/activemodel/test/cases/errors_test.rb
+@@ -0,0 +1,198 @@
++# encoding: utf-8
++require 'cases/helper'
++require 'cases/tests_database'
++
++require 'models/topic'
++
++class ErrorsTest < ActiveModel::TestCase
++  include ActiveModel::TestsDatabase
++
++  def setup
++    Topic._validators.clear
++    @subject = Topic.new
++    @errors  = @subject.errors
++  end
++
++  def test_object_with_errors
++    assert @errors.is_a?(ActiveModel::Errors)
++  end
++
++  def test_add_errors
++    assert_equal [], @errors[:title]
++    @errors.add(:title, "is not valid")
++    assert_equal ["is not valid"], @errors[:title]
++    @errors[:title] = "has a problem"
++    assert_equal ["is not valid", "has a problem" ], @errors[:title]
++  end
++
++  def test_modify_errors_array_directly
++    assert_equal [], @errors[:title]
++    @errors[:title] << "is not valid"
++    assert_equal ["is not valid"], @errors[:title]
++    @errors[:title].clear
++    assert_equal [], @errors[:title]
++  end
++
++  def test_add_errors_using_strings
++    @errors[:title] = "is not valid"
++    assert_equal ["is not valid"], @errors[:title]
++    assert_equal ["is not valid"], @errors['title']
++  end
++
++  def test_add_errors_to_base
++    @errors.add(:base, "base error")
++    assert_equal ["base error"], @errors[:base]
++  end
++
++  # These tests don't try to be a complete of the locales provided
++  # Just needs to be sure that translation happens
++  def test_add_translatable_error
++    @errors.add(:title, :blank)
++    assert_equal ["can't be blank"], @errors[:title]
++  end
++
++  def test_add_proc_object_as_as_error
++    @errors.add(:title, proc { "error".upcase })
++    assert_equal ["ERROR"], @errors[:title]
++  end
++
++  def test_add_translatable_error_to_nonexisting_attribute
++    @errors.add(:not_existent, :blank)
++    assert_equal ["can't be blank"], @errors[:not_existent]
++  end
++
++  def test_add_translatable_error_to_base
++    @errors.add(:base, :blank)
++    assert_equal ["can't be blank"], @errors[:base]
++  end
++
++  def test_add_errors_without_message_defaults_to_invalid
++    @errors.add(:title)
++    assert_equal ["is invalid"], @errors[:title]
++  end
++
++  def test_add_translatable_error_to_array
++    @errors[:title] = :blank
++    assert_equal ["can't be blank"], @errors[:title]
++  end
++
++  def test_iterating_through_all_attributes_and_all_messages
++    @errors.add(:title, "one")
++    @errors.add(:title, "two")
++    @errors.add(:author_name, "three")
++    attributes = []
++    messages   = []
++    @errors.each do |attribute, message|
++      attributes << attribute
++      messages   << message
++    end
++    assert_equal [:title, :title, :author_name], attributes
++    assert_equal ["one", "two", "three"], messages
++  end
++
++  def test_amount_of_errors
++    @errors.add(:title, "one")
++    @errors.add(:title, "two")
++    @errors.add(:author_name, "three")
++    assert_equal 3, @errors.size
++  end
++
++  def test_check_emptyness_of_errors
++    assert @errors.empty?
++    @errors.add(:title)
++    assert !@errors.empty?
++  end
++
++  def test_add_on_empty
++    @subject.title       = [1,2]
++    @subject.author_name = []
++    @errors.add_on_empty([:title, :author_name])
++    assert_equal [], @errors[:title]
++    assert_equal ["can't be empty"], @errors[:author_name]
++  end
++
++  def test_add_on_empty_with_nil
++    @subject.title       = [1,2]
++    @subject.author_name = nil
++    @errors.add_on_empty([:title, :author_name])
++    assert_equal [], @errors[:title]
++    assert_equal ["can't be empty"], @errors[:author_name]
++  end
++
++  def test_add_on_blank
++    @subject.title       = "foo"
++    @subject.author_name = ""
++    @errors.add_on_blank([:title, :author_name])
++    assert_equal [], @errors[:title]
++    assert_equal ["can't be blank"], @errors[:author_name]
++  end
++
++  def test_full_messages
++    @errors.add(:title)
++    @errors.add(:title, :blank)
++    @errors.add(:base, "Base Error")
++    expected = ["Title is invalid", "Title can't be blank", "Base Error"]
++    assert_equal expected, @errors.full_messages
++    assert_equal expected, @errors.to_a
++  end
++
++  def test_errors_to_xml
++    @errors.add(:title)
++    @errors.add(:base, "Base Error")
++    expected = <<-XML.gsub(/^\s{4}/m, '')
++    <?xml version="1.0" encoding="UTF-8"?>
++    <errors>
++      <error>Title is invalid</error>
++      <error>Base Error</error>
++    </errors>
++    XML
++    assert_equal expected, @errors.to_xml
++  end
++
++  def test_errors_to_xml_without_instruct
++    @errors.add(:title)
++    expected = <<-XML.gsub(/^\s{4}/m, '')
++    <errors>
++      <error>Title is invalid</error>
++    </errors>
++    XML
++    assert_equal expected, @errors.to_xml(:skip_instruct => true)
++  end
++
++  def test_errors_to_xml_with_indent
++    @errors.add(:title)
++    expected = <<-XML.gsub(/^\s{4}/m, '')
++    <?xml version="1.0" encoding="UTF-8"?>
++    <errors>
++        <error>Title is invalid</error>
++    </errors>
++    XML
++    assert_equal expected, @errors.to_xml(:indent => 4)
++  end
++
++  def test_deprecated_error_messages_on
++    @errors.add(:title, "can't be blank")
++
++    [:title, "title"].each do |attribute|
++      assert_deprecated { assert_equal "can't be blank", @errors.on(attribute) }
++    end
++
++    @errors.add(:title, "invalid")
++
++    [:title, "title"].each do |attribute|
++      assert_deprecated do
++        assert @errors.on(attribute).include?("invalid")
++        assert @errors.on(attribute).include?("can't be blank")
++      end
++    end
++  end
++
++  def test_deprecated_errors_on_base_and_each
++    assert_deprecated { @errors.add_to_base "invalid topic" }
++    assert_deprecated { assert_equal "invalid topic", @errors.on_base }
++    assert_deprecated { assert @errors.invalid?(:base) }
++    assert_deprecated { assert_equal @errors.to_a, @errors.each_full{|err| err} }
++  end
++
++
++end
+diff --git a/activemodel/test/cases/validations_test.rb b/activemodel/test/cases/validations_test.rb
+index 925a68d..6da4955 100644
+--- a/activemodel/test/cases/validations_test.rb
++++ b/activemodel/test/cases/validations_test.rb
+@@ -97,12 +97,6 @@ class ValidationsTest < ActiveModel::TestCase
+     assert_equal 2, r.errors.count
+   end
+ 
+-  def test_errors_empty_after_errors_on_check
+-    t = Topic.new
+-    assert t.errors[:id].empty?
+-    assert t.errors.empty?
+-  end
+-
+   def test_validates_each
+     hits = 0
+     Topic.validates_each(:title, :content, [:title, :content]) do |record, attr|
+@@ -142,15 +136,6 @@ class ValidationsTest < ActiveModel::TestCase
+     assert_raise(NameError) { t = Topic.create }
+   end
+ 
+-  def test_errors_to_xml
+-    r = Reply.new :title => "Wrong Create"
+-    assert !r.valid?
+-    xml = r.errors.to_xml(:skip_instruct => true)
+-    assert_equal "<errors>", xml.first(8)
+-    assert xml.include?("<error>Title is Wrong Create</error>")
+-    assert xml.include?("<error>Content Empty</error>")
+-  end
+-
+   def test_validation_order
+      Topic.validates_presence_of :title
+      Topic.validates_length_of :title, :minimum => 2
+@@ -187,42 +172,6 @@ class ValidationsTest < ActiveModel::TestCase
+     assert !t.invalid?
+   end
+ 
+-  def test_deprecated_error_messages_on
+-    Topic.validates_presence_of :title
+-
+-    t = Topic.new
+-    assert t.invalid?
+-
+-    [:title, "title"].each do |attribute|
+-      assert_deprecated { assert_equal "can't be blank", t.errors.on(attribute) }
+-    end
+-
+-    Topic.validates_each(:title) do |record, attribute|
+-      record.errors[attribute] << "invalid"
+-    end
+-
+-    assert t.invalid?
+-
+-    [:title, "title"].each do |attribute|
+-      assert_deprecated do
+-        assert t.errors.on(attribute).include?("invalid")
+-        assert t.errors.on(attribute).include?("can't be blank")
+-      end
+-    end
+-  end
+-
+-  def test_deprecated_errors_on_base_and_each
+-    t = Topic.new
+-    assert t.valid?
+-
+-    assert_deprecated { t.errors.add_to_base "invalid topic" }
+-    assert_deprecated { assert_equal "invalid topic", t.errors.on_base }
+-    assert_deprecated { assert t.errors.invalid?(:base) }
+-
+-    all_errors = t.errors.to_a
+-    assert_deprecated { assert_equal all_errors, t.errors.each_full{|err| err} }
+-  end
+-
+   def test_validation_with_message_as_proc
+     Topic.validates_presence_of(:title, :message => proc { "no blanks here".upcase })
+ 
+-- 
+1.6.6.1
+

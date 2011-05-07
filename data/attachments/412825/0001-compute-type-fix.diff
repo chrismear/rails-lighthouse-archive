@@ -1,0 +1,131 @@
+From a8e254c432d1c92ccec7379bfd7a0b41407d39ed Mon Sep 17 00:00:00 2001
+From: Andrew White <andyw@pixeltrix.co.uk>
+Date: Tue, 16 Feb 2010 13:45:44 +0000
+Subject: [PATCH] Refactor compute_type to handle situations where the correct class is already loaded
+
+---
+ activerecord/lib/active_record/base.rb  |   37 ++++++++++++++++--------------
+ activerecord/test/cases/base_test.rb    |    8 ------
+ activerecord/test/cases/modules_test.rb |   12 ++++++++-
+ 3 files changed, 30 insertions(+), 27 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index f30eba4..a822757 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -551,7 +551,7 @@ module ActiveRecord #:nodoc:
+     class << self # Class methods
+       def colorize_logging(*args)
+         ActiveSupport::Deprecation.warn "ActiveRecord::Base.colorize_logging and " <<
+-          "config.active_record.colorize_logging are deprecated. Please use " << 
++          "config.active_record.colorize_logging are deprecated. Please use " <<
+           "Rails::Subscriber.colorize_logging or config.colorize_logging instead", caller
+       end
+       alias :colorize_logging= :colorize_logging
+@@ -1226,16 +1226,6 @@ module ActiveRecord #:nodoc:
+           end
+         end
+ 
+-        # Nest the type name in the same module as this class.
+-        # Bar is "MyApp::Business::Bar" relative to MyApp::Business::Foo
+-        def type_name_with_module(type_name)
+-          if store_full_sti_class
+-            type_name
+-          else
+-            (/^::/ =~ type_name) ? type_name : "#{parent.name}::#{type_name}"
+-          end
+-        end
+-
+         def construct_finder_arel(options = {}, scope = nil)
+           relation = options.is_a?(Hash) ? unscoped.apply_finder_options(options) : unscoped.merge(options)
+           relation = scope.merge(relation) if scope
+@@ -1462,13 +1452,26 @@ module ActiveRecord #:nodoc:
+         # Returns the class type of the record using the current module as a prefix. So descendants of
+         # MyApp::Business::Account would appear as MyApp::Business::AccountSubclass.
+         def compute_type(type_name)
+-          modularized_name = type_name_with_module(type_name)
+-          silence_warnings do
+-            begin
+-              class_eval(modularized_name, __FILE__, __LINE__)
+-            rescue NameError
+-              class_eval(type_name, __FILE__, __LINE__)
++          if type_name.match(/^::/)
++            # If the type is prefixed with a scope operator then we assume that
++            # the type_name is an absolute reference.
++            type_name.constantize
++          else
++            # Build a list of candidates to search for
++            candiates = []
++            name.scan(/::|$/) { candiates.unshift "#{$`}::#{type_name}" }
++            candiates << type_name
++
++            candiates.each do |candidate|
++              begin
++                constant = candidate.constantize
++                return constant if candidate == constant.to_s
++              rescue NameError
++              rescue ArgumentError
++              end
+             end
++
++            raise NameError, "uninitialized constant #{candiates.first}"
+           end
+         end
+ 
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 1441b42..4192bf0 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -2139,14 +2139,6 @@ class BasicsTest < ActiveRecord::TestCase
+     assert xml.include?(%(<arbitrary-element>#{value}</arbitrary-element>))
+   end
+ 
+-  def test_type_name_with_module_should_handle_beginning
+-    ActiveRecord::Base.store_full_sti_class = false
+-    assert_equal 'ActiveRecord::Person', ActiveRecord::Base.send(:type_name_with_module, 'Person')
+-    assert_equal '::Person', ActiveRecord::Base.send(:type_name_with_module, '::Person')
+-  ensure
+-    ActiveRecord::Base.store_full_sti_class = true
+-  end
+-
+   def test_to_param_should_return_string
+     assert_kind_of String, Client.find(:first).to_param
+   end
+diff --git a/activerecord/test/cases/modules_test.rb b/activerecord/test/cases/modules_test.rb
+index d781a22..9911996 100644
+--- a/activerecord/test/cases/modules_test.rb
++++ b/activerecord/test/cases/modules_test.rb
+@@ -12,7 +12,7 @@ class ModulesTest < ActiveRecord::TestCase
+     [:Firm, :Client].each do |const|
+       @undefined_consts.merge! const => Object.send(:remove_const, const) if Object.const_defined?(const)
+     end
+-    
++
+     ActiveRecord::Base.store_full_sti_class = false
+   end
+ 
+@@ -21,7 +21,7 @@ class ModulesTest < ActiveRecord::TestCase
+     @undefined_consts.each do |constant, value|
+       Object.send :const_set, constant, value unless value.nil?
+     end
+-    
++
+     ActiveRecord::Base.store_full_sti_class = true
+   end
+ 
+@@ -82,4 +82,12 @@ class ModulesTest < ActiveRecord::TestCase
+       end
+     end
+   end
++
++  def test_compute_type_can_infer_class_name_of_sibling_inside_module
++    old = ActiveRecord::Base.store_full_sti_class
++    ActiveRecord::Base.store_full_sti_class = true
++    assert_equal MyApplication::Business::Firm, MyApplication::Business::Client.send(:compute_type, "Firm")
++  ensure
++    ActiveRecord::Base.store_full_sti_class = old
++  end
+ end
+-- 
+1.6.4.4
+

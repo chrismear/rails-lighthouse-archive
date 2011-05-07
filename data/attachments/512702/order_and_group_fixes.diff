@@ -1,0 +1,118 @@
+From 9dab20959163c0ceb8156c10c4374adcd97cb768 Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Thu, 6 May 2010 16:14:09 -0400
+Subject: [PATCH 1/2] Fix unintuitive behavior with multiple order and group clauses
+
+---
+ .../lib/active_record/relation/calculations.rb     |    2 +-
+ .../lib/active_record/relation/query_methods.rb    |   12 ++++--------
+ .../lib/active_record/relation/spawn_methods.rb    |    7 ++++++-
+ activerecord/test/cases/base_test.rb               |   10 ++++++++++
+ 4 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/activerecord/lib/active_record/relation/calculations.rb b/activerecord/lib/active_record/relation/calculations.rb
+index 8ab5eaa..858d298 100644
+--- a/activerecord/lib/active_record/relation/calculations.rb
++++ b/activerecord/lib/active_record/relation/calculations.rb
+@@ -195,7 +195,7 @@ module ActiveRecord
+ 
+       select_statement <<  ", #{group_field} AS #{group_alias}"
+ 
+-      relation = select(select_statement).group(group)
++      relation = except(:group).select(select_statement).group(group)
+ 
+       calculated_data = @klass.connection.select_all(relation.to_sql)
+ 
+diff --git a/activerecord/lib/active_record/relation/query_methods.rb b/activerecord/lib/active_record/relation/query_methods.rb
+index 7bca12d..2c2cade 100644
+--- a/activerecord/lib/active_record/relation/query_methods.rb
++++ b/activerecord/lib/active_record/relation/query_methods.rb
+@@ -162,14 +162,10 @@ module ActiveRecord
+       arel = arel.take(@limit_value) if @limit_value.present?
+       arel = arel.skip(@offset_value) if @offset_value.present?
+ 
+-      @group_values.uniq.each do |g|
+-        arel = arel.group(g) if g.present?
+-      end
+-
+-      @order_values.uniq.each do |o|
+-        arel = arel.order(Arel::SqlLiteral.new(o.to_s)) if o.present?
+-      end
+-
++      arel = arel.group(*@group_values.uniq.select{|g| g.present?})
++      
++      arel = arel.order(*@order_values.uniq.select{|o| o.present?}.map(&:to_s))
++      
+       selects = @select_values.uniq
+ 
+       quoted_table_name = @klass.quoted_table_name
+diff --git a/activerecord/lib/active_record/relation/spawn_methods.rb b/activerecord/lib/active_record/relation/spawn_methods.rb
+index 8fdd64a..4d708e6 100644
+--- a/activerecord/lib/active_record/relation/spawn_methods.rb
++++ b/activerecord/lib/active_record/relation/spawn_methods.rb
+@@ -80,9 +80,14 @@ module ActiveRecord
+ 
+       options.assert_valid_keys(VALID_FIND_OPTIONS)
+ 
+-      [:joins, :select, :group, :having, :order, :limit, :offset, :from, :lock, :readonly].each do |finder|
++      [:joins, :select, :group, :having, :limit, :offset, :from, :lock, :readonly].each do |finder|
+         relation = relation.send(finder, options[finder]) if options.has_key?(finder)
+       end
++      
++      # Give precedence to newly-applied orders and groups to play nicely with with_scope
++      [:group, :order].each do |finder|
++        relation.send("#{finder}_values=", Array.wrap(options[finder]) + relation.send("#{finder}_values")) if options.has_key?(finder)
++      end
+ 
+       relation = relation.where(options[:conditions]) if options.has_key?(:conditions)
+       relation = relation.includes(options[:include]) if options.has_key?(:include)
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 3623680..c18d423 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1993,6 +1993,16 @@ class BasicsTest < ActiveRecord::TestCase
+     last  = Developer.find :last, :order => 'developers.name, developers.salary DESC'
+     assert_equal last, Developer.find(:all, :order => 'developers.name, developers.salary DESC').last
+   end
++  
++  def test_find_keeps_multiple_order_values
++    combined = Developer.find(:all, :order => 'developers.name, developers.salary')
++    assert_equal combined, Developer.find(:all, :order => ['developers.name', 'developers.salary'])
++  end
++  
++  def test_find_keeps_multiple_group_values
++    combined = Developer.find(:all, :group => 'developers.name, developers.salary')
++    assert_equal combined, Developer.find(:all, :group => ['developers.name', 'developers.salary'])
++  end
+ 
+   def test_find_symbol_ordered_last
+     last  = Developer.find :last, :order => :salary
+-- 
+1.6.4.4
+
+
+From 93af017c65ed38e9d2a36e1a63642e34b0c52452 Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Thu, 6 May 2010 16:19:40 -0400
+Subject: [PATCH 2/2] Be sure to create an SqlLiteral as the old code did (not doing so passed tests but might be bad anyway)
+
+---
+ .../lib/active_record/relation/query_methods.rb    |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/relation/query_methods.rb b/activerecord/lib/active_record/relation/query_methods.rb
+index 2c2cade..99cfa73 100644
+--- a/activerecord/lib/active_record/relation/query_methods.rb
++++ b/activerecord/lib/active_record/relation/query_methods.rb
+@@ -164,7 +164,7 @@ module ActiveRecord
+ 
+       arel = arel.group(*@group_values.uniq.select{|g| g.present?})
+       
+-      arel = arel.order(*@order_values.uniq.select{|o| o.present?}.map(&:to_s))
++      arel = arel.order(*@order_values.uniq.select{|o| o.present?}.map {|o| Arel::SqlLiteral.new(o.to_s)})
+       
+       selects = @select_values.uniq
+ 
+-- 
+1.6.4.4
+

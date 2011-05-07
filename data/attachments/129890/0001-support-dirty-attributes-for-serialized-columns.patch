@@ -1,0 +1,220 @@
+From 92b203a01c9b936b7dc51aa22b49408ab35c6028 Mon Sep 17 00:00:00 2001
+From: steve <coderrr.contact@gmail.com>
+Date: Fri, 29 May 2009 07:43:07 +0700
+Subject: [PATCH] support dirty attributes for serialized columns
+
+---
+ activerecord/lib/active_record/base.rb  |   10 +++++
+ activerecord/lib/active_record/dirty.rb |   31 +++++++++++++--
+ activerecord/test/cases/base_test.rb    |   62 ++++++++++++++++++++++++++++++-
+ 3 files changed, 98 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index ec49d40..2c74b3c 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -1671,6 +1671,10 @@ module ActiveRecord #:nodoc:
+             object.send(:callback, :after_initialize)
+           end
+ 
++          if ActiveRecord::Base.partial_updates
++            object.send(:update_serialized_attributes) 
++          end
++
+           object
+         end
+ 
+@@ -2443,6 +2447,7 @@ module ActiveRecord #:nodoc:
+       def initialize(attributes = nil)
+         @attributes = attributes_from_column_definition
+         @attributes_cache = {}
++        @serialized_attributes_were = {}
+         @new_record = true
+         ensure_proper_type
+         self.attributes = attributes unless attributes.nil?
+@@ -3128,6 +3133,11 @@ module ActiveRecord #:nodoc:
+         YAML::load(string) rescue string
+       end
+ 
++      def object_to_yaml(val)
++        return val if val.is_a? String and val =~ /^---/
++        val.to_yaml rescue val
++      end
++
+       def clone_attributes(reader_method = :read_attribute, attributes = {})
+         self.attribute_names.inject(attributes) do |attrs, name|
+           attrs[name] = clone_attribute_value(reader_method, name)
+diff --git a/activerecord/lib/active_record/dirty.rb b/activerecord/lib/active_record/dirty.rb
+index 178767e..714996e 100644
+--- a/activerecord/lib/active_record/dirty.rb
++++ b/activerecord/lib/active_record/dirty.rb
+@@ -64,6 +64,7 @@ module ActiveRecord
+     #   person.name = 'bob'
+     #   person.changed # => ['name']
+     def changed
++      check_serialized_for_dirt
+       changed_attributes.keys
+     end
+ 
+@@ -79,6 +80,7 @@ module ActiveRecord
+     def save_with_dirty(*args) #:nodoc:
+       if status = save_without_dirty(*args)
+         changed_attributes.clear
++        update_serialized_attributes
+       end
+       status
+     end
+@@ -87,6 +89,7 @@ module ActiveRecord
+     def save_with_dirty!(*args) #:nodoc:
+       status = save_without_dirty!(*args)
+       changed_attributes.clear
++      update_serialized_attributes
+       status
+     end
+ 
+@@ -94,6 +97,7 @@ module ActiveRecord
+     def reload_with_dirty(*args) #:nodoc:
+       record = reload_without_dirty(*args)
+       changed_attributes.clear
++      update_serialized_attributes
+       record
+     end
+ 
+@@ -103,8 +107,20 @@ module ActiveRecord
+         @changed_attributes ||= {}
+       end
+ 
++      def update_serialized_attributes
++        @serialized_attributes_were ||= {}
++        self.class.serialized_attributes.keys.each do |attr|
++          @serialized_attributes_were[attr] = object_to_yaml(@attributes[attr])
++        end
++      end
++
+       # Handle <tt>*_changed?</tt> for +method_missing+.
+       def attribute_changed?(attr)
++        if self.class.serialized_attributes.keys.include? attr
++          changed = @serialized_attributes_were[attr] != object_to_yaml(@attributes[attr])
++          changed_attributes[attr] = @serialized_attributes_were[attr]  if changed
++        end
++
+         changed_attributes.include?(attr)
+       end
+ 
+@@ -115,7 +131,12 @@ module ActiveRecord
+ 
+       # Handle <tt>*_was</tt> for +method_missing+.
+       def attribute_was(attr)
+-        attribute_changed?(attr) ? changed_attributes[attr] : __send__(attr)
++        if attribute_changed?(attr)
++          val = changed_attributes[attr]
++          self.class.serialized_attributes.include?(attr) ? object_from_yaml(val) : val
++        else
++          __send__(attr)
++        end
+       end
+ 
+       # Handle <tt>*_will_change!</tt> for +method_missing+.
+@@ -142,14 +163,16 @@ module ActiveRecord
+ 
+       def update_with_dirty
+         if partial_updates?
+-          # Serialized attributes should always be written in case they've been
+-          # changed in place.
+-          update_without_dirty(changed | self.class.serialized_attributes.keys)
++          update_without_dirty(changed)
+         else
+           update_without_dirty
+         end
+       end
+ 
++      def check_serialized_for_dirt
++        self.class.serialized_attributes.keys.each {|attr| attribute_changed?(attr) }
++      end
++
+       def field_changed?(attr, old, value)
+         if column = column_for_attribute(attr)
+           if column.number? && column.null && (old.nil? || old == 0) && value.blank?
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 59aa695..5c6e3f8 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1273,7 +1273,7 @@ class BasicsTest < ActiveRecord::TestCase
+     assert_equal 2147483647, company.rating
+   end
+ 
+-  # TODO: extend defaults tests to other databases!
++  # TODO: extend defaults tests to other databases! 
+   if current_adapter?(:PostgreSQLAdapter)
+     def test_default
+       default = Default.new
+@@ -1435,6 +1435,66 @@ class BasicsTest < ActiveRecord::TestCase
+     assert_equal(myobj, topic.content)
+   end
+ 
++  def r(&b)
++    yield  if @run_block
++  end
++
++  def test_serialized_attribute_supports_partial_update
++    Topic.serialize("content")
++
++    # test with and without the content_changed? before save cuz it could affect internal state
++    [true, false].each do |tf|
++      @run_block = tf
++
++      topic1 = Topic.create(:content => [1,2,3])
++
++      Topic.find(topic1.id).update_attribute :content, [1,2,4]
++      r { assert ! topic1.content_changed? }
++      r { assert_equal [1,2,3], topic1.content_was }
++      topic1.save! # no change, dont update
++      assert_equal [1,2,4], Topic.find(topic1.id).content
++
++      topic1.content[2] = 5
++      r { assert topic1.content_changed? }
++      r { assert_equal [1,2,3], topic1.content_was }
++      topic1.save! # change, update
++      assert_equal [1,2,5], Topic.find(topic1.id).content
++
++      topic1.content[2] = 6
++      r { assert topic1.content_changed? }
++      r { assert_equal [1,2,5], topic1.content_was }
++      topic1.save! # change again, update
++      assert_equal [1,2,6], Topic.find(topic1.id).content
++
++      topic2 = Topic.create
++      Topic.find(topic2.id).update_attribute :content, [1]
++      r { assert ! topic2.content_changed? }
++      r { assert_equal [1,2,6], topic1.content_was }
++      topic2.save! # no change, dont update
++      assert_equal [1], Topic.find(topic2.id).content
++
++      topic3 = Topic.new
++      topic3.content = [1,2,3]
++      r { assert topic3.content_changed? }
++      r { assert_equal nil, topic3.content_was }
++      topic3.save!
++      assert_equal [1,2,3], Topic.find(topic3.id).content
++
++      Topic.find(topic3.id).update_attribute :content, {45=>32}
++      r { assert ! topic3.content_changed? }
++      r { assert_equal [1,2,3], topic3.content_was }
++      topic3.save!
++      assert_equal({45=>32}, Topic.find(topic3.id).content)
++
++      topic3.reload
++      Topic.find(topic3.id).update_attribute :content, :hello
++      r { assert ! topic3.content_changed? }
++      r { assert_equal({45=>32}, topic3.content_was) }
++      topic3.save!
++      assert_equal :hello, Topic.find(topic3.id).content
++    end
++  end
++
+   def test_serialized_time_attribute
+     myobj = Time.local(2008,1,1,1,0)
+     topic = Topic.create("content" => myobj).reload
+-- 
+1.6.2.107.ge47ee
+

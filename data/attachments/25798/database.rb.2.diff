@@ -1,0 +1,177 @@
+From 0679fa11be6c77c415fae47286bf1bd8f8728a94 Mon Sep 17 00:00:00 2001
+From: Cheah Chu Yeow <chuyeow@gmail.com>
+Date: Wed, 4 Jun 2008 13:04:38 +0800
+Subject: [PATCH] Allow specs to be accessed so that default configs can be used. [Adam Keys]
+
+---
+ railties/lib/initializer.rb                   |    5 ++-
+ railties/lib/rails/database_configurator.rb   |   33 ++++++++++++++++++++++
+ railties/lib/rails/database_spec_generator.rb |   26 ++++++++++++++++++
+ railties/test/database_configurator_test.rb   |   12 ++++++++
+ railties/test/database_spec_generator_test.rb |   36 +++++++++++++++++++++++++
+ 5 files changed, 110 insertions(+), 2 deletions(-)
+ create mode 100644 railties/lib/rails/database_configurator.rb
+ create mode 100644 railties/lib/rails/database_spec_generator.rb
+ create mode 100644 railties/test/database_configurator_test.rb
+ create mode 100644 railties/test/database_spec_generator_test.rb
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index dd6a0c6..aa4fa8e 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -9,7 +9,8 @@ require 'rails/plugin/locator'
+ require 'rails/plugin/loader'
+ require 'rails/gem_dependency'
+ require 'rails/rack'
+-
++require 'rails/database_spec_generator'
++require 'rails/database_configurator'
+ 
+ RAILS_ENV = (ENV['RAILS_ENV'] || 'development').dup unless defined?(RAILS_ENV)
+ 
+@@ -702,7 +703,7 @@ module Rails
+     # contents of the file are processed via ERB before being sent through
+     # YAML::load.
+     def database_configuration
+-      YAML::load(ERB.new(IO.read(database_configuration_file)).result)
++      Rails::DatabaseConfigurator.config(database_configuration_file)
+     end
+ 
+     # The path to the current environment's file (<tt>development.rb</tt>, etc.). By
+diff --git a/railties/lib/rails/database_configurator.rb b/railties/lib/rails/database_configurator.rb
+new file mode 100644
+index 0000000..2c6dccb
+--- /dev/null
++++ b/railties/lib/rails/database_configurator.rb
+@@ -0,0 +1,33 @@
++module Rails
++  class DatabaseConfigurator
++    def self.config(filename)
++      new(filename).specs
++    end
++
++    attr_reader :filename
++
++    def initialize(filename)
++      @filename = filename
++    end
++
++    def specs
++      if ruby_config?
++        load(filename)
++        DatabaseSpecGenerator.specs
++      elsif yaml_config?
++        YAML::load(ERB.new(IO.read(filename)).result)
++      else
++        raise 'Unknown database configuration format'
++      end
++    end
++
++    protected
++      def ruby_config?
++        File.extname(filename) == '.rb'
++      end
++
++      def yaml_config?
++        File.extname(filename) == '.yml'
++      end
++  end
++end
+\ No newline at end of file
+diff --git a/railties/lib/rails/database_spec_generator.rb b/railties/lib/rails/database_spec_generator.rb
+new file mode 100644
+index 0000000..2af7c94
+--- /dev/null
++++ b/railties/lib/rails/database_spec_generator.rb
+@@ -0,0 +1,26 @@
++module Rails
++  class DatabaseSpecGenerator
++    @@specs = {}
++
++    def method_missing(sym, *args)
++      options = args.extract_options!
++      if options.has_key?(:config)
++        @@specs[sym.to_s] = options[:config]
++      else
++        @@specs[sym.to_s]
++      end
++    end
++
++    def self.map(&block)
++      yield(new)
++    end
++
++    def self.specs
++      @@specs
++    end
++
++    def self.reset
++      @@specs = {}
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/railties/test/database_configurator_test.rb b/railties/test/database_configurator_test.rb
+new file mode 100644
+index 0000000..bb5d65b
+--- /dev/null
++++ b/railties/test/database_configurator_test.rb
+@@ -0,0 +1,12 @@
++require 'abstract_unit'
++require 'rails/database_configurator'
++
++class TestDatabaseConfigurator < Test::Unit::TestCase
++  def test_ruby_config
++    assert Rails::DatabaseConfigurator.new('database.rb').send(:ruby_config?)
++  end
++  
++  def test_yaml_config
++    assert Rails::DatabaseConfigurator.new('database.yml').send(:yaml_config?)
++  end
++end
+diff --git a/railties/test/database_spec_generator_test.rb b/railties/test/database_spec_generator_test.rb
+new file mode 100644
+index 0000000..6b76425
+--- /dev/null
++++ b/railties/test/database_spec_generator_test.rb
+@@ -0,0 +1,36 @@
++require 'abstract_unit'
++require 'rails/database_spec_generator'
++
++class DatabaseSpecGeneratorTest < Test::Unit::TestCase
++  def setup
++    Rails::DatabaseSpecGenerator.reset
++  end
++
++  def test_generate_config_block_form
++    Rails::DatabaseSpecGenerator.map do |db|
++      db.development :config => {:database => 'development.sqlite3', :adapter => 'sqlite3'}
++      db.test :config => {:database => 'test.sqlite3', :adapter => 'sqlite3'}
++      db.production :config => {:database => 'production.sqlite3', :adapter => 'sqlite3'}
++    end
++
++    assert_equal({"development" => {:database => 'development.sqlite3', :adapter => 'sqlite3'}, "test" => {:database => 'test.sqlite3', :adapter => 'sqlite3'}, "production" => {:database => 'production.sqlite3', :adapter => 'sqlite3'}}, Rails::DatabaseSpecGenerator.specs)
++  end
++
++  def test_spec_accessor
++    Rails::DatabaseSpecGenerator.map do |db|
++      db.defaults :config => {
++        :adapter => 'mysql',
++        :encoding => 'utf8'
++      }
++      db.development :config => {
++        :database => 'foo_development'
++      }.merge(db.defaults) # Access spec directly.
++    end
++
++    assert_equal({
++      :adapter => 'mysql',
++      :encoding => 'utf8',
++      :database => 'foo_development'
++    }, Rails::DatabaseSpecGenerator.specs['development'])
++  end
++end
+\ No newline at end of file
+-- 
+1.5.5.1
+

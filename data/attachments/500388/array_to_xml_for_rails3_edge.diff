@@ -1,0 +1,332 @@
+From 186942f5c4b0f1c39347fa35aa080aead7a87bff Mon Sep 17 00:00:00 2001
+From: Neeraj Singh <neerajdotname@gmail.com>
+Date: Tue, 27 Apr 2010 16:45:26 -0400
+Subject: [PATCH] array.to_xml should be able to handle all types of data elements [#4490 state:resolved]
+
+---
+ .../serializeration/xml_serialization_test.rb      |    7 ++-
+ activesupport/lib/active_support/core_ext/array.rb |    1 +
+ .../active_support/core_ext/array/conversions.rb   |   31 +++++------
+ activesupport/lib/active_support/core_ext/hash.rb  |    1 +
+ .../active_support/core_ext/hash/conversions.rb    |   55 +++-----------------
+ .../core_ext/hash/conversions_xml_value.rb         |   51 ++++++++++++++++++
+ activesupport/test/core_ext/array_ext_test.rb      |   10 ++--
+ 7 files changed, 84 insertions(+), 72 deletions(-)
+ create mode 100644 activesupport/lib/active_support/core_ext/hash/conversions_xml_value.rb
+
+diff --git a/activemodel/test/cases/serializeration/xml_serialization_test.rb b/activemodel/test/cases/serializeration/xml_serialization_test.rb
+index 6340aad..ac8665d 100644
+--- a/activemodel/test/cases/serializeration/xml_serialization_test.rb
++++ b/activemodel/test/cases/serializeration/xml_serialization_test.rb
+@@ -1,6 +1,7 @@
+ require 'cases/helper'
+ require 'models/contact'
+ require 'active_support/core_ext/object/instance_variables'
++require 'ostruct'
+ 
+ class Contact
+   extend ActiveModel::Naming
+@@ -23,7 +24,9 @@ class XmlSerializationTest < ActiveModel::TestCase
+     @contact.age = 25
+     @contact.created_at = Time.utc(2006, 8, 1)
+     @contact.awesome = false
+-    @contact.preferences = { :gem => 'ruby' }
++    customer = OpenStruct.new
++    customer.name = "John"
++    @contact.preferences = customer
+   end
+ 
+   test "should serialize default root" do
+@@ -93,7 +96,7 @@ class XmlSerializationTest < ActiveModel::TestCase
+   end
+ 
+   test "should serialize yaml" do
+-    assert_match %r{<preferences type=\"yaml\">--- \n:gem: ruby\n</preferences>}, @contact.to_xml
++    assert_match %r{<preferences type=\"yaml\">--- !ruby/object:OpenStruct \ntable:\s*:name: John\n</preferences>}, @contact.to_xml
+   end
+ 
+   test "should call proc on object" do
+diff --git a/activesupport/lib/active_support/core_ext/array.rb b/activesupport/lib/active_support/core_ext/array.rb
+index 4688468..d20b725 100644
+--- a/activesupport/lib/active_support/core_ext/array.rb
++++ b/activesupport/lib/active_support/core_ext/array.rb
+@@ -5,3 +5,4 @@ require 'active_support/core_ext/array/conversions'
+ require 'active_support/core_ext/array/extract_options'
+ require 'active_support/core_ext/array/grouping'
+ require 'active_support/core_ext/array/random_access'
++require 'active_support/core_ext/hash/conversions_xml_value'
+diff --git a/activesupport/lib/active_support/core_ext/array/conversions.rb b/activesupport/lib/active_support/core_ext/array/conversions.rb
+index 5d8e78e..b9ef8c0 100644
+--- a/activesupport/lib/active_support/core_ext/array/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/array/conversions.rb
+@@ -1,4 +1,5 @@
+ require 'active_support/core_ext/hash/keys'
++require 'active_support/core_ext/hash/conversions_xml_value'
+ require 'active_support/core_ext/hash/reverse_merge'
+ require 'active_support/inflector'
+ 
+@@ -51,6 +52,8 @@ class Array
+   alias_method :to_default_s, :to_s
+   alias_method :to_s, :to_formatted_s
+ 
++  include Hash::XmlValue
++
+   # Returns a string that represents this array in XML by sending +to_xml+
+   # to each element. Active Record collections delegate their representation
+   # in XML to this method.
+@@ -127,34 +130,26 @@ class Array
+   #   </messages>
+   #
+   def to_xml(options = {})
+-    raise "Not all elements respond to to_xml" unless all? { |e| e.respond_to? :to_xml }
+     require 'builder' unless defined?(Builder)
+ 
+     options = options.dup
+-    options[:root]     ||= all? { |e| e.is_a?(first.class) && first.class.to_s != "Hash" } ? ActiveSupport::Inflector.pluralize(ActiveSupport::Inflector.underscore(first.class.name)).tr('/', '_') : "records"
+-    options[:children] ||= options[:root].singularize
+     options[:indent]   ||= 2
+-    options[:builder]  ||= Builder::XmlMarkup.new(:indent => options[:indent])
++    options.reverse_merge!({ :builder => Builder::XmlMarkup.new(:indent => options[:indent]) })
+ 
+-    root     = options.delete(:root).to_s
+-    children = options.delete(:children)
++    options[:root]     ||= all? { |e| e.is_a?(first.class) && first.class.to_s != "Hash" } ? ActiveSupport::Inflector.pluralize(ActiveSupport::Inflector.underscore(first.class.name)).tr('/', '_') : "objects"
+ 
+-    if !options.has_key?(:dasherize) || options[:dasherize]
+-      root = root.dasherize
+-    end
+ 
+     options[:builder].instruct! unless options.delete(:skip_instruct)
++    root = rename_key(options[:root].to_s, options)
+ 
+-    opts = options.merge({ :root => children })
++    options[:children] ||= options[:root].singularize
++    attributes = options[:skip_types] ? {} : {:type => "array"}
++    return options[:builder].tag!(root, attributes) if empty?
+ 
+-    xml = options[:builder]
+-    if empty?
+-      xml.tag!(root, options[:skip_types] ? {} : {:type => "array"})
+-    else
+-      xml.tag!(root, options[:skip_types] ? {} : {:type => "array"}) {
+-        yield xml if block_given?
+-        each { |e| e.to_xml(opts.merge({ :skip_instruct => true })) }
+-      }
++    options[:builder].__send__(:method_missing, root, attributes) do
++      each { |value| xml_value(options[:children], value, options) }
++      yield options[:builder] if block_given?
+     end
+   end
++
+ end
+diff --git a/activesupport/lib/active_support/core_ext/hash.rb b/activesupport/lib/active_support/core_ext/hash.rb
+index 5014834..2e7bdce 100644
+--- a/activesupport/lib/active_support/core_ext/hash.rb
++++ b/activesupport/lib/active_support/core_ext/hash.rb
+@@ -1,4 +1,5 @@
+ require 'active_support/core_ext/hash/conversions'
++require 'active_support/core_ext/hash/conversions_xml_value'
+ require 'active_support/core_ext/hash/deep_merge'
+ require 'active_support/core_ext/hash/diff'
+ require 'active_support/core_ext/hash/except'
+diff --git a/activesupport/lib/active_support/core_ext/hash/conversions.rb b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+index c882434..1b2f69f 100644
+--- a/activesupport/lib/active_support/core_ext/hash/conversions.rb
++++ b/activesupport/lib/active_support/core_ext/hash/conversions.rb
+@@ -3,6 +3,7 @@ require 'active_support/core_ext/array/wrap'
+ require 'active_support/core_ext/hash/reverse_merge'
+ require 'active_support/core_ext/object/blank'
+ require 'active_support/core_ext/string/inflections'
++require 'active_support/core_ext/hash/conversions_xml_value'
+ 
+ class Hash
+   # This module exists to decorate files deserialized using Hash.from_xml with
+@@ -19,6 +20,8 @@ class Hash
+     end
+   end
+ 
++  include XmlValue
++
+   XML_TYPE_NAMES = {
+     "Symbol"     => "symbol",
+     "Fixnum"     => "integer",
+@@ -29,7 +32,9 @@ class Hash
+     "FalseClass" => "boolean",
+     "Date"       => "date",
+     "DateTime"   => "datetime",
+-    "Time"       => "datetime"
++    "Time"       => "datetime",
++    "Array"      => "array",
++    "Hash"       => "hash"
+   } unless defined?(XML_TYPE_NAMES)
+ 
+   XML_FORMATTING = {
+@@ -135,57 +140,13 @@ class Hash
+                              :root => "hash" })
+     options[:builder].instruct! unless options.delete(:skip_instruct)
+     root = rename_key(options[:root].to_s, options)
+-
++    # common upto this point
+     options[:builder].__send__(:method_missing, root) do
+       each do |key, value|
+-        case value
+-          when ::Hash
+-            value.to_xml(options.merge({ :root => key, :skip_instruct => true }))
+-          when ::Array
+-            value.to_xml(options.merge({ :root => key, :children => key.to_s.singularize, :skip_instruct => true}))
+-          when ::Method, ::Proc
+-            # If the Method or Proc takes two arguments, then
+-            # pass the suggested child element name.  This is
+-            # used if the Method or Proc will be operating over
+-            # multiple records and needs to create an containing
+-            # element that will contain the objects being
+-            # serialized.
+-            if 1 == value.arity
+-              value.call(options.merge({ :root => key, :skip_instruct => true }))
+-            else
+-              value.call(options.merge({ :root => key, :skip_instruct => true }), key.to_s.singularize)
+-            end
+-          else
+-            if value.respond_to?(:to_xml)
+-              value.to_xml(options.merge({ :root => key, :skip_instruct => true }))
+-            else
+-              type_name = XML_TYPE_NAMES[value.class.name]
+-
+-              key = rename_key(key.to_s, options)
+-
+-              attributes = options[:skip_types] || value.nil? || type_name.nil? ? { } : { :type => type_name }
+-              if value.nil?
+-                attributes[:nil] = true
+-              end
+-
+-              options[:builder].tag!(key,
+-                XML_FORMATTING[type_name] ? XML_FORMATTING[type_name].call(value) : value,
+-                attributes
+-              )
+-            end
+-        end
++        xml_value(key, value, options)
+       end
+-      
+       yield options[:builder] if block_given?
+     end
+-
+-  end
+-
+-  def rename_key(key, options = {})
+-    camelize = options.has_key?(:camelize) && options[:camelize]
+-    dasherize = !options.has_key?(:dasherize) || options[:dasherize]
+-    key = key.camelize if camelize
+-    dasherize ? key.dasherize : key
+   end
+ 
+   class << self
+diff --git a/activesupport/lib/active_support/core_ext/hash/conversions_xml_value.rb b/activesupport/lib/active_support/core_ext/hash/conversions_xml_value.rb
+new file mode 100644
+index 0000000..fac8f90
+--- /dev/null
++++ b/activesupport/lib/active_support/core_ext/hash/conversions_xml_value.rb
+@@ -0,0 +1,51 @@
++class Hash
++  module XmlValue
++    def xml_value(key, value, options)
++        case value
++          when ::Hash
++            value.to_xml(options.merge({ :root => key, :skip_instruct => true }))
++          when ::Array
++            value.to_xml(options.merge({ :root => key, :children => key.to_s.singularize, :skip_instruct => true}))
++          when ::Method, ::Proc
++            # If the Method or Proc takes two arguments, then
++            # pass the suggested child element name.  This is
++            # used if the Method or Proc will be operating over
++            # multiple records and needs to create an containing
++            # element that will contain the objects being
++            # serialized.
++            if 1 == value.arity
++              value.call(options.merge({ :root => key, :skip_instruct => true }))
++            else
++              value.call(options.merge({ :root => key, :skip_instruct => true }), key.to_s.singularize)
++            end
++          else
++            if value.respond_to?(:to_xml)
++              value.to_xml(options.merge({ :root => key, :skip_instruct => true }))
++            else
++              type_name = XML_TYPE_NAMES[value.class.name]
++
++              key = rename_key(key.to_s, options)
++
++              attributes = options[:skip_types] || value.nil? || type_name.nil? ? { } : { :type => type_name }
++              if value.nil?
++                attributes[:nil] = true
++              end
++
++              options[:builder].tag!(key,
++                XML_FORMATTING[type_name] ? XML_FORMATTING[type_name].call(value) : value,
++                attributes
++              )
++            end
++          end
++        #yield options[:builder] if block_given?
++    end
++
++    def rename_key(key, options = {})
++      camelize = options.has_key?(:camelize) && options[:camelize]
++      dasherize = !options.has_key?(:dasherize) || options[:dasherize]
++      key = key.camelize if camelize
++      dasherize ? key.dasherize : key
++    end
++  end
++end
++
+diff --git a/activesupport/test/core_ext/array_ext_test.rb b/activesupport/test/core_ext/array_ext_test.rb
+index aecc644..e761746 100644
+--- a/activesupport/test/core_ext/array_ext_test.rb
++++ b/activesupport/test/core_ext/array_ext_test.rb
+@@ -211,7 +211,7 @@ class ArrayToXmlTests < Test::Unit::TestCase
+       { :name => "Jason", :age => 31, :age_in_millis => BigDecimal.new('1.0') }
+     ].to_xml(:skip_instruct => true, :indent => 0)
+ 
+-    assert_equal '<records type="array"><record>', xml.first(30)
++    assert_equal '<objects type="array"><object>', xml.first(30)
+     assert xml.include?(%(<age type="integer">26</age>)), xml
+     assert xml.include?(%(<age-in-millis type="integer">820497600000</age-in-millis>)), xml
+     assert xml.include?(%(<name>David</name>)), xml
+@@ -233,7 +233,7 @@ class ArrayToXmlTests < Test::Unit::TestCase
+       { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
+     ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0)
+ 
+-    assert_equal "<records><record>", xml.first(17)
++    assert_equal "<objects><object>", xml.first(17)
+     assert xml.include?(%(<street-address>Paulina</street-address>))
+     assert xml.include?(%(<name>David</name>))
+     assert xml.include?(%(<street-address>Evergreen</street-address>))
+@@ -245,7 +245,7 @@ class ArrayToXmlTests < Test::Unit::TestCase
+       { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
+     ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0, :dasherize => false)
+ 
+-    assert_equal "<records><record>", xml.first(17)
++    assert_equal "<objects><object>", xml.first(17)
+     assert xml.include?(%(<street_address>Paulina</street_address>))
+     assert xml.include?(%(<street_address>Evergreen</street_address>))
+   end
+@@ -255,7 +255,7 @@ class ArrayToXmlTests < Test::Unit::TestCase
+       { :name => "David", :street_address => "Paulina" }, { :name => "Jason", :street_address => "Evergreen" }
+     ].to_xml(:skip_instruct => true, :skip_types => true, :indent => 0, :dasherize => true)
+ 
+-    assert_equal "<records><record>", xml.first(17)
++    assert_equal "<objects><object>", xml.first(17)
+     assert xml.include?(%(<street-address>Paulina</street-address>))
+     assert xml.include?(%(<street-address>Evergreen</street-address>))
+   end
+@@ -319,7 +319,7 @@ class ArrayExtractOptionsTests < Test::Unit::TestCase
+     assert_equal({}, options)
+     assert_equal [hash], array
+   end
+-
++  
+   def test_extract_options_extracts_extractable_subclass
+     hash = ExtractableHashSubclass.new
+     hash[:foo] = 1
+-- 
+1.6.5.2
+

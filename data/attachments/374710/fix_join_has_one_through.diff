@@ -1,0 +1,117 @@
+From 01b3c88f5137d8ce98daafc62a88cb953a61bcc6 Mon Sep 17 00:00:00 2001
+From: Tatsuya Ono <ononoma@gmail.com>
+Date: Mon, 11 Jan 2010 21:18:49 +0000
+Subject: [PATCH 1/2] added a test to reproduce issue on joining with has_one-through association.
+
+---
+ activerecord/test/cases/finder_test.rb |   17 +++++++++++++++++
+ activerecord/test/models/comment.rb    |    1 +
+ 2 files changed, 18 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/finder_test.rb b/activerecord/test/cases/finder_test.rb
+index f1bede9..b5eb75d 100644
+--- a/activerecord/test/cases/finder_test.rb
++++ b/activerecord/test/cases/finder_test.rb
+@@ -1043,6 +1043,23 @@ class FinderTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_finder_with_association
++    comments_on_thinking = Post.find(2).comments.count
++    
++    comments = Comment.find :all, :conditions=>["posts.title = ?", "So I was thinking"], :joins=>[:post]
++    
++    assert_equal comments_on_thinking, comments.size    
++  end
++  
++  def test_finder_with_association_through
++    david = Author.find 1
++    comments_on_david = david.posts.inject(0) {|sum, post| sum += post.comments.count }
++    
++    comments = Comment.find :all, :conditions=>["authors.name = ?", "David"], :joins=>[:post_author]
++    
++    assert_equal comments_on_david, comments.size    
++  end
++
+   protected
+     def bind(statement, *vars)
+       if vars.first.is_a?(Hash)
+diff --git a/activerecord/test/models/comment.rb b/activerecord/test/models/comment.rb
+index 399dea9..b39d1ea 100644
+--- a/activerecord/test/models/comment.rb
++++ b/activerecord/test/models/comment.rb
+@@ -6,6 +6,7 @@ class Comment < ActiveRecord::Base
+               :conditions => { "posts.author_id" => 1 }
+ 
+   belongs_to :post, :counter_cache => true
++  has_one :post_author, :through=>:post, :source=>:author
+ 
+   def self.what_are_you
+     'a comment...'
+-- 
+1.6.6
+
+
+From c52b06fda580b4d4c85eab7d1144e5a17cc7e74c Mon Sep 17 00:00:00 2001
+From: Tatsuya Ono <ononoma@gmail.com>
+Date: Mon, 11 Jan 2010 23:14:21 +0000
+Subject: [PATCH 2/2] fixed an issue on joining with has_one-through association.
+
+---
+ activerecord/lib/active_record/associations.rb |   30 ++++++++++++++---------
+ 1 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 3ff8aba..70a67aa 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -2082,18 +2082,24 @@ module ActiveRecord
+                     when reflection.options[:through]
+                       through_conditions = through_reflection.options[:conditions] ? "AND #{interpolate_sql(sanitize_sql(through_reflection.options[:conditions]))}" : ''
+ 
+-                      jt_foreign_key = jt_as_extra = jt_source_extra = jt_sti_extra = nil
++                      jt_first_key = jt_second_key = jt_as_extra = jt_source_extra = jt_sti_extra = nil
+                       first_key = second_key = as_extra = nil
+-
+-                      if through_reflection.options[:as] # has_many :through against a polymorphic join
+-                        jt_foreign_key = through_reflection.options[:as].to_s + '_id'
+-                        jt_as_extra = " AND %s.%s = %s" % [
+-                          connection.quote_table_name(aliased_join_table_name),
+-                          connection.quote_column_name(through_reflection.options[:as].to_s + '_type'),
+-                          klass.quote_value(parent.active_record.base_class.name)
+-                        ]
++                      
++                      if through_reflection.macro == :belongs_to
++                        jt_first_key = through_reflection.primary_key_name
++                        jt_second_key = parent.primary_key
+                       else
+-                        jt_foreign_key = through_reflection.primary_key_name
++                        jt_first_key = parent.primary_key
++                        if through_reflection.options[:as] # has_many :through against a polymorphic join
++                          jt_second_key = through_reflection.options[:as].to_s + '_id'
++                          jt_as_extra = " AND %s.%s = %s" % [
++                            connection.quote_table_name(aliased_join_table_name),
++                            connection.quote_column_name(through_reflection.options[:as].to_s + '_type'),
++                            klass.quote_value(parent.active_record.base_class.name)
++                          ]
++                        else
++                          jt_second_key = through_reflection.primary_key_name
++                        end
+                       end
+ 
+                       case source_reflection.macro
+@@ -2134,9 +2140,9 @@ module ActiveRecord
+                       " #{join_type} %s ON (%s.%s = %s.%s%s%s%s) " % [
+                         table_alias_for(through_reflection.klass.table_name, aliased_join_table_name),
+                         connection.quote_table_name(parent.aliased_table_name),
+-                        connection.quote_column_name(parent.primary_key),
++                        connection.quote_column_name(jt_first_key),
+                         connection.quote_table_name(aliased_join_table_name),
+-                        connection.quote_column_name(jt_foreign_key),
++                        connection.quote_column_name(jt_second_key),
+                         jt_as_extra, jt_source_extra, jt_sti_extra
+                       ] +
+                       " #{join_type} %s ON (%s.%s = %s.%s%s) " % [
+-- 
+1.6.6
+

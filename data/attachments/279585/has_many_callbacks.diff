@@ -1,0 +1,388 @@
+From 213e6c064653df228b17ca1953a68e0b3f066c9a Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Sun, 27 Sep 2009 15:57:08 +1000
+Subject: [PATCH 1/3] Allow :before_create, :after_create, :before_destroy, :after_destroy callbacks on AR collection associations.
+
+---
+ activerecord/lib/active_record/associations.rb     |    4 +-
+ .../has_and_belongs_to_many_association.rb         |    6 ++
+ .../associations/has_many_association.rb           |    4 +
+ .../associations/has_many_through_association.rb   |    7 ++-
+ .../test/cases/associations/callbacks_test.rb      |   69 +++++++++++++++++++-
+ activerecord/test/models/author.rb                 |   22 ++++++
+ activerecord/test/models/post.rb                   |    5 ++
+ activerecord/test/models/project.rb                |    9 ++-
+ 8 files changed, 122 insertions(+), 4 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index c739fdd..a0bdecb 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1523,6 +1523,7 @@ module ActiveRecord
+           :uniq,
+           :finder_sql, :counter_sql,
+           :before_add, :after_add, :before_remove, :after_remove,
++          :before_create, :after_create, :before_destroy, :after_destroy,
+           :extend, :readonly,
+           :validate
+         ]
+@@ -1578,6 +1579,7 @@ module ActiveRecord
+           :uniq,
+           :finder_sql, :counter_sql, :delete_sql, :insert_sql,
+           :before_add, :after_add, :before_remove, :after_remove,
++          :before_create, :after_create, :before_destroy, :after_destroy,
+           :extend, :readonly,
+           :validate
+         ]
+@@ -1784,7 +1786,7 @@ module ActiveRecord
+         end
+ 
+         def add_association_callbacks(association_name, options)
+-          callbacks = %w(before_add after_add before_remove after_remove)
++          callbacks = %w(before_add after_add before_remove after_remove before_create after_create before_destroy after_destroy)
+           callbacks.each do |callback_name|
+             full_callback_name = "#{callback_name}_for_#{association_name}"
+             defined_callbacks = options[callback_name.to_sym]
+diff --git a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+index 83a4a8b..de2d244 100644
+--- a/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_and_belongs_to_many_association.rb
+@@ -45,6 +45,8 @@ module ActiveRecord
+               "Primary key is not allowed in a has_and_belongs_to_many join table (#{@reflection.options[:join_table]})."
+           end
+ 
++          callback(:before_create, record)
++
+           if record.new_record?
+             if force
+               record.save!
+@@ -78,10 +80,13 @@ module ActiveRecord
+             @owner.connection.insert(sql)
+           end
+ 
++          callback(:after_create, record)
++
+           return true
+         end
+ 
+         def delete_records(records)
++          records.each { |record| callback(:before_destroy, record) }
+           if sql = @reflection.options[:delete_sql]
+             records.each { |record| @owner.connection.delete(interpolate_sql(sql, record)) }
+           else
+@@ -89,6 +94,7 @@ module ActiveRecord
+             sql = "DELETE FROM #{@owner.connection.quote_table_name @reflection.options[:join_table]} WHERE #{@reflection.primary_key_name} = #{owner_quoted_id} AND #{@reflection.association_foreign_key} IN (#{ids})"
+             @owner.connection.delete(sql)
+           end
++          records.each { |record| callback(:after_destroy, record) }
+         end
+ 
+         def construct_sql
+diff --git a/activerecord/lib/active_record/associations/has_many_association.rb b/activerecord/lib/active_record/associations/has_many_association.rb
+index 1f673ad..48ed537 100644
+--- a/activerecord/lib/active_record/associations/has_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_association.rb
+@@ -58,11 +58,14 @@ module ActiveRecord
+ 
+         def insert_record(record, force = false, validate = true)
+           set_belongs_to_association_for(record)
++          callback(:before_create, record)
+           force ? record.save! : record.save(validate)
++          callback(:after_create, record)
+         end
+ 
+         # Deletes the records according to the <tt>:dependent</tt> option.
+         def delete_records(records)
++          records.each { |record| callback(:before_destroy, record) }
+           case @reflection.options[:dependent]
+             when :destroy
+               records.each { |r| r.destroy }
+@@ -76,6 +79,7 @@ module ActiveRecord
+               )
+               @owner.class.update_counters(@owner.id, cached_counter_attribute_name => -records.size) if has_cached_counter?
+           end
++          records.each { |record| callback(:after_destroy, record) }
+         end
+ 
+         def target_obsolete?
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 6af14a5..93cc9b1 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -58,6 +58,7 @@ module ActiveRecord
+         end
+         
+         def insert_record(record, force = true, validate = true)
++          callback(:before_create, record)
+           if record.new_record?
+             if force
+               record.save!
+@@ -67,15 +68,19 @@ module ActiveRecord
+           end
+           through_reflection = @reflection.through_reflection
+           klass = through_reflection.klass
+-          @owner.send(@reflection.through_reflection.name).proxy_target << klass.send(:with_scope, :create => construct_join_attributes(record)) { through_reflection.create_association! }
++          result = @owner.send(@reflection.through_reflection.name).proxy_target << klass.send(:with_scope, :create => construct_join_attributes(record)) { through_reflection.create_association! }
++          callback(:after_create, record)
++          result
+         end
+ 
+         # TODO - add dependent option support
+         def delete_records(records)
++          records.each { |record| callback(:before_destroy, record) }
+           klass = @reflection.through_reflection.klass
+           records.each do |associate|
+             klass.delete_all(construct_join_attributes(associate))
+           end
++          records.each { |record| callback(:after_destroy, record) }
+         end
+ 
+         def find_target
+diff --git a/activerecord/test/cases/associations/callbacks_test.rb b/activerecord/test/cases/associations/callbacks_test.rb
+index 91b1af1..2db6750 100644
+--- a/activerecord/test/cases/associations/callbacks_test.rb
++++ b/activerecord/test/cases/associations/callbacks_test.rb
+@@ -1,6 +1,5 @@
+ require "cases/helper"
+ require 'models/post'
+-require 'models/comment'
+ require 'models/author'
+ require 'models/category'
+ require 'models/project'
+@@ -83,6 +82,52 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+     assert_equal callback_log, jack.post_log
+   end
+ 
++  def test_has_many_create_callbacks
++    jack = Author.new :name => "Jack"
++    post = jack.posts_with_db_callbacks.build :title => "Call me back!", :body => "Before you create and after you create"
++    assert_equal [], jack.post_log
++    assert jack.save
++    assert_equal 1, jack.posts_with_db_callbacks.count
++    assert_equal ["before_creating<new>", "after_creating#{jack.posts_with_db_callbacks.first.id}"], jack.post_log
++  end
++
++  def test_has_many_destroy_callbacks
++    first_post = @david.posts_with_db_callbacks.first
++    new_post = @david.posts_with_db_callbacks.build :title => "foo", :body => "bar"
++    @david.posts_with_db_callbacks.delete(new_post)
++    assert_equal [], @david.post_log
++    @david.posts_with_db_callbacks.delete(first_post)
++    assert_equal ["before_destroying#{first_post.id}", "after_destroying#{first_post.id}"], @david.post_log
++  end
++
++  def test_has_many_through_create_callbacks
++    Post.reset_log
++    post = posts(:thinking)
++    post.people_with_db_callbacks.build(:first_name => "Ted")
++    people_count = post.people_with_db_callbacks.count
++    assert_equal [], Post.log
++    post.save
++    assert_equal people_count + 1, post.people_with_db_callbacks.count
++    assert_equal [[:created, :before, 'Ted'], [:created, :after, 'Ted']], Post.log 
++  end
++
++  def test_has_many_through_destroy_callbacks
++    post = posts(:thinking)
++    ted = post.people_with_db_callbacks.create(:first_name => "Ted")
++    tim = post.people_with_db_callbacks.create(:first_name => "Tim")
++    post.save
++    post.reload
++    Post.reset_log
++    new_person = post.people_with_db_callbacks.build(:first_name => "Ted")
++    assert_equal 3, post.people_with_db_callbacks.length
++    post.people_with_db_callbacks.delete(new_person)
++    assert_equal 2, post.people_with_db_callbacks.length
++    assert_equal [], Post.log
++    post.people_with_db_callbacks.delete(ted)
++    assert_equal 1, post.people_with_db_callbacks.length
++    assert_equal [[:destroyed, :before, 'Ted'], [:destroyed, :after, 'Ted']], Post.log 
++  end
++
+   def test_has_and_belongs_to_many_add_callback
+     david = developers(:david)
+     ar = projects(:active_record)
+@@ -147,6 +192,28 @@ class AssociationCallbacksTest < ActiveRecord::TestCase
+     assert_equal callback_log, project.developers_log
+   end
+ 
++  def test_has_and_belongs_to_many_create_callbacks
++    project = Project.new :name => "Callbacks"
++    project.developers_with_db_callbacks.build :name => "Jack", :salary => 95000
++
++    assert_equal [], project.developers_log
++    assert project.save
++    assert_equal 1, project.developers_with_db_callbacks.count
++    assert_equal ["before_creating<new>", "after_creating#{project.developers_with_db_callbacks.first.id}"], project.developers_log
++  end
++
++  def test_has_and_belongs_to_many_destroy_callbacks
++    first_developer = developers(:david)
++    project = projects(:active_record)
++    project.developers << first_developer
++    project.reload
++    new_developer = project.developers_with_db_callbacks.build :name => "Jack", :salary => 95000
++    project.developers_with_db_callbacks.delete(new_developer)
++    assert_equal [], project.developers_log
++    project.developers_with_db_callbacks.delete(first_developer)
++    assert_equal ["before_destroying#{first_developer.id}", "after_destroying#{first_developer.id}"], project.developers_log
++  end
++
+   def test_dont_add_if_before_callback_raises_exception
+     assert !@david.unchangable_posts.include?(@authorless)
+     begin
+diff --git a/activerecord/test/models/author.rb b/activerecord/test/models/author.rb
+index f264f98..e15b823 100644
+--- a/activerecord/test/models/author.rb
++++ b/activerecord/test/models/author.rb
+@@ -68,6 +68,12 @@ class Author < ActiveRecord::Base
+   has_many :posts_with_multiple_callbacks, :class_name => "Post",
+            :before_add => [:log_before_adding, Proc.new {|o, r| o.post_log << "before_adding_proc#{r.id || '<new>'}"}],
+            :after_add  => [:log_after_adding,  Proc.new {|o, r| o.post_log << "after_adding_proc#{r.id || '<new>'}"}]
++  has_many :posts_with_db_callbacks, :class_name => "Post", 
++           :before_create  => :log_before_creating,
++           :after_create   => :log_after_creating,
++           :before_destroy => :log_before_destroying,
++           :after_destroy  => :log_after_destroying
++
+   has_many :unchangable_posts, :class_name => "Post", :before_add => :raise_exception, :after_add => :log_after_adding
+ 
+   has_many :categorizations
+@@ -120,6 +126,22 @@ class Author < ActiveRecord::Base
+       @post_log << "after_removing#{object.id}"
+     end
+ 
++    def log_before_creating(object)
++      @post_log << "before_creating#{object.id || '<new>'}"
++    end
++
++    def log_after_creating(object)
++      @post_log << "after_creating#{object.id}"
++    end
++
++    def log_before_destroying(object)
++      @post_log << "before_destroying#{object.id}"
++    end
++
++    def log_after_destroying(object)
++      @post_log << "after_destroying#{object.id}"
++    end
++
+     def raise_exception(object)
+       raise Exception.new("You can't add a post")
+     end
+diff --git a/activerecord/test/models/post.rb b/activerecord/test/models/post.rb
+index 374e536..9405984 100644
+--- a/activerecord/test/models/post.rb
++++ b/activerecord/test/models/post.rb
+@@ -69,6 +69,11 @@ class Post < ActiveRecord::Base
+               :after_add     => lambda {|owner, reader| log(:added,   :after,  reader.first_name) },
+               :before_remove => lambda {|owner, reader| log(:removed, :before, reader.first_name) },
+               :after_remove  => lambda {|owner, reader| log(:removed, :after,  reader.first_name) }
++  has_many :people_with_db_callbacks, :source=>:person, :through => :readers,
++              :before_create  => lambda {|owner, reader| log(:created,   :before, reader.first_name) },
++              :after_create   => lambda {|owner, reader| log(:created,   :after,  reader.first_name) },
++              :before_destroy => lambda {|owner, reader| log(:destroyed, :before, reader.first_name) },
++              :after_destroy  => lambda {|owner, reader| log(:destroyed, :after,  reader.first_name) }
+ 
+   def self.top(limit)
+     ranked_by_comments.limit(limit)
+diff --git a/activerecord/test/models/project.rb b/activerecord/test/models/project.rb
+index f25b2dd..3f02de7 100644
+--- a/activerecord/test/models/project.rb
++++ b/activerecord/test/models/project.rb
+@@ -9,10 +9,17 @@ class Project < ActiveRecord::Base
+   has_and_belongs_to_many :salaried_developers, :class_name => "Developer", :conditions => "salary > 0"
+   has_and_belongs_to_many :developers_with_finder_sql, :class_name => "Developer", :finder_sql => 'SELECT t.*, j.* FROM developers_projects j, developers t WHERE t.id = j.developer_id AND j.project_id = #{id} ORDER BY t.id'
+   has_and_belongs_to_many :developers_by_sql, :class_name => "Developer", :delete_sql => "DELETE FROM developers_projects WHERE project_id = \#{id} AND developer_id = \#{record.id}"
+-  has_and_belongs_to_many :developers_with_callbacks, :class_name => "Developer", :before_add => Proc.new {|o, r| o.developers_log << "before_adding#{r.id || '<new>'}"},
++  has_and_belongs_to_many :developers_with_callbacks, :class_name => "Developer", 
++                            :before_add => Proc.new {|o, r| o.developers_log << "before_adding#{r.id || '<new>'}"},
+                             :after_add => Proc.new {|o, r| o.developers_log << "after_adding#{r.id || '<new>'}"},
+                             :before_remove => Proc.new {|o, r| o.developers_log << "before_removing#{r.id}"},
+                             :after_remove => Proc.new {|o, r| o.developers_log << "after_removing#{r.id}"}
++  has_and_belongs_to_many :developers_with_db_callbacks, :class_name => "Developer", 
++                            :before_create => Proc.new {|o, r| o.developers_log << "before_creating#{r.id || '<new>'}"},
++                            :after_create => Proc.new {|o, r| o.developers_log << "after_creating#{r.id || '<new>'}"},
++                            :before_destroy => Proc.new {|o, r| o.developers_log << "before_destroying#{r.id}"},
++                            :after_destroy => Proc.new {|o, r| o.developers_log << "after_destroying#{r.id}"}
++
+   has_and_belongs_to_many :well_payed_salary_groups, :class_name => "Developer", :group => "developers.salary", :having => "SUM(salary) > 10000", :select => "SUM(salary) as salary"
+ 
+   attr_accessor :developers_log
+-- 
+1.6.4.4
+
+
+From c70ef1cef287e77b77c002a1a154da2df640cd98 Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Sun, 27 Sep 2009 16:08:46 +1000
+Subject: [PATCH 2/3] Added doc for +before_create+, +after_create+, +before_destroy+ and +after_destroy+ callbacks.
+
+---
+ activerecord/lib/active_record/associations.rb |    6 +++++-
+ 1 files changed, 5 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index a0bdecb..58bd77f 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -317,7 +317,11 @@ module ActiveRecord
+     #     has_and_belongs_to_many :developers, :after_add => [:evaluate_velocity, Proc.new { |p, d| p.shipping_date = Time.now}]
+     #   end
+     #
+-    # Possible callbacks are: +before_add+, +after_add+, +before_remove+ and +after_remove+.
++    # Possible callbacks are: +before_add+, +after_add+, +before_remove+, +after_remove+, 
++    # +before_create+, +after_create+, +before_destroy+ and +after_destroy+.
++    #
++    # The callbacks +before_add+, +after_add+, +before_remove+ and +after_remove+ are called when the collection gets modified in memory.
++    # The callback +before_create+, +after_create+, +before_destroy+ and +after_destroy+ are called when the collection gets modified in the datastore.
+     #
+     # Should any of the +before_add+ callbacks throw an exception, the object does not get added to the collection. Same with
+     # the +before_remove+ callbacks; if an exception is thrown the object doesn't get removed.
+-- 
+1.6.4.4
+
+
+From 7f967cc9cd104debadd9e264dce382319946ee36 Mon Sep 17 00:00:00 2001
+From: Lawrence Pit <lawrence.pit@gmail.com>
+Date: Sun, 27 Sep 2009 17:48:54 +1000
+Subject: [PATCH 3/3] Return original result after call to :after_create callback.
+
+---
+ .../associations/has_many_association.rb           |    5 +++--
+ .../associations/has_many_through_association.rb   |    2 +-
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/has_many_association.rb b/activerecord/lib/active_record/associations/has_many_association.rb
+index 48ed537..b2b7c74 100644
+--- a/activerecord/lib/active_record/associations/has_many_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_association.rb
+@@ -59,8 +59,9 @@ module ActiveRecord
+         def insert_record(record, force = false, validate = true)
+           set_belongs_to_association_for(record)
+           callback(:before_create, record)
+-          force ? record.save! : record.save(validate)
+-          callback(:after_create, record)
++          result = force ? record.save! : record.save(validate)
++          callback(:after_create, record) if result
++          result
+         end
+ 
+         # Deletes the records according to the <tt>:dependent</tt> option.
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 93cc9b1..15e2373 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -69,7 +69,7 @@ module ActiveRecord
+           through_reflection = @reflection.through_reflection
+           klass = through_reflection.klass
+           result = @owner.send(@reflection.through_reflection.name).proxy_target << klass.send(:with_scope, :create => construct_join_attributes(record)) { through_reflection.create_association! }
+-          callback(:after_create, record)
++          callback(:after_create, record) if result
+           result
+         end
+ 
+-- 
+1.6.4.4
+

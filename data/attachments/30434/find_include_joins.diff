@@ -1,0 +1,141 @@
+From f347b585bd452b4a3686772dcd2b1e9ee449a1a3 Mon Sep 17 00:00:00 2001
+From: Peter Wagenet <peter.wagenet@gmail.com>
+Date: Tue, 1 Jul 2008 13:47:13 -0400
+Subject: [PATCH] Check the joins clause when determining whether or not to preload includes
+
+---
+ activerecord/lib/active_record/associations.rb |   25 +++++++++++++++++++----
+ 1 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 4b71540..ba05dd2 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1529,19 +1529,34 @@ module ActiveRecord
+           return [] unless select && select.is_a?(String)
+           select.scan(/"?([\.\w]+)"?.?\./).flatten
+         end
++        
++        def joins_tables(options)
++          scope = scope(:find)
++          joins = ""
++          [(scope && scope[:joins]), options[:joins]].each do |join|
++            case join
++            when Symbol, Hash, Array
++              join_dependency = ActiveRecord::Associations::ClassMethods::InnerJoinDependency.new(self, join, nil)
++              joins << " #{join_dependency.join_associations.collect { |assoc| assoc.association_join }.join} "
++            else
++              joins << " #{join} "
++            end
++          end
++          joins.scan(/([\.\w]+).?\./).flatten
++        end
+ 
+-        # Checks if the conditions reference a table other than the current model table
++        # Checks if the conditions reference a table other than the current model's table or joined tables.
+         def include_eager_conditions?(options, tables = nil)
+-          ((tables || conditions_tables(options)) - [table_name]).any?
++          ((tables || conditions_tables(options)) - (joins_tables(options) << table_name)).any?
+         end
+ 
+-        # Checks if the query order references a table other than the current model's table.
++        # Checks if the query order references a table other than the current model's table or joined tables.
+         def include_eager_order?(options, tables = nil)
+-          ((tables || order_tables(options)) - [table_name]).any?
++          ((tables || order_tables(options)) - (joins_tables(options) << table_name)).any?
+         end
+ 
+         def include_eager_select?(options)
+-          (selects_tables(options) - [table_name]).any?
++          (selects_tables(options) - (joins_tables(options) << table_name)).any?
+         end
+ 
+         def references_eager_loaded_tables?(options)
+-- 
+1.5.5
+
+
+From 1f150217fe6cf3304f303e1ebe8e64f019d3d42a Mon Sep 17 00:00:00 2001
+From: Peter Wagenet <peter.wagenet@gmail.com>
+Date: Tue, 1 Jul 2008 15:35:44 -0400
+Subject: [PATCH] Added some testing
+
+---
+ activerecord/test/cases/associations/eager_test.rb |   18 ++++++++++++++++++
+ 1 files changed, 18 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index f65ada5..91684a9 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -620,4 +620,22 @@ class EagerAssociationTest < ActiveRecord::TestCase
+   def test_order_on_join_table_with_include_and_limit
+     assert_equal 5, Developer.find(:all, :include => 'projects', :order => 'developers_projects.joined_on DESC', :limit => 5).size
+   end
++  
++  def test_loading_with_multiple_associations_joins_and_select
++    posts = []
++    
++    # Old behavior
++    assert_queries(1) do # Using all at once loading
++      posts = Post.find(:all, :select => "posts.*, authors.name AS test_name",
++                              :include => [ :comments, :author, :categories ], :order => "authors.name")
++    end
++    assert_nil (begin posts.first.test_name rescue nil end) # test_name won't exist because select is discarded
++    
++    # New behavior
++    assert_queries(4) do # Loading with multiple queries
++      posts = Post.find(:all, :select => "posts.*, authors.name AS test_name", :joins => :author, 
++                              :include => [ :comments, :author, :categories ], :order => "authors.name")
++    end
++    assert_equal "David", posts.first.test_name
++  end
+ end
+-- 
+1.5.5
+
+
+From 797ff7c6a0541e68d993b13f7c99933e9da1817b Mon Sep 17 00:00:00 2001
+From: Peter Wagenet <peter.wagenet@gmail.com>
+Date: Tue, 1 Jul 2008 18:43:40 -0400
+Subject: [PATCH] Made the tests more generic
+
+---
+ activerecord/test/cases/associations/eager_test.rb |   14 +++++++-------
+ 1 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/activerecord/test/cases/associations/eager_test.rb b/activerecord/test/cases/associations/eager_test.rb
+index 91684a9..8b02bf6 100644
+--- a/activerecord/test/cases/associations/eager_test.rb
++++ b/activerecord/test/cases/associations/eager_test.rb
+@@ -621,20 +621,20 @@ class EagerAssociationTest < ActiveRecord::TestCase
+     assert_equal 5, Developer.find(:all, :include => 'projects', :order => 'developers_projects.joined_on DESC', :limit => 5).size
+   end
+   
+-  def test_loading_with_multiple_associations_joins_and_select
++  def test_loading_with_multiple_associations_and_select
+     posts = []
+-    
+-    # Old behavior
+     assert_queries(1) do # Using all at once loading
+       posts = Post.find(:all, :select => "posts.*, authors.name AS test_name",
+-                              :include => [ :comments, :author, :categories ], :order => "authors.name")
++                              :include => [ :comments, :author, :categories ])
+     end
+     assert_nil (begin posts.first.test_name rescue nil end) # test_name won't exist because select is discarded
+-    
+-    # New behavior
++  end
++  
++  def test_loading_with_multiple_associations_and_select_with_join
++    posts = []
+     assert_queries(4) do # Loading with multiple queries
+       posts = Post.find(:all, :select => "posts.*, authors.name AS test_name", :joins => :author, 
+-                              :include => [ :comments, :author, :categories ], :order => "authors.name")
++                              :include => [ :comments, :author, :categories ])
+     end
+     assert_equal "David", posts.first.test_name
+   end
+-- 
+1.5.5
+

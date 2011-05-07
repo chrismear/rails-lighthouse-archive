@@ -1,0 +1,219 @@
+From e39736f9c4f0e307587c068ec5afc68b34945b08 Mon Sep 17 00:00:00 2001
+From: Aliaksey Kandratsenka <alk@tut.by>
+Date: Sun, 1 Feb 2009 18:00:48 +0200
+Subject: [PATCH] return associated records not proxies from readers of non-collection associations
+
+When using association value in if/unless operators it's not possible
+to emulate nil value. So we used to load the associated record on
+first access and return nil if record wasn't found. Because records
+are always loaded eagerly there is no sence in using proxies for them.
+---
+ activerecord/lib/active_record/associations.rb     |   39 ++++++++++++++++----
+ .../associations/has_one_association.rb            |    5 +++
+ .../associations/belongs_to_associations_test.rb   |   14 -------
+ .../associations/has_one_associations_test.rb      |    3 +-
+ .../has_one_through_associations_test.rb           |    2 +-
+ .../test/cases/associations/join_model_test.rb     |    2 +-
+ activerecord/test/cases/associations_test.rb       |   12 +++---
+ 7 files changed, 45 insertions(+), 32 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 3f6e1e2..eca869b 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -88,6 +88,20 @@ module ActiveRecord
+       end unless self.new_record?
+     end
+ 
++    # Returns (possibly not loaded) association proxy for association with given name.
++    def association_proxy(name, force_reload = false)
++      association = association_instance_get(name)
++
++      unless association
++        reflection = self.class.reflect_on_association(name)
++        association = reflection.proxy_class.new(self, reflection)
++        association_instance_set(name, association)
++      end
++
++      association.reload if force_reload
++      association
++    end
++
+     private
+       # Gets the specified association instance if it responds to :loaded?, nil otherwise.
+       def association_instance_get(name)
+@@ -1262,17 +1276,26 @@ module ActiveRecord
+             force_reload = params.first unless params.empty?
+             association = association_instance_get(reflection.name)
+ 
+-            if association.nil? || force_reload
++            unless association
+               association = association_proxy_class.new(self, reflection)
+-              retval = association.reload
+-              if retval.nil? and association_proxy_class == BelongsToAssociation
+-                association_instance_set(reflection.name, nil)
+-                return nil
+-              end
+               association_instance_set(reflection.name, association)
+             end
+ 
+-            association.target.nil? ? nil : association
++            association.reload if force_reload
++
++            rv = association.__send__(:load_target)
++            if !rv && association_proxy_class == BelongsToAssociation
++              # This is special case covered by
++              # BelongsToAssociationsTest#test_forgetting_the_load_when_foreign_key_enters_late
++              # This will be removed when proper support for updating
++              # association on foreign key change will be implemented
++              #
++              # The effect of this is to attempt loading
++              # (non-polymorphic) belongs_to association on every
++              # access till it finds associated record
++              association_instance_set(reflection.name, nil)
++            end
++            rv
+           end
+ 
+           define_method("loaded_#{reflection.name}?") do
+@@ -1283,7 +1306,7 @@ module ActiveRecord
+           define_method("#{reflection.name}=") do |new_value|
+             association = association_instance_get(reflection.name)
+ 
+-            if association.nil? || association.target != new_value
++            unless association
+               association = association_proxy_class.new(self, reflection)
+             end
+ 
+diff --git a/activerecord/lib/active_record/associations/has_one_association.rb b/activerecord/lib/active_record/associations/has_one_association.rb
+index 9603230..0141b45 100644
+--- a/activerecord/lib/active_record/associations/has_one_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_association.rb
+@@ -54,6 +54,11 @@ module ActiveRecord
+         end
+       end
+ 
++      def reset
++        super
++        construct_sql
++      end
++
+       protected
+         def owner_quoted_id
+           if @reflection.options[:primary_key]
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 40a8503..5de74fa 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -31,7 +31,6 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_triple_equality
+-    assert Client.find(3).firm === Firm
+     assert Firm === Client.find(3).firm
+   end
+ 
+@@ -47,19 +46,6 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal apple.id, citibank.firm_id
+   end
+ 
+-  def test_no_unexpected_aliasing
+-    first_firm = companies(:first_firm)
+-    another_firm = companies(:another_firm)
+-
+-    citibank = Account.create("credit_limit" => 10)
+-    citibank.firm = first_firm
+-    original_proxy = citibank.firm
+-    citibank.firm = another_firm
+-
+-    assert_equal first_firm.object_id, original_proxy.target.object_id
+-    assert_equal another_firm.object_id, citibank.firm.target.object_id
+-  end
+-
+   def test_creating_the_belonging_object
+     citibank = Account.create("credit_limit" => 10)
+     apple    = citibank.create_firm("name" => "Apple")
+diff --git a/activerecord/test/cases/associations/has_one_associations_test.rb b/activerecord/test/cases/associations/has_one_associations_test.rb
+index 14032a6..0643e07 100644
+--- a/activerecord/test/cases/associations/has_one_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_associations_test.rb
+@@ -55,7 +55,6 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+ 
+   def test_triple_equality
+     assert Account === companies(:first_firm).account
+-    assert companies(:first_firm).account === Account
+   end
+ 
+   def test_type_mismatch
+@@ -196,7 +195,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
+   def test_build_before_child_saved
+     firm = Firm.find(1)
+ 
+-    account = firm.account.build("credit_limit" => 1000)
++    account = firm.build_account("credit_limit" => 1000)
+     assert_equal account, firm.account
+     assert account.new_record?
+     assert firm.save
+diff --git a/activerecord/test/cases/associations/has_one_through_associations_test.rb b/activerecord/test/cases/associations/has_one_through_associations_test.rb
+index f65d76e..fef0cc6 100644
+--- a/activerecord/test/cases/associations/has_one_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_through_associations_test.rb
+@@ -111,7 +111,7 @@ class HasOneThroughAssociationsTest < ActiveRecord::TestCase
+   def test_assigning_association_correctly_assigns_target
+     new_member = Member.create(:name => "Chris")
+     new_member.club = new_club = Club.create(:name => "LRUG")
+-    assert_equal new_club, new_member.club.target
++    assert_equal new_club, new_member.association_proxy(:club).target
+   end
+ 
+   def test_has_one_through_proxy_should_not_respond_to_private_methods
+diff --git a/activerecord/test/cases/associations/join_model_test.rb b/activerecord/test/cases/associations/join_model_test.rb
+index 7a0427a..001378a 100644
+--- a/activerecord/test/cases/associations/join_model_test.rb
++++ b/activerecord/test/cases/associations/join_model_test.rb
+@@ -169,7 +169,7 @@ class AssociationsJoinModelTest < ActiveRecord::TestCase
+ 
+   def test_create_polymorphic_has_one_with_scope
+     old_count = Tagging.count
+-    tagging = posts(:welcome).tagging.create(:tag => tags(:misc))
++    tagging = posts(:welcome).create_tagging(:tag => tags(:misc))
+     assert_equal "Post", tagging.taggable_type
+     assert_equal old_count+1, Tagging.count
+   end
+diff --git a/activerecord/test/cases/associations_test.rb b/activerecord/test/cases/associations_test.rb
+index 056a294..6fa8052 100644
+--- a/activerecord/test/cases/associations_test.rb
++++ b/activerecord/test/cases/associations_test.rb
+@@ -91,10 +91,10 @@ class AssociationProxyTest < ActiveRecord::TestCase
+ 
+   def test_proxy_accessors
+     welcome = posts(:welcome)
+-    assert_equal  welcome, welcome.author.proxy_owner
+-    assert_equal  welcome.class.reflect_on_association(:author), welcome.author.proxy_reflection
+-    welcome.author.class  # force load target
+-    assert_equal  welcome.author, welcome.author.proxy_target
++    proxy = welcome.association_proxy(:author)
++    assert_equal  welcome, proxy.proxy_owner
++    assert_equal  welcome.class.reflect_on_association(:author), proxy.proxy_reflection
++    assert_equal  welcome.author, proxy.proxy_target
+ 
+     david = authors(:david)
+     assert_equal  david, david.posts.proxy_owner
+@@ -174,12 +174,12 @@ class AssociationProxyTest < ActiveRecord::TestCase
+ 
+   def test_failed_reload_returns_nil
+     p = setup_dangling_association
+-    assert_nil p.author.reload
++    assert_nil p.association_proxy(:author).reload
+   end
+ 
+   def test_failed_reset_returns_nil
+     p = setup_dangling_association
+-    assert_nil p.author.reset
++    assert_nil p.association_proxy(:author).reset
+   end
+ 
+   def test_reload_returns_assocition
+-- 
+1.5.6.5
+

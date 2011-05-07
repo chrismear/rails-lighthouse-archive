@@ -1,0 +1,152 @@
+From de2cfe17a6c526adf7106424df734387a8312f56 Mon Sep 17 00:00:00 2001
+From: Aliaksey Kandratsenka <alk@tut.by>
+Date: Sun, 1 Feb 2009 18:20:14 +0200
+Subject: [PATCH] made association reflections know about its association proxy class
+
+---
+ activerecord/lib/active_record/associations.rb |   38 ++++++++++++------------
+ activerecord/lib/active_record/reflection.rb   |   16 ++++++++++
+ 2 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 3f2b5d7..3f6e1e2 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -794,11 +794,7 @@ module ActiveRecord
+         add_multiple_associated_save_callbacks(reflection.name)
+         add_association_callbacks(reflection.name, reflection.options)
+ 
+-        if options[:through]
+-          collection_accessor_methods(reflection, HasManyThroughAssociation)
+-        else
+-          collection_accessor_methods(reflection, HasManyAssociation)
+-        end
++        collection_accessor_methods(reflection)
+       end
+ 
+       # Specifies a one-to-one association with another class. This method should only be used
+@@ -899,7 +895,7 @@ module ActiveRecord
+       def has_one(association_id, options = {})
+         if options[:through]
+           reflection = create_has_one_through_reflection(association_id, options)
+-          association_accessor_methods(reflection, ActiveRecord::Associations::HasOneThroughAssociation)
++          association_accessor_methods(reflection)
+         else
+           reflection = create_has_one_reflection(association_id, options)
+ 
+@@ -914,9 +910,9 @@ module ActiveRecord
+           after_save method_name
+ 
+           add_single_associated_validation_callbacks(reflection.name) if options[:validate] == true
+-          association_accessor_methods(reflection, HasOneAssociation)
+-          association_constructor_method(:build,  reflection, HasOneAssociation)
+-          association_constructor_method(:create, reflection, HasOneAssociation)
++          association_accessor_methods(reflection)
++          association_constructor_method(:build,  reflection)
++          association_constructor_method(:create, reflection)
+ 
+           configure_dependency_for_has_one(reflection)
+         end
+@@ -1012,7 +1008,7 @@ module ActiveRecord
+         reflection = create_belongs_to_reflection(association_id, options)
+ 
+         if reflection.options[:polymorphic]
+-          association_accessor_methods(reflection, BelongsToPolymorphicAssociation)
++          association_accessor_methods(reflection)
+ 
+           method_name = "polymorphic_belongs_to_before_save_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+@@ -1030,9 +1026,9 @@ module ActiveRecord
+           end
+           before_save method_name
+         else
+-          association_accessor_methods(reflection, BelongsToAssociation)
+-          association_constructor_method(:build,  reflection, BelongsToAssociation)
+-          association_constructor_method(:create, reflection, BelongsToAssociation)
++          association_accessor_methods(reflection)
++          association_constructor_method(:build,  reflection)
++          association_constructor_method(:create, reflection)
+ 
+           method_name = "belongs_to_before_save_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+@@ -1228,7 +1224,7 @@ module ActiveRecord
+ 
+         add_multiple_associated_validation_callbacks(reflection.name) unless options[:validate] == false
+         add_multiple_associated_save_callbacks(reflection.name)
+-        collection_accessor_methods(reflection, HasAndBelongsToManyAssociation)
++        collection_accessor_methods(reflection)
+ 
+         # Don't use a before_destroy callback since users' before_destroy
+         # callbacks will be executed after the association is wiped out.
+@@ -1260,7 +1256,8 @@ module ActiveRecord
+           table_name_prefix + join_table + table_name_suffix
+         end
+ 
+-        def association_accessor_methods(reflection, association_proxy_class)
++        def association_accessor_methods(reflection)
++          association_proxy_class = reflection.proxy_class
+           define_method(reflection.name) do |*params|
+             force_reload = params.first unless params.empty?
+             association = association_instance_get(reflection.name)
+@@ -1307,7 +1304,8 @@ module ActiveRecord
+           end
+         end
+ 
+-        def collection_reader_method(reflection, association_proxy_class)
++        def collection_reader_method(reflection)
++          association_proxy_class = reflection.proxy_class
+           define_method(reflection.name) do |*params|
+             force_reload = params.first unless params.empty?
+             association = association_instance_get(reflection.name)
+@@ -1331,8 +1329,9 @@ module ActiveRecord
+           end
+         end
+ 
+-        def collection_accessor_methods(reflection, association_proxy_class, writer = true)
+-          collection_reader_method(reflection, association_proxy_class)
++        def collection_accessor_methods(reflection, writer = true)
++          association_proxy_class = reflection.proxy_class
++          collection_reader_method(reflection)
+ 
+           if writer
+             define_method("#{reflection.name}=") do |new_value|
+@@ -1413,7 +1412,8 @@ module ActiveRecord
+           after_update method_name
+         end
+ 
+-        def association_constructor_method(constructor, reflection, association_proxy_class)
++        def association_constructor_method(constructor, reflection)
++          association_proxy_class = reflection.proxy_class
+           define_method("#{constructor}_#{reflection.name}") do |*params|
+             attributees      = params.first unless params.empty?
+             replace_existing = params[1].nil? ? true : params[1]
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index e69bfb1..9181fbf 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -156,6 +156,22 @@ module ActiveRecord
+         @klass ||= active_record.send(:compute_type, class_name)
+       end
+ 
++      def proxy_class
++        @proxy_class ||= begin
++                           mod = ActiveRecord::Associations
++                           case macro
++                           when :belongs_to
++                             options[:polymorphic] ? mod::BelongsToPolymorphicAssociation : mod::BelongsToAssociation
++                           when :has_one
++                             options[:through] ? mod::HasOneThroughAssociation : mod::HasOneAssociation
++                           when :has_many
++                             options[:through] ? mod::HasManyThroughAssociation : mod::HasManyAssociation
++                           when :has_and_belongs_to_many
++                             mod::HasAndBelongsToManyAssociation
++                           end
++                         end
++      end
++
+       # Returns a new, unsaved instance of the associated class. +options+ will
+       # be passed to the class's constructor.
+       def build_association(*options)
+-- 
+1.5.6.5
+

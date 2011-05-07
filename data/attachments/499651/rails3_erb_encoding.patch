@@ -1,0 +1,421 @@
+From 6f0ed5bf7d719f23e900cf25e56a5eba509750c4 Mon Sep 17 00:00:00 2001
+From: Cezary Baginski <cezary.baginski@gmail.com>
+Date: Tue, 27 Apr 2010 16:41:46 +0200
+Subject: [PATCH 1/3] activesupport: added external_encode! to string
+
+---
+ .../active_support/core_ext/string/multibyte.rb    |   42 ++++++++++-
+ activesupport/test/core_ext/string_ext_test.rb     |   83 ++++++++++++++++++++
+ 2 files changed, 123 insertions(+), 2 deletions(-)
+
+diff --git a/activesupport/lib/active_support/core_ext/string/multibyte.rb b/activesupport/lib/active_support/core_ext/string/multibyte.rb
+index 42e053d..b591c3d 100644
+--- a/activesupport/lib/active_support/core_ext/string/multibyte.rb
++++ b/activesupport/lib/active_support/core_ext/string/multibyte.rb
+@@ -43,17 +43,21 @@ class String
+         self
+       end
+     end
+-    
++
+     # Returns true if the string has UTF-8 semantics (a String used for purely byte resources is unlikely to have
+     # them), returns false otherwise.
+     def is_utf8?
+       ActiveSupport::Multibyte::Chars.consumes?(self)
+     end
++
++    def external_encode!(source_encoding = nil)
++      self
++    end
+   else
+     def mb_chars #:nodoc
+       self
+     end
+-    
++
+     def is_utf8? #:nodoc
+       case encoding
+       when Encoding::UTF_8
+@@ -64,5 +68,39 @@ class String
+         false
+       end
+     end
++
++    def external_encode!(source_encoding = nil)
++
++      unless self.encoding == Encoding::ASCII_8BIT
++        if source_encoding
++          unless source_encoding == self.encoding
++            raise ArgumentError, "source_encoding given (#{source_encoding}) for non-binary string (#{self.encoding})"
++          end
++        end
++      end
++
++      enc = Encoding.default_external
++
++      # pick anything but binary if possible
++      source_encoding ||= (self.encoding == Encoding::ASCII_8BIT ? enc : self.encoding )
++
++      # noop case
++      return self if source_encoding == enc and enc == self.encoding
++
++      # allow force_encoding to work on frozen strings
++      s = (self.frozen? ? self.dup : self)
++
++      # correct the string's encoding if necessary
++      s = s.force_encoding(source_encoding) if s.encoding == Encoding::ASCII_8BIT
++
++      # Two things happen here:
++      #  - characters are validated (unless source is utf-8 already)
++      #  - non utf-8 strings are converted to utf-8 before converted to binary
++      s = s.encode!('utf-8')
++
++      # convert to the default
++      return s.force_encoding(Encoding::ASCII_8BIT) if enc == Encoding::ASCII_8BIT
++      s.encode!(enc)
++    end
+   end
+ end
+diff --git a/activesupport/test/core_ext/string_ext_test.rb b/activesupport/test/core_ext/string_ext_test.rb
+index 97b08da..957ed94 100644
+--- a/activesupport/test/core_ext/string_ext_test.rb
++++ b/activesupport/test/core_ext/string_ext_test.rb
+@@ -252,6 +252,89 @@ class CoreExtStringMultibyteTest < ActiveSupport::TestCase
+       assert UNICODE_STRING.mb_chars.kind_of?(String)
+     end
+   end
++
++  if RUBY_VERSION >= '1.9'
++    def with_external_encoding(encoding)
++      old_external = Encoding.default_external
++      silence_warnings { Encoding.default_external = encoding }
++      yield
++      silence_warnings { Encoding.default_external = old_external}
++    end
++
++    def reencode(str)
++      enc = Encoding::default_external
++      if enc == Encoding::ASCII_8BIT
++        str.dup.encode!('utf-8').dup.force_encoding(enc)
++      else
++        str.dup.encode!(enc)
++      end
++    end
++
++    def assert_equal_encodings(expected, str)
++      assert_equal [Encoding::default_external, expected.dup.force_encoding(Encoding::ASCII_8BIT) ],
++        [str.encoding, str.dup.force_encoding(Encoding::ASCII_8BIT)]
++    end
++
++    UTF_STRING = '日本語'.freeze
++    EUC_STRING = UTF_STRING.dup.encode!('euc-jp').freeze
++    SJIS_STRING = UTF_STRING.dup.encode!('sjis').freeze
++    EUC_STRING_AS_BINARY = EUC_STRING.dup.force_encoding('ascii-8bit').freeze
++
++    def test_external_encode_assumes_current_encoding_for_binary_input
++      with_external_encoding('euc-jp') do
++        expected = reencode(UTF_STRING)
++        assert_equal_encodings expected, EUC_STRING_AS_BINARY.external_encode!
++      end
++    end
++
++    def test_encoding_fails_for_incompatible_strings
++      with_external_encoding('euc-jp') do
++        begin
++          SJIS_STRING.dup.force_encoding('ascii-8bit').external_encode!
++          flunk 'Should have raised incompatibility error'
++        rescue Encoding::InvalidByteSequenceError => error
++          assert_match %r!.*on\sEUC-JP!, error.message
++        end
++        begin
++          SJIS_STRING.dup.force_encoding('ascii-8bit').external_encode!('euc-jp')
++          flunk 'Should have raised incompatibility error'
++        rescue Encoding::InvalidByteSequenceError => error
++          assert_match %r!.*on\sEUC-JP!, error.message
++        end
++      end
++    end
++
++    def test_external_encode_assumes_given_encoding_for_binary_input
++      with_external_encoding('ascii-8bit') do
++        expected = reencode(UTF_STRING)
++        assert_equal_encodings expected, EUC_STRING_AS_BINARY.external_encode!(Encoding::EUC_JP)
++      end
++    end
++
++    def test_external_encoding_converts_to_unicode_before_binary
++      with_external_encoding('ascii-8bit') do
++        expected = reencode(UTF_STRING)
++        assert_equal_encodings expected, EUC_STRING.external_encode!
++      end
++    end
++
++    def test_external_encode_conversions
++      %w(euc-jp sjis ascii-8bit utf-8).each do |encoding|
++        with_external_encoding(encoding) do
++          expected = reencode(UTF_STRING)
++          assert_equal_encodings expected, UTF_STRING.external_encode!
++          assert_equal_encodings expected, EUC_STRING.external_encode!
++          assert_equal_encodings expected, EUC_STRING_AS_BINARY.external_encode!(Encoding::EUC_JP)
++        end
++      end
++    end
++  else
++    def test_external_encode_does_nothing
++      with_kcode('UTF8') do
++        assert_equal '日本語', '日本語'.external_encode!
++      end
++    end
++  end
+ end
+ 
+ =begin
+-- 
+1.6.3.3
+
+
+From dc4f6f2801b593da468a08c64ec1ba83de8216c5 Mon Sep 17 00:00:00 2001
+From: Cezary Baginski <cezary.baginski@gmail.com>
+Date: Tue, 27 Apr 2010 16:43:22 +0200
+Subject: [PATCH 2/3] actionpack: added render error line number fixtures
+
+---
+ .../fixtures/test/_raise_at_2_no_newline.html.erb  |    2 ++
+ actionpack/test/fixtures/test/_raise_at_3.html.erb |    3 +++
+ 2 files changed, 5 insertions(+), 0 deletions(-)
+ create mode 100644 actionpack/test/fixtures/test/_raise_at_2_no_newline.html.erb
+ create mode 100644 actionpack/test/fixtures/test/_raise_at_3.html.erb
+
+diff --git a/actionpack/test/fixtures/test/_raise_at_2_no_newline.html.erb b/actionpack/test/fixtures/test/_raise_at_2_no_newline.html.erb
+new file mode 100644
+index 0000000..22404d4
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_raise_at_2_no_newline.html.erb
+@@ -0,0 +1,2 @@
++<%# encoding: us-ascii %><%= "line1" %>
++<%= error + "line2" %>
+diff --git a/actionpack/test/fixtures/test/_raise_at_3.html.erb b/actionpack/test/fixtures/test/_raise_at_3.html.erb
+new file mode 100644
+index 0000000..3ac0ec3
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_raise_at_3.html.erb
+@@ -0,0 +1,3 @@
++<%# encoding: us-ascii %>
++<%= "line2" %>
++<%= error + "line3" %>
+-- 
+1.6.3.3
+
+
+From 7681266317bd21dca51ec90c0ae5bb5c2a3be6a8 Mon Sep 17 00:00:00 2001
+From: Cezary Baginski <cezary.baginski@gmail.com>
+Date: Tue, 27 Apr 2010 16:47:09 +0200
+Subject: [PATCH 3/3] actionpack: ERb encoding support in Ruby 1.9
+
+---
+ .../lib/action_view/template/handlers/erb.rb       |   25 ++++++++--
+ .../test/fixtures/test/_euc_jp_magic.html.erb      |    1 +
+ actionpack/test/fixtures/test/_sjis_magic.html.erb |    1 +
+ actionpack/test/fixtures/test/_utf8_magic.html.erb |    2 +
+ .../test/fixtures/test/sjis_euc_partials.html.erb  |    1 +
+ .../fixtures/test/sjis_euc_utf_partials.html.erb   |    1 +
+ actionpack/test/fixtures/test/utf8.html.erb        |    3 -
+ actionpack/test/fixtures/test/utf8_magic.html.erb  |    5 --
+ actionpack/test/template/render_test.rb            |   51 +++++++++++++++++--
+ 9 files changed, 72 insertions(+), 18 deletions(-)
+ create mode 100644 actionpack/test/fixtures/test/_euc_jp_magic.html.erb
+ create mode 100644 actionpack/test/fixtures/test/_sjis_magic.html.erb
+ create mode 100644 actionpack/test/fixtures/test/_utf8_magic.html.erb
+ create mode 100644 actionpack/test/fixtures/test/sjis_euc_partials.html.erb
+ create mode 100644 actionpack/test/fixtures/test/sjis_euc_utf_partials.html.erb
+ delete mode 100644 actionpack/test/fixtures/test/utf8_magic.html.erb
+
+diff --git a/actionpack/lib/action_view/template/handlers/erb.rb b/actionpack/lib/action_view/template/handlers/erb.rb
+index 705c2bf..8165069 100644
+--- a/actionpack/lib/action_view/template/handlers/erb.rb
++++ b/actionpack/lib/action_view/template/handlers/erb.rb
+@@ -71,10 +71,27 @@ module ActionView
+       self.erb_implementation = Erubis
+ 
+       def compile(template)
+-        source = template.source.gsub(/\A(<%(#.*coding[:=]\s*(\S+)\s*)-?%>)\s*\n?/, '')
+-        erb = "<% __in_erb_template=true %>#{source}"
+-        result = self.class.erb_implementation.new(erb, :trim=>(self.class.erb_trim_mode == "-")).src
+-        result = "#{$2}\n#{result}" if $2
++        if RUBY_VERSION >= '1.9'
++          # Convert to binary so the regexp works
++          source = template.source.dup.force_encoding(Encoding::ASCII_8BIT)
++          source = source.gsub(/\A(<%(#.*coding[:=]\s*(\S+)\s*)-?%>)[ \t\r\f]*(\n?)/, ''.force_encoding(Encoding::ASCII_8BIT))
++
++          # use the encoding from magic or assume default
++          detected_encoding = $3 ? Encoding.find($3) : Encoding::default_external
++          newline = $4
++
++          # reencode to default, passing detected as source encoding
++          reencoded_source = source.external_encode!(detected_encoding)
++
++          # render - interpolation honors the encoding
++          erb = "<% __in_erb_template=true %>#{newline}#{reencoded_source}"
++          result = self.class.erb_implementation.new(erb, :trim=>(self.class.erb_trim_mode == "-")).src
++          result = result.external_encode!
++        else
++          source = template.source.gsub(/\A(<%(#.*coding[:=]\s*(\S+)\s*)-?%>)[ \t\r\f]*(\n?)/, '')
++          erb = "<% __in_erb_template=true %>#{$4}#{source}"
++          result = self.class.erb_implementation.new(erb, :trim=>(self.class.erb_trim_mode == "-")).src
++        end
+         result
+       end
+     end
+diff --git a/actionpack/test/fixtures/test/_euc_jp_magic.html.erb b/actionpack/test/fixtures/test/_euc_jp_magic.html.erb
+new file mode 100644
+index 0000000..ab796f4
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_euc_jp_magic.html.erb
+@@ -0,0 +1 @@
++<%# encoding: euc-jp %>���ܸ�Υƥ�����
+diff --git a/actionpack/test/fixtures/test/_sjis_magic.html.erb b/actionpack/test/fixtures/test/_sjis_magic.html.erb
+new file mode 100644
+index 0000000..4e8040a
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_sjis_magic.html.erb
+@@ -0,0 +1 @@
++<%# encoding: sjis %>���{��̃e�L�X�g
+diff --git a/actionpack/test/fixtures/test/_utf8_magic.html.erb b/actionpack/test/fixtures/test/_utf8_magic.html.erb
+new file mode 100644
+index 0000000..8f113c5
+--- /dev/null
++++ b/actionpack/test/fixtures/test/_utf8_magic.html.erb
+@@ -0,0 +1,2 @@
++<%# encoding: utf-8 -%>
++Русский <%= render :partial => 'test/utf8_partial_magic' %>
+diff --git a/actionpack/test/fixtures/test/sjis_euc_partials.html.erb b/actionpack/test/fixtures/test/sjis_euc_partials.html.erb
+new file mode 100644
+index 0000000..c6e9f59
+--- /dev/null
++++ b/actionpack/test/fixtures/test/sjis_euc_partials.html.erb
+@@ -0,0 +1 @@
++<%# encoding: us-ascii %><%= render(:file => 'test/_sjis_magic.html.erb') %><%= render(:file => 'test/_euc_jp_magic.html.erb') %>
+diff --git a/actionpack/test/fixtures/test/sjis_euc_utf_partials.html.erb b/actionpack/test/fixtures/test/sjis_euc_utf_partials.html.erb
+new file mode 100644
+index 0000000..89faa3c
+--- /dev/null
++++ b/actionpack/test/fixtures/test/sjis_euc_utf_partials.html.erb
+@@ -0,0 +1 @@
++<%# encoding: euc-jp %><%= render(:file => 'test/_sjis_magic.html.erb') %><%= render(:file => 'test/_euc_jp_magic.html.erb') %><%= render(:file => 'test/_utf8_magic.html.erb') %>
+diff --git a/actionpack/test/fixtures/test/utf8.html.erb b/actionpack/test/fixtures/test/utf8.html.erb
+index ac98c2f..1487758 100644
+--- a/actionpack/test/fixtures/test/utf8.html.erb
++++ b/actionpack/test/fixtures/test/utf8.html.erb
+@@ -1,4 +1 @@
+ Русский <%= render :partial => 'test/utf8_partial' %>
+-<%= "日".encoding %>
+-<%= @output_buffer.encoding %>
+-<%= __ENCODING__ %>
+diff --git a/actionpack/test/fixtures/test/utf8_magic.html.erb b/actionpack/test/fixtures/test/utf8_magic.html.erb
+deleted file mode 100644
+index 257279c..0000000
+--- a/actionpack/test/fixtures/test/utf8_magic.html.erb
++++ /dev/null
+@@ -1,5 +0,0 @@
+-<%# encoding: utf-8 -%>
+-Русский <%= render :partial => 'test/utf8_partial_magic' %>
+-<%= "日".encoding %>
+-<%= @output_buffer.encoding %>
+-<%= __ENCODING__ %>
+diff --git a/actionpack/test/template/render_test.rb b/actionpack/test/template/render_test.rb
+index c9a50da..22a2c64 100644
+--- a/actionpack/test/template/render_test.rb
++++ b/actionpack/test/template/render_test.rb
+@@ -114,6 +114,22 @@ module RenderTestCases
+     assert_equal File.expand_path("#{FIXTURE_LOAD_PATH}/test/_raise.html.erb"), e.file_name
+   end
+ 
++  def test_render_with_magic_and_errors
++    @view.render(:partial => "test/raise_at_3")
++    flunk "Render did not raise Template::Error"
++  rescue ActionView::Template::Error => e
++    assert_match %r!undefined local variable or method.*!, e.message
++    assert_equal "3", e.line_number
++  end
++
++  def test_render_with_magic_and_errors_no_newline
++    @view.render(:partial => "test/raise_at_2_no_newline")
++    flunk "Render did not raise Template::Error"
++  rescue ActionView::Template::Error => e
++    assert_match %r!undefined local variable or method.*!, e.message
++    assert_equal "2", e.line_number
++  end
++
+   def test_render_sub_template_with_errors
+     @view.render(:file => "test/sub_template_raise")
+     flunk "Render did not raise Template::Error"
+@@ -281,9 +297,9 @@ class LazyViewRenderTest < ActiveSupport::TestCase
+   if '1.9'.respond_to?(:force_encoding)
+     def test_render_utf8_template_with_magic_comment
+       with_external_encoding Encoding::ASCII_8BIT do
+-        result = @view.render(:file => "test/utf8_magic.html.erb", :layouts => "layouts/yield")
+-        assert_equal Encoding::UTF_8, result.encoding
+-        assert_equal "Русский текст\n\nUTF-8\nUTF-8\nUTF-8\n", result
++        result = @view.render(:file => "test/_utf8_magic.html.erb", :layouts => "layouts/yield")
++        assert_equal Encoding::ASCII_8BIT, result.encoding
++        assert_equal "Русский текст\n\n", result.force_encoding('UTF-8')
+       end
+     end
+ 
+@@ -291,7 +307,7 @@ class LazyViewRenderTest < ActiveSupport::TestCase
+       with_external_encoding Encoding::UTF_8 do
+         result = @view.render(:file => "test/utf8.html.erb", :layouts => "layouts/yield")
+         assert_equal Encoding::UTF_8, result.encoding
+-        assert_equal "Русский текст\n\nUTF-8\nUTF-8\nUTF-8\n", result
++        assert_equal "Русский текст\n\n", result
+       end
+     end
+ 
+@@ -301,7 +317,7 @@ class LazyViewRenderTest < ActiveSupport::TestCase
+           result = @view.render(:file => "test/utf8.html.erb", :layouts => "layouts/yield")
+           flunk 'Should have raised incompatible encoding error'
+         rescue ActionView::Template::Error => error
+-          assert_match 'invalid byte sequence in Shift_JIS', error.original_exception.message
++          assert_match %r!.* on Shift_JIS!, error.original_exception.message
+         end
+       end
+     end
+@@ -312,11 +328,34 @@ class LazyViewRenderTest < ActiveSupport::TestCase
+           result = @view.render(:file => "test/utf8_magic_with_bare_partial.html.erb", :layouts => "layouts/yield")
+           flunk 'Should have raised incompatible encoding error'
+         rescue ActionView::Template::Error => error
+-          assert_match 'invalid byte sequence in Shift_JIS', error.original_exception.message
++          assert_match %r!.* from Shift_JIS to UTF-8!, error.original_exception.message
+         end
+       end
+     end
+ 
++    unless Encoding.default_external == Encoding::US_ASCII
++      def test_render_with_multiple_encodings
++        result = @view.render(:file => "test/sjis_euc_partials.html.erb", :layouts => "layouts/yield")
++        assert_equal Encoding.default_external, result.encoding
++        with_external_encoding Encoding::UTF_8 do
++          assert_equal "日本語のテキスト\n日本語のテキスト\n\n".external_encode!, result.external_encode!
++        end
++      end
++
++      def test_render_with_multiple_encodings_including_utf8
++        result = @view.render(:file => "test/sjis_euc_utf_partials.html.erb", :layouts => "layouts/yield")
++        assert_equal Encoding.default_external, result.encoding
++        assert_equal "日本語のテキスト\n日本語のテキスト\nРусский текст\n\n\n".external_encode!, result
++      end
++
++      def test_render_euc_template_with_magic_comment
++        result = @view.render(:file => "test/_euc_jp_magic.html.erb", :layouts => "layouts/yield")
++        assert_equal Encoding.default_external, result.encoding
++        expected = "日本語のテキスト\n".encode!('euc-jp').external_encode!
++        assert_equal expected, result
++      end
++    end
++
+     def with_external_encoding(encoding)
+       old, Encoding.default_external = Encoding.default_external, encoding
+       yield
+-- 
+1.6.3.3
+

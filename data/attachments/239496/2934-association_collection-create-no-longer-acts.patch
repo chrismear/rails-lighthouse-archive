@@ -1,0 +1,145 @@
+From 2874868ca20eb1df7f62f47c7586738bb246f960 Mon Sep 17 00:00:00 2001
+From: Dan Croak <dcroak@thoughtbot.com>
+Date: Sun, 9 Aug 2009 21:32:00 -0400
+Subject: [PATCH] [#2934] association_collection#create no longer acts as association_collection#create! patch for 2-3-stable modified from railsbob's patch for master
+
+---
+ .../associations/has_many_through_association.rb   |   12 +++++++-
+ .../has_many_through_associations_test.rb          |   30 +++++++++++++++++++-
+ activerecord/test/cases/reflection_test.rb         |    4 +-
+ activerecord/test/models/company.rb                |    2 +
+ activerecord/test/models/contract.rb               |    5 +++
+ activerecord/test/schema/schema.rb                 |    4 ++
+ 6 files changed, 53 insertions(+), 4 deletions(-)
+ create mode 100644 activerecord/test/models/contract.rb
+
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index df2ef64..6af14a5 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -17,7 +17,17 @@ module ActiveRecord
+ 
+       def create(attrs = nil)
+         transaction do
+-          self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.create_association } : @reflection.create_association)
++          object = if attrs
++            @reflection.klass.send(:with_scope, :create => attrs) {
++              @reflection.create_association
++            }
++          else
++            @reflection.create_association
++          end
++          raise_on_type_mismatch(object)
++          add_record_to_target_with_callbacks(object) do |r|
++            insert_record(object, false)
++          end
+           object
+         end
+       end
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index 7453eb0..a43f876 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -11,9 +11,13 @@ require 'models/author'
+ require 'models/owner'
+ require 'models/pet'
+ require 'models/toy'
++require 'models/contract'
++require 'models/company'
++require 'models/developer'
+ 
+ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+-  fixtures :posts, :readers, :people, :comments, :authors, :owners, :pets, :toys
++  fixtures :posts, :readers, :people, :comments, :authors, :owners, :pets, :toys,
++           :companies
+ 
+   def test_associate_existing
+     assert_queries(2) { posts(:thinking);people(:david) }
+@@ -157,6 +161,30 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+     assert_equal peeps + 1, posts(:thinking).people.count
+   end
+ 
++  def test_associate_with_create_and_invalid_options
++    peeps = companies(:first_firm).developers.count
++    assert_nothing_raised { companies(:first_firm).developers.create(:name => '0') }
++    assert_equal peeps, companies(:first_firm).developers.count
++  end
++
++  def test_associate_with_create_and_valid_options
++    peeps = companies(:first_firm).developers.count
++    assert_nothing_raised { companies(:first_firm).developers.create(:name => 'developer') }
++    assert_equal peeps + 1, companies(:first_firm).developers.count
++  end
++
++  def test_associate_with_create_bang_and_invalid_options
++    peeps = companies(:first_firm).developers.count
++    assert_raises(ActiveRecord::RecordInvalid) { companies(:first_firm).developers.create!(:name => '0') }
++    assert_equal peeps, companies(:first_firm).developers.count
++  end
++
++  def test_associate_with_create_bang_and_valid_options
++    peeps = companies(:first_firm).developers.count
++    assert_nothing_raised { companies(:first_firm).developers.create!(:name => 'developer') }
++    assert_equal peeps + 1, companies(:first_firm).developers.count
++  end
++
+   def test_clear_associations
+     assert_queries(2) { posts(:welcome);posts(:welcome).people(true) }
+     
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 30ec157..a0107d2 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -170,8 +170,8 @@ class ReflectionTest < ActiveRecord::TestCase
+ 
+   def test_reflection_of_all_associations
+     # FIXME these assertions bust a lot
+-    assert_equal 28, Firm.reflect_on_all_associations.size
+-    assert_equal 21, Firm.reflect_on_all_associations(:has_many).size
++    assert_equal 30, Firm.reflect_on_all_associations.size
++    assert_equal 23, Firm.reflect_on_all_associations(:has_many).size
+     assert_equal 7, Firm.reflect_on_all_associations(:has_one).size
+     assert_equal 0, Firm.reflect_on_all_associations(:belongs_to).size
+   end
+diff --git a/activerecord/test/models/company.rb b/activerecord/test/models/company.rb
+index 2a65b03..d4bbbeb 100644
+--- a/activerecord/test/models/company.rb
++++ b/activerecord/test/models/company.rb
+@@ -9,6 +9,8 @@ class Company < AbstractCompany
+   validates_presence_of :name
+ 
+   has_one :dummy_account, :foreign_key => "firm_id", :class_name => "Account"
++  has_many :contracts
++  has_many :developers, :through => :contracts
+ 
+   def arbitrary_method
+     "I am Jack's profound disappointment"
+diff --git a/activerecord/test/models/contract.rb b/activerecord/test/models/contract.rb
+new file mode 100644
+index 0000000..5235bfa
+--- /dev/null
++++ b/activerecord/test/models/contract.rb
+@@ -0,0 +1,5 @@
++class Contract < ActiveRecord::Base
++  belongs_to :company
++  belongs_to :developer
++end
++
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index d080140..87fad0e 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -125,6 +125,10 @@ ActiveRecord::Schema.define do
+     t.integer :extendedWarranty, :null => false
+   end
+ 
++  create_table :contracts, :force => true do |t|
++    t.integer :developer_id
++    t.integer :company_id
++  end
+ 
+   create_table :customers, :force => true do |t|
+     t.string  :name
+-- 
+1.6.2.2
+

@@ -1,0 +1,138 @@
+From c304496e08c14a938d816ca7faf009da9e007f17 Mon Sep 17 00:00:00 2001
+From: Roger Leite <roger.barreto+github@gmail.com>
+Date: Tue, 4 Jan 2011 16:55:05 -0200
+Subject: [PATCH] [PATCH] all instrumentation events that include a block now fire a start event before the block is yielded [#4594 state:resolved]
+ In many situations, we want to instrument when something starts, as well as when it has finished.
+ A canonical example is AR transactions, which are helpful when they log which model started/ended them.
+
+---
+ activesupport/lib/active_support/notifications.rb  |    6 +-
+ .../active_support/notifications/instrumenter.rb   |    8 +++-
+ activesupport/test/notifications_test.rb           |   43 +++++++++++++++----
+ 3 files changed, 43 insertions(+), 14 deletions(-)
+
+diff --git a/activesupport/lib/active_support/notifications.rb b/activesupport/lib/active_support/notifications.rb
+index fd79188..35d8d9d 100644
+--- a/activesupport/lib/active_support/notifications.rb
++++ b/activesupport/lib/active_support/notifications.rb
+@@ -47,11 +47,11 @@ module ActiveSupport
+       attr_writer :notifier
+       delegate :publish, :to => :notifier
+ 
+-      def instrument(name, payload = {})
++      def instrument(name, payload = {}, &block)
+         if @instrumenters[name]
+-          instrumenter.instrument(name, payload) { yield payload if block_given? }
++          instrumenter.instrument(name, payload, &block)
+         else
+-          yield payload if block_given?
++          block.call(payload) if block_given?
+         end
+       end
+ 
+diff --git a/activesupport/lib/active_support/notifications/instrumenter.rb b/activesupport/lib/active_support/notifications/instrumenter.rb
+index 441fefb..81bee34 100644
+--- a/activesupport/lib/active_support/notifications/instrumenter.rb
++++ b/activesupport/lib/active_support/notifications/instrumenter.rb
+@@ -13,12 +13,16 @@ module ActiveSupport
+ 
+       # Instrument the given block by measuring the time taken to execute it
+       # and publish it. Notice that events get sent even if an error occurs
+-      # in the passed-in block
++      # in the passed-in block, and that events that include a block also 
++      # automatically include a start event
+       def instrument(name, payload={})
+         started = Time.now
+ 
+         begin
+-          yield
++          if block_given?
++            @notifier.publish("#{name}.start", started, started, @id, payload)
++            yield payload
++          end
+         rescue Exception => e
+           payload[:exception] = [e.class.name, e.message]
+           raise e
+diff --git a/activesupport/test/notifications_test.rb b/activesupport/test/notifications_test.rb
+index 9faa11e..93c5ddb 100644
+--- a/activesupport/test/notifications_test.rb
++++ b/activesupport/test/notifications_test.rb
+@@ -133,9 +133,9 @@ module Notifications
+ 
+     def test_instrument_yields_the_paylod_for_further_modification
+       assert_equal 2, instrument(:awesome) { |p| p[:result] = 1 + 1 }
+-      assert_equal 1, @events.size
+-      assert_equal :awesome, @events.first.name
+-      assert_equal Hash[:result => 2], @events.first.payload
++      assert_equal 2, @events.size
++      assert_equal :awesome, @events.last.name
++      assert_equal Hash[:result => 2], @events.last.payload
+     end
+ 
+     def test_instrumenter_exposes_its_id
+@@ -144,16 +144,23 @@ module Notifications
+ 
+     def test_nested_events_can_be_instrumented
+       instrument(:awesome, :payload => "notifications") do
++        #assert 'awesome.start' event
++        assert_equal 1, @events.size
++        assert_equal 'awesome.start', @events.last.name
++
+         instrument(:wot, :payload => "child") do
+-          1 + 1
++          dummy_sum = 1 + 1
++          #assert 'wot.start' event
++          assert_equal 2, @events.size
++          assert_equal 'wot.start', @events.last.name
+         end
+ 
+-        assert_equal 1, @events.size
+-        assert_equal :wot, @events.first.name
+-        assert_equal Hash[:payload => "child"], @events.first.payload
++        assert_equal 3, @events.size
++        assert_equal :wot, @events.last.name
++        assert_equal Hash[:payload => "child"], @events.last.payload
+       end
+ 
+-      assert_equal 2, @events.size
++      assert_equal 4, @events.size
+       assert_equal :awesome, @events.last.name
+       assert_equal Hash[:payload => "notifications"], @events.last.payload
+     end
+@@ -167,7 +174,9 @@ module Notifications
+         assert_equal "FAIL", e.message
+       end
+ 
+-      assert_equal 1, @events.size
++      assert_equal 2, @events.size
++      assert_equal 'awesome.start', @events.first.name
++      assert_equal :awesome, @events.last.name
+       assert_equal Hash[:payload => "notifications",
+         :exception => ["RuntimeError", "FAIL"]], @events.last.payload
+     end
+@@ -178,6 +187,22 @@ module Notifications
+       assert_equal :awesome, @events.last.name
+       assert_equal Hash[:payload => "notifications"], @events.last.payload
+     end
++
++    def test_start_event_fires_with_block
++      instrument(:awesome, :payload => 'notifications') do
++        #noop
++      end
++
++      assert_equal 2, @events.size
++      assert_equal 'awesome.start', @events.first.name
++    end
++
++    def test_start_event_not_fired_without_block
++      instrument(:awesome, :payload => 'notifications')
++      assert_equal 1, @events.size
++      assert_equal :awesome, @events.first.name
++    end
++
+   end
+ 
+   class EventTest < TestCase
+-- 
+1.7.0.4
+

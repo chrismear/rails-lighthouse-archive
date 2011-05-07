@@ -1,0 +1,92 @@
+From 7ba09277632c4dbe94cf3b0913bd39ebafcfda96 Mon Sep 17 00:00:00 2001
+From: Elad Meidar <elad@eizesus.com>
+Date: Mon, 8 Feb 2010 23:49:25 -0500
+Subject: [PATCH] Changing belongs_to to support cache_counter coutners update when updating the actual column
+
+---
+ activerecord/lib/active_record/associations.rb     |   34 +++++++++++++-------
+ .../associations/belongs_to_associations_test.rb   |   17 ++++++++++
+ 2 files changed, 39 insertions(+), 12 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 3ff8aba..dfeb4db 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1036,21 +1036,31 @@ module ActiveRecord
+       #   belongs_to :company, :touch => true
+       #   belongs_to :company, :touch => :employees_last_updated_at
+       def belongs_to(association_id, options = {})
+-        reflection = create_belongs_to_reflection(association_id, options)
+-
+-        if reflection.options[:polymorphic]
+-          association_accessor_methods(reflection, BelongsToPolymorphicAssociation)
+-        else
+-          association_accessor_methods(reflection, BelongsToAssociation)
+-          association_constructor_method(:build,  reflection, BelongsToAssociation)
+-          association_constructor_method(:create, reflection, BelongsToAssociation)
+-        end
+-
+-        add_counter_cache_callbacks(reflection)          if options[:counter_cache]
+-        add_touch_callbacks(reflection, options[:touch]) if options[:touch]
+-
+-        configure_dependency_for_belongs_to(reflection)
+-      end
++         association_column = options[:foreign_key] ||= association_id.to_s + "_id" #
++         reflection = create_belongs_to_reflection(association_id, options)
++
++         if reflection.options[:polymorphic]
++           association_accessor_methods(reflection, BelongsToPolymorphicAssociation)
++         else
++           association_accessor_methods(reflection, BelongsToAssociation)
++           association_constructor_method(:build,  reflection, BelongsToAssociation)
++           association_constructor_method(:create, reflection, BelongsToAssociation)
++         end
++
++         if options[:counter_cache]
++           define_method("#{association_column}=") do |*params|
++             new_associated_id = params.first unless params.empty?
++             current_associated_id = self.send("#{association_column}")
++             reflection.class_name.constantize.update_counters current_associated_id, reflection.counter_cache_column.to_sym => -1
++             reflection.class_name.constantize.update_counters new_associated_id, reflection.counter_cache_column.to_sym => +1
++             self.attributes[association_column.to_sym] = new_associated_id
++           end
++           add_counter_cache_callbacks(reflection)          
++         end
++         add_touch_callbacks(reflection, options[:touch]) if options[:touch]
++
++         configure_dependency_for_belongs_to(reflection)
++       end
+ 
+       # Specifies a many-to-many relationship with another class. This associates two classes via an
+       # intermediate join table.  Unless the join table is explicitly specified as an option, it is
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 9f3945f..c67dff9 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -319,6 +319,23 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal 17, reply.replies.size
+   end
+ 
++  def test_registration_update_changes_section_counts_when_update_attributes
++    sec1 = Section.create! :name => "foo"
++    sec2 = Section.create! :name => "bar"
++    
++    r = Registration.create! :name => "foo", :section => sec1
++    sec1.reload
++  
++    assert_equal 1, sec1.registrations_count
++    
++    r.update_attributes(:section_id => sec2) 
++    sec1.reload
++    assert_equal 0, sec1.registrations_count
++    sec2.reload
++    assert_equal 1, sec2.registrations_count
++    
++  end
++  
+   def test_association_assignment_sticks
+     post = Post.find(:first)
+ 
+-- 
+1.6.0.2
+

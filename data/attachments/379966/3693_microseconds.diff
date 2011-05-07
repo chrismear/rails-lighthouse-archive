@@ -1,0 +1,105 @@
+From 0c1a622e9729777271b3b65bbf38fbfb216e9754 Mon Sep 17 00:00:00 2001
+From: Chris Hapgood <cch1@hapgoods.com>
+Date: Fri, 15 Jan 2010 18:34:49 -0500
+Subject: [PATCH] Fix #microseconds conversion and #fast_string_to_time
+
+ * Use direct integer parsing in #fast_string_to_time to avoid convoluted
+   conversions and errors due to truncation.
+ * Use Float#round in #microseconds to avoid truncation errors.
+---
+ .../abstract/schema_definitions.rb                 |   13 +++---
+ activerecord/test/cases/schema_definitions_test.rb |   43 ++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 6 deletions(-)
+ create mode 100644 activerecord/test/cases/schema_definitions_test.rb
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+index 520f3c8..5e8a016 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_definitions.rb
+@@ -13,6 +13,7 @@ module ActiveRecord
+       module Format
+         ISO_DATE = /\A(\d{4})-(\d\d)-(\d\d)\z/
+         ISO_DATETIME = /\A(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?\z/
++        NEW_ISO_DATETIME = /\A(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(?:\.(\d+))?\z/
+       end
+ 
+       attr_reader :name, :default, :type, :limit, :null, :sql_type, :precision, :scale
+@@ -167,10 +168,11 @@ module ActiveRecord
+         end
+ 
+         protected
+-          # '0.123456' -> 123456
+-          # '1.123456' -> 123456
++          # Rational(123456, 1_000_000) -> 123456
++          # The sec_fraction component returned by Date._parse is a Rational fraction of a second or nil
++          # NB: This method is optimized for performance by immediately converting away from Rational.
+           def microseconds(time)
+-            ((time[:sec_fraction].to_f % 1) * 1_000_000).to_i
++            ((time[:sec_fraction].to_f % 1) * 1_000_000).round
+           end
+ 
+           def new_date(year, mon, mday)
+@@ -194,9 +196,8 @@ module ActiveRecord
+ 
+           # Doesn't handle time zones.
+           def fast_string_to_time(string)
+-            if string =~ Format::ISO_DATETIME
+-              microsec = ($7.to_f * 1_000_000).to_i
+-              new_time $1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, $6.to_i, microsec
++            if md = Format::NEW_ISO_DATETIME.match(string)
++              new_time *md.to_a[1..7].map(&:to_i)
+             end
+           end
+ 
+diff --git a/activerecord/test/cases/schema_definitions_test.rb b/activerecord/test/cases/schema_definitions_test.rb
+new file mode 100644
+index 0000000..a58d6c0
+--- /dev/null
++++ b/activerecord/test/cases/schema_definitions_test.rb
+@@ -0,0 +1,43 @@
++require "cases/helper"
++
++class SchemaDefinitionsTest < ActiveRecord::TestCase
++
++  REGRESSION_SAMPLES = %w{000249 125014 003912 256051 524287}
++  
++  test 'fast_string_to_time converts properly' do
++    converted = ActiveRecord::ConnectionAdapters::Column.send('fast_string_to_time', "2010-01-12 12:34:56.000249")
++    assert_equal Time.mktime(2010, 01, 12, 12, 34, 56, 249), converted
++  end
++  
++  test 'fallback_string_to_time converts properly' do
++    converted = ActiveRecord::ConnectionAdapters::Column.send('fallback_string_to_time', "2010-01-12 12:34:56.000249")
++    assert_equal Time.mktime(2010, 01, 12, 12, 34, 56, 249), converted
++  end
++  
++  test 'fallback_string_to_time converts properly with no microseconds' do
++    converted = ActiveRecord::ConnectionAdapters::Column.send('fallback_string_to_time', "2010-01-12 12:34:56")
++    assert_equal Time.mktime(2010, 01, 12, 12, 34, 56, 0), converted
++  end
++  
++  test "fast_string_to_time can handle problematic microseconds" do
++    REGRESSION_SAMPLES.each do |u|
++      converted = ActiveRecord::ConnectionAdapters::Column.send('fast_string_to_time', "2010-01-12 12:34:56.#{u}")
++      assert_equal u.to_i, converted.usec
++    end
++  end
++
++  test "microseconds can handle problematic microseconds" do
++    REGRESSION_SAMPLES.each do |u|
++      i = u.to_i
++      converted = ActiveRecord::ConnectionAdapters::Column.send('microseconds', {:sec_fraction => Rational(i, 1_000_000)})
++      assert_equal i, converted
++
++      converted = ActiveRecord::ConnectionAdapters::Column.send('microseconds', {:sec_fraction => Rational(i, 1_000_000)})
++      assert_equal i, converted
++    end
++  end
++  
++  test 'fast constant is equally restrictive' do
++    assert_match ActiveRecord::ConnectionAdapters::Column::Format::NEW_ISO_DATETIME, "2010-01-12 12:34:56.555493"
++  end
++end
+-- 
+1.6.3.3
+

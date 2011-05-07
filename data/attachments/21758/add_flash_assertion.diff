@@ -1,0 +1,282 @@
+From 2f136cea367b32cd6996cb9179222cd1bcc61254 Mon Sep 17 00:00:00 2001
+From: pivotal <pivotal@cypress.flood.pivotallabs.com>
+Date: Mon, 5 May 2008 18:06:09 -0700
+Subject: [PATCH] nw/ch - Mock flash
+
+---
+ .../assertions/response_assertions.rb              |   42 ++++++++++++++++++++
+ actionpack/lib/action_controller/flash.rb          |   37 +++++++++++++----
+ .../test/controller/action_pack_assertions_test.rb |   27 +++++++++++++
+ 3 files changed, 97 insertions(+), 9 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/assertions/response_assertions.rb b/actionpack/lib/action_controller/assertions/response_assertions.rb
+index c5fc6c7..7d13162 100644
+--- a/actionpack/lib/action_controller/assertions/response_assertions.rb
++++ b/actionpack/lib/action_controller/assertions/response_assertions.rb
+@@ -43,6 +43,48 @@ module ActionController
+           end
+         end
+       end
++      
++      # Assert that the action has set a flash message appropriately to display it.
++      #
++      #  ==== Examples
++      #
++      #   class MyController < ApplicationController
++      #     def create
++      #       flash[:notice] = "Created it!"
++      #       redirect_to :action => "show"
++      #     end
++      #   
++      #     def show_with_flash
++      #       flash.now[:notice] = "Showing it with a flash!"
++      #       render :action => "show"
++      #     end
++      #
++      #     def show
++      #     end
++      #   end
++      #
++      #  post :create
++      #  assert_redirected_to :action => "show"
++      #  assert_showing_flash :notice, "Created it!"
++      #
++      #  get :show_with_flash
++      #  assert_response :success
++      #  assert_template "show"
++      #  assert_showing_flash :notice, "Showing it with a flash!"
++      #
++      def assert_showing_flash(key, expected_message)
++        clean_backtrace do
++          if @response.redirect?
++            fail "Please use flash rather than flash.now for this redirect action" if flash.swept[key] == expected_message
++            assert_equal expected_message, flash[key]
++          else
++            fail "Please use flash.now rather than flash for this non-redirect action" if flash.swept[key] != expected_message &&
++              flash[key] == expected_message
++            assert_equal expected_message, flash.swept[key]
++          end
++        end
++      end
++      
+ 
+       # Assert that the redirection options passed in match those of the redirect called in the latest action. 
+       # This match can be partial, such that assert_redirected_to(:controller => "weblog") will also
+diff --git a/actionpack/lib/action_controller/flash.rb b/actionpack/lib/action_controller/flash.rb
+index 692168f..0a94a8f 100644
+--- a/actionpack/lib/action_controller/flash.rb
++++ b/actionpack/lib/action_controller/flash.rb
+@@ -135,6 +135,22 @@ module ActionController #:nodoc:
+         end
+     end
+ 
++    class SweepTrackingFlashHash < FlashHash
++      def initialize #:nodoc:
++        super
++        @swept = {}
++      end
++      
++      def delete(k)
++        @swept[k] = self[k]
++        super
++      end
++      
++      def swept
++        @swept
++      end
++    end
++    
+     module InstanceMethods #:nodoc:
+       protected
+         def reset_session_with_flash
+@@ -148,15 +164,18 @@ module ActionController #:nodoc:
+         # Note that if sessions are disabled only flash.now will work.
+         def flash(refresh = false) #:doc:
+           if !defined?(@_flash) || refresh
+-            @_flash =
+-              if session.is_a?(Hash)
+-                # don't put flash in session if disabled
+-                FlashHash.new
+-              else
+-                # otherwise, session is a CGI::Session or a TestSession
+-                # so make sure it gets retrieved from/saved to session storage after request processing
+-                session["flash"] ||= FlashHash.new
+-              end
++            @_flash = case session
++            when Hash
++              # don't put flash in session if disabled
++              FlashHash.new
++            when CGI::Session
++              # make sure it gets retrieved from/saved to session storage after request processing
++              session["flash"] ||= FlashHash.new
++            when TestSession
++              # make sure it gets retrieved from/saved to session storage after request processing
++              # but use the SweepTrackingFlashHash, so we can get at flash.now for testing
++              session["flash"] ||= SweepTrackingFlashHash.new
++            end
+           end
+ 
+           @_flash
+diff --git a/actionpack/test/controller/action_pack_assertions_test.rb b/actionpack/test/controller/action_pack_assertions_test.rb
+index 1db0575..f2f3932 100644
+--- a/actionpack/test/controller/action_pack_assertions_test.rb
++++ b/actionpack/test/controller/action_pack_assertions_test.rb
+@@ -48,6 +48,18 @@ class ActionPackAssertionsController < ActionController::Base
+     flash.clear
+     render :text => "wow!"
+   end
++  
++  # Flash.now example
++  def flash_now
++    flash.now[:hello] = "flash now example"
++    render :text => "ok"
++  end
++
++  # Flash and redirect example
++  def flash_and_redirect
++    flash[:hello] = "flash and redirect example"
++    redirect_to '/some/path'
++  end
+ 
+   # assign some template instance variables
+   def assign_this
+@@ -277,6 +289,21 @@ class ActionPackAssertionsControllerTest < Test::Unit::TestCase
+       assert_redirected_to "/action_pack_assertions/foo"
+     end
+   end
++  
++  def test_assert_showing_flash
++    process :flash_and_redirect
++    assert_showing_flash :hello, "flash and redirect example"
++    assert_raises(Test::Unit::AssertionFailedError, "Please use flash rather than flash.now for this redirect action") {assert_showing_flash :hello, "my name is inigo montoya..."}
++    
++    process :flash_me
++    assert_raises(Test::Unit::AssertionFailedError, "Please use flash.now rather than flash for this non-redirect action") {assert_showing_flash :hello, "my name is inigo montoya..."}
++  end
++  
++  def test_assert_showing_flash_with_flash_now
++    process :flash_now
++    assert_showing_flash :hello, "flash now example"
++    assert_raises(Test::Unit::AssertionFailedError, "") {assert_showing_flash :hello, "my name is inigo montoya..."}
++  end
+ 
+   # -- standard request/response object testing --------------------------------
+ 
+-- 
+1.5.4.5
+
+
+From 27123c6007ae7f721572b3a97b261d014550ca4e Mon Sep 17 00:00:00 2001
+From: pivotal <pivotal@cypress.flood.pivotallabs.com>
+Date: Tue, 6 May 2008 10:13:55 -0700
+Subject: [PATCH] nw/ch - clean up tests for assert_showing_flash
+
+---
+ .../assertions/response_assertions.rb              |    5 +-
+ .../test/controller/action_pack_assertions_test.rb |   53 +++++++++++++++++---
+ 2 files changed, 47 insertions(+), 11 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/assertions/response_assertions.rb b/actionpack/lib/action_controller/assertions/response_assertions.rb
+index 7d13162..0c1f32e 100644
+--- a/actionpack/lib/action_controller/assertions/response_assertions.rb
++++ b/actionpack/lib/action_controller/assertions/response_assertions.rb
+@@ -75,11 +75,10 @@ module ActionController
+       def assert_showing_flash(key, expected_message)
+         clean_backtrace do
+           if @response.redirect?
+-            fail "Please use flash rather than flash.now for this redirect action" if flash.swept[key] == expected_message
++            assert flash.swept[key] != expected_message, "Please use flash rather than flash.now for this redirect action"
+             assert_equal expected_message, flash[key]
+           else
+-            fail "Please use flash.now rather than flash for this non-redirect action" if flash.swept[key] != expected_message &&
+-              flash[key] == expected_message
++            assert flash[key] != expected_message, "Please use flash.now rather than flash for this non-redirect action"
+             assert_equal expected_message, flash.swept[key]
+           end
+         end
+diff --git a/actionpack/test/controller/action_pack_assertions_test.rb b/actionpack/test/controller/action_pack_assertions_test.rb
+index f2f3932..58b52d2 100644
+--- a/actionpack/test/controller/action_pack_assertions_test.rb
++++ b/actionpack/test/controller/action_pack_assertions_test.rb
+@@ -51,13 +51,19 @@ class ActionPackAssertionsController < ActionController::Base
+   
+   # Flash.now example
+   def flash_now
+-    flash.now[:hello] = "flash now example"
++    flash.now['hello'] = "flash now example"
+     render :text => "ok"
+   end
+ 
+   # Flash and redirect example
+   def flash_and_redirect
+-    flash[:hello] = "flash and redirect example"
++    flash['hello'] = "flash and redirect example"
++    redirect_to '/some/path'
++  end
++
++  # Flash.now with redirect example
++  def flash_now_and_redirect
++    flash.now['hello'] = "flash now and redirect"
+     redirect_to '/some/path'
+   end
+ 
+@@ -292,19 +298,50 @@ class ActionPackAssertionsControllerTest < Test::Unit::TestCase
+   
+   def test_assert_showing_flash
+     process :flash_and_redirect
+-    assert_showing_flash :hello, "flash and redirect example"
+-    assert_raises(Test::Unit::AssertionFailedError, "Please use flash rather than flash.now for this redirect action") {assert_showing_flash :hello, "my name is inigo montoya..."}
+-    
++    assert_showing_flash "hello", "flash and redirect example"
++  end
++  
++  def test_assert_showing_flash_fails_when_flash_message_doesnt_match
++    process :flash_and_redirect
++    begin
++      assert_showing_flash "hello", "my name is inigo montoya..."
++      fail "assert_showing_flash should fail because the argument doesn't match"
++    rescue Test::Unit::AssertionFailedError => e
++      assert_equal "<\"my name is inigo montoya...\"> expected but was\n<\"flash and redirect example\">.", e.message
++    end
++  end
++  
++  def test_assert_showing_flash_fails_when_using_flash_on_non_redirect_action
+     process :flash_me
+-    assert_raises(Test::Unit::AssertionFailedError, "Please use flash.now rather than flash for this non-redirect action") {assert_showing_flash :hello, "my name is inigo montoya..."}
++    begin
++      assert_showing_flash "hello", "my name is inigo montoya..."
++      fail "assert_showing_flash should fail because flash was used with a non-redirect"
++    rescue Test::Unit::AssertionFailedError => e
++      assert e.message.starts_with?("Please use flash.now rather than flash for this non-redirect action")
++    end
+   end
+   
+   def test_assert_showing_flash_with_flash_now
+     process :flash_now
+-    assert_showing_flash :hello, "flash now example"
+-    assert_raises(Test::Unit::AssertionFailedError, "") {assert_showing_flash :hello, "my name is inigo montoya..."}
++    assert_showing_flash "hello", "flash now example"
++    begin
++      assert_showing_flash "hello", "my name is inigo montoya..."
++      fail "assert_showing_flash should fail because the argument doesn't match"
++    rescue Test::Unit::AssertionFailedError => e
++      assert_equal "<\"my name is inigo montoya...\"> expected but was\n<\"flash now example\">.", e.message
++    end
+   end
+ 
++  def test_assert_showing_flash_fails_when_using_flash_now_on_redirect_action
++    process :flash_now_and_redirect
++    begin
++      assert_showing_flash "hello", "flash now and redirect"
++      fail "assert_showing_flash should fail because flash.now was used with a redirect "
++    rescue Test::Unit::AssertionFailedError => e
++      assert e.message.starts_with?("Please use flash rather than flash.now for this redirect action")
++    end
++  end
++  
+   # -- standard request/response object testing --------------------------------
+ 
+   # make sure that the template objects exist
+-- 
+1.5.4.5
+

@@ -1,0 +1,181 @@
+From 0c99a22c6986467c41accbf86a7c45897da4c175 Mon Sep 17 00:00:00 2001
+From: Brian Durand <brian@embellishedvisions.com>
+Date: Mon, 4 Apr 2011 21:11:41 -0500
+Subject: [PATCH] Fix threading issues with BufferedLogger. [#6671 state:resolved]
+
+---
+ .../lib/active_support/buffered_logger.rb          |   51 ++++++++++++++-----
+ activesupport/test/buffered_logger_test.rb         |   52 ++++++++++++++++++++
+ 2 files changed, 90 insertions(+), 13 deletions(-)
+
+diff --git a/activesupport/lib/active_support/buffered_logger.rb b/activesupport/lib/active_support/buffered_logger.rb
+index e41731f..f21046f 100644
+--- a/activesupport/lib/active_support/buffered_logger.rb
++++ b/activesupport/lib/active_support/buffered_logger.rb
+@@ -25,22 +25,28 @@ module ActiveSupport
+     # Silences the logger for the duration of the block.
+     def silence(temporary_level = ERROR)
+       if silencer
++        old_logger_level = @tmp_levels[Thread.current]
+         begin
+-          old_logger_level, self.level = level, temporary_level
++          @tmp_levels[Thread.current] = temporary_level
+           yield self
+         ensure
+-          self.level = old_logger_level
++          if old_logger_level
++            @tmp_levels[Thread.current] = old_logger_level
++          else
++            @tmp_levels.delete(Thread.current)
++          end
+         end
+       else
+         yield self
+       end
+     end
+ 
+-    attr_accessor :level
++    attr_writer :level
+     attr_reader :auto_flushing
+ 
+     def initialize(log, level = DEBUG)
+       @level         = level
++      @tmp_levels    = {}
+       @buffer        = {}
+       @auto_flushing = 1
+       @guard = Mutex.new
+@@ -57,8 +63,12 @@ module ActiveSupport
+       end
+     end
+ 
++    def level
++      @tmp_levels[Thread.current] || @level
++    end
++
+     def add(severity, message = nil, progname = nil, &block)
+-      return if @level > severity
++      return if level > severity
+       message = (message || (block && block.call) || progname).to_s
+       # If a newline is necessary then create a new message ending with a newline.
+       # Ensures that the original message is not mutated.
+@@ -79,7 +89,7 @@ module ActiveSupport
+         end                                                             # end
+ 
+         def #{severity.downcase}?                                       # def debug?
+-          #{severity} >= @level                                         #   DEBUG >= @level
++          #{severity} >= level                                         #   DEBUG >= level
+         end                                                             # end
+       EOT
+     end
+@@ -100,18 +110,15 @@ module ActiveSupport
+ 
+     def flush
+       @guard.synchronize do
+-        unless buffer.empty?
+-          old_buffer = buffer
+-          all_content = StringIO.new
+-          old_buffer.each do |content|
+-            all_content << content
+-          end
+-          @log.write(all_content.string)
+-        end
++        write_buffer(buffer)
+ 
+         # Important to do this even if buffer was empty or else @buffer will
+         # accumulate empty arrays for each request where nothing was logged.
+         clear_buffer
++
++        # Clear buffers associated with dead threads or else spawned threads
++        # that don't call flush will result in a memory leak.
++        flush_dead_buffers
+       end
+     end
+ 
+@@ -133,5 +140,23 @@ module ActiveSupport
+       def clear_buffer
+         @buffer.delete(Thread.current)
+       end
++
++      def flush_dead_buffers
++        @buffer.keys.reject{|thread| thread.alive?}.each do |thread|
++          buffer = @buffer[thread]
++          write_buffer(buffer)
++          @buffer.delete(thread)
++        end
++      end
++
++      def write_buffer(buffer)
++        unless buffer.empty?
++          all_content = StringIO.new
++          buffer.each do |content|
++            all_content << content
++          end
++          @log.write(all_content.string)
++        end
++      end
+   end
+ end
+diff --git a/activesupport/test/buffered_logger_test.rb b/activesupport/test/buffered_logger_test.rb
+index 8d1b1c0..8ff1c55 100644
+--- a/activesupport/test/buffered_logger_test.rb
++++ b/activesupport/test/buffered_logger_test.rb
+@@ -159,4 +159,56 @@ class BufferedLoggerTest < Test::Unit::TestCase
+     end
+     assert byte_string.include?(BYTE_STRING)
+   end
++
++  def test_silence_only_current_thread
++    @logger.auto_flushing = true
++    run_thread_a = false
++
++    a = Thread.new do
++      while !run_thread_a do
++        sleep(0.001)
++      end
++      @logger.info("x")
++      run_thread_a = false
++    end
++
++    @logger.silence do
++      run_thread_a = true
++      @logger.info("a")
++      while run_thread_a do
++        sleep(0.001)
++      end
++    end
++
++    a.join
++
++    assert @output.string.include?("x")
++    assert !@output.string.include?("a")
++  end
++
++  def test_flush_dead_buffers
++    @logger.auto_flushing = false
++
++    a = Thread.new do
++      @logger.info("a")
++    end
++    
++    keep_running = true
++    b = Thread.new do
++      @logger.info("b")
++      while keep_running
++        sleep(0.001)
++      end
++    end
++
++    @logger.info("x")
++    a.join
++    @logger.flush
++
++    assert @output.string.include?("x")
++    assert @output.string.include?("a")
++    assert !@output.string.include?("b")
++    
++    keep_running = false
++  end
+ end
+-- 
+1.7.3.4
+

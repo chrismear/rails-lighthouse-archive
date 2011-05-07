@@ -1,0 +1,147 @@
+From 10a8510887fb5d39b39ac3cb8540451a9cb01aa0 Mon Sep 17 00:00:00 2001
+From: Brian Underwood <bunderwood@rbmtechnologies.com>
+Date: Thu, 14 Oct 2010 09:34:03 -0400
+Subject: [PATCH] Take care of case where different includes() (such as when calling a scope on an assocation) combine as an Array and Hash but are addressing the same assocation.  [#1860 state:resolved]
+
+---
+ activerecord/lib/active_record/associations.rb     |   14 +++++++++-
+ .../cases/associations/twice_eager_loaded_test.rb  |   27 ++++++++++++++++++++
+ activerecord/test/fixtures/price_estimates.yml     |    2 +
+ activerecord/test/models/pirate.rb                 |    2 +-
+ activerecord/test/models/price_estimate.rb         |    3 ++
+ activerecord/test/models/treasure.rb               |    2 +
+ activerecord/test/schema/schema.rb                 |    1 +
+ 7 files changed, 48 insertions(+), 3 deletions(-)
+ create mode 100644 activerecord/test/cases/associations/twice_eager_loaded_test.rb
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index affa2fb..4825aa4 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1928,7 +1928,12 @@ module ActiveRecord
+                   join_association.join_type = join_type
+                   @join_parts << join_association
+                 when Array
+-                  associations.each do |association|
++                  # Take care of case [:bar_assocation, {:bar_assocation => :foo_assocation}]
++                  keys = associations.select do |assocation|
++                    assocation.is_a?(Hash)
++                  end.collect(&:keys).flatten
++
++                  (associations - keys).each do |association|
+                     build(association, parent, join_type)
+                   end
+                 when Hash
+@@ -1962,7 +1967,12 @@ module ActiveRecord
+                 join_parts.delete(join_part)
+                 construct_association(parent, join_part, row)
+               when Array
+-                associations.each do |association|
++                # Take care of case [:bar_assocation, {:bar_assocation => :foo_assocation}]
++                keys = associations.select do |assocation|
++                  assocation.is_a?(Hash)
++                end.collect(&:keys).flatten
++
++                (associations - keys).each do |association|
+                   construct(parent, association, join_parts, row)
+                 end
+               when Hash
+diff --git a/activerecord/test/cases/associations/twice_eager_loaded_test.rb b/activerecord/test/cases/associations/twice_eager_loaded_test.rb
+new file mode 100644
+index 0000000..4cdae34
+--- /dev/null
++++ b/activerecord/test/cases/associations/twice_eager_loaded_test.rb
+@@ -0,0 +1,27 @@
++require 'models/pirate'
++require 'models/treasure'
++require 'models/price_estimate'
++
++class TwiceEagerLoadedTest < ActiveRecord::TestCase
++  fixtures :pirate, :treasure, :price_estimate
++
++  def test_loading_assocation_and_scope_with_includes
++    Pirate.all.each do |pirate|
++      # The treasures association has includes(:price_estimates)
++      # The pricey scope has includes(:price_estimates => :estimate_of)
++      # These should combine as includes(:price_estimates => :estimate_of)
++
++      assert_nothing_raised do
++        pirate.treasures.pricey
++      end
++
++      # The example above is to demonstrate why this is an important issue
++      # but in case the assocation or scope above gets changed, let's do these manually
++      # The where() clause isn't neccessary for this test, just duplicating the above
++      assert_nothing_raised do
++        Pirate.treasures.includes(:price_estimates).includes(:price_estimates => :pirate).where('price_estimates.price > 15')
++      end
++    end
++  end
++
++end
+\ No newline at end of file
+diff --git a/activerecord/test/fixtures/price_estimates.yml b/activerecord/test/fixtures/price_estimates.yml
+index 1149ab1..9104279 100644
+--- a/activerecord/test/fixtures/price_estimates.yml
++++ b/activerecord/test/fixtures/price_estimates.yml
+@@ -1,7 +1,9 @@
+ saphire_1:
+   price: 10
+   estimate_of: sapphire (Treasure)
++  pirate: redbeard
+ 
+ sapphire_2:
+   price: 20
+   estimate_of: sapphire (Treasure)
++  pirate: blackbeard
+diff --git a/activerecord/test/models/pirate.rb b/activerecord/test/models/pirate.rb
+index d89c8cf..c73f581 100644
+--- a/activerecord/test/models/pirate.rb
++++ b/activerecord/test/models/pirate.rb
+@@ -14,7 +14,7 @@ class Pirate < ActiveRecord::Base
+     :before_remove => proc {|p,pa| p.ship_log << "before_removing_proc_parrot_#{pa.id}"},
+     :after_remove  => proc {|p,pa| p.ship_log << "after_removing_proc_parrot_#{pa.id}"}
+ 
+-  has_many :treasures, :as => :looter
++  has_many :treasures, :includes => :price_estimates, :as => :looter
+   has_many :treasure_estimates, :through => :treasures, :source => :price_estimates
+ 
+   # These both have :autosave enabled because accepts_nested_attributes_for is used on them.
+diff --git a/activerecord/test/models/price_estimate.rb b/activerecord/test/models/price_estimate.rb
+index ef3bba3..1a93d22 100644
+--- a/activerecord/test/models/price_estimate.rb
++++ b/activerecord/test/models/price_estimate.rb
+@@ -1,3 +1,6 @@
+ class PriceEstimate < ActiveRecord::Base
+   belongs_to :estimate_of, :polymorphic => true
++
++  # Pirate that made the estimation
++  belongs_to :pirate
+ end
+diff --git a/activerecord/test/models/treasure.rb b/activerecord/test/models/treasure.rb
+index 2a98e74..729c812 100644
+--- a/activerecord/test/models/treasure.rb
++++ b/activerecord/test/models/treasure.rb
+@@ -4,5 +4,7 @@ class Treasure < ActiveRecord::Base
+ 
+   has_many :price_estimates, :as => :estimate_of
+ 
++  scope :pricey, includes(:price_estimates => :pirate).where('price_estimates.price > 15')
++
+   accepts_nested_attributes_for :looter
+ end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index ea62833..ba9d892 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -436,6 +436,7 @@ ActiveRecord::Schema.define do
+     t.string :estimate_of_type
+     t.integer :estimate_of_id
+     t.integer :price
++    t.integer :pirate_id
+   end
+ 
+   create_table :products, :force => true do |t|
+-- 
+1.7.1
+

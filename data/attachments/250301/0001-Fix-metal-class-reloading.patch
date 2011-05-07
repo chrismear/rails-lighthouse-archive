@@ -1,0 +1,208 @@
+From 78ef5b5296a0788a261943bb5d3fe8e0e32526c8 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Mon, 17 Aug 2009 22:30:07 +0200
+Subject: [PATCH] Fix metal class reloading.
+
+It was broken for two reasons:
+- The dispatcher's middleware stack contains references to old metal classes,
+  which not only makes metal class reloading ineffective, but also
+  causes Dependencies to throw warnings. When classs reloading is turned on,
+  the dispatcher now rebuilds the middleware stack during every request.
+  It also locks the entire request because rebuilding the middleware stack
+  is not thread-safe.
+- The class reloading routines were being called after the dispatcher's
+  'call' method has returned. This interferes with Rack response bodies that
+  call arbitrary code in the #each method. This changeset defers class
+  reloading to after #close has been called on the Rack body.
+---
+ actionpack/lib/action_controller.rb                |    1 +
+ .../lib/action_controller/dispatch/dispatcher.rb   |   57 ++++++++++++------
+ actionpack/lib/action_controller/reloader.rb       |   61 ++++++++++++++++++++
+ railties/lib/initializer.rb                        |    2 +-
+ 4 files changed, 101 insertions(+), 20 deletions(-)
+ create mode 100644 actionpack/lib/action_controller/reloader.rb
+
+diff --git a/actionpack/lib/action_controller.rb b/actionpack/lib/action_controller.rb
+index 37ff618..6d9eb99 100644
+--- a/actionpack/lib/action_controller.rb
++++ b/actionpack/lib/action_controller.rb
+@@ -15,6 +15,7 @@ module ActionController
+   autoload :UrlFor,               "action_controller/metal/url_for"
+   autoload :Session,              "action_controller/metal/session"
+   autoload :Helpers,              "action_controller/metal/helpers"
++  autoload :Reloader,             "action_controller/reloader"
+ 
+   # Ported modules
+   # require 'action_controller/routing'
+diff --git a/actionpack/lib/action_controller/dispatch/dispatcher.rb b/actionpack/lib/action_controller/dispatch/dispatcher.rb
+index 9ad1cad..640d0bf 100644
+--- a/actionpack/lib/action_controller/dispatch/dispatcher.rb
++++ b/actionpack/lib/action_controller/dispatch/dispatcher.rb
+@@ -3,6 +3,9 @@ require 'active_support/core_ext/module/delegation'
+ module ActionController
+   # Dispatches requests to the appropriate controller and takes care of
+   # reloading the app after each request when Dependencies.load? is true.
++  #
++  # Before Dispatcher is usable, it must be initialized by calling
++  # Dispatcher.setup!
+   class Dispatcher
+     cattr_accessor :prepare_each_request
+     self.prepare_each_request = false
+@@ -17,24 +20,44 @@ module ActionController
+     end
+ 
+     class << self
+-      def define_dispatcher_callbacks(cache_classes)
+-        unless cache_classes
++      def setup!(cache_classes)
++        # When class reloading is turned on, we will want to rebuild the
++        # middleware stack every time we process a request. If we don't
++        # rebuild the middleware stack, then the stack may contain references
++        # to old classes metal classes, which will b0rk class reloading.
++        #
++        # So in the following lines we'll dynamically define Dispatcher.new
++        # and Dispatcher#call with a different code body depending on whether
++        # class reloading is turned on. This dynamic defining is a
++        # micro-optimization in order to avoid if-blocks in the method bodies,
++        # because sonce class reloading is turned on or off it will stay that
++        # way anyway.
++        
++        if cache_classes
++          # Define ActionController::Dispatcher.new
++          def new
++            @@middleware.build(@@router)
++          end
++          
++        else
+           # Run prepare callbacks before every request in development mode
+           self.prepare_each_request = true
+-
+-          # Development mode callbacks
+-          ActionDispatch::Callbacks.before_dispatch do |app|
+-            ActionController::Dispatcher.router.reload
++          
++          ActionView::Helpers::AssetTagHelper.cache_asset_timestamps = false
++          
++          # Define ActionController::Dispatcher.new
++          def new
++            allocate
+           end
+-
+-          ActionDispatch::Callbacks.after_dispatch do
+-            # Cleanup the application before processing the current request.
+-            ActiveRecord::Base.reset_subclasses if defined?(ActiveRecord)
+-            ActiveSupport::Dependencies.clear
+-            ActiveRecord::Base.clear_reloadable_connections! if defined?(ActiveRecord)
++          
++          class_eval do
++            # Define ActionController::Dispatcher#call
++            def call(env)
++              Reloader.run do
++                @@middleware.build(@@router).call(env)
++              end
++            end
+           end
+-
+-          ActionView::Helpers::AssetTagHelper.cache_asset_timestamps = false
+         end
+ 
+         if defined?(ActiveRecord)
+@@ -52,14 +75,10 @@ module ActionController
+         to_prepare do
+           I18n.reload!
+         end
+-      end
++      end # End of #setup! method.
+ 
+       delegate :to_prepare, :prepare_dispatch, :before_dispatch, :after_dispatch,
+         :to => ActionDispatch::Callbacks
+-
+-      def new
+-        @@middleware.build(@@router)
+-      end
+     end
+   end
+ end
+diff --git a/actionpack/lib/action_controller/reloader.rb b/actionpack/lib/action_controller/reloader.rb
+new file mode 100644
+index 0000000..aac16db
+--- /dev/null
++++ b/actionpack/lib/action_controller/reloader.rb
+@@ -0,0 +1,61 @@
++module ActionController
++  # Utility class for handling class reloading for when Dependencies.load? is true.
++  # This class is used internally by ActionController::Dispatcher and should not be
++  # used directly.
++  class Reloader
++    @@default_lock = Mutex.new
++    cattr_accessor :default_lock
++
++    class BodyWrapper
++      def initialize(body, lock)
++        @body = body
++        @lock = lock
++      end
++
++      def close
++        @body.close if @body.respond_to?(:close)
++      ensure
++        begin
++          # Cleanup the application before processing the current request.
++          ActiveRecord::Base.reset_subclasses if defined?(ActiveRecord)
++          ActiveSupport::Dependencies.clear
++          ActiveRecord::Base.clear_reloadable_connections! if defined?(ActiveRecord)
++        ensure
++          @lock.unlock
++        end
++      end
++
++      def method_missing(*args, &block)
++        @body.send(*args, &block)
++      end
++
++      def respond_to?(symbol, include_private = false)
++        symbol == :close || @body.respond_to?(symbol, include_private)
++      end
++    end
++
++    def self.run(lock = @@default_lock)
++      lock.lock
++      begin
++        ActionController::Dispatcher.router.reload
++        status, headers, body = yield
++        # We do not want to run the code reloading routines in an ensure block here
++        # because the returned Rack response body may lazily generate its data. This
++        # is for example the case if one calls
++        #
++        #   render :text => lambda { ... code here which refers to application models ... }
++        #
++        # in an ActionController.
++        #
++        # Instead, we will want to cleanup the application code after the request is
++        # completely finished. So we wrap the body in a BodyWrapper class so that
++        # when the Rack handler calls #close during the end of the request, we get to
++        # run our cleanup code.
++        [status, headers, BodyWrapper.new(body, lock)]
++      rescue Exception
++        lock.unlock
++        raise
++      end
++    end
++  end
++end
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 336bff9..ad73c1e 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -524,7 +524,7 @@ Run `rake gems:install` to install the missing gems.
+   Initializer.default.add :prepare_dispatcher do
+     next unless configuration.frameworks.include?(:action_controller)
+     require 'dispatcher' unless defined?(::Dispatcher)
+-    Dispatcher.define_dispatcher_callbacks(configuration.cache_classes)
++    Dispatcher.setup!(configuration.cache_classes)
+   end
+ 
+   # Routing must be initialized after plugins to allow the former to extend the routes
+-- 
+1.6.0.5
+

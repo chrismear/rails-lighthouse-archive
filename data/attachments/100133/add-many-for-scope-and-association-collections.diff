@@ -1,0 +1,156 @@
+From: Chris Kampmeier <chris@kampers.net>
+Date: Mon, 16 Mar 2009 05:56:32 -0700
+Subject: [PATCH] Add #many? implementations for Scope and AssociationCollection so they use a SQL COUNT, if possible, instead of always loading the collection
+
+---
+ .../associations/association_collection.rb         |    8 ++++
+ activerecord/lib/active_record/named_scope.rb      |   10 +++++-
+ .../associations/has_many_associations_test.rb     |   39 ++++++++++++++++++++
+ activerecord/test/cases/named_scope_test.rb        |   34 +++++++++++++++++
+ 4 files changed, 90 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 3aef1b2..1cb3051 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -302,6 +302,14 @@ module ActiveRecord
+         end
+       end
+ 
++      def many?
++        if block_given?
++          method_missing(:many?) { |*block_args| yield(*block_args) }
++        else
++          size > 1
++        end
++      end
++
+       def uniq(collection = self)
+         seen = Set.new
+         collection.inject([]) do |kept, record|
+diff --git a/activerecord/lib/active_record/named_scope.rb b/activerecord/lib/active_record/named_scope.rb
+index 1f3ef30..569b89a 100644
+--- a/activerecord/lib/active_record/named_scope.rb
++++ b/activerecord/lib/active_record/named_scope.rb
+@@ -107,7 +107,7 @@ module ActiveRecord
+ 
+     class Scope
+       attr_reader :proxy_scope, :proxy_options, :current_scoped_methods_when_defined
+-      NON_DELEGATE_METHODS = %w(nil? send object_id class extend find size count sum average maximum minimum paginate first last empty? any? respond_to?).to_set
++      NON_DELEGATE_METHODS = %w(nil? send object_id class extend find size count sum average maximum minimum paginate first last empty? any? many? respond_to?).to_set
+       [].methods.each do |m|
+         unless m =~ /^__/ || NON_DELEGATE_METHODS.include?(m.to_s)
+           delegate m, :to => :proxy_found
+@@ -166,6 +166,14 @@ module ActiveRecord
+         end
+       end
+ 
++      def many?
++        if block_given?
++          proxy_found.many? { |*block_args| yield(*block_args) }
++        else
++          size > 1
++        end
++      end
++
+       protected
+       def proxy_found
+         @found || load_found
+diff --git a/activerecord/test/cases/associations/has_many_associations_test.rb b/activerecord/test/cases/associations/has_many_associations_test.rb
+index 30edf79..012ef10 100644
+--- a/activerecord/test/cases/associations/has_many_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_associations_test.rb
+@@ -1017,6 +1017,45 @@ class HasManyAssociationsTest < ActiveRecord::TestCase
+     assert firm.clients.loaded?
+   end
+ 
++  def test_calling_many_should_count_instead_of_loading_association
++    firm = companies(:first_firm)
++    assert_queries(1) do
++      firm.clients.many?  # use count query
++    end
++    assert !firm.clients.loaded?
++  end
++
++  def test_calling_many_on_loaded_association_should_not_use_query
++    firm = companies(:first_firm)
++    firm.clients.collect  # force load
++    assert_no_queries { assert firm.clients.many? }
++  end
++
++  def test_calling_many_should_defer_to_collection_if_using_a_block
++    firm = companies(:first_firm)
++    assert_queries(1) do
++      firm.clients.expects(:size).never
++      firm.clients.many? { true }
++    end
++    assert firm.clients.loaded?
++  end
++
++  def test_calling_many_should_return_false_if_none_or_one
++    firm = companies(:another_firm)
++    assert !firm.clients_like_ms.many?
++    assert_equal 0, firm.clients_like_ms.size
++
++    firm = companies(:first_firm)
++    assert !firm.limited_clients.many?
++    assert_equal 1, firm.limited_clients.size
++  end
++
++  def test_calling_many_should_return_true_if_more_than_one
++    firm = companies(:first_firm)
++    assert firm.clients.many?
++    assert_equal 2, firm.clients.size
++  end
++
+   def test_joins_with_namespaced_model_should_use_correct_type
+     old = ActiveRecord::Base.store_full_sti_class
+     ActiveRecord::Base.store_full_sti_class = true
+diff --git a/activerecord/test/cases/named_scope_test.rb b/activerecord/test/cases/named_scope_test.rb
+index ae6a54a..c33bee5 100644
+--- a/activerecord/test/cases/named_scope_test.rb
++++ b/activerecord/test/cases/named_scope_test.rb
+@@ -234,6 +234,40 @@ class NamedScopeTest < ActiveRecord::TestCase
+     assert_no_queries { assert topics.any? }
+   end
+ 
++  def test_many_should_not_load_results
++    topics = Topic.base
++    assert_queries(2) do
++      topics.many?   # use count query
++      topics.collect # force load
++      topics.many?   # use loaded (no query)
++    end
++  end
++
++  def test_many_should_call_proxy_found_if_using_a_block
++    topics = Topic.base
++    assert_queries(1) do
++      topics.expects(:size).never
++      topics.many? { true }
++    end
++  end
++
++  def test_many_should_not_fire_query_if_named_scope_loaded
++    topics = Topic.base
++    topics.collect # force load
++    assert_no_queries { assert topics.many? }
++  end
++
++  def test_many_should_return_false_if_none_or_one
++    topics = Topic.base.scoped(:conditions => {:id => 0})
++    assert !topics.many?
++    topics = Topic.base.scoped(:conditions => {:id => 1})
++    assert !topics.many?
++  end
++
++  def test_many_should_return_true_if_more_than_one
++    assert Topic.base.many?
++  end
++
+   def test_should_build_with_proxy_options
+     topic = Topic.approved.build({})
+     assert topic.approved
+-- 
+1.6.1.3
+

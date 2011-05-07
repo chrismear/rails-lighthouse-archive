@@ -1,0 +1,112 @@
+From 830be924f6eedf10c52c5fceae731f3102713f9b Mon Sep 17 00:00:00 2001
+From: Murray Steele <muz@h-lame.com>
+Date: Mon, 5 Jan 2009 13:06:11 +0000
+Subject: [PATCH] Adding a fix for obscure problem with nested include statements and missing data.
+
+The test case perhaps isn't explicit enough, so here's a clearer description of the problem we're going to solve:
+
+1. We do a find.
+2. It uses at least 3 includes.
+3. These includes are all nested.
+4. We use conditions or order clauses that force the eager loading to use the old-style single query method.
+5. For at least one row of returned data one of the top level includes is missing.
+6. The data that is missing is from an include that has at least 2 includes that come after it alphabetically.
+
+If all of these are true (this is what the test setup and find ensure), then the missing data will cause a NoMethodError on an instance of the 1st include after the missing one by trying to add an instance of the 2nd include after the missing one's nested object to it.  For example, looking at the test supplied:
+
+1. We set up an author to have a post that has a comment and a categorization that has a category.
+2. We don't give this author any author favorites.
+3. We look for that Author and include all his posts (and their comments), all his categorizations (and their category) and all his author favorites (and their favourite author)
+4. The alphabetic order of the includes is: author_favorites, :categorizations, :posts.
+5. The missing author favourites data will attempt to add a comment (the 2nd include after the missing one's nested object) to the categorization instance (the 1st include after the missing one).
+
+The problem stems from the fact that in JoinDependency we iterate over an array of Associations and an array of JoinDependencies and assume they will never get out of sync.  In the scenario described by our test they do get out of sync and so we create an instance of something and then try to use the wrong join to add it to it's owner instance.
+
+The solution we've used is to make sure that when we use a join we use the correct one, so instead of taking the next one from the array, we look through the array for the correct one.
+
+Signed-off-by: Murray Steele <muz@h-lame.com>
+---
+ activerecord/lib/active_record/associations.rb     |   15 ++++++----
+ .../associations/eager_load_nested_include_test.rb |   31 ++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 86616ab..9d3ddf1 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1949,18 +1949,21 @@ module ActiveRecord
+             def construct(parent, associations, joins, row)
+               case associations
+                 when Symbol, String
+-                  while (join = joins.shift).reflection.name.to_s != associations.to_s
+-                    raise ConfigurationError, "Not Enough Associations" if joins.empty?
+-                  end
+-                  construct_association(parent, join, row)
++                  j = joins.detect{|j| j.reflection.name.to_s == associations.to_s && j.parent_table_name == parent.class.table_name}
++                  raise ConfigurationError, "No such association" if j.nil?
++                  joins.delete(j)
++                  construct_association(parent, j, row)
+                 when Array
+                   associations.each do |association|
+                     construct(parent, association, joins, row)
+                   end
+                 when Hash
+                   associations.keys.sort{|a,b|a.to_s<=>b.to_s}.each do |name|
+-                    association = construct_association(parent, joins.shift, row)
+-                    construct(association, associations[name], joins, row) if association
++                    j = joins.detect{|j| j.reflection.name.to_s == name.to_s && j.parent_table_name == parent.class.table_name}
++ 	                  raise ConfigurationError, "No such association" if j.nil?
++ 	                  association = construct_association(parent, j, row)
++ 	                  joins.delete(j)
++ 	                  construct(association, associations[name], joins, row) if association
+                   end
+                 else
+                   raise ConfigurationError, associations.inspect
+diff --git a/activerecord/test/cases/associations/eager_load_nested_include_test.rb b/activerecord/test/cases/associations/eager_load_nested_include_test.rb
+index 12dec5c..ce603cd 100644
+--- a/activerecord/test/cases/associations/eager_load_nested_include_test.rb
++++ b/activerecord/test/cases/associations/eager_load_nested_include_test.rb
+@@ -1,4 +1,9 @@
+ require 'cases/helper'
++require 'models/author'
++require 'models/post'
++require 'models/comment'
++require 'models/category'
++require 'models/categorization'
+ 
+ module Remembered
+   def self.included(base)
+@@ -99,3 +104,29 @@ class EagerLoadPolyAssocsTest < ActiveRecord::TestCase
+     end
+   end
+ end
++
++class EagerLoadNestedIncludeWithMissingDataTest < ActiveRecord::TestCase
++  
++  def setup
++    @davey_mcdave = Author.create(:name => 'Davey McDave')
++    @first_post = @davey_mcdave.posts.create(:title => 'Davey Speaks', :body => 'Expressive wordage')
++    @first_comment = @first_post.comments.create(:body => 'Inflamatory doublespeak')
++    @first_categorization = @davey_mcdave.categorizations.create(:category => Category.first, :post => @first_post)
++  end
++  
++  def teardown
++    @davey_mcdave.destroy
++    @first_post.destroy
++    @first_comment.destroy
++    @first_categorization.destroy
++  end
++  
++  def test_missing_data_in_a_nested_include_should_not_cause_errors_when_constructing_objects
++    assert_nothing_raised do
++      # We're including author favorites & their favourite author, however @davey_mcdave 
++      # doesn't have any.
++      Author.find :all, :include => {:posts => :comments, :categorizations => :category, :author_favorites => :favorite_author }, :conditions => {:authors => {:name => @davey_mcdave.name}}, :order => 'categories.name'
++    end
++  end
++  
++end
+\ No newline at end of file
+-- 
+1.5.4.5
+

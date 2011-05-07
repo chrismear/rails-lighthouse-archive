@@ -1,0 +1,160 @@
+From 582b4dba566e60ce7224197b42d4500b416df8b3 Mon Sep 17 00:00:00 2001
+From: Matthew Rudy Jacobs <matthewrudyjacobs@gmail.com>
+Date: Sun, 22 Feb 2009 19:23:04 +0000
+Subject: [PATCH] add metal to Engine load paths
+
+---
+ railties/lib/rails/plugin.rb                       |    8 ++++++--
+ .../engines/engine/app/metal/engine_metal.rb       |   10 ++++++++++
+ railties/test/plugin_loader_test.rb                |    4 ++--
+ 3 files changed, 18 insertions(+), 4 deletions(-)
+ create mode 100644 railties/test/fixtures/plugins/engines/engine/app/metal/engine_metal.rb
+
+diff --git a/railties/lib/rails/plugin.rb b/railties/lib/rails/plugin.rb
+index 4901abe..80deb73 100644
+--- a/railties/lib/rails/plugin.rb
++++ b/railties/lib/rails/plugin.rb
+@@ -80,6 +80,10 @@ module Rails
+       File.join(directory, 'app', 'controllers')
+     end
+ 
++    def metal_path
++      File.join(directory, 'app', 'metal')
++    end
++
+     def routing_file
+       File.join(directory, 'config', 'routes.rb')
+     end
+@@ -100,7 +104,7 @@ module Rails
+ 
+       
+       def app_paths
+-        [ File.join(directory, 'app', 'models'), File.join(directory, 'app', 'helpers'), controller_path ]
++        [ File.join(directory, 'app', 'models'), File.join(directory, 'app', 'helpers'), controller_path, metal_path ]
+       end
+       
+       def lib_path
+@@ -160,4 +164,4 @@ module Rails
+       File.join(directory, 'rails', 'init.rb')
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/railties/test/fixtures/plugins/engines/engine/app/metal/engine_metal.rb b/railties/test/fixtures/plugins/engines/engine/app/metal/engine_metal.rb
+new file mode 100644
+index 0000000..d67a127
+--- /dev/null
++++ b/railties/test/fixtures/plugins/engines/engine/app/metal/engine_metal.rb
+@@ -0,0 +1,10 @@
++class EngineMetal
++  def self.call(env)
++    if env["PATH_INFO"] =~ /^\/metal/
++      [200, {"Content-Type" => "text/html"}, ["Engine metal"]]
++    else
++      [404, {"Content-Type" => "text/html"}, ["Not Found"]]
++    end
++  end
++end
++
+diff --git a/railties/test/plugin_loader_test.rb b/railties/test/plugin_loader_test.rb
+index e802b1a..b270748 100644
+--- a/railties/test/plugin_loader_test.rb
++++ b/railties/test/plugin_loader_test.rb
+@@ -120,7 +120,7 @@ class TestPluginLoader < Test::Unit::TestCase
+ 
+     @loader.add_plugin_load_paths
+ 
+-    %w( models controllers helpers ).each do |app_part|
++    %w( models controllers metal helpers ).each do |app_part|
+       assert ActiveSupport::Dependencies.load_paths.include?(
+         File.join(plugin_fixture_path('engines/engine'), 'app', app_part)
+       ), "Couldn't find #{app_part} in load path"
+@@ -161,4 +161,4 @@ class TestPluginLoader < Test::Unit::TestCase
+       $LOAD_PATH.clear
+       ORIGINAL_LOAD_PATH.each { |path| $LOAD_PATH << path }
+     end
+-end
+\ No newline at end of file
++end
+-- 
+1.5.6.3
+
+
+From 37642cfaa1a79e7fb649e50595b1be1a34430ccc Mon Sep 17 00:00:00 2001
+From: Matthew Rudy Jacobs <matthewrudyjacobs@gmail.com>
+Date: Sun, 22 Feb 2009 20:07:32 +0000
+Subject: [PATCH] Rack::Metal now contains a list of extra metal paths
+ so we can load from a plugin
+
+---
+ railties/lib/initializer.rb         |    2 ++
+ railties/lib/rails/plugin/loader.rb |    5 ++++-
+ railties/lib/rails/rack/metal.rb    |   15 +++++++++------
+ 3 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 0e05634..f3f5745 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -545,6 +545,8 @@ Run `rake gems:install` to install the missing gems.
+     end
+ 
+     def initialize_metal
++      Rails::Rack::Metal.metal_paths += plugin_loader.engine_metal_paths
++
+       configuration.middleware.insert_before(
+         :"ActionController::RewindableInput",
+         Rails::Rack::Metal, :if => Rails::Rack::Metal.metals.any?)
+diff --git a/railties/lib/rails/plugin/loader.rb b/railties/lib/rails/plugin/loader.rb
+index 7f85bb8..a78369e 100644
+--- a/railties/lib/rails/plugin/loader.rb
++++ b/railties/lib/rails/plugin/loader.rb
+@@ -65,6 +65,9 @@ module Rails
+         $LOAD_PATH.uniq!
+       end
+ 
++      def engine_metal_paths
++        engines.collect(&:metal_path)
++      end
+ 
+       protected
+         def configure_engines
+@@ -185,4 +188,4 @@ module Rails
+ 
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/railties/lib/rails/rack/metal.rb b/railties/lib/rails/rack/metal.rb
+index b185227..8dac992 100644
+--- a/railties/lib/rails/rack/metal.rb
++++ b/railties/lib/rails/rack/metal.rb
+@@ -6,14 +6,17 @@ module Rails
+       NotFoundResponse = [404, {}, []].freeze
+       NotFound = lambda { NotFoundResponse }
+ 
++      cattr_accessor :metal_paths
++      self.metal_paths = ["#{Rails.root}/app/metal"]
++
+       def self.metals
+-        base = "#{Rails.root}/app/metal"
+-        matcher = /\A#{Regexp.escape(base)}\/(.*)\.rb\Z/
++        matcher = /#{Regexp.escape('/app/metal/')}(.*)\.rb\Z/
++        metal_glob = metal_paths.map{ |base| "#{base}/**/*.rb" }
+ 
+-        Dir["#{base}/**/*.rb"].sort.map do |file|
+-          file.sub!(matcher, '\1')
+-          require file
+-          file.classify.constantize
++        Dir[*metal_glob].sort.map do |file|
++          path = file.match(matcher)[1]
++          require path
++          path.classify.constantize
+         end
+       end
+ 
+-- 
+1.5.6.3
+

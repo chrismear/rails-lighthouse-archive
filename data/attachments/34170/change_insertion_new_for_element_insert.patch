@@ -1,0 +1,160 @@
+From f0da53fbf394670a41f888fcd7d7f27bb7d4d0d3 Mon Sep 17 00:00:00 2001
+From: miloops <miloops@gmail.com>
+Date: Tue, 22 Jul 2008 11:13:38 -0300
+Subject: [PATCH] Prototype helpers should generate Element.insert instead of Insertion.new, which has been deprecated in Prototype 1.6.
+
+---
+ .../assertions/selector_assertions.rb              |   26 ++++++++++++-------
+ .../lib/action_view/helpers/prototype_helper.rb    |   12 ++++----
+ actionpack/test/template/prototype_helper_test.rb  |   12 ++++----
+ 3 files changed, 28 insertions(+), 22 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/assertions/selector_assertions.rb b/actionpack/lib/action_controller/assertions/selector_assertions.rb
+index 70b0ed5..9114894 100644
+--- a/actionpack/lib/action_controller/assertions/selector_assertions.rb
++++ b/actionpack/lib/action_controller/assertions/selector_assertions.rb
+@@ -407,6 +407,7 @@ module ActionController
+ 
+           if rjs_type == :insert
+             arg = args.shift
++            position  = arg
+             insertion = "insert_#{arg}".to_sym
+             raise ArgumentError, "Unknown RJS insertion type #{arg}" unless RJS_STATEMENTS[insertion]
+             statement = "(#{RJS_STATEMENTS[insertion]})"
+@@ -418,6 +419,7 @@ module ActionController
+         else
+           statement = "#{RJS_STATEMENTS[:any]}"
+         end
++        position ||= Regexp.new(RJS_INSERTIONS.join('|'))
+ 
+         # Next argument we're looking for is the element identifier. If missing, we pick
+         # any element.
+@@ -434,9 +436,14 @@ module ActionController
+               Regexp.new("\\$\\(\"#{id}\"\\)#{statement}\\(#{RJS_PATTERN_HTML}\\)", Regexp::MULTILINE)
+             when :remove, :show, :hide, :toggle
+               Regexp.new("#{statement}\\(\"#{id}\"\\)")
+-            else
+-              Regexp.new("#{statement}\\(\"#{id}\", #{RJS_PATTERN_HTML}\\)", Regexp::MULTILINE)
+-          end
++            when :replace, :replace_html
++              Regexp.new("#{statement}\\(\"#{id}\", #{RJS_PATTERN_HTML}\\)")
++            when :insert, :insert_html
++              Regexp.new("Element.insert\\(\\\"#{id}\\\", \\{ #{position}: #{RJS_PATTERN_HTML} \\}\\);")
++             else
++              Regexp.union(Regexp.new("#{statement}\\(\"#{id}\", #{RJS_PATTERN_HTML}\\)"),
++                Regexp.new("Element.insert\\(\\\"#{id}\\\", \\{ #{position}: #{RJS_PATTERN_HTML} \\}\\);"))
++           end
+ 
+         # Duplicate the body since the next step involves destroying it.
+         matches = nil
+@@ -445,7 +452,7 @@ module ActionController
+             matches = @response.body.match(pattern)
+           else
+             @response.body.gsub(pattern) do |match|
+-              html = unescape_rjs($2)
++              html = unescape_rjs(match)
+               matches ||= []
+               matches.concat HTML::Document.new(html).root.children.select { |n| n.tag? }
+               ""
+@@ -585,17 +592,16 @@ module ActionController
+             :hide                 => /Element\.hide/,
+             :toggle                 => /Element\.toggle/
+           }
++          RJS_STATEMENTS[:any] = Regexp.new("(#{RJS_STATEMENTS.values.join('|')})")
++          RJS_PATTERN_HTML = /"((\\"|[^"])*)"/
+           RJS_INSERTIONS = [:top, :bottom, :before, :after]
+           RJS_INSERTIONS.each do |insertion|
+-            RJS_STATEMENTS["insert_#{insertion}".to_sym] = Regexp.new(Regexp.quote("new Insertion.#{insertion.to_s.camelize}"))
++            RJS_STATEMENTS["insert_#{insertion}".to_sym] = /Element.insert\(\"([^\"]*)\", \{ #{insertion.to_s.downcase}: #{RJS_PATTERN_HTML} \}\);/
+           end
+-          RJS_STATEMENTS[:any] = Regexp.new("(#{RJS_STATEMENTS.values.join('|')})")
+           RJS_STATEMENTS[:insert_html] = Regexp.new(RJS_INSERTIONS.collect do |insertion|
+-            Regexp.quote("new Insertion.#{insertion.to_s.camelize}")
++            /Element.insert\(\"([^\"]*)\", \{ #{insertion.to_s.downcase}: #{RJS_PATTERN_HTML} \}\);/
+           end.join('|'))
+-          RJS_PATTERN_HTML = /"((\\"|[^"])*)"/
+-          RJS_PATTERN_EVERYTHING = Regexp.new("#{RJS_STATEMENTS[:any]}\\(\"([^\"]*)\", #{RJS_PATTERN_HTML}\\)",
+-                                              Regexp::MULTILINE)
++          RJS_PATTERN_EVERYTHING = Regexp.new("#{RJS_STATEMENTS[:any]}\\(\"([^\"]*)\", #{RJS_PATTERN_HTML}\\)", Regexp::MULTILINE)
+           RJS_PATTERN_UNICODE_ESCAPED_CHAR = /\\u([0-9a-zA-Z]{4})/
+         end
+ 
+diff --git a/actionpack/lib/action_view/helpers/prototype_helper.rb b/actionpack/lib/action_view/helpers/prototype_helper.rb
+index cb4b53a..5194f00 100644
+--- a/actionpack/lib/action_view/helpers/prototype_helper.rb
++++ b/actionpack/lib/action_view/helpers/prototype_helper.rb
+@@ -608,7 +608,7 @@ module ActionView
+         # Example:
+         #
+         #   # Generates:
+-        #   #     new Insertion.Bottom("list", "<li>Some item</li>");
++        #   #     new Element.insert("list", { bottom: <li>Some item</li>" });
+         #   #     new Effect.Highlight("list");
+         #   #     ["status-indicator", "cancel-link"].each(Element.hide);
+         #   update_page do |page|
+@@ -741,16 +741,16 @@ module ActionView
+           #
+           #   # Insert the rendered 'navigation' partial just before the DOM
+           #   # element with ID 'content'.
+-          #   # Generates: new Insertion.Before("content", "-- Contents of 'navigation' partial --");
++          #   # Generates: Element.insert("content", { before: "-- Contents of 'navigation' partial --" });
+           #   page.insert_html :before, 'content', :partial => 'navigation'
+           #
+           #   # Add a list item to the bottom of the <ul> with ID 'list'.
+-          #   # Generates: new Insertion.Bottom("list", "<li>Last item</li>");
++          #   # Generates: Element.insert("list", { bottom: "<li>Last item</li>" });
+           #   page.insert_html :bottom, 'list', '<li>Last item</li>'
+           #
+           def insert_html(position, id, *options_for_render)
+-            insertion = position.to_s.camelize
+-            call "new Insertion.#{insertion}", id, render(*options_for_render)
++            content = javascript_object_for(render(*options_for_render))
++            record "Element.insert(\"#{id}\", { #{position.to_s.downcase}: #{content} });"
+           end
+ 
+           # Replaces the inner HTML of the DOM element with the given +id+.
+@@ -1054,7 +1054,7 @@ module ActionView
+ 
+         js_options['asynchronous'] = options[:type] != :synchronous
+         js_options['method']       = method_option_to_s(options[:method]) if options[:method]
+-        js_options['insertion']    = "Insertion.#{options[:position].to_s.camelize}" if options[:position]
++        js_options['insertion']    = options[:position].to_s.downcase if options[:position]
+         js_options['evalScripts']  = options[:script].nil? || options[:script]
+ 
+         if options[:form]
+diff --git a/actionpack/test/template/prototype_helper_test.rb b/actionpack/test/template/prototype_helper_test.rb
+index 92cc857..eb3517e 100644
+--- a/actionpack/test/template/prototype_helper_test.rb
++++ b/actionpack/test/template/prototype_helper_test.rb
+@@ -287,13 +287,13 @@ class JavaScriptGeneratorTest < PrototypeHelperBaseTest
+   end
+ 
+   def test_insert_html_with_string
+-    assert_equal 'new Insertion.Top("element", "\\u003Cp\\u003EThis is a test\\u003C/p\\u003E");',
++    assert_equal 'Element.insert("element", { top: "\\u003Cp\\u003EThis is a test\\u003C/p\\u003E" });',
+       @generator.insert_html(:top, 'element', '<p>This is a test</p>')
+-    assert_equal 'new Insertion.Bottom("element", "\\u003Cp\u003EThis is a test\\u003C/p\u003E");',
++    assert_equal 'Element.insert("element", { bottom: "\\u003Cp\u003EThis is a test\\u003C/p\u003E" });',
+       @generator.insert_html(:bottom, 'element', '<p>This is a test</p>')
+-    assert_equal 'new Insertion.Before("element", "\\u003Cp\u003EThis is a test\\u003C/p\u003E");',
++    assert_equal 'Element.insert("element", { before: "\\u003Cp\u003EThis is a test\\u003C/p\u003E" });',
+       @generator.insert_html(:before, 'element', '<p>This is a test</p>')
+-    assert_equal 'new Insertion.After("element", "\\u003Cp\u003EThis is a test\\u003C/p\u003E");',
++    assert_equal 'Element.insert("element", { after: "\\u003Cp\u003EThis is a test\\u003C/p\u003E" });',
+       @generator.insert_html(:after, 'element', '<p>This is a test</p>')
+   end
+ 
+@@ -366,8 +366,8 @@ class JavaScriptGeneratorTest < PrototypeHelperBaseTest
+     @generator.replace_html('baz', '<p>This is a test</p>')
+ 
+     assert_equal <<-EOS.chomp, @generator.to_s
+-new Insertion.Top("element", "\\u003Cp\\u003EThis is a test\\u003C/p\\u003E");
+-new Insertion.Bottom("element", "\\u003Cp\\u003EThis is a test\\u003C/p\\u003E");
++Element.insert("element", { top: "\\u003Cp\\u003EThis is a test\\u003C/p\\u003E" });
++Element.insert("element", { bottom: "\\u003Cp\\u003EThis is a test\\u003C/p\\u003E" });
+ ["foo", "bar"].each(Element.remove);
+ Element.update("baz", "\\u003Cp\\u003EThis is a test\\u003C/p\\u003E");
+     EOS
+-- 
+1.5.5.1
+

@@ -1,0 +1,181 @@
+From cd741e2320d8a4b1de636eb331493252a1d55f64 Mon Sep 17 00:00:00 2001
+From: James Hill <jamie@jamie-laptop.local>
+Date: Wed, 22 Jul 2009 00:54:50 +0100
+Subject: [PATCH] Allow validations to use values from custom readers
+
+---
+ activemodel/lib/active_model/errors.rb             |    6 ++--
+ activemodel/lib/active_model/validations.rb        |   24 +++++++++++++++++++-
+ .../cases/validations/presence_validation_test.rb  |   14 +++++++++++
+ activemodel/test/cases/validations_test.rb         |   14 +++++++++++
+ 4 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/activemodel/lib/active_model/errors.rb b/activemodel/lib/active_model/errors.rb
+index a4cf700..0b7d348 100644
+--- a/activemodel/lib/active_model/errors.rb
++++ b/activemodel/lib/active_model/errors.rb
+@@ -68,7 +68,7 @@ module ActiveModel
+     # Will add an error message to each of the attributes in +attributes+ that is empty.
+     def add_on_empty(attributes, custom_message = nil)
+       [attributes].flatten.each do |attribute|
+-        value = @base.send(attribute)
++        value = @base.instance_eval { value_for(attribute) }
+         is_empty = value.respond_to?(:empty?) ? value.empty? : false
+         add(attribute, :empty, :default => custom_message) unless !value.nil? && !is_empty
+       end
+@@ -77,7 +77,7 @@ module ActiveModel
+     # Will add an error message to each of the attributes in +attributes+ that is blank (using Object#blank?).
+     def add_on_blank(attributes, custom_message = nil)
+       [attributes].flatten.each do |attribute|
+-        value = @base.send(attribute)
++        value = @base.instance_eval { value_for(attribute) }
+         add(attribute, :blank, :default => custom_message) if value.blank?
+       end
+     end
+@@ -146,7 +146,7 @@ module ActiveModel
+       defaults = defaults.compact.flatten << :"messages.#{message}"
+ 
+       key = defaults.shift
+-      value = @base.send(attribute)
++      value = @base.instance_eval { value_for(attribute) }
+ 
+       options = { :default => defaults,
+         :model => @base.class.name.humanize,
+diff --git a/activemodel/lib/active_model/validations.rb b/activemodel/lib/active_model/validations.rb
+index 54a8693..8b3a0ad 100644
+--- a/activemodel/lib/active_model/validations.rb
++++ b/activemodel/lib/active_model/validations.rb
+@@ -66,7 +66,7 @@ module ActiveModel
+         # Declare the validation.
+         send(validation_method(options[:on]), options) do |record|
+           attrs.each do |attr|
+-            value = record.send(attr)
++            value = record.instance_eval { value_for(attr) }
+             next if (value.nil? && options[:allow_nil]) || (value.blank? && options[:allow_blank])
+             yield record, attr, value
+           end
+@@ -95,6 +95,28 @@ module ActiveModel
+     def invalid?
+       !valid?
+     end
++    
++    protected
++      # Hook method defining how an attribute value should be retieved. By default this is assumed
++      # to be an instance named after the attribute. Override this method in subclasses should you
++      # need to retrieve the value for a given attribute differently e.g.
++      #   class MyClass
++      #     include ActiveModel::Validations
++      #
++      #     def initialize(data = {})
++      #       @data = data
++      #     end
++      #     
++      #     private
++      #     
++      #     def value_for(key)
++      #       @data[key]
++      #     end
++      #   end
++      #
++      def value_for(key)
++        send(key)
++      end
+   end
+ end
+ 
+diff --git a/activemodel/test/cases/validations/presence_validation_test.rb b/activemodel/test/cases/validations/presence_validation_test.rb
+index aa5bdf1..bb6fb91 100644
+--- a/activemodel/test/cases/validations/presence_validation_test.rb
++++ b/activemodel/test/cases/validations/presence_validation_test.rb
+@@ -54,4 +54,18 @@ class PresenceValidationTest < ActiveModel::TestCase
+       assert p.valid?
+     end
+   end
++  
++  def test_validates_presence_of_for_ruby_class_with_custom_reader
++    repair_validations(Person) do
++      CustomReader.validates_presence_of :karma
++
++      p = CustomReader.new
++      assert p.invalid?
++
++      assert_equal ["can't be blank"], p.errors[:karma]
++
++      p[:karma] = "Cold"
++      assert p.valid?
++    end
++  end
+ end
+diff --git a/activemodel/test/cases/validations_test.rb b/activemodel/test/cases/validations_test.rb
+index 8c89494..0b340e6 100644
+--- a/activemodel/test/cases/validations_test.rb
++++ b/activemodel/test/cases/validations_test.rb
+@@ -5,6 +5,7 @@ require 'cases/tests_database'
+ require 'models/topic'
+ require 'models/reply'
+ require 'models/developer'
++require 'models/custom_reader'
+ 
+ class ValidationsTest < ActiveModel::TestCase
+   include ActiveModel::TestsDatabase
+@@ -97,6 +98,19 @@ class ValidationsTest < ActiveModel::TestCase
+     assert_equal %w(gotcha gotcha), t.errors[:title]
+     assert_equal %w(gotcha gotcha), t.errors[:content]
+   end
++  
++  def test_validates_each_custom_reader
++    hits = 0
++    CustomReader.validates_each(:title, :content, [:title, :content]) do |record, attr|
++      record.errors.add attr, 'gotcha'
++      hits += 1
++    end
++    t = CustomReader.new("title" => "valid", "content" => "whatever")
++    assert !t.valid?
++    assert_equal 4, hits
++    assert_equal %w(gotcha gotcha), t.errors[:title]
++    assert_equal %w(gotcha gotcha), t.errors[:content]
++  end
+ 
+   def test_validate_block
+     Topic.validate { |topic| topic.errors.add("title", "will never be valid") }
+-- 
+1.6.0.3
+
+
+From ca62ebe9fd765cf668adcfc2dd838d43fa0dc149 Mon Sep 17 00:00:00 2001
+From: James Hill <jamie@jamie-laptop.local>
+Date: Wed, 22 Jul 2009 00:55:37 +0100
+Subject: [PATCH] Added new test model of custom_reader
+
+---
+ activemodel/test/models/custom_reader.rb |   17 +++++++++++++++++
+ 1 files changed, 17 insertions(+), 0 deletions(-)
+ create mode 100644 activemodel/test/models/custom_reader.rb
+
+diff --git a/activemodel/test/models/custom_reader.rb b/activemodel/test/models/custom_reader.rb
+new file mode 100644
+index 0000000..0eb28a6
+--- /dev/null
++++ b/activemodel/test/models/custom_reader.rb
+@@ -0,0 +1,17 @@
++class CustomReader
++  include ActiveModel::Validations
++
++  def initialize(data = {})
++    @data = data
++  end
++  
++  def []=(key, value)
++    @data[key] = value
++  end
++
++  private
++  
++  def value_for(key)
++    @data[key]
++  end
++end
+\ No newline at end of file
+-- 
+1.6.0.3
+

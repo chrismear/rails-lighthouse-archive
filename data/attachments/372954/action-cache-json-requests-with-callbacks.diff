@@ -1,0 +1,87 @@
+From 4aeee9fd1dd8e58ce92ede0fc812f80b583b421f Mon Sep 17 00:00:00 2001
+From: Ary Djmal <arydjmal@gmail.com>
+Date: Sat, 9 Jan 2010 17:32:01 -0500
+Subject: [PATCH] Added support for action-cache json requests wrapped in a callback (jsonp)
+
+---
+ .../lib/action_controller/caching/actions.rb       |    7 +++++
+ actionpack/test/controller/caching_test.rb         |   25 +++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/caching/actions.rb b/actionpack/lib/action_controller/caching/actions.rb
+index 35111a4..6eca128 100644
+--- a/actionpack/lib/action_controller/caching/actions.rb
++++ b/actionpack/lib/action_controller/caching/actions.rb
+@@ -126,12 +126,19 @@ module ActionController #:nodoc:
+           cache_path = ActionCachePath.new(controller, path_options || {})
+ 
+           if cache = controller.read_fragment(cache_path.path, @store_options)
++            cache = reset_json_callback(cache, controller.params[:callback]) if controller.request.format.json?
+             controller._render_cache_fragment(cache, cache_path.extension, @layout == false)
+           else
+             yield
+             controller._save_fragment(cache_path.path, @layout == false, @store_options)
+           end
+         end
++
++      private
++        def reset_json_callback(cache, callback)
++          cache = cache.sub(/^\w+\((.*)\)$/, '\1')
++          callback.present? ? "#{callback}(#{cache})" : cache
++        end
+       end
+ 
+       class ActionCachePath
+diff --git a/actionpack/test/controller/caching_test.rb b/actionpack/test/controller/caching_test.rb
+index 5a8dc0c..5848403 100644
+--- a/actionpack/test/controller/caching_test.rb
++++ b/actionpack/test/controller/caching_test.rb
+@@ -156,7 +156,7 @@ class ActionCachingTestController < ActionController::Base
+   caches_action :index, :redirected, :forbidden, :if => Proc.new { |c| !c.request.format.json? }, :expires_in => 1.hour
+   caches_action :show, :cache_path => 'http://test.host/custom/show'
+   caches_action :edit, :cache_path => Proc.new { |c| c.params[:id] ? "http://test.host/#{c.params[:id]};edit" : "http://test.host/edit" }
+-  caches_action :with_layout
++  caches_action :with_json_callback, :with_layout
+   caches_action :layout_false, :layout => false
+   caches_action :record_not_found, :four_oh_four, :simple_runtime_error
+ 
+@@ -176,6 +176,11 @@ class ActionCachingTestController < ActionController::Base
+     response.status = "403 Forbidden"
+   end
+ 
++  def with_json_callback
++    @cache_this = MockTime.now.to_f.to_s
++    render :json => @cache_this, :callback => params[:callback]
++  end
++
+   def with_layout
+     @cache_this = MockTime.now.to_f.to_s
+     render :text => @cache_this, :layout => true
+@@ -340,6 +345,24 @@ class ActionCacheTest < ActionController::TestCase
+     assert fragment_exist?('test.host/1;edit')
+   end
+ 
++  def test_action_cache_with_json_callback
++    old_use_accept_header = ActionController::Base.use_accept_header
++    ActionController::Base.use_accept_header = true
++    @request.env['HTTP_ACCEPT'] = 'application/json'
++    get :with_json_callback, :callback => 'jsonp123456789'
++    cached_time = content_to_cache
++    assert_equal "jsonp123456789(#{cached_time})", @response.body
++    assert fragment_exist?('hostname.com/action_caching_test/with_json_callback')
++
++    get :with_json_callback, :callback => 'jsonp987654321'
++    assert_equal "jsonp987654321(#{cached_time})", @response.body
++    assert_equal "jsonp123456789(#{cached_time})", read_fragment('hostname.com/action_caching_test/with_json_callback')
++
++    get :with_json_callback
++    assert_equal cached_time, @response.body
++    ActionController::Base.use_accept_header = old_use_accept_header
++  end
++
+   def test_cache_expiration
+     get :index
+     cached_time = content_to_cache
+-- 
+1.6.5
+

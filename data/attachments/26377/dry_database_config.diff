@@ -1,0 +1,1857 @@
+From e6a5c64550b47a5ce994030e68a849e2d0d91150 Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Wed, 4 Jun 2008 08:55:34 -0500
+Subject: [PATCH] Started AR::Base.configure (for use in environments)
+
+* Added configuration module for configuration proxies
+* DatabaseSpec for configuring a specific connection
+* DatabaseEnvironment for configuring multiple environments
+---
+ activerecord/lib/active_record.rb                  |    2 +
+ .../configuration/database_environment.rb          |   23 +++++
+ .../active_record/configuration/database_spec.rb   |   21 ++++
+ .../abstract/connection_specification.rb           |    9 ++-
+ activerecord/test/cases/configuration_test.rb      |   98 ++++++++++++++++++++
+ 5 files changed, 152 insertions(+), 1 deletions(-)
+ create mode 100644 activerecord/lib/active_record/configuration/database_environment.rb
+ create mode 100644 activerecord/lib/active_record/configuration/database_spec.rb
+ create mode 100644 activerecord/test/cases/configuration_test.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index d4f7170..5dd31f3 100755
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -37,6 +37,8 @@ unless defined? ActiveSupport
+ end
+ 
+ require 'active_record/base'
++require 'active_record/configuration/database_spec'
++require 'active_record/configuration/database_environment'
+ require 'active_record/named_scope'
+ require 'active_record/observer'
+ require 'active_record/query_cache'
+diff --git a/activerecord/lib/active_record/configuration/database_environment.rb b/activerecord/lib/active_record/configuration/database_environment.rb
+new file mode 100644
+index 0000000..d723aad
+--- /dev/null
++++ b/activerecord/lib/active_record/configuration/database_environment.rb
+@@ -0,0 +1,23 @@
++module ActiveRecord
++  module Configuration
++    class DatabaseEnvironment
++      
++      attr_reader :db_specs
++      
++      def initialize
++        @db_specs = Hash.new { |hash, key| hash[key] = DatabaseSpec.new }
++      end
++      
++      def method_missing(env, *args, &block)
++        yield db_specs[env]
++      end
++      
++      def specs
++        db_specs.inject({}) do |acc, env_spec|
++          acc.update(env_spec.first => env_spec.last.spec)
++        end
++      end
++      
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/configuration/database_spec.rb b/activerecord/lib/active_record/configuration/database_spec.rb
+new file mode 100644
+index 0000000..aa978fd
+--- /dev/null
++++ b/activerecord/lib/active_record/configuration/database_spec.rb
+@@ -0,0 +1,21 @@
++module ActiveRecord
++  module Configuration
++    class DatabaseSpec
++      attr_reader :spec
++      
++      def initialize
++        @spec = {}
++      end
++      
++      def method_missing(meth, *values, &block)
++        spec[name_for(meth)] = values.first
++      end
++      
++      protected
++      
++        def name_for(sym)
++          sym.to_s.gsub('=', '').to_sym
++        end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+index 2a8807f..5487763 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+@@ -122,7 +122,14 @@ module ActiveRecord
+           connection.verify!(@@verification_timeout)
+         end
+       end
+-
++      
++      # Set the database configuration
++      def configure(&block)
++        env = ActiveRecord::Configuration::DatabaseEnvironment.new
++        yield env
++        self.configurations = env.specs
++      end
++      
+       private
+         def clear_cache!(cache, thread_id = nil, &block)
+           if cache
+diff --git a/activerecord/test/cases/configuration_test.rb b/activerecord/test/cases/configuration_test.rb
+new file mode 100644
+index 0000000..cb96a27
+--- /dev/null
++++ b/activerecord/test/cases/configuration_test.rb
+@@ -0,0 +1,98 @@
++require 'cases/helper'
++
++class ConfigurationTest < Test::Unit::TestCase
++  def setup
++    @spec = {:development => {:adapter => 'sqlite3', 
++                              :database => 'db/foo_development.sqlite3', 
++                              :timeout => 5000},
++             :test => {:adapter => 'sqlite3', 
++                       :database => 'db/foo_development.sqlite3', 
++                       :timeout => 5000},
++             :production => {:adapter => 'sqlite3', 
++                             :database => 'db/foo_development.sqlite3', 
++                             :timeout => 5000}
++    }
++  end
++  
++  def test_generate_spec_for_one_environment
++    
++    db_spec = ActiveRecord::Configuration::DatabaseSpec.new
++    db_spec.adapter  = @spec[:development][:adapter]
++    db_spec.database = @spec[:development][:database]
++    db_spec.timeout  = @spec[:development][:timeout]
++    
++    assert_equal @spec[:development], db_spec.spec
++  end
++  
++  def test_spec_correctly_translates_keys
++    db_spec = ActiveRecord::Configuration::DatabaseSpec.new
++    assert_equal :foo, db_spec.send(:name_for, 'foo=')
++  end
++  
++  def test_generate_multiple_environments
++        
++    env = ActiveRecord::Configuration::DatabaseEnvironment.new
++    env.development do |setup|
++      setup.adapter  = @spec[:development][:adapter]
++      setup.database = @spec[:development][:database]
++      setup.timeout  = @spec[:development][:timeout]
++    end
++    env.test do |setup|
++      setup.adapter  = @spec[:test][:adapter]
++      setup.database = @spec[:test][:database]
++      setup.timeout  = @spec[:test][:timeout]
++    end
++    env.production do |setup|
++      setup.adapter  = @spec[:production][:adapter]
++      setup.database = @spec[:production][:database]
++      setup.timeout  = @spec[:production][:timeout]
++    end
++    
++    assert_equal @spec, env.specs
++  end
++  
++  def test_generate_from_partial_specifications
++    spec = {:development => @spec[:development], :test => @spec[:test]}
++    
++    env = ActiveRecord::Configuration::DatabaseEnvironment.new
++    env.development do |setup|
++      setup.adapter  = spec[:development][:adapter]
++    end
++    env.development do |setup|
++      setup.database = spec[:development][:database]
++      setup.timeout  = spec[:development][:timeout]
++    end
++    env.test do |setup|
++      setup.adapter  = spec[:test][:adapter]
++      setup.database = spec[:test][:database]
++    end
++    env.test do |setup|
++      setup.timeout  = spec[:test][:timeout]
++    end
++    
++    assert_equal spec, env.specs
++  end
++  
++  def test_configuration
++    ActiveRecord::Base.configure do |db|
++      db.development do |setup|
++        setup.adapter  = @spec[:development][:adapter]
++        setup.database = @spec[:development][:database]
++        setup.timeout  = @spec[:development][:timeout]
++      end
++      db.test do |setup|
++        setup.adapter  = @spec[:test][:adapter]
++        setup.database = @spec[:test][:database]
++        setup.timeout  = @spec[:test][:timeout]
++      end
++      db.production do |setup|
++        setup.adapter  = @spec[:production][:adapter]
++        setup.database = @spec[:production][:database]
++        setup.timeout  = @spec[:production][:timeout]
++      end
++    end
++    
++    assert_equal @spec, ActiveRecord::Base.configurations
++  end
++  
++end
+\ No newline at end of file
+-- 
+1.5.4.4
+
+
+From fa411d46156dbc92fcff1224a7f7538bf7797a12 Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Thu, 5 Jun 2008 09:03:25 -0500
+Subject: [PATCH] Hooked AR config into initializer
+
+* Changed environments from symbols to strings to appease AR::Base.establish_connection
+* Properly set AR::Base.configurations
+* Try to configure AR from Configuration before attempting to load database.yml
+* Subclassed OrderedOptions to ActiveRecordOptions for AR connection info
+---
+ .../configuration/database_environment.rb          |    2 +-
+ .../abstract/connection_specification.rb           |    2 +-
+ activerecord/test/cases/configuration_test.rb      |   64 ++++++++++----------
+ railties/lib/initializer.rb                        |   25 +++++++-
+ 4 files changed, 57 insertions(+), 36 deletions(-)
+
+diff --git a/activerecord/lib/active_record/configuration/database_environment.rb b/activerecord/lib/active_record/configuration/database_environment.rb
+index d723aad..a22d26d 100644
+--- a/activerecord/lib/active_record/configuration/database_environment.rb
++++ b/activerecord/lib/active_record/configuration/database_environment.rb
+@@ -9,7 +9,7 @@ module ActiveRecord
+       end
+       
+       def method_missing(env, *args, &block)
+-        yield db_specs[env]
++        yield db_specs[env.to_s]
+       end
+       
+       def specs
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+index 5487763..d8febe3 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+@@ -127,7 +127,7 @@ module ActiveRecord
+       def configure(&block)
+         env = ActiveRecord::Configuration::DatabaseEnvironment.new
+         yield env
+-        self.configurations = env.specs
++        @@configurations = env.specs
+       end
+       
+       private
+diff --git a/activerecord/test/cases/configuration_test.rb b/activerecord/test/cases/configuration_test.rb
+index cb96a27..221bb0b 100644
+--- a/activerecord/test/cases/configuration_test.rb
++++ b/activerecord/test/cases/configuration_test.rb
+@@ -2,13 +2,13 @@ require 'cases/helper'
+ 
+ class ConfigurationTest < Test::Unit::TestCase
+   def setup
+-    @spec = {:development => {:adapter => 'sqlite3', 
++    @spec = {'development' => {:adapter => 'sqlite3', 
+                               :database => 'db/foo_development.sqlite3', 
+                               :timeout => 5000},
+-             :test => {:adapter => 'sqlite3', 
++             'test' => {:adapter => 'sqlite3', 
+                        :database => 'db/foo_development.sqlite3', 
+                        :timeout => 5000},
+-             :production => {:adapter => 'sqlite3', 
++             'production' => {:adapter => 'sqlite3', 
+                              :database => 'db/foo_development.sqlite3', 
+                              :timeout => 5000}
+     }
+@@ -17,11 +17,11 @@ class ConfigurationTest < Test::Unit::TestCase
+   def test_generate_spec_for_one_environment
+     
+     db_spec = ActiveRecord::Configuration::DatabaseSpec.new
+-    db_spec.adapter  = @spec[:development][:adapter]
+-    db_spec.database = @spec[:development][:database]
+-    db_spec.timeout  = @spec[:development][:timeout]
++    db_spec.adapter  = @spec['development'][:adapter]
++    db_spec.database = @spec['development'][:database]
++    db_spec.timeout  = @spec['development'][:timeout]
+     
+-    assert_equal @spec[:development], db_spec.spec
++    assert_equal @spec['development'], db_spec.spec
+   end
+   
+   def test_spec_correctly_translates_keys
+@@ -33,41 +33,41 @@ class ConfigurationTest < Test::Unit::TestCase
+         
+     env = ActiveRecord::Configuration::DatabaseEnvironment.new
+     env.development do |setup|
+-      setup.adapter  = @spec[:development][:adapter]
+-      setup.database = @spec[:development][:database]
+-      setup.timeout  = @spec[:development][:timeout]
++      setup.adapter  = @spec['development'][:adapter]
++      setup.database = @spec['development'][:database]
++      setup.timeout  = @spec['development'][:timeout]
+     end
+     env.test do |setup|
+-      setup.adapter  = @spec[:test][:adapter]
+-      setup.database = @spec[:test][:database]
+-      setup.timeout  = @spec[:test][:timeout]
++      setup.adapter  = @spec['test'][:adapter]
++      setup.database = @spec['test'][:database]
++      setup.timeout  = @spec['test'][:timeout]
+     end
+     env.production do |setup|
+-      setup.adapter  = @spec[:production][:adapter]
+-      setup.database = @spec[:production][:database]
+-      setup.timeout  = @spec[:production][:timeout]
++      setup.adapter  = @spec['production'][:adapter]
++      setup.database = @spec['production'][:database]
++      setup.timeout  = @spec['production'][:timeout]
+     end
+     
+     assert_equal @spec, env.specs
+   end
+   
+   def test_generate_from_partial_specifications
+-    spec = {:development => @spec[:development], :test => @spec[:test]}
++    spec = {'development' => @spec['development'], 'test' => @spec['test']}
+     
+     env = ActiveRecord::Configuration::DatabaseEnvironment.new
+     env.development do |setup|
+-      setup.adapter  = spec[:development][:adapter]
++      setup.adapter  = spec['development'][:adapter]
+     end
+     env.development do |setup|
+-      setup.database = spec[:development][:database]
+-      setup.timeout  = spec[:development][:timeout]
++      setup.database = spec['development'][:database]
++      setup.timeout  = spec['development'][:timeout]
+     end
+     env.test do |setup|
+-      setup.adapter  = spec[:test][:adapter]
+-      setup.database = spec[:test][:database]
++      setup.adapter  = spec['test'][:adapter]
++      setup.database = spec['test'][:database]
+     end
+     env.test do |setup|
+-      setup.timeout  = spec[:test][:timeout]
++      setup.timeout  = spec['test'][:timeout]
+     end
+     
+     assert_equal spec, env.specs
+@@ -76,19 +76,19 @@ class ConfigurationTest < Test::Unit::TestCase
+   def test_configuration
+     ActiveRecord::Base.configure do |db|
+       db.development do |setup|
+-        setup.adapter  = @spec[:development][:adapter]
+-        setup.database = @spec[:development][:database]
+-        setup.timeout  = @spec[:development][:timeout]
++        setup.adapter  = @spec['development'][:adapter]
++        setup.database = @spec['development'][:database]
++        setup.timeout  = @spec['development'][:timeout]
+       end
+       db.test do |setup|
+-        setup.adapter  = @spec[:test][:adapter]
+-        setup.database = @spec[:test][:database]
+-        setup.timeout  = @spec[:test][:timeout]
++        setup.adapter  = @spec['test'][:adapter]
++        setup.database = @spec['test'][:database]
++        setup.timeout  = @spec['test'][:timeout]
+       end
+       db.production do |setup|
+-        setup.adapter  = @spec[:production][:adapter]
+-        setup.database = @spec[:production][:database]
+-        setup.timeout  = @spec[:production][:timeout]
++        setup.adapter  = @spec['production'][:adapter]
++        setup.database = @spec['production'][:database]
++        setup.timeout  = @spec['production'][:timeout]
+       end
+     end
+     
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index f0b5e3f..694a344 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -332,7 +332,11 @@ module Rails
+     # and then establishes the connection.
+     def initialize_database
+       if configuration.frameworks.include?(:active_record)
+-        ActiveRecord::Base.configurations = configuration.database_configuration
++        ActiveRecord::Base.configure do |db|
++          configuration.active_record.connector.call(db)
++        end
++        ActiveRecord::Base.configurations ||= configuration.database_configuration
++        
+         ActiveRecord::Base.establish_connection
+       end
+     end
+@@ -672,9 +676,10 @@ module Rails
+       self.routes_configuration_file    = default_routes_configuration_file
+       self.gems                         = default_gems
+ 
+-      for framework in default_frameworks
++      for framework in (default_frameworks - [:active_record])
+         self.send("#{framework}=", Rails::OrderedOptions.new)
+       end
++      self.active_record = Rails::ActiveRecordOptions.new
+       self.active_support = Rails::OrderedOptions.new
+     end
+ 
+@@ -902,3 +907,19 @@ class Rails::OrderedOptions < Array #:nodoc:
+       return false
+     end
+ end
++
++class Rails::ActiveRecordOptions < Rails::OrderedOptions
++  
++  def initialize
++    @connector = Proc.new {}
++    super
++  end
++  
++  def configure(&block)
++    @connector = block
++  end
++  
++  def connector
++    @connector
++  end
++end
+-- 
+1.5.4.4
+
+
+From b31db01b0e456c5adbe99900b3f5f47a02fe092f Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Thu, 5 Jun 2008 23:23:05 -0500
+Subject: [PATCH] Properly handle multiple calls to ActiveRecordOptions#configure
+
+---
+ railties/lib/initializer.rb |   12 +++++++-----
+ 1 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 694a344..2059072 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -333,7 +333,9 @@ module Rails
+     def initialize_database
+       if configuration.frameworks.include?(:active_record)
+         ActiveRecord::Base.configure do |db|
+-          configuration.active_record.connector.call(db)
++          configuration.active_record.connectors.each do |connector|
++            connector.call(db)
++          end
+         end
+         ActiveRecord::Base.configurations ||= configuration.database_configuration
+         
+@@ -911,15 +913,15 @@ end
+ class Rails::ActiveRecordOptions < Rails::OrderedOptions
+   
+   def initialize
+-    @connector = Proc.new {}
++    @connectors = []
+     super
+   end
+   
+   def configure(&block)
+-    @connector = block
++    @connectors << block
+   end
+   
+-  def connector
+-    @connector
++  def connectors
++    @connectors
+   end
+ end
+-- 
+1.5.4.4
+
+
+From 397278bd03ef25e470f85242f95c973096532473 Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Thu, 5 Jun 2008 23:50:44 -0500
+Subject: [PATCH] Read database credentials from a YAML file
+
+---
+ .../active_record/configuration/database_spec.rb   |   23 ++++++++++++++++++++
+ 1 files changed, 23 insertions(+), 0 deletions(-)
+
+diff --git a/activerecord/lib/active_record/configuration/database_spec.rb b/activerecord/lib/active_record/configuration/database_spec.rb
+index aa978fd..ea1ba7f 100644
+--- a/activerecord/lib/active_record/configuration/database_spec.rb
++++ b/activerecord/lib/active_record/configuration/database_spec.rb
+@@ -1,5 +1,23 @@
+ module ActiveRecord
+   module Configuration
++    class Credentials
++      attr_reader :filename
++      def initialize(filename)
++        @filename = filename
++      end
++      
++      def validate!
++        raise "Credentials file #{filename} not found" unless File.exists?(filename)
++        raise "Invalid credentials file #{filename} (must be .yml)" unless File.extname(filename) == '.yml'
++      end
++      
++      def extract
++        validate!
++        vars = YAML.load_file(filename)
++        [vars['username'], vars['password']]
++      end
++    end
++    
+     class DatabaseSpec
+       attr_reader :spec
+       
+@@ -7,6 +25,10 @@ module ActiveRecord
+         @spec = {}
+       end
+       
++      def credentials=(path)
++        self.username, self.password = Credentials.new(path).extract
++      end
++      
+       def method_missing(meth, *values, &block)
+         spec[name_for(meth)] = values.first
+       end
+@@ -16,6 +38,7 @@ module ActiveRecord
+         def name_for(sym)
+           sym.to_s.gsub('=', '').to_sym
+         end
++        
+     end
+   end
+ end
+\ No newline at end of file
+-- 
+1.5.4.4
+
+
+From dadeed68eed42e398f6d6359f05552f10f4dcf4c Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Fri, 6 Jun 2008 00:21:28 -0500
+Subject: [PATCH] Read credentials from a Ruby file.
+
+* Moved AR::Configuration::Credentials to is own file
+* Refactored Credentials to support multiple file formats
+---
+ activerecord/lib/active_record.rb                  |    5 +-
+ .../lib/active_record/configuration/credentials.rb |   45 ++++++++++++++++++++
+ .../active_record/configuration/database_spec.rb   |   18 --------
+ activerecord/test/cases/configuration_test.rb      |   33 ++++++++++++++
+ 4 files changed, 81 insertions(+), 20 deletions(-)
+ create mode 100644 activerecord/lib/active_record/configuration/credentials.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index 5dd31f3..be20daf 100755
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -37,8 +37,6 @@ unless defined? ActiveSupport
+ end
+ 
+ require 'active_record/base'
+-require 'active_record/configuration/database_spec'
+-require 'active_record/configuration/database_environment'
+ require 'active_record/named_scope'
+ require 'active_record/observer'
+ require 'active_record/query_cache'
+@@ -58,6 +56,9 @@ require 'active_record/calculations'
+ require 'active_record/serialization'
+ require 'active_record/attribute_methods'
+ require 'active_record/dirty'
++require 'active_record/configuration/database_spec'
++require 'active_record/configuration/database_environment'
++require 'active_record/configuration/credentials'
+ 
+ ActiveRecord::Base.class_eval do
+   extend ActiveRecord::QueryCache
+diff --git a/activerecord/lib/active_record/configuration/credentials.rb b/activerecord/lib/active_record/configuration/credentials.rb
+new file mode 100644
+index 0000000..a5c29fb
+--- /dev/null
++++ b/activerecord/lib/active_record/configuration/credentials.rb
+@@ -0,0 +1,45 @@
++module ActiveRecord
++  module Configuration
++    class Credentials
++      
++      attr_reader :filename
++      def initialize(filename)
++        @filename = filename
++      end
++      
++      def validate!
++        unless File.exists?(filename)
++          raise "Credentials file #{filename} not found"
++        end
++        
++        unless %w{.yml .rb}.include?(File.extname(filename))
++          raise "Unknown credentials file #{filename}"
++        end
++      end
++      
++      def extract
++        validate!
++        case File.extname(filename)
++        when '.yml'
++          extract_yaml
++        when '.rb'
++          extract_rb
++        end
++      end
++      
++      protected
++      
++        def extract_yaml
++          vars = YAML.load_file(filename)
++          [vars['username'], vars['password']]
++        end
++        
++        def extract_rb
++          username = ''
++          password = ''
++          eval(File.read(filename), binding, filename)
++          [username, password]
++        end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/configuration/database_spec.rb b/activerecord/lib/active_record/configuration/database_spec.rb
+index ea1ba7f..377ba85 100644
+--- a/activerecord/lib/active_record/configuration/database_spec.rb
++++ b/activerecord/lib/active_record/configuration/database_spec.rb
+@@ -1,23 +1,5 @@
+ module ActiveRecord
+   module Configuration
+-    class Credentials
+-      attr_reader :filename
+-      def initialize(filename)
+-        @filename = filename
+-      end
+-      
+-      def validate!
+-        raise "Credentials file #{filename} not found" unless File.exists?(filename)
+-        raise "Invalid credentials file #{filename} (must be .yml)" unless File.extname(filename) == '.yml'
+-      end
+-      
+-      def extract
+-        validate!
+-        vars = YAML.load_file(filename)
+-        [vars['username'], vars['password']]
+-      end
+-    end
+-    
+     class DatabaseSpec
+       attr_reader :spec
+       
+diff --git a/activerecord/test/cases/configuration_test.rb b/activerecord/test/cases/configuration_test.rb
+index 221bb0b..f7646b4 100644
+--- a/activerecord/test/cases/configuration_test.rb
++++ b/activerecord/test/cases/configuration_test.rb
+@@ -95,4 +95,37 @@ class ConfigurationTest < Test::Unit::TestCase
+     assert_equal @spec, ActiveRecord::Base.configurations
+   end
+   
++  def test_read_yaml_creds
++    credentials = {'username' => 'foo', 'password' => 'bar'}
++    
++    with_temporary_credentials(:yml, credentials.to_yaml) do |filename|
++      creds = ActiveRecord::Configuration::Credentials.new(filename)
++      assert_equal ['foo', 'bar'], creds.extract
++    end
++  end
++  
++  def test_read_ruby_creds
++    credentials = <<-EOR
++      username = 'foo'
++      password = 'bar'
++    EOR
++    
++    with_temporary_credentials(:rb, credentials) do |filename|
++      creds = ActiveRecord::Configuration::Credentials.new(filename)
++      assert_equal ['foo', 'bar'], creds.extract
++    end
++  end
++  
++  private
++    
++    def with_temporary_credentials(kind, creds)
++      filename = File.join(Dir.tmpdir, "credentials.#{kind}")
++      File.open(filename, 'w') do |f|
++        f.write creds
++      end
++      
++      yield filename
++      
++      File.delete(filename) if File.exists?(filename)
++    end
+ end
+\ No newline at end of file
+-- 
+1.5.4.4
+
+
+From 7cc38b4160d6ce4b2457ca3b2bc00e5e94cfa87e Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Fri, 6 Jun 2008 00:52:30 -0500
+Subject: [PATCH] Throw a fit if the user tries to set username/password directly in production
+
+---
+ .../active_record/configuration/database_spec.rb   |   18 +++++++++++++++++-
+ activerecord/test/cases/configuration_test.rb      |   16 ++++++++++++++++
+ 2 files changed, 33 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/lib/active_record/configuration/database_spec.rb b/activerecord/lib/active_record/configuration/database_spec.rb
+index 377ba85..80702ae 100644
+--- a/activerecord/lib/active_record/configuration/database_spec.rb
++++ b/activerecord/lib/active_record/configuration/database_spec.rb
+@@ -7,8 +7,24 @@ module ActiveRecord
+         @spec = {}
+       end
+       
++      def username=(value)
++        if const_defined?(Rails) && Rails.env.production?
++          raise "You cannot set username directly in production. Use a credentials file instead."
++        else
++          spec['username'] = value
++        end
++      end
++      
++      def password=(value)
++        if const_defined?(Rails) && Rails.env.production?
++          raise "You cannot set password directly in production. Use a credentials file instead."
++        else
++          spec['password'] = value
++        end
++      end
++      
+       def credentials=(path)
+-        self.username, self.password = Credentials.new(path).extract
++        spec['username'], spec['password'] = Credentials.new(path).extract
+       end
+       
+       def method_missing(meth, *values, &block)
+diff --git a/activerecord/test/cases/configuration_test.rb b/activerecord/test/cases/configuration_test.rb
+index f7646b4..28beeb3 100644
+--- a/activerecord/test/cases/configuration_test.rb
++++ b/activerecord/test/cases/configuration_test.rb
+@@ -1,5 +1,16 @@
+ require 'cases/helper'
+ 
++module Rails
++  def self.env
++    o = Class.new do
++      def production?
++        true
++      end
++    end
++    o.new
++  end
++end
++
+ class ConfigurationTest < Test::Unit::TestCase
+   def setup
+     @spec = {'development' => {:adapter => 'sqlite3', 
+@@ -116,6 +127,11 @@ class ConfigurationTest < Test::Unit::TestCase
+     end
+   end
+   
++  def test_cant_set_user_pass_in_production
++    spec = ActiveRecord::Configuration::DatabaseSpec.new
++    assert_raises(RuntimeError) { spec.username = 'foo' }
++  end
++  
+   private
+     
+     def with_temporary_credentials(kind, creds)
+-- 
+1.5.4.4
+
+
+From 98c7ecd994f9f386b24f0af1b450590a602aa380 Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Fri, 6 Jun 2008 08:17:56 -0500
+Subject: [PATCH] First take on generating apps without database.yml.
+
+* Put database config in environments.rb
+* Add method in AppGenerator to figure out what database config to use
+---
+ railties/environments/environment.rb               |   45 ++++++++++++++++++++
+ .../generators/applications/app/app_generator.rb   |   32 ++++++++++++--
+ 2 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/railties/environments/environment.rb b/railties/environments/environment.rb
+index a85ade3..d2b7692 100644
+--- a/railties/environments/environment.rb
++++ b/railties/environments/environment.rb
+@@ -64,4 +64,49 @@ Rails::Initializer.run do |config|
+ 
+   # Activate observers that should always be running
+   # config.active_record.observers = :cacher, :garbage_collector
++  
++  # Specify your database connections. You can partially configure your
++  # your database here and then finish in an environment-specific file or
++  # an initializer.
++  config.active_record.configure do |db|
++    
++    <%= header %>
++    db.development do |setup|
++    <%- config.each do |key, value| -%>
++      setup.<%= key %> = <%= value %>
++    <%- end -%>
++      setup.database = "<%= app_name %>_development"
++    end
++    
++    # Warning: The database defined as "test" will be erased and
++    # re-generated from your development database when you run "rake".
++    # Do not set this db to the same as development or production.
++    db.test do |setup|
++    <%- config.each do |key, value| -%>
++      setup.<%= key %> = <%= value %>
++    <%- end -%>
++      setup.database = "<%= app_name %>_test"
++    end
++    
++    # You cannot specify the username and password for your database directly
++    # here. You need to add those details to a credentials file that looks
++    # like this:
++    #
++    #  username = 'root'
++    #  password = ''
++    #
++    # Specify the path to your credentials file below. For more info see 
++    # http://rubyonrails.org/awesome_credentials_docs
++    db.production do |setup|
++    <%-
++      production_config = config.dup
++      [:username, :password].each { |key| production_config.delete(key) }
++      production_config[:credentials] = '"/path/to/your/credentials.rb"'
++    -%>
++    <%- production_config.each do |key, value| -%>
++      setup.<%= key %> = <%= value %>
++    <%- end -%>
++      setup.database = "<%= app_name %>_production"
++    end
++  end
+ end
+diff --git a/railties/lib/rails_generator/generators/applications/app/app_generator.rb b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+index 2f2dd82..58683fa 100644
+--- a/railties/lib/rails_generator/generators/applications/app/app_generator.rb
++++ b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+@@ -53,10 +53,10 @@ class AppGenerator < Rails::Generator::Base
+       m.template "helpers/test_helper.rb",        "test/test_helper.rb"
+ 
+       # database.yml and routes.rb
+-      m.template "configs/databases/#{options[:db]}.yml", "config/database.yml", :assigns => {
+-        :app_name => @app_name,
+-        :socket   => options[:db] == "mysql" ? mysql_socket_location : nil
+-      }
++      # m.template "configs/databases/#{options[:db]}.yml", "config/database.yml", :assigns => {
++      #   :app_name => @app_name,
++      #   :socket   => options[:db] == "mysql" ? mysql_socket_location : nil
++      # }
+       m.template "configs/routes.rb", "config/routes.rb"
+ 
+       # Initializers
+@@ -66,7 +66,7 @@ class AppGenerator < Rails::Generator::Base
+ 
+       # Environments
+       m.file "environments/boot.rb",    "config/boot.rb"
+-      m.template "environments/environment.rb", "config/environment.rb", :assigns => { :freeze => options[:freeze], :app_name => @app_name, :app_secret => secret }
++      m.template "environments/environment.rb", "config/environment.rb", :assigns => { :freeze => options[:freeze], :app_name => @app_name, :app_secret => secret }.merge(database_environment_for(options[:db]))
+       m.file "environments/production.rb",  "config/environments/production.rb"
+       m.file "environments/development.rb", "config/environments/development.rb"
+       m.file "environments/test.rb",        "config/environments/test.rb"
+@@ -131,6 +131,28 @@ class AppGenerator < Rails::Generator::Base
+     def mysql_socket_location
+       MYSQL_SOCKET_LOCATIONS.find { |f| File.exist?(f) } unless RUBY_PLATFORM =~ /(:?mswin|mingw)/
+     end
++    
++    def database_environment_for(db)
++      # header = File.read("#{RAILS_ROOT}/configs/databases/#{db}.txt")
++      header = '# TODO: add the adapter-specific header'
++      config = {:username => 'root', :password => '', :adapter => db}
++      config = case db
++      when 'mysql'
++        {:encoding => 'utf8', 
++         :socket => mysql_socket_location}.merge(config)
++      when 'postgresql'
++        {:encoding => 'unicode'}.merge(config)
++      when 'sqlite2'
++        config.delete(:username)
++        config.delete(:password)
++        config
++      when 'sqlite3'
++        config.delete(:username)
++        config.delete(:password)
++        config
++      end
++      {:header => header.lstrip, :config => config}
++    end
+ 
+ 
+   # Installation skeleton.  Intermediate directories are automatically
+-- 
+1.5.4.4
+
+
+From dff8b7926b7239b94666c84224767d1aaeab298f Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Fri, 6 Jun 2008 08:30:22 -0500
+Subject: [PATCH] Properly generate the database name
+
+---
+ railties/environments/environment.rb               |    6 +++---
+ .../generators/applications/app/app_generator.rb   |   15 ++++++++-------
+ 2 files changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/railties/environments/environment.rb b/railties/environments/environment.rb
+index d2b7692..66aaa2e 100644
+--- a/railties/environments/environment.rb
++++ b/railties/environments/environment.rb
+@@ -75,7 +75,7 @@ Rails::Initializer.run do |config|
+     <%- config.each do |key, value| -%>
+       setup.<%= key %> = <%= value %>
+     <%- end -%>
+-      setup.database = "<%= app_name %>_development"
++      setup.database = <%= database[app_name, 'development'] %>
+     end
+     
+     # Warning: The database defined as "test" will be erased and
+@@ -85,7 +85,7 @@ Rails::Initializer.run do |config|
+     <%- config.each do |key, value| -%>
+       setup.<%= key %> = <%= value %>
+     <%- end -%>
+-      setup.database = "<%= app_name %>_test"
++      setup.database = <%= database[app_name, 'test'] %>
+     end
+     
+     # You cannot specify the username and password for your database directly
+@@ -106,7 +106,7 @@ Rails::Initializer.run do |config|
+     <%- production_config.each do |key, value| -%>
+       setup.<%= key %> = <%= value %>
+     <%- end -%>
+-      setup.database = "<%= app_name %>_production"
++      setup.database = <%= database[app_name, 'production'] %>
+     end
+   end
+ end
+diff --git a/railties/lib/rails_generator/generators/applications/app/app_generator.rb b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+index 58683fa..34a7d95 100644
+--- a/railties/lib/rails_generator/generators/applications/app/app_generator.rb
++++ b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+@@ -52,11 +52,7 @@ class AppGenerator < Rails::Generator::Base
+       m.template "helpers/application_helper.rb", "app/helpers/application_helper.rb"
+       m.template "helpers/test_helper.rb",        "test/test_helper.rb"
+ 
+-      # database.yml and routes.rb
+-      # m.template "configs/databases/#{options[:db]}.yml", "config/database.yml", :assigns => {
+-      #   :app_name => @app_name,
+-      #   :socket   => options[:db] == "mysql" ? mysql_socket_location : nil
+-      # }
++      # Routes
+       m.template "configs/routes.rb", "config/routes.rb"
+ 
+       # Initializers
+@@ -135,7 +131,10 @@ class AppGenerator < Rails::Generator::Base
+     def database_environment_for(db)
+       # header = File.read("#{RAILS_ROOT}/configs/databases/#{db}.txt")
+       header = '# TODO: add the adapter-specific header'
+-      config = {:username => 'root', :password => '', :adapter => db}
++      config = {:username => 'root', 
++                :password => '', 
++                :adapter => db}
++      database = lambda { |app, env| "#{app}_#{env}" }
+       config = case db
+       when 'mysql'
+         {:encoding => 'utf8', 
+@@ -143,15 +142,17 @@ class AppGenerator < Rails::Generator::Base
+       when 'postgresql'
+         {:encoding => 'unicode'}.merge(config)
+       when 'sqlite2'
++        database = lambda { |app, env| "db/#{env}.sqlite2" }
+         config.delete(:username)
+         config.delete(:password)
+         config
+       when 'sqlite3'
++        database = lambda { |app, env| "db/#{env}.sqlite3" }
+         config.delete(:username)
+         config.delete(:password)
+         config
+       end
+-      {:header => header.lstrip, :config => config}
++      {:header => header.lstrip, :config => config, :database => database}
+     end
+ 
+ 
+-- 
+1.5.4.4
+
+
+From 089f8c5f6521c9429e4f6976625bc1a74f60b99f Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Fri, 6 Jun 2008 08:44:29 -0500
+Subject: [PATCH] Add adapter-specific comments before the database config.
+
+* Note, the formatting in the text files for each adapter is a little funky so that it lines up nicely in the generated environment.
+* Removed old database.yml templates
+---
+ railties/configs/databases/frontbase.txt           |    4 ++
+ railties/configs/databases/frontbase.yml           |   28 ----------
+ railties/configs/databases/mysql.txt               |   16 ++++++
+ railties/configs/databases/mysql.yml               |   54 --------------------
+ railties/configs/databases/oracle.txt              |   18 +++++++
+ railties/configs/databases/oracle.yml              |   39 --------------
+ railties/configs/databases/postgresql.txt          |   25 +++++++++
+ railties/configs/databases/postgresql.yml          |   48 -----------------
+ railties/configs/databases/sqlite2.txt             |    2 +
+ railties/configs/databases/sqlite2.yml             |   16 ------
+ railties/configs/databases/sqlite3.txt             |    2 +
+ railties/configs/databases/sqlite3.yml             |   19 -------
+ .../generators/applications/app/app_generator.rb   |    9 ++-
+ 13 files changed, 73 insertions(+), 207 deletions(-)
+ create mode 100644 railties/configs/databases/frontbase.txt
+ delete mode 100644 railties/configs/databases/frontbase.yml
+ create mode 100644 railties/configs/databases/mysql.txt
+ delete mode 100644 railties/configs/databases/mysql.yml
+ create mode 100644 railties/configs/databases/oracle.txt
+ delete mode 100644 railties/configs/databases/oracle.yml
+ create mode 100644 railties/configs/databases/postgresql.txt
+ delete mode 100644 railties/configs/databases/postgresql.yml
+ create mode 100644 railties/configs/databases/sqlite2.txt
+ delete mode 100644 railties/configs/databases/sqlite2.yml
+ create mode 100644 railties/configs/databases/sqlite3.txt
+ delete mode 100644 railties/configs/databases/sqlite3.yml
+
+diff --git a/railties/configs/databases/frontbase.txt b/railties/configs/databases/frontbase.txt
+new file mode 100644
+index 0000000..8eeff14
+--- /dev/null
++++ b/railties/configs/databases/frontbase.txt
+@@ -0,0 +1,4 @@
++      # FrontBase versions 4.x
++    #
++    # Get the bindings:
++    #   gem install ruby-frontbase
+\ No newline at end of file
+diff --git a/railties/configs/databases/frontbase.yml b/railties/configs/databases/frontbase.yml
+deleted file mode 100644
+index c0c3588..0000000
+--- a/railties/configs/databases/frontbase.yml
++++ /dev/null
+@@ -1,28 +0,0 @@
+-# FrontBase versions 4.x
+-#
+-# Get the bindings:
+-#   gem install ruby-frontbase
+-
+-development:
+-  adapter: frontbase
+-  host: localhost
+-  database: <%= app_name %>_development
+-  username: <%= app_name %>
+-  password: ''
+-
+-# Warning: The database defined as "test" will be erased and
+-# re-generated from your development database when you run "rake".
+-# Do not set this db to the same as development or production.
+-test:
+-  adapter: frontbase
+-  host: localhost
+-  database: <%= app_name %>_test
+-  username: <%= app_name %>
+-  password: ''
+-
+-production:
+-  adapter: frontbase
+-  host: localhost
+-  database: <%= app_name %>_production
+-  username: <%= app_name %>
+-  password: ''
+diff --git a/railties/configs/databases/mysql.txt b/railties/configs/databases/mysql.txt
+new file mode 100644
+index 0000000..0e2283d
+--- /dev/null
++++ b/railties/configs/databases/mysql.txt
+@@ -0,0 +1,16 @@
++      # MySQL.  Versions 4.1 and 5.0 are recommended.
++    #
++    # Install the MySQL driver:
++    #   gem install mysql
++    # On Mac OS X:
++    #   sudo gem install mysql -- --with-mysql-dir=/usr/local/mysql
++    # On Mac OS X Leopard:
++    #   sudo env ARCHFLAGS="-arch i386" gem install mysql -- --with-mysql-config=/usr/local/mysql/bin/mysql_config
++    #       This sets the ARCHFLAGS environment variable to your native architecture
++    # On Windows:
++    #   gem install mysql
++    #       Choose the win32 build.
++    #       Install MySQL and put its /bin directory on your path.
++    #
++    # And be sure to use new-style password hashing:
++    #   http://dev.mysql.com/doc/refman/5.0/en/old-client.html
+\ No newline at end of file
+diff --git a/railties/configs/databases/mysql.yml b/railties/configs/databases/mysql.yml
+deleted file mode 100644
+index 7fcadcd..0000000
+--- a/railties/configs/databases/mysql.yml
++++ /dev/null
+@@ -1,54 +0,0 @@
+-# MySQL.  Versions 4.1 and 5.0 are recommended.
+-#
+-# Install the MySQL driver:
+-#   gem install mysql
+-# On Mac OS X:
+-#   sudo gem install mysql -- --with-mysql-dir=/usr/local/mysql
+-# On Mac OS X Leopard:
+-#   sudo env ARCHFLAGS="-arch i386" gem install mysql -- --with-mysql-config=/usr/local/mysql/bin/mysql_config
+-#       This sets the ARCHFLAGS environment variable to your native architecture
+-# On Windows:
+-#   gem install mysql
+-#       Choose the win32 build.
+-#       Install MySQL and put its /bin directory on your path.
+-#
+-# And be sure to use new-style password hashing:
+-#   http://dev.mysql.com/doc/refman/5.0/en/old-client.html
+-development:
+-  adapter: mysql
+-  encoding: utf8
+-  database: <%= app_name %>_development
+-  username: root
+-  password:
+-<% if socket -%>
+-  socket: <%= socket %>
+-<% else -%>
+-  host: localhost
+-<% end -%>
+-
+-# Warning: The database defined as "test" will be erased and
+-# re-generated from your development database when you run "rake".
+-# Do not set this db to the same as development or production.
+-test:
+-  adapter: mysql
+-  encoding: utf8
+-  database: <%= app_name %>_test
+-  username: root
+-  password:
+-<% if socket -%>
+-  socket: <%= socket %>
+-<% else -%>
+-  host: localhost
+-<% end -%>
+-
+-production:
+-  adapter: mysql
+-  encoding: utf8
+-  database: <%= app_name %>_production
+-  username: root
+-  password: 
+-<% if socket -%>
+-  socket: <%= socket %>
+-<% else -%>
+-  host: localhost
+-<% end -%>
+diff --git a/railties/configs/databases/oracle.txt b/railties/configs/databases/oracle.txt
+new file mode 100644
+index 0000000..41dd152
+--- /dev/null
++++ b/railties/configs/databases/oracle.txt
+@@ -0,0 +1,18 @@
++      # Oracle/OCI 8i, 9, 10g
++    #
++    # Requires Ruby/OCI8:
++    #  http://rubyforge.org/projects/ruby-oci8/
++    #
++    # Specify your database using any valid connection syntax, such as a
++    # tnsnames.ora service name, or a SQL connect url string of the form:
++    #
++    #   //host:[port][/service name]
++    #
++    # By default prefetch_rows (OCI_ATTR_PREFETCH_ROWS) is set to 100. And
++    # until true bind variables are supported, cursor_sharing is set by default
++    # to 'similar'. Both can be changed in the configation below; the defaults
++    # are equivalent to specifying:
++    #
++    #  prefetch_rows: 100
++    #  cursor_sharing: similar
++    #
+\ No newline at end of file
+diff --git a/railties/configs/databases/oracle.yml b/railties/configs/databases/oracle.yml
+deleted file mode 100644
+index a1883f6..0000000
+--- a/railties/configs/databases/oracle.yml
++++ /dev/null
+@@ -1,39 +0,0 @@
+-# Oracle/OCI 8i, 9, 10g
+-#
+-# Requires Ruby/OCI8:
+-#  http://rubyforge.org/projects/ruby-oci8/
+-#
+-# Specify your database using any valid connection syntax, such as a
+-# tnsnames.ora service name, or a SQL connect url string of the form:
+-#
+-#   //host:[port][/service name]
+-#
+-# By default prefetch_rows (OCI_ATTR_PREFETCH_ROWS) is set to 100. And
+-# until true bind variables are supported, cursor_sharing is set by default
+-# to 'similar'. Both can be changed in the configation below; the defaults
+-# are equivalent to specifying:
+-#
+-#  prefetch_rows: 100
+-#  cursor_sharing: similar
+-#
+-
+-development:
+-  adapter: oracle
+-  database: <%= app_name %>_development
+-  username: <%= app_name %>
+-  password:
+-
+-# Warning: The database defined as "test" will be erased and
+-# re-generated from your development database when you run "rake".
+-# Do not set this db to the same as development or production.
+-test:
+-  adapter: oracle
+-  database: <%= app_name %>_test
+-  username: <%= app_name %>
+-  password:
+-
+-production:
+-  adapter: oracle
+-  database: <%= app_name %>_production
+-  username: <%= app_name %>
+-  password: 
+diff --git a/railties/configs/databases/postgresql.txt b/railties/configs/databases/postgresql.txt
+new file mode 100644
+index 0000000..c0b45bd
+--- /dev/null
++++ b/railties/configs/databases/postgresql.txt
+@@ -0,0 +1,25 @@
++      # PostgreSQL. Versions 7.4 and 8.x are supported.
++    #
++    # Install the ruby-postgres driver:
++    #   gem install ruby-postgres
++    # On Mac OS X:
++    #   gem install ruby-postgres -- --include=/usr/local/pgsql
++    # On Windows:
++    #   gem install ruby-postgres
++    #       Choose the win32 build.
++    #       Install PostgreSQL and put its /bin directory on your path.
++    #
++    # Connect on a TCP socket. Omitted by default since the client uses a
++    # domain socket that doesn't need configuration. Windows does not have
++    # domain sockets, so uncomment these lines.
++    #host: localhost
++    #port: 5432
++    #
++    # Schema search path. The server defaults to $user,public
++    #schema_search_path: myapp,sharedapp,public
++    #
++    # Minimum log levels, in increasing order:
++    #   debug5, debug4, debug3, debug2, debug1,
++    #   log, notice, warning, error, fatal, and panic
++    # The server defaults to notice.
++    #min_messages: warning
+\ No newline at end of file
+diff --git a/railties/configs/databases/postgresql.yml b/railties/configs/databases/postgresql.yml
+deleted file mode 100644
+index 36f6e5a..0000000
+--- a/railties/configs/databases/postgresql.yml
++++ /dev/null
+@@ -1,48 +0,0 @@
+-# PostgreSQL. Versions 7.4 and 8.x are supported.
+-#
+-# Install the ruby-postgres driver:
+-#   gem install ruby-postgres
+-# On Mac OS X:
+-#   gem install ruby-postgres -- --include=/usr/local/pgsql
+-# On Windows:
+-#   gem install ruby-postgres
+-#       Choose the win32 build.
+-#       Install PostgreSQL and put its /bin directory on your path.
+-development:
+-  adapter: postgresql
+-  encoding: unicode
+-  database: <%= app_name %>_development
+-  username: <%= app_name %>
+-  password:
+-
+-  # Connect on a TCP socket. Omitted by default since the client uses a
+-  # domain socket that doesn't need configuration. Windows does not have
+-  # domain sockets, so uncomment these lines.
+-  #host: localhost
+-  #port: 5432
+-
+-  # Schema search path. The server defaults to $user,public
+-  #schema_search_path: myapp,sharedapp,public
+-
+-  # Minimum log levels, in increasing order:
+-  #   debug5, debug4, debug3, debug2, debug1,
+-  #   log, notice, warning, error, fatal, and panic
+-  # The server defaults to notice.
+-  #min_messages: warning
+-
+-# Warning: The database defined as "test" will be erased and
+-# re-generated from your development database when you run "rake".
+-# Do not set this db to the same as development or production.
+-test:
+-  adapter: postgresql
+-  encoding: unicode
+-  database: <%= app_name %>_test
+-  username: <%= app_name %>
+-  password:
+-
+-production:
+-  adapter: postgresql
+-  encoding: unicode
+-  database: <%= app_name %>_production
+-  username: <%= app_name %>
+-  password:
+diff --git a/railties/configs/databases/sqlite2.txt b/railties/configs/databases/sqlite2.txt
+new file mode 100644
+index 0000000..6631628
+--- /dev/null
++++ b/railties/configs/databases/sqlite2.txt
+@@ -0,0 +1,2 @@
++      # SQLite version 2.x
++    #   gem install sqlite-ruby
+diff --git a/railties/configs/databases/sqlite2.yml b/railties/configs/databases/sqlite2.yml
+deleted file mode 100644
+index fc48bd6..0000000
+--- a/railties/configs/databases/sqlite2.yml
++++ /dev/null
+@@ -1,16 +0,0 @@
+-# SQLite version 2.x
+-#   gem install sqlite-ruby
+-development:
+-  adapter: sqlite
+-  database: db/development.sqlite2
+-
+-# Warning: The database defined as "test" will be erased and
+-# re-generated from your development database when you run "rake".
+-# Do not set this db to the same as development or production.
+-test:
+-  adapter: sqlite
+-  database: db/test.sqlite2
+-
+-production:
+-  adapter: sqlite
+-  database: db/production.sqlite2
+diff --git a/railties/configs/databases/sqlite3.txt b/railties/configs/databases/sqlite3.txt
+new file mode 100644
+index 0000000..2fdf770
+--- /dev/null
++++ b/railties/configs/databases/sqlite3.txt
+@@ -0,0 +1,2 @@
++      # SQLite version 3.x
++    #   gem install sqlite3-ruby (not necessary on OS X Leopard)
+\ No newline at end of file
+diff --git a/railties/configs/databases/sqlite3.yml b/railties/configs/databases/sqlite3.yml
+deleted file mode 100644
+index fff44a4..0000000
+--- a/railties/configs/databases/sqlite3.yml
++++ /dev/null
+@@ -1,19 +0,0 @@
+-# SQLite version 3.x
+-#   gem install sqlite3-ruby (not necessary on OS X Leopard)
+-development:
+-  adapter: sqlite3
+-  database: db/development.sqlite3
+-  timeout: 5000
+-
+-# Warning: The database defined as "test" will be erased and
+-# re-generated from your development database when you run "rake".
+-# Do not set this db to the same as development or production.
+-test:
+-  adapter: sqlite3
+-  database: db/test.sqlite3
+-  timeout: 5000
+-
+-production:
+-  adapter: sqlite3
+-  database: db/production.sqlite3
+-  timeout: 5000
+diff --git a/railties/lib/rails_generator/generators/applications/app/app_generator.rb b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+index 34a7d95..d790434 100644
+--- a/railties/lib/rails_generator/generators/applications/app/app_generator.rb
++++ b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+@@ -129,8 +129,7 @@ class AppGenerator < Rails::Generator::Base
+     end
+     
+     def database_environment_for(db)
+-      # header = File.read("#{RAILS_ROOT}/configs/databases/#{db}.txt")
+-      header = '# TODO: add the adapter-specific header'
++      header = header_for(db)
+       config = {:username => 'root', 
+                 :password => '', 
+                 :adapter => db}
+@@ -150,10 +149,14 @@ class AppGenerator < Rails::Generator::Base
+         database = lambda { |app, env| "db/#{env}.sqlite3" }
+         config.delete(:username)
+         config.delete(:password)
+-        config
++        {:timeout => 5000}.merge(config)
+       end
+       {:header => header.lstrip, :config => config, :database => database}
+     end
++    
++    def header_for(db)
++      File.read(source_path("configs/databases/#{db}.txt"))
++    end
+ 
+ 
+   # Installation skeleton.  Intermediate directories are automatically
+-- 
+1.5.4.4
+
+
+From 00e3fc52fbbe3a86cae1775948c92ddeb60b5637 Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Sun, 8 Jun 2008 11:01:21 -0500
+Subject: [PATCH] Hang AR configuration off config.active_record.connection
+
+* Added connection method off ActiveRecordOptions
+* Added docs to classes that might pop up in a stack trace
+* Moved check for Rails into AR::Base.configure
+* Remove ActiveRecord::Configuration::DatabaseEnvironment and tests
+---
+ activerecord/lib/active_record.rb                  |    1 -
+ .../lib/active_record/configuration/credentials.rb |   20 ++++++++-
+ .../configuration/database_environment.rb          |   23 ----------
+ .../active_record/configuration/database_spec.rb   |   15 ++++--
+ .../abstract/connection_specification.rb           |    7 ++-
+ activerecord/test/cases/configuration_test.rb      |   44 --------------------
+ railties/lib/initializer.rb                        |    8 +++-
+ 7 files changed, 39 insertions(+), 79 deletions(-)
+ delete mode 100644 activerecord/lib/active_record/configuration/database_environment.rb
+
+diff --git a/activerecord/lib/active_record.rb b/activerecord/lib/active_record.rb
+index be20daf..222db6d 100755
+--- a/activerecord/lib/active_record.rb
++++ b/activerecord/lib/active_record.rb
+@@ -57,7 +57,6 @@ require 'active_record/serialization'
+ require 'active_record/attribute_methods'
+ require 'active_record/dirty'
+ require 'active_record/configuration/database_spec'
+-require 'active_record/configuration/database_environment'
+ require 'active_record/configuration/credentials'
+ 
+ ActiveRecord::Base.class_eval do
+diff --git a/activerecord/lib/active_record/configuration/credentials.rb b/activerecord/lib/active_record/configuration/credentials.rb
+index a5c29fb..3cf4ec7 100644
+--- a/activerecord/lib/active_record/configuration/credentials.rb
++++ b/activerecord/lib/active_record/configuration/credentials.rb
+@@ -1,5 +1,21 @@
+ module ActiveRecord
+   module Configuration
++    
++    # Reads username and password info out of a file. Recognizes YAML and 
++    # Ruby-encoded files.
++    #
++    # YAML credential files should look like this:
++    # <tt>
++    # username: 'database_user'
++    # password: 'database_password'
++    # </tt>
++    #
++    # Ruby credential files should assign to +username+ and +password+:
++    # <tt>
++    # username = 'database_user'
++    # password = 'database_password'
++    # </tt>
++    #
+     class Credentials
+       
+       attr_reader :filename
+@@ -7,7 +23,7 @@ module ActiveRecord
+         @filename = filename
+       end
+       
+-      def validate!
++      def validate! #:nodoc:
+         unless File.exists?(filename)
+           raise "Credentials file #{filename} not found"
+         end
+@@ -17,7 +33,7 @@ module ActiveRecord
+         end
+       end
+       
+-      def extract
++      def extract #:nodoc:
+         validate!
+         case File.extname(filename)
+         when '.yml'
+diff --git a/activerecord/lib/active_record/configuration/database_environment.rb b/activerecord/lib/active_record/configuration/database_environment.rb
+deleted file mode 100644
+index a22d26d..0000000
+--- a/activerecord/lib/active_record/configuration/database_environment.rb
++++ /dev/null
+@@ -1,23 +0,0 @@
+-module ActiveRecord
+-  module Configuration
+-    class DatabaseEnvironment
+-      
+-      attr_reader :db_specs
+-      
+-      def initialize
+-        @db_specs = Hash.new { |hash, key| hash[key] = DatabaseSpec.new }
+-      end
+-      
+-      def method_missing(env, *args, &block)
+-        yield db_specs[env.to_s]
+-      end
+-      
+-      def specs
+-        db_specs.inject({}) do |acc, env_spec|
+-          acc.update(env_spec.first => env_spec.last.spec)
+-        end
+-      end
+-      
+-    end
+-  end
+-end
+\ No newline at end of file
+diff --git a/activerecord/lib/active_record/configuration/database_spec.rb b/activerecord/lib/active_record/configuration/database_spec.rb
+index 80702ae..9014890 100644
+--- a/activerecord/lib/active_record/configuration/database_spec.rb
++++ b/activerecord/lib/active_record/configuration/database_spec.rb
+@@ -1,5 +1,8 @@
+ module ActiveRecord
+   module Configuration
++    
++    # Generates a connection specifier in the format 
++    # ActiveRecord::Base.establish_connection expects.
+     class DatabaseSpec
+       attr_reader :spec
+       
+@@ -7,27 +10,29 @@ module ActiveRecord
+         @spec = {}
+       end
+       
+-      def username=(value)
+-        if const_defined?(Rails) && Rails.env.production?
++      def username=(value) #:nodoc:
++        if Rails.env.production?
+           raise "You cannot set username directly in production. Use a credentials file instead."
+         else
+           spec['username'] = value
+         end
+       end
+       
+-      def password=(value)
+-        if const_defined?(Rails) && Rails.env.production?
++      def password=(value) #:nodoc:
++        if Rails.env.production?
+           raise "You cannot set password directly in production. Use a credentials file instead."
+         else
+           spec['password'] = value
+         end
+       end
+       
++      # Set the path to load credentials from. Credentials should recognize
++      # the file type.
+       def credentials=(path)
+         spec['username'], spec['password'] = Credentials.new(path).extract
+       end
+       
+-      def method_missing(meth, *values, &block)
++      def method_missing(meth, *values, &block) #:nodoc:
+         spec[name_for(meth)] = values.first
+       end
+       
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+index d8febe3..e00a32d 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_specification.rb
+@@ -125,9 +125,10 @@ module ActiveRecord
+       
+       # Set the database configuration
+       def configure(&block)
+-        env = ActiveRecord::Configuration::DatabaseEnvironment.new
+-        yield env
+-        @@configurations = env.specs
++        raise "Only use configure inside of Rails" unless Object.const_defined?(:Rails)
++        spec = ActiveRecord::Configuration::DatabaseSpec.new
++        yield spec
++        @@configurations[Rails.env] = spec.spec
+       end
+       
+       private
+diff --git a/activerecord/test/cases/configuration_test.rb b/activerecord/test/cases/configuration_test.rb
+index 28beeb3..7edf427 100644
+--- a/activerecord/test/cases/configuration_test.rb
++++ b/activerecord/test/cases/configuration_test.rb
+@@ -40,50 +40,6 @@ class ConfigurationTest < Test::Unit::TestCase
+     assert_equal :foo, db_spec.send(:name_for, 'foo=')
+   end
+   
+-  def test_generate_multiple_environments
+-        
+-    env = ActiveRecord::Configuration::DatabaseEnvironment.new
+-    env.development do |setup|
+-      setup.adapter  = @spec['development'][:adapter]
+-      setup.database = @spec['development'][:database]
+-      setup.timeout  = @spec['development'][:timeout]
+-    end
+-    env.test do |setup|
+-      setup.adapter  = @spec['test'][:adapter]
+-      setup.database = @spec['test'][:database]
+-      setup.timeout  = @spec['test'][:timeout]
+-    end
+-    env.production do |setup|
+-      setup.adapter  = @spec['production'][:adapter]
+-      setup.database = @spec['production'][:database]
+-      setup.timeout  = @spec['production'][:timeout]
+-    end
+-    
+-    assert_equal @spec, env.specs
+-  end
+-  
+-  def test_generate_from_partial_specifications
+-    spec = {'development' => @spec['development'], 'test' => @spec['test']}
+-    
+-    env = ActiveRecord::Configuration::DatabaseEnvironment.new
+-    env.development do |setup|
+-      setup.adapter  = spec['development'][:adapter]
+-    end
+-    env.development do |setup|
+-      setup.database = spec['development'][:database]
+-      setup.timeout  = spec['development'][:timeout]
+-    end
+-    env.test do |setup|
+-      setup.adapter  = spec['test'][:adapter]
+-      setup.database = spec['test'][:database]
+-    end
+-    env.test do |setup|
+-      setup.timeout  = spec['test'][:timeout]
+-    end
+-    
+-    assert_equal spec, env.specs
+-  end
+-  
+   def test_configuration
+     ActiveRecord::Base.configure do |db|
+       db.development do |setup|
+diff --git a/railties/lib/initializer.rb b/railties/lib/initializer.rb
+index 2059072..c49bd92 100644
+--- a/railties/lib/initializer.rb
++++ b/railties/lib/initializer.rb
+@@ -910,13 +910,19 @@ class Rails::OrderedOptions < Array #:nodoc:
+     end
+ end
+ 
+-class Rails::ActiveRecordOptions < Rails::OrderedOptions
++class Rails::ActiveRecordOptions < Rails::OrderedOptions #:nodoc:
+   
+   def initialize
+     @connectors = []
+     super
+   end
+   
++  def connection
++    # Returning self so that you can chain connection.configure is
++    # somewhat ugly, but at least it doesn't introduce another class
++    self
++  end
++  
+   def configure(&block)
+     @connectors << block
+   end
+-- 
+1.5.4.4
+
+
+From e6d1e045b4ada0db05f169ed05346c42428b3b53 Mon Sep 17 00:00:00 2001
+From: Adam Keys <adam@therealadam.com>
+Date: Sun, 8 Jun 2008 11:46:50 -0500
+Subject: [PATCH] Generate a DRYer app skeleton
+
+* Move environment-specific AR configuration into environment files
+* Properly quote adapter and database names
+---
+ railties/environments/development.rb               |    9 ++++-
+ railties/environments/environment.rb               |   40 ++------------------
+ railties/environments/production.rb                |   14 +++++++
+ railties/environments/test.rb                      |    9 ++++
+ .../generators/applications/app/app_generator.rb   |   20 +++------
+ 5 files changed, 42 insertions(+), 50 deletions(-)
+
+diff --git a/railties/environments/development.rb b/railties/environments/development.rb
+index 85c9a60..a97883c 100644
+--- a/railties/environments/development.rb
++++ b/railties/environments/development.rb
+@@ -14,4 +14,11 @@ config.action_view.debug_rjs                         = true
+ config.action_controller.perform_caching             = false
+ 
+ # Don't care if the mailer can't send
+-config.action_mailer.raise_delivery_errors = false
+\ No newline at end of file
++config.action_mailer.raise_delivery_errors = false
++
++# Development database settings
++config.active_record.connection.configure do |db|
++  db.username = 'root'
++  db.password = ''
++  db.database = <%= database[app_name, 'development'] %>
++end
+\ No newline at end of file
+diff --git a/railties/environments/environment.rb b/railties/environments/environment.rb
+index 66aaa2e..4ada0d5 100644
+--- a/railties/environments/environment.rb
++++ b/railties/environments/environment.rb
+@@ -71,42 +71,10 @@ Rails::Initializer.run do |config|
+   config.active_record.configure do |db|
+     
+     <%= header %>
+-    db.development do |setup|
+-    <%- config.each do |key, value| -%>
+-      setup.<%= key %> = <%= value %>
+-    <%- end -%>
+-      setup.database = <%= database[app_name, 'development'] %>
+-    end
++  <%- config.each do |key, value| -%>
++    db.<%= key %> = <%= value %>
++  <%- end -%>
++    db.database = <%= database[app_name, 'development'] %>
+     
+-    # Warning: The database defined as "test" will be erased and
+-    # re-generated from your development database when you run "rake".
+-    # Do not set this db to the same as development or production.
+-    db.test do |setup|
+-    <%- config.each do |key, value| -%>
+-      setup.<%= key %> = <%= value %>
+-    <%- end -%>
+-      setup.database = <%= database[app_name, 'test'] %>
+-    end
+-    
+-    # You cannot specify the username and password for your database directly
+-    # here. You need to add those details to a credentials file that looks
+-    # like this:
+-    #
+-    #  username = 'root'
+-    #  password = ''
+-    #
+-    # Specify the path to your credentials file below. For more info see 
+-    # http://rubyonrails.org/awesome_credentials_docs
+-    db.production do |setup|
+-    <%-
+-      production_config = config.dup
+-      [:username, :password].each { |key| production_config.delete(key) }
+-      production_config[:credentials] = '"/path/to/your/credentials.rb"'
+-    -%>
+-    <%- production_config.each do |key, value| -%>
+-      setup.<%= key %> = <%= value %>
+-    <%- end -%>
+-      setup.database = <%= database[app_name, 'production'] %>
+-    end
+   end
+ end
+diff --git a/railties/environments/production.rb b/railties/environments/production.rb
+index 69c8b9e..f53f609 100644
+--- a/railties/environments/production.rb
++++ b/railties/environments/production.rb
+@@ -20,3 +20,17 @@ config.action_view.cache_template_loading            = true
+ 
+ # Disable delivery errors, bad email addresses will be ignored
+ # config.action_mailer.raise_delivery_errors = false
++
++# You cannot specify the username and password for your database directly
++# here. You need to add those details to a credentials file that looks
++# like this:
++#
++#  username = 'root'
++#  password = ''
++#
++# Specify the path to your credentials file below. For more info see 
++# http://rubyonrails.org/awesome_credentials_docs
++config.active_record.connection.configure do |db|
++  db.database = <%= database[app_name, 'production'] %>
++  db.credentials = '/path/to/your/credentials.rb'
++end
+diff --git a/railties/environments/test.rb b/railties/environments/test.rb
+index 1e709e1..5ce2b6c 100644
+--- a/railties/environments/test.rb
++++ b/railties/environments/test.rb
+@@ -20,3 +20,12 @@ config.action_controller.allow_forgery_protection    = false
+ # The :test delivery method accumulates sent emails in the
+ # ActionMailer::Base.deliveries array.
+ config.action_mailer.delivery_method = :test
++
++# Warning: The database defined as "test" will be erased and
++# re-generated from your development database when you run "rake".
++# Do not set this db to the same as development or production.
++config.active_record.connection.configure do |db|
++  db.username = 'root'
++  db.password = ''
++  db.database = <%= database[app_name, 'test'] %>
++end
+\ No newline at end of file
+diff --git a/railties/lib/rails_generator/generators/applications/app/app_generator.rb b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+index d790434..c679843 100644
+--- a/railties/lib/rails_generator/generators/applications/app/app_generator.rb
++++ b/railties/lib/rails_generator/generators/applications/app/app_generator.rb
+@@ -63,9 +63,9 @@ class AppGenerator < Rails::Generator::Base
+       # Environments
+       m.file "environments/boot.rb",    "config/boot.rb"
+       m.template "environments/environment.rb", "config/environment.rb", :assigns => { :freeze => options[:freeze], :app_name => @app_name, :app_secret => secret }.merge(database_environment_for(options[:db]))
+-      m.file "environments/production.rb",  "config/environments/production.rb"
+-      m.file "environments/development.rb", "config/environments/development.rb"
+-      m.file "environments/test.rb",        "config/environments/test.rb"
++      m.template "environments/production.rb",  "config/environments/production.rb", :assigns => {:app_name => @app_name}.merge(database_environment_for(options[:db]))
++      m.template "environments/development.rb", "config/environments/development.rb",  :assigns => {:app_name => @app_name}.merge(database_environment_for(options[:db]))
++      m.template "environments/test.rb",        "config/environments/test.rb",  :assigns => {:app_name => @app_name}.merge(database_environment_for(options[:db]))
+ 
+       # Scripts
+       %w( about console dbconsole destroy generate performance/benchmarker performance/profiler performance/request process/reaper process/spawner process/inspector runner server plugin ).each do |file|
+@@ -130,10 +130,8 @@ class AppGenerator < Rails::Generator::Base
+     
+     def database_environment_for(db)
+       header = header_for(db)
+-      config = {:username => 'root', 
+-                :password => '', 
+-                :adapter => db}
+-      database = lambda { |app, env| "#{app}_#{env}" }
++      config = {:adapter => "'#{db}'"}
++      database = lambda { |app, env| "'#{app}_#{env}'" }
+       config = case db
+       when 'mysql'
+         {:encoding => 'utf8', 
+@@ -141,14 +139,10 @@ class AppGenerator < Rails::Generator::Base
+       when 'postgresql'
+         {:encoding => 'unicode'}.merge(config)
+       when 'sqlite2'
+-        database = lambda { |app, env| "db/#{env}.sqlite2" }
+-        config.delete(:username)
+-        config.delete(:password)
++        database = lambda { |app, env| "'db/#{env}.sqlite2'" }
+         config
+       when 'sqlite3'
+-        database = lambda { |app, env| "db/#{env}.sqlite3" }
+-        config.delete(:username)
+-        config.delete(:password)
++        database = lambda { |app, env| "'db/#{env}.sqlite3'" }
+         {:timeout => 5000}.merge(config)
+       end
+       {:header => header.lstrip, :config => config, :database => database}
+-- 
+1.5.4.4
+

@@ -1,0 +1,294 @@
+From 8846bf5a6a264f0aabe5cfa311cde87210c9005e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=C3=89tienne=20Barri=C3=A9?= <etienne.barrie@gmail.com>
+Date: Sun, 16 May 2010 18:50:25 +0200
+Subject: [PATCH] make add_index and remove_index more resilient; new rename_index method; track database limits
+
+---
+ .../abstract/database_limits.rb                    |   57 ++++++++++++++++++++
+ .../abstract/schema_statements.rb                  |   45 +++++++++++++--
+ .../connection_adapters/abstract_adapter.rb        |    2 +
+ .../connection_adapters/postgresql_adapter.rb      |    5 +-
+ .../connection_adapters/sqlite_adapter.rb          |    4 +-
+ .../test/cases/active_schema_test_mysql.rb         |    5 ++
+ activerecord/test/cases/migration_test.rb          |   31 +++++++++++
+ activerecord/test/cases/schema_test_postgresql.rb  |    4 +-
+ 8 files changed, 140 insertions(+), 13 deletions(-)
+ create mode 100644 activerecord/lib/active_record/connection_adapters/abstract/database_limits.rb
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/database_limits.rb b/activerecord/lib/active_record/connection_adapters/abstract/database_limits.rb
+new file mode 100644
+index 0000000..4118ea7
+--- /dev/null
++++ b/activerecord/lib/active_record/connection_adapters/abstract/database_limits.rb
+@@ -0,0 +1,57 @@
++module ActiveRecord
++  module ConnectionAdapters # :nodoc:
++    module DatabaseLimits
++
++      # the maximum length of a table alias
++      def table_alias_length
++        255
++      end
++
++      # the maximum length of a column name
++      def column_name_length
++        64
++      end
++
++      # the maximum length of a table name
++      def table_name_length
++        64
++      end
++
++      # the maximum length of an index name
++      def index_name_length
++        64
++      end
++
++      # the maximum number of columns per table
++      def columns_per_table
++        1024
++      end
++
++      # the maximum number of indexes per table
++      def indexes_per_table
++        16
++      end
++
++      # the maximum number of columns in a multicolumn index
++      def columns_per_multicolumn_index
++        16
++      end
++
++      # the maximum number of elements in an IN (x,y,z) clause
++      def in_clause_length
++        65535
++      end
++
++      # the maximum length of a SQL query
++      def sql_query_length
++        1048575
++      end
++
++      # maximum number of joins in a single query
++      def joins_per_query
++        256
++      end
++
++    end
++  end
++end
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+index 211cd7e..4fa5881 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/schema_statements.rb
+@@ -8,11 +8,6 @@ module ActiveRecord
+         {}
+       end
+ 
+-      # This is the maximum length a table alias can be
+-      def table_alias_length
+-        255
+-      end
+-
+       # Truncates a table alias according to the limits of the current adapter.
+       def table_alias_for(table_name)
+         table_name[0..table_alias_length-1].gsub(/\./, '_')
+@@ -283,6 +278,14 @@ module ActiveRecord
+           index_type = options
+         end
+ 
++        if index_name.length > index_name_length
++          @logger.warn("Index name '#{index_name}' on table '#{table_name}' is too long; the limit is #{index_name_length} characters. Skipping.")
++          return
++        end
++        if index_exists?(table_name, index_name, false)
++          @logger.warn("Index name '#{index_name}' on table '#{table_name}' already exists. Skipping.")
++          return
++        end
+         quoted_column_names = quoted_columns_for_index(column_names, options).join(", ")
+ 
+         execute "CREATE #{index_type} INDEX #{quote_column_name(index_name)} ON #{quote_table_name(table_name)} (#{quoted_column_names})"
+@@ -299,7 +302,28 @@ module ActiveRecord
+       # Remove the index named by_branch_party in the accounts table.
+       #   remove_index :accounts, :name => :by_branch_party
+       def remove_index(table_name, options = {})
+-        execute "DROP INDEX #{quote_column_name(index_name(table_name, options))} ON #{quote_table_name(table_name)}"
++        index_name = index_name(table_name, options)
++        unless index_exists?(table_name, index_name, true)
++          @logger.warn("Index name '#{index_name}' on table '#{table_name}' does not exist. Skipping.")
++          return
++        end
++        remove_index!(table_name, index_name)
++      end
++
++      def remove_index!(table_name, index_name) #:nodoc:
++        execute "DROP INDEX #{quote_column_name(index_name)} ON #{table_name}"
++      end
++
++      # Rename an index.
++      #
++      # Rename the index_people_on_last_name index to index_users_on_last_name
++      #   rename_index :people, 'index_people_on_last_name', 'index_users_on_last_name'
++      def rename_index(table_name, old_name, new_name)
++        # this is a naive implementation; some DBs may support this more efficiently (Postgres, for instance)
++        old_index_def = indexes(table_name).detect { |i| i.name == old_name }
++        return unless old_index_def
++        remove_index(table_name, :name => old_name)
++        add_index(table_name, old_index_def.columns, :name => new_name, :unique => old_index_def.unique)
+       end
+ 
+       def index_name(table_name, options) #:nodoc:
+@@ -316,6 +340,15 @@ module ActiveRecord
+         end
+       end
+ 
++      # Verify the existence of an index.
++      #
++      # The default argument is returned if the underlying implementation does not define the indexes method,
++      # as there's no way to determine the correct answer in that case.
++      def index_exists?(table_name, index_name, default)
++        return default unless respond_to?(:indexes)
++        indexes(table_name).detect { |i| i.name == index_name }
++      end
++
+       # Returns a string of <tt>CREATE TABLE</tt> SQL statement(s) for recreating the
+       # entire structure of the database.
+       def structure_dump
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index 22871f2..b225776 100755
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -11,6 +11,7 @@ require 'active_record/connection_adapters/abstract/quoting'
+ require 'active_record/connection_adapters/abstract/connection_pool'
+ require 'active_record/connection_adapters/abstract/connection_specification'
+ require 'active_record/connection_adapters/abstract/query_cache'
++require 'active_record/connection_adapters/abstract/database_limits'
+ 
+ module ActiveRecord
+   module ConnectionAdapters # :nodoc:
+@@ -29,6 +30,7 @@ module ActiveRecord
+     # notably, the instance methods provided by SchemaStatement are very useful.
+     class AbstractAdapter
+       include Quoting, DatabaseStatements, SchemaStatements
++      include DatabaseLimits
+       include QueryCache
+       include ActiveSupport::Callbacks
+       define_callbacks :checkout, :checkin
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 87b2ef6..1dd37b8 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -859,9 +859,8 @@ module ActiveRecord
+         execute "ALTER TABLE #{quote_table_name(table_name)} RENAME COLUMN #{quote_column_name(column_name)} TO #{quote_column_name(new_column_name)}"
+       end
+ 
+-      # Drops an index from a table.
+-      def remove_index(table_name, options = {})
+-        execute "DROP INDEX #{quote_table_name(index_name(table_name, options))}"
++      def remove_index!(table_name, index_name) #:nodoc:
++        execute "DROP INDEX #{quote_table_name(index_name)}"
+       end
+ 
+       # Maps logical Rails types to PostgreSQL-specific data types.
+diff --git a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+index 0bf97a9..f82e5bf 100644
+--- a/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/sqlite_adapter.rb
+@@ -244,8 +244,8 @@ module ActiveRecord
+         column ? column['name'] : nil
+       end
+ 
+-      def remove_index(table_name, options={}) #:nodoc:
+-        execute "DROP INDEX #{quote_column_name(index_name(table_name, options))}"
++      def remove_index!(table_name, index_name) #:nodoc:
++        execute "DROP INDEX #{quote_column_name(index_name)}"
+       end
+ 
+       def rename_table(name, new_name)
+diff --git a/activerecord/test/cases/active_schema_test_mysql.rb b/activerecord/test/cases/active_schema_test_mysql.rb
+index f4d123b..3526f49 100644
+--- a/activerecord/test/cases/active_schema_test_mysql.rb
++++ b/activerecord/test/cases/active_schema_test_mysql.rb
+@@ -16,6 +16,10 @@ class ActiveSchemaTest < ActiveRecord::TestCase
+   end
+ 
+   def test_add_index
++    # add_index calls index_exists? which can't work since execute is stubbed
++    ActiveRecord::ConnectionAdapters::MysqlAdapter.send(:define_method, :index_exists?) do |*|
++      false
++    end
+     expected = "CREATE  INDEX `index_people_on_last_name` ON `people` (`last_name`)"
+     assert_equal expected, add_index(:people, :last_name, :length => nil)
+ 
+@@ -30,6 +34,7 @@ class ActiveSchemaTest < ActiveRecord::TestCase
+ 
+     expected = "CREATE  INDEX `index_people_on_last_name_and_first_name` ON `people` (`last_name`(15), `first_name`(10))"
+     assert_equal expected, add_index(:people, [:last_name, :first_name], :length => {:last_name => 15, :first_name => 10})
++    ActiveRecord::ConnectionAdapters::MysqlAdapter.send(:remove_method, :index_exists?)
+   end
+ 
+   def test_drop_table
+diff --git a/activerecord/test/cases/migration_test.rb b/activerecord/test/cases/migration_test.rb
+index 299e72e..ab288b0 100644
+--- a/activerecord/test/cases/migration_test.rb
++++ b/activerecord/test/cases/migration_test.rb
+@@ -119,6 +119,37 @@ if ActiveRecord::Base.connection.supports_migrations?
+       end
+     end
+ 
++    def test_add_index_length_limit
++      too_long_index_name = 'index' * 13
++      assert_nothing_raised { Person.connection.add_index("people", "first_name", :name => too_long_index_name) }
++      assert !Person.connection.index_exists?("people", too_long_index_name, false)
++    end
++
++    def test_remove_nonexistent_index
++      # we do this by name, so OpenBase is a wash as noted above
++      unless current_adapter?(:OpenBaseAdapter)
++        assert_nothing_raised { Person.connection.remove_index("people", "no_such_index") }
++      end
++    end
++
++    def test_rename_index
++      unless current_adapter?(:OpenBaseAdapter)
++        # keep the names short to make Oracle and similar behave
++        Person.connection.add_index('people', [:first_name], :name => 'old_idx')
++        assert_nothing_raised { Person.connection.rename_index('people', 'old_idx', 'new_idx') }
++        # if the adapter doesn't support the indexes call, pick defaults that let the test pass
++        assert !Person.connection.index_exists?('people', 'old_idx', false)
++        assert Person.connection.index_exists?('people', 'new_idx', true)
++      end
++    end
++
++    def test_double_add_index
++      unless current_adapter?(:OpenBaseAdapter)
++        Person.connection.add_index('people', [:first_name], :name => 'some_idx')
++        assert_nothing_raised { Person.connection.add_index('people', [:first_name], :name => 'some_idx') }
++      end
++    end
++
+     def testing_table_with_only_foo_attribute
+       Person.connection.create_table :testings, :id => false do |t|
+         t.column :foo, :string
+diff --git a/activerecord/test/cases/schema_test_postgresql.rb b/activerecord/test/cases/schema_test_postgresql.rb
+index a294848..96d325b 100644
+--- a/activerecord/test/cases/schema_test_postgresql.rb
++++ b/activerecord/test/cases/schema_test_postgresql.rb
+@@ -137,11 +137,11 @@ class SchemaTest < ActiveRecord::TestCase
+ 
+   def test_with_uppercase_index_name
+     ActiveRecord::Base.connection.execute "CREATE INDEX \"things_Index\" ON #{SCHEMA_NAME}.things (name)"
+-    assert_nothing_raised { ActiveRecord::Base.connection.remove_index :things, :name => "#{SCHEMA_NAME}.things_Index"}
++    assert_nothing_raised { ActiveRecord::Base.connection.remove_index! "things", "#{SCHEMA_NAME}.things_Index"}
+ 
+     ActiveRecord::Base.connection.execute "CREATE INDEX \"things_Index\" ON #{SCHEMA_NAME}.things (name)"
+     ActiveRecord::Base.connection.schema_search_path = SCHEMA_NAME
+-    assert_nothing_raised { ActiveRecord::Base.connection.remove_index :things, :name => "things_Index"}
++    assert_nothing_raised { ActiveRecord::Base.connection.remove_index! "things", "things_Index"}
+     ActiveRecord::Base.connection.schema_search_path = "public"
+   end
+ 
+-- 
+1.7.1
+

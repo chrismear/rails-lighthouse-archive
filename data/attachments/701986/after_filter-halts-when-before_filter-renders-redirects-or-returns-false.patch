@@ -1,0 +1,198 @@
+From d67840a4087d2448bb630d5d6c861573a72c0dee Mon Sep 17 00:00:00 2001
+From: Marcelo Giorgi <marklazz.uy@gmail.com>
+Date: Sun, 3 Oct 2010 00:25:36 -0300
+Subject: [PATCH] Make after_filter halt when before_filter render, redirects or returns false [#5648 state:resolved]
+
+---
+ actionpack/lib/abstract_controller/callbacks.rb |    2 +-
+ actionpack/test/controller/filters_test.rb      |   55 +++++++++++++++++++++++
+ activesupport/lib/active_support/callbacks.rb   |    8 +++-
+ activesupport/test/callbacks_test.rb            |   53 ++++++++++++++++++++++
+ 4 files changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/actionpack/lib/abstract_controller/callbacks.rb b/actionpack/lib/abstract_controller/callbacks.rb
+index 7b0d806..72ef3fa 100644
+--- a/actionpack/lib/abstract_controller/callbacks.rb
++++ b/actionpack/lib/abstract_controller/callbacks.rb
+@@ -8,7 +8,7 @@ module AbstractController
+     include ActiveSupport::Callbacks
+ 
+     included do
+-      define_callbacks :process_action, :terminator => "response_body"
++      define_callbacks :process_action, :terminator => "response_body || result == false", :skip_after_when_halted => true
+     end
+ 
+     # Override AbstractController::Base's process_action to run the
+diff --git a/actionpack/test/controller/filters_test.rb b/actionpack/test/controller/filters_test.rb
+index dfc9094..523b00b 100644
+--- a/actionpack/test/controller/filters_test.rb
++++ b/actionpack/test/controller/filters_test.rb
+@@ -91,6 +91,49 @@ class FilterTest < ActionController::TestCase
+       end
+   end
+ 
++  class BeforeFilterRenderingController < ActionController::Base
++    before_filter :before_filter_rendering
++    after_filter :unreached_after_filter
++
++    def show
++      @ran_action = true
++      render :inline => "ran action"
++    end
++
++    private
++      def before_filter_rendering
++        @ran_filter ||= []
++        @ran_filter << "before_filter_rendering"
++        render :inline => "something else"
++      end
++
++      def unreached_after_filter
++        @ran_filter << "unreached_after_filter"
++      end
++  end
++
++  class BeforeFilterReturnsFalseController < ActionController::Base
++    before_filter :before_filter_returns_false
++    after_filter :unreached_after_filter
++
++    def show
++      @ran_action = true
++      render :inline => "ran action"
++    end
++
++    private
++      def before_filter_returns_false
++        @ran_filter ||= []
++        @ran_filter << "before_filter_returns_false"
++        false
++      end
++
++      def unreached_after_filter
++        @ran_filter << "unreached_after_filter"
++      end
++  end
++
++
+   class ConditionalFilterController < ActionController::Base
+     def show
+       render :inline => "ran action"
+@@ -625,6 +668,18 @@ class FilterTest < ActionController::TestCase
+     assert !assigns["ran_action"]
+   end
+ 
++  def test_before_filter_rendering_breaks_filtering_chain
++    response = test_process(BeforeFilterRenderingController)
++    assert_equal %w( before_filter_rendering ), assigns["ran_filter"]
++    assert !assigns["ran_action"]
++  end
++
++  def test_before_filter_returns_false_then_it_breaks_filtering_chain
++    response = test_process(BeforeFilterReturnsFalseController)
++    assert_equal %w( before_filter_returns_false ), assigns["ran_filter"]
++    assert !assigns["ran_action"]
++  end
++
+   def test_filters_with_mixed_specialization_run_in_order
+     assert_nothing_raised do
+       response = test_process(MixedSpecializationController, 'bar')
+diff --git a/activesupport/lib/active_support/callbacks.rb b/activesupport/lib/active_support/callbacks.rb
+index 0c1d46c..9469a8d 100644
+--- a/activesupport/lib/active_support/callbacks.rb
++++ b/activesupport/lib/active_support/callbacks.rb
+@@ -234,7 +234,12 @@ module ActiveSupport
+           #   filter_name
+           # end
+           if @kind == :after
+-            [@compiled_options[0], @filter, @compiled_options[1]].compact.join("\n")
++            [ @compiled_options[0], @filter, @compiled_options[1] ].tap do |after_code|
++                if chain.config[:skip_after_when_halted]
++                  after_code.unshift("unless (halted)")
++                  after_code.concat(["end"])
++                end
++            end.compact.join("\n")
+           else
+             "end"
+           end
+@@ -337,6 +342,7 @@ module ActiveSupport
+         @name = name
+         @config = {
+           :terminator => "false",
++          :skip_after_when_halted => false,
+           :rescuable => false,
+           :scope => [ :kind ]
+         }.merge(config)
+diff --git a/activesupport/test/callbacks_test.rb b/activesupport/test/callbacks_test.rb
+index 51b28b6..1d1b034 100644
+--- a/activesupport/test/callbacks_test.rb
++++ b/activesupport/test/callbacks_test.rb
+@@ -430,6 +430,45 @@ module CallbacksTest
+     end
+   end
+ 
++  class CallbackTerminatorSkipAfterWhenHalt
++    include ActiveSupport::Callbacks
++
++    define_callbacks :save, :terminator => "result == :halt", :skip_after_when_halted => true
++
++    set_callback :save, :before, :first
++    set_callback :save, :before, :second
++    set_callback :save, :around, :around_it
++    set_callback :save, :before, :third
++    set_callback :save, :after, :first
++    set_callback :save, :after, :second
++    set_callback :save, :after, :third
++
++
++    attr_reader :history, :saved
++    def initialize
++      @history = []
++    end
++
++    def first
++      @history << "first"
++    end
++
++    def second
++      @history << "second"
++      :halt
++    end
++
++    def third
++      @history << "third"
++    end
++
++    def save
++      run_callbacks :save do
++        @saved = true
++      end
++    end
++  end
++
+   class CallbackObject
+     def before(caller)
+       caller.record << "before"
+@@ -540,6 +579,20 @@ module CallbacksTest
+     end
+   end
+ 
++  class CallbackTerminatorSkipAfterWhenHaltTest < Test::Unit::TestCase
++    def test_termination
++      terminator = CallbackTerminatorSkipAfterWhenHalt.new
++      terminator.save
++      assert_equal ["first", "second"], terminator.history
++    end
++
++   def test_block_never_called_if_terminated
++      obj = CallbackTerminator.new
++      obj.save
++      assert !obj.saved
++    end
++  end
++
+   class HyphenatedKeyTest < Test::Unit::TestCase
+     def test_save
+       obj = HyphenatedCallbacks.new
+-- 
+1.7.0.4
+

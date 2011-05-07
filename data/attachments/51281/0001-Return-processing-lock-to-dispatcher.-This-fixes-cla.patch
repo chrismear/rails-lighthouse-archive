@@ -1,0 +1,85 @@
+From af597b37a628a7f24d0370457c97aa45785daf8a Mon Sep 17 00:00:00 2001
+From: Aliaksey Kandratsenka <alk@tut.by>
+Date: Thu, 2 Oct 2008 21:06:22 +0300
+Subject: [PATCH] Return processing lock to dispatcher. This fixes class reloading race in development mode.
+
+Without this fix class reloading is unguarded and our app easily hits this race.
+
+This commit also adds ActionController::Dispatcher#dispatch_unlocking -- non-locking version of dispatch.
+It's named anologously to POSIX {getc,getchar,...}_unlocked functions.
+
+This partially reverts commit 19db0b732458347b5237ac90865d62b3fd2157f1 "Added back ActionController::Base.allow_concurrency flag and moved lock down to controller processing."
+---
+ actionpack/lib/action_controller/base.rb       |    9 +--------
+ actionpack/lib/action_controller/dispatcher.rb |   14 +++++++++++++-
+ 2 files changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/actionpack/lib/action_controller/base.rb b/actionpack/lib/action_controller/base.rb
+index 976bd98..e99e828 100644
+--- a/actionpack/lib/action_controller/base.rb
++++ b/actionpack/lib/action_controller/base.rb
+@@ -290,8 +290,6 @@ module ActionController #:nodoc:
+     @@allow_concurrency = false
+     cattr_accessor :allow_concurrency
+ 
+-    @@guard = Monitor.new
+-
+     # Modern REST web services often need to submit complex data to the web application.
+     # The <tt>@@param_parsers</tt> hash lets you register handlers which will process the HTTP body and add parameters to the
+     # <tt>params</tt> hash. These handlers are invoked for POST and PUT requests.
+@@ -532,12 +530,7 @@ module ActionController #:nodoc:
+         assign_names
+ 
+         log_processing
+-
+-        if @@allow_concurrency
+-          send(method, *arguments)
+-        else
+-          @@guard.synchronize { send(method, *arguments) }
+-        end
++        send(method, *arguments)
+ 
+         send_response
+       ensure
+diff --git a/actionpack/lib/action_controller/dispatcher.rb b/actionpack/lib/action_controller/dispatcher.rb
+index 106d960..90c8400 100644
+--- a/actionpack/lib/action_controller/dispatcher.rb
++++ b/actionpack/lib/action_controller/dispatcher.rb
+@@ -2,6 +2,8 @@ module ActionController
+   # Dispatches requests to the appropriate controller and takes care of
+   # reloading the app after each request when Dependencies.load? is true.
+   class Dispatcher
++    @@guard = Mutex.new
++
+     class << self
+       def define_dispatcher_callbacks(cache_classes)
+         unless cache_classes
+@@ -99,7 +101,7 @@ module ActionController
+       @output, @request, @response = output, request, response
+     end
+ 
+-    def dispatch
++    def dispatch_unlocked
+       begin
+         run_callbacks :before_dispatch
+         handle_request
+@@ -110,6 +112,16 @@ module ActionController
+       end
+     end
+ 
++    def dispatch
++      if ActionController::Base.allow_concurrency
++        dispatch_unlocked
++      else
++        @@guard.synchronize do
++          dispatch_unlocked
++        end
++      end
++    end
++
+     def dispatch_cgi(cgi, session_options)
+       if cgi ||= self.class.failsafe_response(@output, '400 Bad Request') { CGI.new }
+         @request = CgiRequest.new(cgi, session_options)
+-- 
+1.5.6.5
+

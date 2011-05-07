@@ -1,0 +1,101 @@
+From 1844fc10315b3648d326e5a04b74b73c3d909781 Mon Sep 17 00:00:00 2001
+From: Steven Soroka <ssoroka78@gmail.com>
+Date: Mon, 30 Mar 2009 16:39:55 -0500
+Subject: [PATCH] fixes AssociationProxy#method_missing masking method_missing in models.  closes #2378. [Steven Soroka]
+
+---
+ .../associations/association_proxy.rb              |   20 ++++++++++++--------
+ activerecord/test/cases/associations_test.rb       |   15 ++++++++++++++-
+ activerecord/test/models/parrot.rb                 |   10 ++++++++++
+ 3 files changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations/association_proxy.rb b/activerecord/lib/active_record/associations/association_proxy.rb
+index 676c4ac..ce42040 100644
+--- a/activerecord/lib/active_record/associations/association_proxy.rb
++++ b/activerecord/lib/active_record/associations/association_proxy.rb
+@@ -210,16 +210,20 @@ module ActiveRecord
+         # Forwards any missing method call to the \target.
+         def method_missing(method, *args)
+           if load_target
+-            unless @target.respond_to?(method)
+-              message = "undefined method `#{method.to_s}' for \"#{@target}\":#{@target.class.to_s}"
++            message = "undefined method `#{method.to_s}' for \"#{@target}\":#{@target.class.to_s}"
++            begin
++              unless @target.private_methods.include?(method.to_s)
++                if block_given?
++                  @target.send(method, *args)  { |*block_args| yield(*block_args) }
++                else
++                  @target.send(method, *args)
++                end
++              else # method is private, pretend we don't know what you're talking about.
++                raise NoMethodError, message
++              end
++            rescue NoMethodError => e
+               raise NoMethodError, message
+             end
+-
+-            if block_given?
+-              @target.send(method, *args)  { |*block_args| yield(*block_args) }
+-            else
+-              @target.send(method, *args)
+-            end
+           end
+         end
+ 
+diff --git a/activerecord/test/cases/associations_test.rb b/activerecord/test/cases/associations_test.rb
+index 056a294..c2e5363 100644
+--- a/activerecord/test/cases/associations_test.rb
++++ b/activerecord/test/cases/associations_test.rb
+@@ -87,7 +87,8 @@ class AssociationsTest < ActiveRecord::TestCase
+ end
+ 
+ class AssociationProxyTest < ActiveRecord::TestCase
+-  fixtures :authors, :posts, :categorizations, :categories, :developers, :projects, :developers_projects
++  fixtures :authors, :posts, :categorizations, :categories, :developers, :projects, :developers_projects,
++    :pirates, :parrots, :parrots_pirates
+ 
+   def test_proxy_accessors
+     welcome = posts(:welcome)
+@@ -188,6 +189,18 @@ class AssociationProxyTest < ActiveRecord::TestCase
+       assert_equal david.projects, david.projects.reload.reload
+     end
+   end
++  
++  def test_method_missing_in_model_through_proxy
++    # assert it works without the association proxy
++    assert_nothing_raised do
++      assert_equal 'hi_my_name_is_polly', Parrot.new.say_hi_my_name_is_polly
++    end
++    # test with association proxy
++    pirate = pirates(:blackbeard)
++    assert_nothing_raised do
++      assert_equal 'hello', pirate.parrot.say_hello
++    end
++  end
+ 
+   def setup_dangling_association
+     josh = Author.create(:name => "Josh")
+diff --git a/activerecord/test/models/parrot.rb b/activerecord/test/models/parrot.rb
+index 4a7ed52..d70c729 100644
+--- a/activerecord/test/models/parrot.rb
++++ b/activerecord/test/models/parrot.rb
+@@ -6,6 +6,16 @@ class Parrot < ActiveRecord::Base
+   alias_attribute :title, :name
+ 
+   validates_presence_of :name
++
++  # if method starts with 'say_', return the rest as a string.
++  # this is a test for association proxies
++  def method_missing(m, *a, &b)
++    if m.to_s =~ /say_(.*)/
++      $1
++    else
++      super
++    end
++  end
+ end
+ 
+ class LiveParrot < Parrot
+-- 
+1.5.5
+

@@ -1,0 +1,113 @@
+From 00d2ceb513f8f7c69c9f35961b998c6d8cf46b24 Mon Sep 17 00:00:00 2001
+From: Matthijs Langenberg <mlangenberg@gmail.com>
+Date: Fri, 24 Sep 2010 22:37:26 +0200
+Subject: [PATCH] Fix broken module namespacing in ActiveResource with Ruby 1.9
+
+Following namespace use case was broken with Ruby 1.9:
+
+  class Author < ActiveRecord::Base
+    ...
+  end
+
+  module Api
+    class Book < ActiveResouce::Base
+    end
+  end
+
+Let's say XML contains <book><author><name>John</name></author>....
+
+  Api::Book.first.author.class.to_s #=>
+    Ruby 1.8.7: "Api::Book::Author" (namespaced, correct),
+    Ruby 1.9: "Author" (toplevel, broken)
+---
+ activeresource/lib/active_resource/base.rb |   10 ++++++----
+ activeresource/test/abstract_unit.rb       |    6 ++++++
+ activeresource/test/cases/base_test.rb     |    5 +++++
+ activeresource/test/fixtures/sound.rb      |    6 +++++-
+ 4 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/activeresource/lib/active_resource/base.rb b/activeresource/lib/active_resource/base.rb
+index d31db9f..72b7aef 100644
+--- a/activeresource/lib/active_resource/base.rb
++++ b/activeresource/lib/active_resource/base.rb
+@@ -1352,8 +1352,9 @@ module ActiveResource
+         namespaces = module_names[0, module_names.size-1].map do |module_name|
+           receiver = receiver.const_get(module_name)
+         end
+-        if namespace = namespaces.reverse.detect { |ns| ns.const_defined?(resource_name) }
+-          return namespace.const_get(resource_name)
++        const_args = RUBY_VERSION < "1.9" ? [resource_name] : [resource_name, false]
++        if namespace = namespaces.reverse.detect { |ns| ns.const_defined?(*const_args) }
++          return namespace.const_get(*const_args)
+         else
+           raise NameError
+         end
+@@ -1369,8 +1370,9 @@ module ActiveResource
+           self.class.const_get(resource_name)
+         end
+       rescue NameError
+-        if self.class.const_defined?(resource_name)
+-          resource = self.class.const_get(resource_name)
++        const_args = RUBY_VERSION < "1.9" ? [resource_name] : [resource_name, false]
++        if self.class.const_defined?(*const_args)
++          resource = self.class.const_get(*const_args)
+         else
+           resource = self.class.const_set(resource_name, Class.new(ActiveResource::Base))
+         end
+diff --git a/activeresource/test/abstract_unit.rb b/activeresource/test/abstract_unit.rb
+index 129efeb..4ce62f6 100644
+--- a/activeresource/test/abstract_unit.rb
++++ b/activeresource/test/abstract_unit.rb
+@@ -75,6 +75,10 @@ def setup_response
+     </person>
+   eof
+ 
++  @startup_sound = { 
++      :name => "Mac Startup Sound", :author => { :name => "Jim Reekes" } 
++    }.to_xml(:root => 'sound') 
++
+   ActiveResource::HttpMock.respond_to do |mock|
+     mock.get    "/people/1.xml",                {}, @matz
+     mock.get    "/people/2.xml",                {}, @david
+@@ -111,6 +115,8 @@ def setup_response
+     mock.head   "/people/Greg/addresses/1.xml", {}, nil, 200
+     # customer
+     mock.get    "/customers/1.xml",             {}, @luis
++    # sound
++    mock.get    "/sounds/1.xml",                {}, @startup_sound
+   end
+ 
+   Person.user = nil
+diff --git a/activeresource/test/cases/base_test.rb b/activeresource/test/cases/base_test.rb
+index 6fabeee..029b8c9 100644
+--- a/activeresource/test/cases/base_test.rb
++++ b/activeresource/test/cases/base_test.rb
+@@ -1083,4 +1083,9 @@ class BaseTest < Test::Unit::TestCase
+     plan.save!
+     assert_equal 10.00, plan.price
+   end
++  
++  def test_namespacing
++    sound = Asset::Sound.find(1)
++    assert_equal "Asset::Sound::Author", sound.author.class.to_s
++  end
+ end
+diff --git a/activeresource/test/fixtures/sound.rb b/activeresource/test/fixtures/sound.rb
+index 5c0ef5d..d9d2b99 100644
+--- a/activeresource/test/fixtures/sound.rb
++++ b/activeresource/test/fixtures/sound.rb
+@@ -1,5 +1,9 @@
+-module Asset
++module Asset  
+   class Sound < ActiveResource::Base
+     self.site = "http://37s.sunrise.i:3000"
+   end
+ end
++
++# to test namespacing in a module
++class Author
++end
+\ No newline at end of file
+-- 
+1.6.6.1
+

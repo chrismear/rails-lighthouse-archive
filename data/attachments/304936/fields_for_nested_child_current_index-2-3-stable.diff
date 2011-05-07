@@ -1,0 +1,232 @@
+From 1b20d98b25241ab4a947dc1315638ed01dd71cb3 Mon Sep 17 00:00:00 2001
+From: Elad Meidar <elad@eizesus.com>
+Date: Mon, 26 Oct 2009 00:45:44 -0400
+Subject: [PATCH] Added FormHelper#fields_for_with_index and tests
+
+---
+ actionpack/lib/action_view/helpers/form_helper.rb |  109 ++++++++++++++++++++-
+ actionpack/test/template/form_helper_test.rb      |   42 ++++++++
+ 2 files changed, 148 insertions(+), 3 deletions(-)
+
+diff --git a/actionpack/lib/action_view/helpers/form_helper.rb b/actionpack/lib/action_view/helpers/form_helper.rb
+index 994fac0..f3cbedf 100644
+--- a/actionpack/lib/action_view/helpers/form_helper.rb
++++ b/actionpack/lib/action_view/helpers/form_helper.rb
+@@ -482,6 +482,18 @@ module ActionView
+       #       Delete: <%= project_fields.check_box :_delete %>
+       #     <% end %>
+       #   <% end %>
++      #
++      # You will also be able to use #fields_for_with_index, with 2 arguments: first one
++      # is the form builder, and the second one is an index counter for child elements (first one will be 0)
++      #
++      #   <% form_for @person, :url => { :action => "update" } do |person_form| %>
++      #     ...
++      #     <% person_form.fields_for_with_index :projects do |project_fields, index| %>
++      #       <div class="project_field_<%= index %>" >
++      #         Name: <%= project_fields.text_field :name %>
++      #       </div>
++      #     <% end %>
++      #   <% end %> 
+       def fields_for(record_or_name_or_array, *args, &block)
+         raise ArgumentError, "Missing block" unless block_given?
+         options = args.extract_options!
+@@ -496,9 +508,27 @@ module ActionView
+         end
+ 
+         builder = options[:builder] || ActionView::Base.default_form_builder
++        
+         yield builder.new(object_name, object, self, options, block)
+       end
+-
++      
++      def fields_for_with_index(record_or_name_or_array, *args, &block)        
++        raise ArgumentError, "Missing block" unless block_given?
++        options = args.extract_options!
++      
++        case record_or_name_or_array
++        when String, Symbol
++          object_name = record_or_name_or_array
++          object = args.first
++        else
++          object = record_or_name_or_array
++          object_name = ActionController::RecordIdentifier.singular_class_name(object)
++        end
++      
++        builder = options[:builder] || ActionView::Base.default_form_builder
++        yield builder.new(object_name, object, self, options, block), next_child_index
++      end
++      
+       # Returns a label tag tailored for labelling an input field for a specified attribute (identified by +method+) on an object
+       # assigned to the template (identified by +object+). The text of label will default to the attribute name unless you specify
+       # it explicitly. Additional options on the label tag can be passed as a hash with +options+. These options will be tagged
+@@ -707,6 +737,13 @@ module ActionView
+       def radio_button(object_name, method, tag_value, options = {})
+         InstanceTag.new(object_name, method, self, options.delete(:object)).to_radio_button_tag(tag_value, options)
+       end
++      
++      private
++      
++      def next_child_index
++        @index ||= -1
++        @index += 1
++      end
+     end
+ 
+     class InstanceTag #:nodoc:
+@@ -939,7 +976,7 @@ module ActionView
+         end
+       end
+ 
+-      (field_helpers - %w(label check_box radio_button fields_for)).each do |selector|
++      (field_helpers - %w(label check_box radio_button fields_for fields_for_with_index)).each do |selector|
+         src = <<-end_src
+           def #{selector}(method, options = {})  # def text_field(method, options = {})
+             @template.send(                      #   @template.send(
+@@ -986,7 +1023,43 @@ module ActionView
+ 
+         @template.fields_for(name, *args, &block)
+       end
++      
++      def fields_for_with_index(record_or_name_or_array, *args, &block)
++        
++        "in Builder#fields_For_with_index"
++        if options.has_key?(:index)
++          index = "[#{options[:index]}]"
++        elsif defined?(@auto_index)
++          self.object_name = @object_name.to_s.sub(/\[\]$/,"")
++          index = "[#{@auto_index}]"
++        else
++          index = ""
++        end
+ 
++        if options[:builder]
++          args << {} unless args.last.is_a?(Hash)
++          args.last[:builder] ||= options[:builder]
++        end
++
++        case record_or_name_or_array
++        when String, Symbol
++          if nested_attributes_association?(record_or_name_or_array)
++            return fields_for_with_index_with_nested_attributes(record_or_name_or_array, args, block)
++          else
++            name = "#{object_name}#{index}[#{record_or_name_or_array}]"
++          end
++        when Array
++          object = record_or_name_or_array.last
++          name = "#{object_name}#{index}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
++          args.unshift(object)
++        else
++          object = record_or_name_or_array
++          name = "#{object_name}#{index}[#{ActionController::RecordIdentifier.singular_class_name(object)}]"
++          args.unshift(object)
++        end
++        @template.fields_for_with_index(name, *args, &block)
++      end
++      
+       def label(method, text = nil, options = {})
+         @template.label(@object_name, method, text, objectify_options(options))
+       end
+@@ -1039,7 +1112,27 @@ module ActionView
+             fields_for_nested_model(name, association, args, block)
+           end
+         end
++        
++        def fields_for_with_index_with_nested_attributes(association_name, args, block)
++          name = "#{object_name}[#{association_name}_attributes]"
++          association = args.first
++
++          if association.respond_to?(:new_record?)
++            association = [association] if @object.send(association_name).is_a?(Array)
++          elsif !association.is_a?(Array)
++            association = @object.send(association_name)
++          end
+ 
++          if association.is_a?(Array)
++            explicit_child_index = args.last[:child_index] if args.last.is_a?(Hash)
++            association.map do |child|
++              fields_for_with_index_nested_model("#{name}[#{explicit_child_index || nested_child_index(name)}]", child, args, block)
++            end.join
++          elsif association
++            fields_for_with_index_nested_model(name, association, args, block)
++          end
++        end
++        
+         def fields_for_nested_model(name, object, args, block)
+           if object.new_record?
+             @template.fields_for(name, object, *args, &block)
+@@ -1050,7 +1143,17 @@ module ActionView
+             end
+           end
+         end
+-
++        
++        def fields_for_with_index_nested_model(name, object, args, block)
++          if object.new_record?
++            @template.fields_for_with_index(name, object, *args, &block)
++          else
++            @template.fields_for_with_index(name, object, *args) do |builder, child_index|
++              @template.concat builder.hidden_field(:id)
++              block.call(builder, child_index)
++            end
++          end
++        end
+         def nested_child_index(name)
+           @nested_child_index[name] ||= -1
+           @nested_child_index[name] += 1
+diff --git a/actionpack/test/template/form_helper_test.rb b/actionpack/test/template/form_helper_test.rb
+index 357c36d..9785623 100644
+--- a/actionpack/test/template/form_helper_test.rb
++++ b/actionpack/test/template/form_helper_test.rb
+@@ -909,6 +909,48 @@ class FormHelperTest < ActionView::TestCase
+     assert_dom_equal expected, output_buffer
+   end
+ 
++  def test_method_fields_for_with_index
++    fields_for_with_index(:post, @post) do |f, index|
++      concat f.text_field(:title)
++      concat f.text_area(:body)
++      concat f.check_box(:secret)
++      concat "<div>This is child index #{index}</div>"
++    end
++
++    expected =
++      "<input name='post[title]' size='30' type='text' id='post_title' value='Hello World' />" +
++      "<textarea name='post[body]' id='post_body' rows='20' cols='40'>Back to the hill and over it again!</textarea>" +
++      "<input name='post[secret]' type='hidden' value='0' />" +
++      "<input name='post[secret]' checked='checked' type='checkbox' id='post_secret' value='1' />" +
++      "<div>This is child index 0</div>"
++
++    assert_dom_equal expected, output_buffer
++  end
++  
++  def test_method_fields_for_with_index_with_nested_attributes_collection_association
++    
++    @post.comments = [Comment.new(321), Comment.new]
++
++    form_for(:post, @post) do |f|
++      concat f.text_field(:title)
++      f.fields_for_with_index(:comments) do |cf, index|
++        concat cf.text_field(:name)
++        concat "<div>This is item index #{index}</div>"
++      end
++    end
++
++    expected = '<form action="http://www.example.com" method="post">' +
++               '<input name="post[title]" size="30" type="text" id="post_title" value="Hello World" />' +
++               '<input id="post_comments_attributes_0_id" name="post[comments_attributes][0][id]" type="hidden" value="321" />' +
++               '<input id="post_comments_attributes_0_name" name="post[comments_attributes][0][name]" size="30" type="text" value="comment #321" />' +
++               "<div>This is item index 0</div>" +
++               '<input id="post_comments_attributes_1_name" name="post[comments_attributes][1][name]" size="30" type="text" value="new comment" />' +
++               "<div>This is item index 1</div>" +
++               '</form>'
++
++    assert_dom_equal expected, output_buffer
++  end
++  
+   def test_fields_for_with_index
+     fields_for("post[]", @post) do |f|
+       concat f.text_field(:title)
+-- 
+1.6.0.2
+

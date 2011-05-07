@@ -1,0 +1,109 @@
+From ac9c7680e564353b72fa52c887980ebc26fb9696 Mon Sep 17 00:00:00 2001
+From: Ernie Miller <ernie@metautonomo.us>
+Date: Mon, 12 Apr 2010 08:53:11 -0400
+Subject: [PATCH] Allow ActiveRelation where condition hashes to access additional Arel predicates
+
+Similar to 'table.column' => 'value', this patch enables 'column#method' => 'value'.
+
+For instance, Article.where('title#matches' => 'Hello%') generates SQL like:
+
+SELECT "articles".* FROM "articles" WHERE ("articles"."title" LIKE 'Hello%')
+---
+ .../active_record/relation/predicate_builder.rb    |   43 +++++++++++++++----
+ activerecord/test/cases/relations_test.rb          |   11 +++++
+ 2 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/activerecord/lib/active_record/relation/predicate_builder.rb b/activerecord/lib/active_record/relation/predicate_builder.rb
+index d0efa21..5cba418 100644
+--- a/activerecord/lib/active_record/relation/predicate_builder.rb
++++ b/activerecord/lib/active_record/relation/predicate_builder.rb
+@@ -14,30 +14,55 @@ module ActiveRecord
+           build_from_hash(value, table)
+         else
+           column = column.to_s
++          method = method_from_value(value)
+ 
+           if column.include?('.')
+             table_name, column = column.split('.', 2)
+             table = Arel::Table.new(table_name, :engine => @engine)
+           end
++          
++          if column.include?('#')
++            column, method = column.split('#', 2)
++          end
+ 
+           unless attribute = table[column]
+             raise StatementInvalid, "No attribute named `#{column}` exists for table `#{table.name}`"
+           end
+-
+-          case value
+-          when Array, ActiveRecord::Associations::AssociationCollection, ActiveRecord::Relation
+-            values = value.to_a
+-            attribute.in(values)
+-          when Range
+-            attribute.in(value)
+-          else
+-            attribute.eq(value)
++          
++          unless valid_comparison_method?(method)
++            raise StatementInvalid, "No comparison method named `#{method}` exists for column `#{column}`"
+           end
++
++          attribute.send(method, *args_for_predicate(method.to_s, value))
+         end
+       end
+ 
+       predicates.flatten
+     end
++    
++    private
++    
++    def args_for_predicate(method, value)
++      value = [Array, ActiveRecord::Associations::AssociationCollection, ActiveRecord::Relation].include?(value.class) ? value.to_a : value
++      if method =~ /_(any|all)$/ && value.is_a?(Array)
++        value
++      else
++        [value]
++      end
++    end
++    
++    def method_from_value(value)
++      case value
++      when Array, Range, ActiveRecord::Associations::AssociationCollection, ActiveRecord::Relation
++        :in
++      else
++        :eq
++      end
++    end
++    
++    def valid_comparison_method?(method)
++      Arel::Attribute::Predications.instance_methods.map(&:to_s).include?(method.to_s)
++    end
+ 
+   end
+ end
+diff --git a/activerecord/test/cases/relations_test.rb b/activerecord/test/cases/relations_test.rb
+index 7b9e680..2791867 100644
+--- a/activerecord/test/cases/relations_test.rb
++++ b/activerecord/test/cases/relations_test.rb
+@@ -81,6 +81,17 @@ class RelationTest < ActiveRecord::TestCase
+     assert_equal ['Mary'],  Author.where(["name = ?", 'Mary']).map(&:name)
+     assert_equal ['Mary'],  Author.where("name = ?", 'Mary').map(&:name)
+   end
++  
++  def test_finding_with_advanced_hash_conditions
++    assert_equal ["David"], Author.where('authors.name' => 'David').map(&:name)
++    assert_equal ["David"], Author.where('authors.name#matches' => 'D%').map(&:name)
++  end
++  
++  def test_finding_with_hash_conditions_checks_predicate_method
++    assert_raise ActiveRecord::StatementInvalid do
++      Author.where('authors.name#nosuchmethod' => 'David').map(&:name)
++    end
++  end
+ 
+   def test_finding_with_order
+     topics = Topic.order('id')
+-- 
+1.6.4.4
+

@@ -1,0 +1,208 @@
+From 0d0b7a87006f078ebbf758a935d158302f8fbda9 Mon Sep 17 00:00:00 2001
+From: Scott Windsor <swindsor@gmail.com>
+Date: Sun, 29 Nov 2009 23:41:40 -0800
+Subject: [PATCH] Adding conditional counter cache
+
+- This adds support for conditional counter caches
+- Also adds support for dirty method without_changes to get original
+  object
+---
+ activerecord/lib/active_record/associations.rb     |   31 +++++++++++++++++--
+ activerecord/lib/active_record/dirty.rb            |    7 ++++
+ activerecord/lib/active_record/reflection.rb       |    8 ++++-
+ .../associations/belongs_to_associations_test.rb   |   20 +++++++++++++
+ activerecord/test/cases/dirty_test.rb              |    8 +++++
+ activerecord/test/models/comment.rb                |    2 +-
+ activerecord/test/models/reply.rb                  |    2 +-
+ activerecord/test/schema/schema.rb                 |    1 +
+ 8 files changed, 71 insertions(+), 8 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 0a612e0..dd50f49 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1040,7 +1040,7 @@ module ActiveRecord
+           association_constructor_method(:create, reflection, BelongsToAssociation)
+         end
+ 
+-        add_counter_cache_callbacks(reflection)          if options[:counter_cache]
++        add_counter_cache_callbacks(reflection, options[:counter_cache]) if options[:counter_cache]
+         add_touch_callbacks(reflection, options[:touch]) if options[:touch]
+ 
+         configure_dependency_for_belongs_to(reflection)
+@@ -1352,23 +1352,46 @@ module ActiveRecord
+           end
+         end
+ 
+-        def add_counter_cache_callbacks(reflection)
++        def add_counter_cache_callbacks(reflection, counter_attributes)
+           cache_column = reflection.counter_cache_column
++          conditional = nil
++          if counter_attributes.is_a?(Hash) && counter_attributes.include?(:condition)
++            conditional = counter_attributes[:condition]
++          end
+ 
+           method_name = "belongs_to_counter_cache_after_create_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+             association = send(reflection.name)
+-            association.class.increment_counter(cache_column, association.id) unless association.nil?
++            if !association.nil? && (!conditional || conditional.call(self))
++              association.class.increment_counter(cache_column, association.id) 
++            end
+           end
+           after_create(method_name)
+ 
+           method_name = "belongs_to_counter_cache_before_destroy_for_#{reflection.name}".to_sym
+           define_method(method_name) do
+             association = send(reflection.name)
+-            association.class.decrement_counter(cache_column, association.id) unless association.nil?
++            if !association.nil? && (!conditional || conditional.call(self))
++              association.class.decrement_counter(cache_column, association.id)
++            end
+           end
+           before_destroy(method_name)
+ 
++          method_name = "belongs_to_counter_cache_before_update_for_#{reflection.name}".to_sym
++          define_method(method_name) do
++            association = send(reflection.name)
++            if !association.nil? && conditional
++              conditional_was = conditional.call(self.without_changes)
++              conditional_is = conditional.call(self)
++              if (conditional_was == true) && (conditional_is == false)
++                association.class.decrement_counter(cache_column, association.id)
++              elsif (conditional_was == false) && (conditional_is == true)
++                association.class.increment_counter(cache_column, association.id)
++              end
++            end
++          end
++          before_update(method_name)
++
+           module_eval(
+             "#{reflection.class_name}.send(:attr_readonly,\"#{cache_column}\".intern) if defined?(#{reflection.class_name}) && #{reflection.class_name}.respond_to?(:attr_readonly)"
+           )
+diff --git a/activerecord/lib/active_record/dirty.rb b/activerecord/lib/active_record/dirty.rb
+index f189651..c909093 100644
+--- a/activerecord/lib/active_record/dirty.rb
++++ b/activerecord/lib/active_record/dirty.rb
+@@ -74,6 +74,13 @@ module ActiveRecord
+       changed.inject({}) { |h, attr| h[attr] = attribute_change(attr); h }
+     end
+ 
++    def without_changes
++      original = self.clone
++      original.id = self.id
++      original.attributes = changed.inject({}) { |h, attr| h[attr] = attribute_was(attr); h }
++      original
++    end
++
+     # Attempts to +save+ the record and clears changed attributes if successful.
+     def save_with_dirty(*args) #:nodoc:
+       if status = save_without_dirty(*args)
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 54b8c61..71a6165 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -196,8 +196,12 @@ module ActiveRecord
+       end
+ 
+       def counter_cache_column
+-        if options[:counter_cache] == true
+-          "#{active_record.name.demodulize.underscore.pluralize}_count"
++        if options[:counter_cache] == true || options[:counter_cache].is_a?(Hash)
++          if options[:counter_cache].is_a?(Hash) && options[:counter_cache].include?(:cache_column)
++            options[:counter_cache][:cache_column]
++          else
++            "#{active_record.name.demodulize.underscore.pluralize}_count"
++          end
+         elsif options[:counter_cache]
+           options[:counter_cache]
+         end
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 9f3945f..11c2384 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -319,6 +319,26 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+     assert_equal 17, reply.replies.size
+   end
+ 
++  def test_conditional_counter_cache
++    post = Post.create(:title => 'my test post', :body => 'weeeee')
++    assert_equal 0, post[:comments_count]
++
++    comment = post.comments.create(:body => 'test comment')
++    assert_equal 1, post.reload[:comments_count]
++    
++    comment.destroy
++    assert_equal 0, post.reload[:comments_count]
++
++    comment = post.comments.create(:body => 'comment text', :deleted => true)
++    assert_equal 0, post.reload[:comments_count]
++
++    comment.update_attributes(:deleted => false)
++    assert_equal 1, post.reload[:comments_count]
++
++    comment.update_attributes(:deleted => true)
++    assert_equal 0, post.reload[:comments_count]
++  end
++
+   def test_association_assignment_sticks
+     post = Post.find(:first)
+ 
+diff --git a/activerecord/test/cases/dirty_test.rb b/activerecord/test/cases/dirty_test.rb
+index fb3d26f..2931f5c 100644
+--- a/activerecord/test/cases/dirty_test.rb
++++ b/activerecord/test/cases/dirty_test.rb
+@@ -298,6 +298,14 @@ class DirtyTest < ActiveRecord::TestCase
+     end
+   end
+ 
++  def test_original_object
++    phrase = "shiver me timbers"
++    pirate = Pirate.create!(:catchphrase => phrase)
++    pirate.catchphrase = "*hic*"
++    assert_equal phrase, pirate.without_changes.catchphrase
++    assert_not_equal pirate.catchphrase, pirate.without_changes.catchphrase
++  end
++
+   private
+     def with_partial_updates(klass, on = true)
+       old = klass.partial_updates?
+diff --git a/activerecord/test/models/comment.rb b/activerecord/test/models/comment.rb
+index 399dea9..daf6044 100644
+--- a/activerecord/test/models/comment.rb
++++ b/activerecord/test/models/comment.rb
+@@ -5,7 +5,7 @@ class Comment < ActiveRecord::Base
+               :joins => :post,
+               :conditions => { "posts.author_id" => 1 }
+ 
+-  belongs_to :post, :counter_cache => true
++  belongs_to :post, :counter_cache => {:condition => lambda {|c| !c.deleted } }
+ 
+   def self.what_are_you
+     'a comment...'
+diff --git a/activerecord/test/models/reply.rb b/activerecord/test/models/reply.rb
+index 4063785..ceac170 100644
+--- a/activerecord/test/models/reply.rb
++++ b/activerecord/test/models/reply.rb
+@@ -43,4 +43,4 @@ module Web
+   class Reply < Web::Topic
+     belongs_to :topic, :foreign_key => "parent_id", :counter_cache => true, :class_name => 'Web::Topic'
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/activerecord/test/schema/schema.rb b/activerecord/test/schema/schema.rb
+index 984c5ba..d524497 100644
+--- a/activerecord/test/schema/schema.rb
++++ b/activerecord/test/schema/schema.rb
+@@ -107,6 +107,7 @@ ActiveRecord::Schema.define do
+     t.integer :post_id, :null => false
+     t.text    :body, :null => false
+     t.string  :type
++    t.boolean :deleted, :default => false
+   end
+ 
+   create_table :companies, :force => true do |t|
+-- 
+1.6.5.2
+

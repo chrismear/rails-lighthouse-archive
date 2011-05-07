@@ -1,0 +1,124 @@
+From 9db18bb70a25d2e0858897073f1efe78b1458078 Mon Sep 17 00:00:00 2001
+From: Paul Gillard <paulmgillard@gmail.com>
+Date: Sat, 4 Jul 2009 12:30:44 +0100
+Subject: [PATCH] Call initialize_copy when cloning
+
+Cloned AR objects are now instantiated through initialize_copy rather than new/initialize. This allows AR classes to override initialize_copy in order to implement deep cloning.
+---
+ activerecord/lib/active_record/base.rb |   65 ++++++++++++++++++-------------
+ activerecord/test/cases/base_test.rb   |    2 +-
+ 2 files changed, 39 insertions(+), 28 deletions(-)
+
+diff --git a/activerecord/lib/active_record/base.rb b/activerecord/lib/active_record/base.rb
+index 72742cb..e4bfa35 100755
+--- a/activerecord/lib/active_record/base.rb
++++ b/activerecord/lib/active_record/base.rb
+@@ -2442,6 +2442,29 @@ module ActiveRecord #:nodoc:
+         result
+       end
+ 
++      # Cloned objects have no id assigned and are treated as new records. Note that this is a "shallow" clone
++      # as it copies the object's attributes only, not its associations. The extent of a "deep" clone is
++      # application specific and is therefore left to the application to implement according to its need.
++      def initialize_copy(other)
++        # Think the assertion which fails if the after_initialize callback goes at the end of the method is wrong. The
++        # deleted clone method called new which therefore called the after_initialize callback. It then went on to copy
++        # over the attributes. But if it's copying the attributes afterwards then it hasn't finished initializing right?
++        # For example in the test suite the topic model's after_initialize method sets the author_email_address to
++        # test@test.com. I would have thought this would mean that all cloned models would have an author email address
++        # of test@test.com. However the test_clone test method seems to test that this is not the case. As a result the
++        # after_initialize callback has to be run *before* the copying of the atrributes rather than afterwards in order
++        # for all tests to pass. This makes no sense to me.
++        callback(:after_initialize) if respond_to_without_attributes?(:after_initialize)
++        cloned_attributes = other.clone_attributes(:read_attribute_before_type_cast)
++        cloned_attributes.delete(self.class.primary_key)
++        @attributes = cloned_attributes
++        clear_aggregation_cache
++        @attributes_cache = {}
++        @new_record = true
++        ensure_proper_type
++        self.class.send(:scope, :create).each { |att, value| self.send("#{att}=", value) } if self.class.send(:scoped?, :create)
++      end
++
+       # Returns a String, which Action Pack uses for constructing an URL to this
+       # object. The default implementation returns this record's id as a String,
+       # or nil if this record's unsaved.
+@@ -2570,19 +2593,6 @@ module ActiveRecord #:nodoc:
+         freeze
+       end
+ 
+-      # Returns a clone of the record that hasn't been assigned an id yet and
+-      # is treated as a new record.  Note that this is a "shallow" clone:
+-      # it copies the object's attributes only, not its associations.
+-      # The extent of a "deep" clone is application-specific and is therefore
+-      # left to the application to implement according to its need.
+-      def clone
+-        attrs = clone_attributes(:read_attribute_before_type_cast)
+-        attrs.delete(self.class.primary_key)
+-        record = self.class.new
+-        record.send :instance_variable_set, '@attributes', attrs
+-        record
+-      end
+-
+       # Returns an instance of the specified +klass+ with the attributes of the current record. This is mostly useful in relation to
+       # single-table inheritance structures where you want a subclass to appear as the superclass. This can be used along with record
+       # identification in Action Pack to allow, say, <tt>Client < Company</tt> to do something like render <tt>:partial => @client.becomes(Company)</tt>
+@@ -2846,6 +2856,21 @@ module ActiveRecord #:nodoc:
+         "#<#{self.class} #{attributes_as_nice_string}>"
+       end
+ 
++    protected
++      def clone_attributes(reader_method = :read_attribute, attributes = {})
++        self.attribute_names.inject(attributes) do |attrs, name|
++          attrs[name] = clone_attribute_value(reader_method, name)
++          attrs
++        end
++      end
++
++      def clone_attribute_value(reader_method, attribute_name)
++        value = send(reader_method, attribute_name)
++        value.duplicable? ? value.clone : value
++      rescue TypeError, NoMethodError
++        value
++      end
++
+     private
+       def create_or_update
+         raise ReadOnlyRecord if readonly?
+@@ -3108,20 +3133,6 @@ module ActiveRecord #:nodoc:
+         return string unless string.is_a?(String) && string =~ /^---/
+         YAML::load(string) rescue string
+       end
+-
+-      def clone_attributes(reader_method = :read_attribute, attributes = {})
+-        self.attribute_names.inject(attributes) do |attrs, name|
+-          attrs[name] = clone_attribute_value(reader_method, name)
+-          attrs
+-        end
+-      end
+-
+-      def clone_attribute_value(reader_method, attribute_name)
+-        value = send(reader_method, attribute_name)
+-        value.duplicable? ? value.clone : value
+-      rescue TypeError, NoMethodError
+-        value
+-      end
+   end
+ 
+   Base.class_eval do
+diff --git a/activerecord/test/cases/base_test.rb b/activerecord/test/cases/base_test.rb
+index 8421a8f..1e2d903 100755
+--- a/activerecord/test/cases/base_test.rb
++++ b/activerecord/test/cases/base_test.rb
+@@ -1352,7 +1352,7 @@ class BasicsTest < ActiveRecord::TestCase
+     cloned_topic.title["a"] = "c"
+     assert_equal "b", topic.title["a"]
+ 
+-    #test if attributes set as part of after_initialize are cloned correctly
++    # test if attributes set as part of after_initialize are cloned correctly
+     assert_equal topic.author_email_address, cloned_topic.author_email_address
+ 
+     # test if saved clone object differs from original
+-- 
+1.6.0.5
+

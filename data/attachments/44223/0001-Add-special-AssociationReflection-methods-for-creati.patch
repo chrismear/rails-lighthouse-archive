@@ -1,0 +1,212 @@
+From 69d1414bf89c582248546005f9a29cbb97fa95e3 Mon Sep 17 00:00:00 2001
+From: Hongli Lai (Phusion) <hongli@phusion.nl>
+Date: Sat, 6 Sep 2008 19:43:14 +0200
+Subject: [PATCH] Add special AssociationReflection methods for creating association objects, and modify the code base to use those methods instead of creating association objects directly. This allows plugins to hook into association object creation behavior.
+
+---
+ activerecord/lib/active_record/associations.rb     |    2 +-
+ .../associations/association_collection.rb         |   10 +++--
+ .../associations/belongs_to_association.rb         |    4 +-
+ .../associations/has_many_through_association.rb   |    9 +++--
+ .../associations/has_one_association.rb            |   16 +++++++--
+ activerecord/lib/active_record/reflection.rb       |   35 ++++++++++++++++++++
+ 6 files changed, 61 insertions(+), 15 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 182b316..53e362a 100755
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1266,7 +1266,7 @@ module ActiveRecord
+               association = association_proxy_class.new(self, reflection)
+             end
+ 
+-            new_value = reflection.klass.new(new_value) if reflection.options[:accessible] && new_value.is_a?(Hash)
++            new_value = reflection.build_association(new_value) if reflection.options[:accessible] && new_value.is_a?(Hash)
+ 
+             if association_proxy_class == HasOneThroughAssociation
+               association.create_through_record(new_value)
+diff --git a/activerecord/lib/active_record/associations/association_collection.rb b/activerecord/lib/active_record/associations/association_collection.rb
+index 168443e..d4bb439 100644
+--- a/activerecord/lib/active_record/associations/association_collection.rb
++++ b/activerecord/lib/active_record/associations/association_collection.rb
+@@ -110,7 +110,7 @@ module ActiveRecord
+ 
+         @owner.transaction do
+           flatten_deeper(records).each do |record|
+-            record = @reflection.klass.new(record) if @reflection.options[:accessible] && record.is_a?(Hash)
++            record = @reflection.build_association(record) if @reflection.options[:accessible] && record.is_a?(Hash)
+ 
+             raise_on_type_mismatch(record)
+             add_record_to_target_with_callbacks(record) do |r|
+@@ -287,7 +287,7 @@ module ActiveRecord
+       # This will perform a diff and delete/add only records that have changed.
+       def replace(other_array)
+         other_array.map! do |val|
+-          val.is_a?(Hash) ? @reflection.klass.new(val) : val
++          val.is_a?(Hash) ? @reflection.build_association(val) : val
+         end if @reflection.options[:accessible]
+ 
+         other_array.each { |val| raise_on_type_mismatch(val) }
+@@ -377,7 +377,9 @@ module ActiveRecord
+         def create_record(attrs)
+           attrs.update(@reflection.options[:conditions]) if @reflection.options[:conditions].is_a?(Hash)
+           ensure_owner_is_not_new
+-          record = @reflection.klass.send(:with_scope, :create => construct_scope[:create]) { @reflection.klass.new(attrs) }
++          record = @reflection.klass.send(:with_scope, :create => construct_scope[:create]) do
++            @reflection.build_association(attrs)
++          end
+           if block_given?
+             add_record_to_target_with_callbacks(record) { |*block_args| yield(*block_args) }
+           else
+@@ -387,7 +389,7 @@ module ActiveRecord
+ 
+         def build_record(attrs)
+           attrs.update(@reflection.options[:conditions]) if @reflection.options[:conditions].is_a?(Hash)
+-          record = @reflection.klass.new(attrs)
++          record = @reflection.build_association(attrs)
+           if block_given?
+             add_record_to_target_with_callbacks(record) { |*block_args| yield(*block_args) }
+           else
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index 7c28cbd..f05c6be 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -2,11 +2,11 @@ module ActiveRecord
+   module Associations
+     class BelongsToAssociation < AssociationProxy #:nodoc:
+       def create(attributes = {})
+-        replace(@reflection.klass.create(attributes))
++        replace(@reflection.create_association(attributes))
+       end
+ 
+       def build(attributes = {})
+-        replace(@reflection.klass.new(attributes))
++        replace(@reflection.build_association(attributes))
+       end
+ 
+       def replace(record)
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index 84fa900..ebd2bf7 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -10,14 +10,14 @@ module ActiveRecord
+ 
+       def create!(attrs = nil)
+         @reflection.klass.transaction do
+-          self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.klass.create! } : @reflection.klass.create!)
++          self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.create_association! } : @reflection.create_association!)
+           object
+         end
+       end
+ 
+       def create(attrs = nil)
+         @reflection.klass.transaction do
+-          self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.klass.create } : @reflection.klass.create)
++          self << (object = attrs ? @reflection.klass.send(:with_scope, :create => attrs) { @reflection.create_association } : @reflection.create_association)
+           object
+         end
+       end
+@@ -47,8 +47,9 @@ module ActiveRecord
+               return false unless record.save
+             end
+           end
+-          klass = @reflection.through_reflection.klass
+-          @owner.send(@reflection.through_reflection.name).proxy_target << klass.send(:with_scope, :create => construct_join_attributes(record)) { klass.create! }
++          through_reflection = @reflection.through_reflection
++          klass = through_reflection.klass
++          @owner.send(@reflection.through_reflection.name).proxy_target << klass.send(:with_scope, :create => construct_join_attributes(record)) { through_reflection.create_association! }
+         end
+ 
+         # TODO - add dependent option support
+diff --git a/activerecord/lib/active_record/associations/has_one_association.rb b/activerecord/lib/active_record/associations/has_one_association.rb
+index 1873325..c92ef5c 100644
+--- a/activerecord/lib/active_record/associations/has_one_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_association.rb
+@@ -7,15 +7,21 @@ module ActiveRecord
+       end
+ 
+       def create(attrs = {}, replace_existing = true)
+-        new_record(replace_existing) { |klass| klass.create(attrs) }
++        new_record(replace_existing) do |reflection|
++          reflection.create_association(attrs)
++        end
+       end
+ 
+       def create!(attrs = {}, replace_existing = true)
+-        new_record(replace_existing) { |klass| klass.create!(attrs) }
++        new_record(replace_existing) do |reflection|
++          reflection.create_association!(attrs)
++        end
+       end
+ 
+       def build(attrs = {}, replace_existing = true)
+-        new_record(replace_existing) { |klass| klass.new(attrs) }
++        new_record(replace_existing) do |reflection|
++          reflection.build_association(attrs)
++        end
+       end
+ 
+       def replace(obj, dont_save = false)
+@@ -91,7 +97,9 @@ module ActiveRecord
+           # instance. Otherwise, if the target has not previously been loaded
+           # elsewhere, the instance we create will get orphaned.
+           load_target if replace_existing
+-          record = @reflection.klass.send(:with_scope, :create => construct_scope[:create]) { yield @reflection.klass }
++          record = @reflection.klass.send(:with_scope, :create => construct_scope[:create]) do
++            yield @reflection
++          end
+ 
+           if replace_existing
+             replace(record, true) 
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 935b193..9bf2af2 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -129,9 +129,44 @@ module ActiveRecord
+ 
+     # Holds all the meta-data about an association as it was specified in the Active Record class.
+     class AssociationReflection < MacroReflection #:nodoc:
++      # Returns the target association's class:
++      # 
++      #   class Author < ActiveRecord::Base
++      #     has_many :books
++      #   end
++      #   
++      #   Author.reflect_on_association(:books).klass
++      #   # => Book
++      #
++      # <b>Note:</b> do not call +klass.new+ or +klass.create+ to instantiate
++      # a new association object. Use +build_association+ or +create_association+
++      # instead. This allows plugins to hook into association object creation.
+       def klass
+         @klass ||= active_record.send(:compute_type, class_name)
+       end
++      
++      # Returns a new, unsaved instance of the associated class. +options+ will
++      # be passed to the class's constructor.
++      def build_association(*options)
++        klass.new(*options)
++      end
++      
++      # Creates a new instance of the associated class, and immediates saves it
++      # with ActiveRecord::Base#save. +options+ will be passed to the class's
++      # creation method. Returns the newly created object.
++      def create_association(*options)
++        klass.create(*options)
++      end
++      
++      # Creates a new instance of the associated class, and immediates saves it
++      # with ActiveRecord::Base#save!. +options+ will be passed to the class's
++      # creation method. If the created record doesn't pass validations, then an
++      # exception will be raised.
++      #
++      # Returns the newly created object.
++      def create_association!(*options)
++        klass.create!(*options)
++      end
+ 
+       def table_name
+         @table_name ||= klass.table_name
+-- 
+1.6.0.1
+

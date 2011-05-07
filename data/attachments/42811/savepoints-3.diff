@@ -1,0 +1,433 @@
+From 7df054a91c3604fbc7ce4d63efbbe0ef06a89259 Mon Sep 17 00:00:00 2001
+From: Jonathan Viney <jonathan@jonathan-desktop.(none)>
+Date: Sun, 31 Aug 2008 21:09:16 +1200
+Subject: [PATCH] Implement savepoints.
+
+---
+ .../abstract/database_statements.rb                |   16 ++-
+ .../connection_adapters/abstract_adapter.rb        |   15 +++
+ .../connection_adapters/mysql_adapter.rb           |   11 ++
+ .../connection_adapters/postgresql_adapter.rb      |   12 ++
+ activerecord/lib/active_record/fixtures.rb         |    2 +
+ activerecord/lib/active_record/transactions.rb     |   12 +--
+ activerecord/test/cases/transactions_test.rb       |  132 ++++++++++++++++++++
+ 7 files changed, 186 insertions(+), 14 deletions(-)
+
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+index aaf9e2e..f52a614 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/database_statements.rb
+@@ -55,12 +55,14 @@ module ActiveRecord
+       end
+ 
+       # Wrap a block in a transaction.  Returns result of block.
+-      def transaction(start_db_transaction = true)
++      def transaction(start_db_transaction = false)
++        start_db_transaction ||= open_transactions.zero? || (open_transactions == 1 && transactional_fixtures)
+         transaction_open = false
+         begin
+           if block_given?
+             if start_db_transaction
+-              begin_db_transaction
++              open_transactions.zero? ? begin_db_transaction : create_savepoint
++              increment_open_transactions
+               transaction_open = true
+             end
+             yield
+@@ -68,21 +70,23 @@ module ActiveRecord
+         rescue Exception => database_transaction_rollback
+           if transaction_open
+             transaction_open = false
+-            rollback_db_transaction
++            decrement_open_transactions
++            open_transactions.zero? ? rollback_db_transaction : rollback_to_savepoint
+           end
+           raise unless database_transaction_rollback.is_a? ActiveRecord::Rollback
+         end
+       ensure
+         if transaction_open
++          decrement_open_transactions
+           begin
+-            commit_db_transaction
++            open_transactions.zero? ? commit_db_transaction : release_savepoint
+           rescue Exception => database_transaction_rollback
+-            rollback_db_transaction
++            open_transactions.zero? ? rollback_db_transaction : rollback_to_savepoint
+             raise
+           end
+         end
+       end
+-
++      
+       # Begins the transaction (and turns off auto-committing).
+       def begin_db_transaction()    end
+ 
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+index 6924bb7..380b71e 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract_adapter.rb
+@@ -137,7 +137,22 @@ module ActiveRecord
+       def decrement_open_transactions
+         @open_transactions -= 1
+       end
++      
++      def create_savepoint
++      end
++      
++      def rollback_to_savepoint
++      end
++      
++      def release_savepoint
++      end
+ 
++      def current_savepoint_name
++        "rails_savepoint_#{open_transactions}"
++      end
++      
++      attr_accessor :transactional_fixtures
++      
+       def log_info(sql, name, runtime)
+         if @logger && @logger.debug?
+           name = "#{name.nil? ? "SQL" : name} (#{sprintf("%f", runtime)})"
+diff --git a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+index 204ebaa..0d73602 100644
+--- a/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/mysql_adapter.rb
+@@ -330,6 +330,17 @@ module ActiveRecord
+         # Transactions aren't supported
+       end
+ 
++      def create_savepoint
++        execute("SAVEPOINT #{current_savepoint_name}")
++      end
++
++      def rollback_to_savepoint
++        execute("ROLLBACK TO SAVEPOINT #{current_savepoint_name}")
++      end
++
++      def release_savepoint
++        execute("RELEASE SAVEPOINT #{current_savepoint_name}")
++      end
+ 
+       def add_limit_offset!(sql, options) #:nodoc:
+         if limit = options[:limit]
+diff --git a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+index 0c2532f..310c383 100644
+--- a/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
++++ b/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
+@@ -518,6 +518,18 @@ module ActiveRecord
+         execute "ROLLBACK"
+       end
+ 
++      def create_savepoint
++        execute("SAVEPOINT #{current_savepoint_name}")
++      end
++
++      def rollback_to_savepoint
++        execute("ROLLBACK TO SAVEPOINT #{current_savepoint_name}")
++      end
++
++      def release_savepoint(savepoint_number)
++        execute("RELEASE SAVEPOINT #{current_savepoint_name}")
++      end
++
+       # SCHEMA STATEMENTS ========================================
+ 
+       def recreate_database(name) #:nodoc:
+diff --git a/activerecord/lib/active_record/fixtures.rb b/activerecord/lib/active_record/fixtures.rb
+index 622cfc3..d80d5b1 100644
+--- a/activerecord/lib/active_record/fixtures.rb
++++ b/activerecord/lib/active_record/fixtures.rb
+@@ -932,6 +932,7 @@ module Test #:nodoc:
+           end
+           ActiveRecord::Base.connection.increment_open_transactions
+           ActiveRecord::Base.connection.begin_db_transaction
++          ActiveRecord::Base.connection.transactional_fixtures = true
+         # Load fixtures for every test.
+         else
+           Fixtures.reset_cache
+@@ -954,6 +955,7 @@ module Test #:nodoc:
+         if use_transactional_fixtures? && ActiveRecord::Base.connection.open_transactions != 0
+           ActiveRecord::Base.connection.rollback_db_transaction
+           ActiveRecord::Base.connection.decrement_open_transactions
++          ActiveRecord::Base.connection.transactional_fixtures = false
+         end
+         ActiveRecord::Base.verify_active_connections!
+       end
+diff --git a/activerecord/lib/active_record/transactions.rb b/activerecord/lib/active_record/transactions.rb
+index 81462a2..f91fea5 100644
+--- a/activerecord/lib/active_record/transactions.rb
++++ b/activerecord/lib/active_record/transactions.rb
+@@ -75,14 +75,10 @@ module ActiveRecord
+     # but not be re-raised by the transaction block.
+     module ClassMethods
+       # See ActiveRecord::Transactions::ClassMethods for detailed documentation.
+-      def transaction(&block)
+-        connection.increment_open_transactions
+-
+-        begin
+-          connection.transaction(connection.open_transactions == 1, &block)
+-        ensure
+-          connection.decrement_open_transactions
+-        end
++      def transaction(options = {}, &block)
++        options.assert_valid_keys :force
++        
++        connection.transaction(options[:force], &block)
+       end
+     end
+ 
+diff --git a/activerecord/test/cases/transactions_test.rb b/activerecord/test/cases/transactions_test.rb
+index af3ee6d..e78c4e3 100644
+--- a/activerecord/test/cases/transactions_test.rb
++++ b/activerecord/test/cases/transactions_test.rb
+@@ -213,6 +213,99 @@ class TransactionTest < ActiveRecord::TestCase
+     assert Topic.find(2).approved?, "Second should still be approved"
+   end
+ 
++  def test_invalid_keys_for_transaction
++    assert_raises ArgumentError do
++      Topic.transaction :forced => true do
++      end
++    end
++  end
++
++  def test_force_savepoint_in_nested_transaction
++    Topic.transaction do
++      @first.approved = true
++      @second.approved = false
++      @first.save!
++      @second.save!
++
++      begin
++        Topic.transaction :force => true do
++          @first.happy = false
++          @first.save!
++          raise
++        end
++      rescue
++      end
++    end
++
++    assert @first.reload.approved?
++    assert !@second.reload.approved?
++  end
++
++  def test_no_savepoint_in_nested_transaction_without_force
++    Topic.transaction do
++      @first.approved = true
++      @second.approved = false
++      @first.save!
++      @second.save!
++
++      begin
++        Topic.transaction do
++          @first.approved = false
++          @first.save!
++          raise
++        end
++      rescue
++      end
++    end
++
++    assert !@first.reload.approved?
++    assert !@second.reload.approved?
++  end
++  
++  def test_many_savepoints
++    Topic.transaction do
++      @first.content = "One"
++      @first.save!
++      
++      begin
++        Topic.transaction :force => true do
++          @first.content = "Two"
++          @first.save!
++          
++          begin
++            Topic.transaction :force => true do
++              @first.content = "Three"
++              @first.save!
++              
++              begin
++                Topic.transaction :force => true do
++                  @first.content = "Four"
++                  @first.save!
++                  raise
++                end
++              rescue
++              end
++              
++              @three = @first.reload.content
++              raise
++            end
++          rescue
++          end
++          
++          @two = @first.reload.content
++          raise
++        end
++      rescue
++      end
++      
++      @one = @first.reload.content
++    end
++    
++    assert_equal "One", @one
++    assert_equal "Two", @two
++    assert_equal "Three", @three
++  end
++
+   uses_mocha 'mocking connection.commit_db_transaction' do
+     def test_rollback_when_commit_raises
+       Topic.connection.expects(:begin_db_transaction)
+@@ -281,6 +374,45 @@ class TransactionTest < ActiveRecord::TestCase
+     end
+ end
+ 
++class TransactionsWithTransactionalFixturesTest < ActiveRecord::TestCase
++  self.use_transactional_fixtures = true
++  fixtures :topics
++
++  def test_automatic_savepoint_in_outer_transaction
++    @first = Topic.find(1)
++    
++    begin
++      Topic.transaction do
++        @first.approved = true
++        @first.save!
++        raise
++      end
++    rescue
++      assert !@first.reload.approved?
++    end
++  end
++
++  def test_no_automatic_savepoint_for_inner_transaction
++    @first = Topic.find(1)
++
++    Topic.transaction do
++      @first.approved = true
++      @first.save!
++
++      begin
++        Topic.transaction do
++          @first.approved = false
++          @first.save!
++          raise
++        end
++      rescue
++      end
++    end
++
++    assert !@first.reload.approved?
++  end
++end
++
+ if current_adapter?(:PostgreSQLAdapter)
+   class ConcurrentTransactionTest < TransactionTest
+     def setup
+-- 
+1.5.4.3
+
+
+From 938670e202c6c2aaa1ccd4b8aa64d2633cc48da4 Mon Sep 17 00:00:00 2001
+From: Jonathan Viney <jonathan.viney@gmail.com>
+Date: Sun, 31 Aug 2008 22:19:59 +1200
+Subject: [PATCH] Fix what looks like a Mysql bug with transactions, savepoints, and create table.
+
+---
+ activerecord/test/cases/defaults_test.rb |   46 ++++++++++++++++-------------
+ 1 files changed, 25 insertions(+), 21 deletions(-)
+
+diff --git a/activerecord/test/cases/defaults_test.rb b/activerecord/test/cases/defaults_test.rb
+index 3473b84..839ed81 100644
+--- a/activerecord/test/cases/defaults_test.rb
++++ b/activerecord/test/cases/defaults_test.rb
+@@ -18,7 +18,31 @@ class DefaultTest < ActiveRecord::TestCase
+     end
+   end
+ 
+-  if current_adapter?(:MysqlAdapter)
++  if current_adapter?(:PostgreSQLAdapter, :SQLServerAdapter, :FirebirdAdapter, :OpenBaseAdapter, :OracleAdapter)
++    def test_default_integers
++      default = Default.new
++      assert_instance_of Fixnum, default.positive_integer
++      assert_equal 1, default.positive_integer
++      assert_instance_of Fixnum, default.negative_integer
++      assert_equal -1, default.negative_integer
++      assert_instance_of BigDecimal, default.decimal_number
++      assert_equal BigDecimal.new("2.78"), default.decimal_number
++    end
++  end
++
++  if current_adapter?(:PostgreSQLAdapter)
++    def test_multiline_default_text
++      # older postgres versions represent the default with escapes ("\\012" for a newline)
++      assert ( "--- []\n\n" == Default.columns_hash['multiline_default'].default ||
++               "--- []\\012\\012" == Default.columns_hash['multiline_default'].default)
++    end
++  end
++end
++
++if current_adapter?(:MysqlAdapter)
++  class DefaultsTestWithoutTransactionalFixtures < ActiveRecord::TestCase
++    self.use_transactional_fixtures = false
++    
+     # MySQL uses an implicit default 0 rather than NULL unless in strict mode.
+     # We use an implicit NULL so schema.rb is compatible with other databases.
+     def test_mysql_integer_not_null_defaults
+@@ -46,24 +70,4 @@ class DefaultTest < ActiveRecord::TestCase
+       klass.connection.drop_table(klass.table_name) rescue nil
+     end
+   end
+-
+-  if current_adapter?(:PostgreSQLAdapter, :SQLServerAdapter, :FirebirdAdapter, :OpenBaseAdapter, :OracleAdapter)
+-    def test_default_integers
+-      default = Default.new
+-      assert_instance_of Fixnum, default.positive_integer
+-      assert_equal 1, default.positive_integer
+-      assert_instance_of Fixnum, default.negative_integer
+-      assert_equal -1, default.negative_integer
+-      assert_instance_of BigDecimal, default.decimal_number
+-      assert_equal BigDecimal.new("2.78"), default.decimal_number
+-    end
+-  end
+-
+-  if current_adapter?(:PostgreSQLAdapter)
+-    def test_multiline_default_text
+-      # older postgres versions represent the default with escapes ("\\012" for a newline)
+-      assert ( "--- []\n\n" == Default.columns_hash['multiline_default'].default ||
+-               "--- []\\012\\012" == Default.columns_hash['multiline_default'].default)
+-    end
+-  end
+ end
+-- 
+1.5.4.3
+
+
+From c98fff235501544391bcb32d61f30741a8c2af3a Mon Sep 17 00:00:00 2001
+From: Jonathan Viney <jonathan.viney@gmail.com>
+Date: Sun, 31 Aug 2008 22:34:54 +1200
+Subject: [PATCH] Fix assert_queries failures by ignoring savepoint sql.
+
+---
+ activerecord/test/cases/helper.rb |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/activerecord/test/cases/helper.rb b/activerecord/test/cases/helper.rb
+index f30d585..de05301 100644
+--- a/activerecord/test/cases/helper.rb
++++ b/activerecord/test/cases/helper.rb
+@@ -31,7 +31,7 @@ rescue LoadError
+ end
+ 
+ ActiveRecord::Base.connection.class.class_eval do
+-  IGNORED_SQL = [/^PRAGMA/, /^SELECT currval/, /^SELECT CAST/, /^SELECT @@IDENTITY/, /^SELECT @@ROWCOUNT/]
++  IGNORED_SQL = [/^PRAGMA/, /^SELECT currval/, /^SELECT CAST/, /^SELECT @@IDENTITY/, /^SELECT @@ROWCOUNT/, /^SAVEPOINT/, /^ROLLBACK TO SAVEPOINT/, /^RELEASE SAVEPOINT/]
+ 
+   def execute_with_query_record(sql, name = nil, &block)
+     $queries_executed ||= []
+-- 
+1.5.4.3
+

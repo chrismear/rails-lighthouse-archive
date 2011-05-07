@@ -1,0 +1,592 @@
+From a1d01a8caf21170fcd29faf710f03c9893601f81 Mon Sep 17 00:00:00 2001
+From: Jon Leighton <j@jonathanleighton.com>
+Date: Wed, 22 Dec 2010 20:57:41 +0000
+Subject: [PATCH 1/2] Improved strategy for updating a belongs_to association when the foreign key changes. Rather than resetting each affected association when the foreign key changes, we should lazily check for 'staleness' (where fk does not match target id) when the association is accessed.
+
+---
+ activerecord/lib/active_record/associations.rb     |   43 +-------------------
+ .../associations/association_proxy.rb              |   10 +++++
+ .../associations/belongs_to_association.rb         |    8 ++++
+ .../belongs_to_polymorphic_association.rb          |    9 ++++
+ activerecord/lib/active_record/reflection.rb       |    5 ++-
+ activerecord/test/cases/nested_attributes_test.rb  |    5 +-
+ activerecord/test/cases/reflection_test.rb         |    2 +
+ 7 files changed, 37 insertions(+), 45 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index cdc8f25..5cff541 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1223,14 +1223,12 @@ module ActiveRecord
+ 
+         if reflection.options[:polymorphic]
+           association_accessor_methods(reflection, BelongsToPolymorphicAssociation)
+-          association_foreign_type_setter_method(reflection)
+         else
+           association_accessor_methods(reflection, BelongsToAssociation)
+           association_constructor_method(:build,  reflection, BelongsToAssociation)
+           association_constructor_method(:create, reflection, BelongsToAssociation)
+         end
+ 
+-        association_foreign_key_setter_method(reflection)
+         add_counter_cache_callbacks(reflection)          if options[:counter_cache]
+         add_touch_callbacks(reflection, options[:touch]) if options[:touch]
+ 
+@@ -1450,7 +1448,7 @@ module ActiveRecord
+             force_reload = params.first unless params.empty?
+             association = association_instance_get(reflection.name)
+ 
+-            if association.nil? || force_reload
++            if association.nil? || force_reload || association.stale_target?
+               association = association_proxy_class.new(self, reflection)
+               retval = force_reload ? reflection.klass.uncached { association.reload } : association.reload
+               if retval.nil? and association_proxy_class == BelongsToAssociation
+@@ -1557,45 +1555,6 @@ module ActiveRecord
+           end
+         end
+ 
+-        def association_foreign_key_setter_method(reflection)
+-          setters = reflect_on_all_associations(:belongs_to).map do |belongs_to_reflection|
+-            if belongs_to_reflection.primary_key_name == reflection.primary_key_name
+-              "association_instance_set(:#{belongs_to_reflection.name}, nil);"
+-            end
+-          end.compact.join
+-
+-          if method_defined?(:"#{reflection.primary_key_name}=")
+-            undef_method :"#{reflection.primary_key_name}="
+-          end
+-
+-          class_eval <<-FILE, __FILE__, __LINE__ + 1
+-            def #{reflection.primary_key_name}=(new_id)
+-              write_attribute :#{reflection.primary_key_name}, new_id
+-              if #{reflection.primary_key_name}_changed?
+-                #{ setters }
+-              end
+-            end
+-          FILE
+-        end
+-
+-        def association_foreign_type_setter_method(reflection)
+-          setters = reflect_on_all_associations(:belongs_to).map do |belongs_to_reflection|
+-            if belongs_to_reflection.options[:foreign_type] == reflection.options[:foreign_type]
+-              "association_instance_set(:#{belongs_to_reflection.name}, nil);"
+-            end
+-          end.compact.join
+-
+-          field = reflection.options[:foreign_type]
+-          class_eval <<-FILE, __FILE__, __LINE__ + 1
+-            def #{field}=(new_id)
+-              write_attribute :#{field}, new_id
+-              if #{field}_changed?
+-                #{ setters }
+-              end
+-            end
+-          FILE
+-        end
+-
+         def add_counter_cache_callbacks(reflection)
+           cache_column = reflection.counter_cache_column
+ 
+diff --git a/activerecord/lib/active_record/associations/association_proxy.rb b/activerecord/lib/active_record/associations/association_proxy.rb
+index 252ff7e..f4eceee 100644
+--- a/activerecord/lib/active_record/associations/association_proxy.rb
++++ b/activerecord/lib/active_record/associations/association_proxy.rb
+@@ -130,6 +130,16 @@ module ActiveRecord
+         @loaded = true
+       end
+ 
++      # The target is stale if the target no longer points to the record(s) that the
++      # relevant foreign_key(s) refers to. If stale, the association accessor method
++      # on the owner will reload the target. It's up to subclasses to implement this
++      # method if relevant.
++      #
++      # Note that if the target has not been loaded, it is not considered stale.
++      def stale_target?
++        false
++      end
++
+       # Returns the target of this proxy, same as +proxy_target+.
+       def target
+         @target
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index b438620..c9abfe3 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -42,6 +42,14 @@ module ActiveRecord
+         @updated
+       end
+ 
++      def stale_target?
++        if @target && @target.persisted?
++          @target.send(@reflection.association_primary_key).to_i != @owner.send(@reflection.primary_key_name).to_i
++        else
++          false
++        end
++      end
++
+       private
+         def find_target
+           find_method = if @reflection.options[:primary_key]
+diff --git a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+index a0df860..844ae94 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+@@ -23,6 +23,15 @@ module ActiveRecord
+         @updated
+       end
+ 
++      def stale_target?
++        if @target && @target.persisted?
++          @target.send(@reflection.association_primary_key).to_i != @owner.send(@reflection.primary_key_name).to_i ||
++          @target.class.base_class.name.to_s != @owner.send(@reflection.options[:foreign_type]).to_s
++        else
++          false
++        end
++      end
++
+       private
+ 
+         # NOTE - for now, we're only supporting inverse setting from belongs_to back onto
+diff --git a/activerecord/lib/active_record/reflection.rb b/activerecord/lib/active_record/reflection.rb
+index 70165c6..e426481 100644
+--- a/activerecord/lib/active_record/reflection.rb
++++ b/activerecord/lib/active_record/reflection.rb
+@@ -209,7 +209,10 @@ module ActiveRecord
+       end
+ 
+       def association_primary_key
+-        @association_primary_key ||= options[:primary_key] || klass.primary_key
++        @association_primary_key ||=
++          options[:primary_key] ||
++          !options[:polymorphic] && klass.primary_key ||
++          'id'
+       end
+ 
+       def active_record_primary_key
+diff --git a/activerecord/test/cases/nested_attributes_test.rb b/activerecord/test/cases/nested_attributes_test.rb
+index ffcc7a0..7d9b110 100644
+--- a/activerecord/test/cases/nested_attributes_test.rb
++++ b/activerecord/test/cases/nested_attributes_test.rb
+@@ -298,7 +298,7 @@ class TestNestedAttributesOnAHasOneAssociation < ActiveRecord::TestCase
+ 
+   def test_should_create_new_model_when_nothing_is_there_and_update_only_is_true
+     @ship.delete
+-    
++
+     @pirate.reload.update_attributes(:update_only_ship_attributes => { :name => 'Mayflower' })
+ 
+     assert_not_nil @pirate.ship
+@@ -411,6 +411,7 @@ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+ 
+   def test_should_modify_an_existing_record_if_there_is_a_matching_composite_id
+     @pirate.stubs(:id).returns('ABC1X')
++    @ship.stubs(:pirate_id).returns(@pirate.id) # prevents pirate from being reloaded due to non-matching foreign key
+     @ship.pirate_attributes = { :id => @pirate.id, :catchphrase => 'Arr' }
+ 
+     assert_equal 'Arr', @ship.pirate.catchphrase
+@@ -451,7 +452,7 @@ class TestNestedAttributesOnABelongsToAssociation < ActiveRecord::TestCase
+ 
+   def test_should_not_destroy_the_associated_model_until_the_parent_is_saved
+     pirate = @ship.pirate
+-    
++
+     @ship.attributes = { :pirate_attributes => { :id => pirate.id, '_destroy' => true } }
+     assert_nothing_raised(ActiveRecord::RecordNotFound) { Pirate.find(pirate.id) }
+     @ship.save
+diff --git a/activerecord/test/cases/reflection_test.rb b/activerecord/test/cases/reflection_test.rb
+index 1e20571..901c12b 100644
+--- a/activerecord/test/cases/reflection_test.rb
++++ b/activerecord/test/cases/reflection_test.rb
+@@ -7,6 +7,7 @@ require 'models/subscriber'
+ require 'models/ship'
+ require 'models/pirate'
+ require 'models/price_estimate'
++require 'models/tagging'
+ 
+ class ReflectionTest < ActiveRecord::TestCase
+   include ActiveRecord::Reflection
+@@ -194,6 +195,7 @@ class ReflectionTest < ActiveRecord::TestCase
+   def test_association_primary_key
+     assert_equal "id", Author.reflect_on_association(:posts).association_primary_key.to_s
+     assert_equal "name", Author.reflect_on_association(:essay).association_primary_key.to_s
++    assert_equal "id", Tagging.reflect_on_association(:taggable).association_primary_key.to_s
+   end
+ 
+   def test_active_record_primary_key
+-- 
+1.7.1
+
+
+From 629981bacf0b7869ec86ac77f16c9a394f6ae395 Mon Sep 17 00:00:00 2001
+From: Jon Leighton <j@jonathanleighton.com>
+Date: Thu, 23 Dec 2010 13:36:25 +0000
+Subject: [PATCH 2/2] If a has_many goes :through a belongs_to, and the foreign key of the belongs_to changes, then the has_many should be considered stale.
+
+---
+ activerecord/lib/active_record/associations.rb     |    6 ++-
+ .../associations/belongs_to_association.rb         |    5 +-
+ .../belongs_to_polymorphic_association.rb          |    8 ++-
+ .../associations/has_many_through_association.rb   |    1 +
+ .../associations/has_one_through_association.rb    |    1 +
+ .../associations/through_association_scope.rb      |   19 ++++++
+ .../associations/belongs_to_associations_test.rb   |   60 ++++++++++++--------
+ .../has_many_through_associations_test.rb          |   16 +++++
+ .../has_one_through_associations_test.rb           |   15 +++++
+ activerecord/test/fixtures/dashboards.yml          |    5 +-
+ activerecord/test/fixtures/members.yml             |    2 +
+ activerecord/test/fixtures/memberships.yml         |    6 +-
+ activerecord/test/fixtures/speedometers.yml        |    6 ++-
+ activerecord/test/fixtures/sponsors.yml            |    9 ++-
+ 14 files changed, 124 insertions(+), 35 deletions(-)
+
+diff --git a/activerecord/lib/active_record/associations.rb b/activerecord/lib/active_record/associations.rb
+index 5cff541..32e0694 100644
+--- a/activerecord/lib/active_record/associations.rb
++++ b/activerecord/lib/active_record/associations.rb
+@@ -1495,7 +1495,11 @@ module ActiveRecord
+               association_instance_set(reflection.name, association)
+             end
+ 
+-            reflection.klass.uncached { association.reload } if force_reload
++            if force_reload
++              reflection.klass.uncached { association.reload }
++            elsif association.stale_target?
++              association.reload
++            end
+ 
+             association
+           end
+diff --git a/activerecord/lib/active_record/associations/belongs_to_association.rb b/activerecord/lib/active_record/associations/belongs_to_association.rb
+index c9abfe3..bbfe18f 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_association.rb
+@@ -44,7 +44,10 @@ module ActiveRecord
+ 
+       def stale_target?
+         if @target && @target.persisted?
+-          @target.send(@reflection.association_primary_key).to_i != @owner.send(@reflection.primary_key_name).to_i
++          target_id   = @target.send(@reflection.association_primary_key).to_s
++          foreign_key = @owner.send(@reflection.primary_key_name).to_s
++
++          target_id != foreign_key
+         else
+           false
+         end
+diff --git a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+index 844ae94..c580de7 100644
+--- a/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
++++ b/activerecord/lib/active_record/associations/belongs_to_polymorphic_association.rb
+@@ -25,8 +25,12 @@ module ActiveRecord
+ 
+       def stale_target?
+         if @target && @target.persisted?
+-          @target.send(@reflection.association_primary_key).to_i != @owner.send(@reflection.primary_key_name).to_i ||
+-          @target.class.base_class.name.to_s != @owner.send(@reflection.options[:foreign_type]).to_s
++          target_id    = @target.send(@reflection.association_primary_key).to_s
++          foreign_key  = @owner.send(@reflection.primary_key_name).to_s
++          target_type  = @target.class.base_class.name
++          foreign_type = @owner.send(@reflection.options[:foreign_type]).to_s
++
++          target_id != foreign_key || target_type != foreign_type
+         else
+           false
+         end
+diff --git a/activerecord/lib/active_record/associations/has_many_through_association.rb b/activerecord/lib/active_record/associations/has_many_through_association.rb
+index f0bc6ae..5f4667b 100644
+--- a/activerecord/lib/active_record/associations/has_many_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_many_through_association.rb
+@@ -59,6 +59,7 @@ module ActiveRecord
+ 
+         def find_target
+           return [] unless target_reflection_has_associated_record?
++          update_stale_state
+           scoped.all
+         end
+ 
+diff --git a/activerecord/lib/active_record/associations/has_one_through_association.rb b/activerecord/lib/active_record/associations/has_one_through_association.rb
+index e8cf739..eb17935 100644
+--- a/activerecord/lib/active_record/associations/has_one_through_association.rb
++++ b/activerecord/lib/active_record/associations/has_one_through_association.rb
+@@ -33,6 +33,7 @@ module ActiveRecord
+ 
+     private
+       def find_target
++        update_stale_state
+         scoped.first
+       end
+     end
+diff --git a/activerecord/lib/active_record/associations/through_association_scope.rb b/activerecord/lib/active_record/associations/through_association_scope.rb
+index 5dc5b0c..b50eebb 100644
+--- a/activerecord/lib/active_record/associations/through_association_scope.rb
++++ b/activerecord/lib/active_record/associations/through_association_scope.rb
+@@ -10,6 +10,17 @@ module ActiveRecord
+         end
+       end
+ 
++      def stale_target?
++        if @target && @reflection.through_reflection.macro == :belongs_to && defined?(@through_foreign_key)
++          previous_key = @through_foreign_key.to_s
++          current_key  = @owner.send(@reflection.through_reflection.primary_key_name).to_s
++
++          previous_key != current_key
++        else
++          false
++        end
++      end
++
+       protected
+ 
+       def construct_find_scope
+@@ -160,6 +171,14 @@ module ActiveRecord
+       end
+ 
+       alias_method :sql_conditions, :conditions
++
++      def update_stale_state
++        construct_scope if stale_target?
++
++        if @reflection.through_reflection.macro == :belongs_to
++          @through_foreign_key = @owner.send(@reflection.through_reflection.primary_key_name)
++        end
++      end
+     end
+   end
+ end
+diff --git a/activerecord/test/cases/associations/belongs_to_associations_test.rb b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+index 1820f95..cdde9a8 100644
+--- a/activerecord/test/cases/associations/belongs_to_associations_test.rb
++++ b/activerecord/test/cases/associations/belongs_to_associations_test.rb
+@@ -17,7 +17,7 @@ require 'models/essay'
+ class BelongsToAssociationsTest < ActiveRecord::TestCase
+   fixtures :accounts, :companies, :developers, :projects, :topics,
+            :developers_projects, :computers, :authors, :author_addresses,
+-           :posts, :tags, :taggings, :comments
++           :posts, :tags, :taggings, :comments, :sponsors, :members
+ 
+   def test_belongs_to
+     Client.find(3).firm.name
+@@ -488,39 +488,53 @@ class BelongsToAssociationsTest < ActiveRecord::TestCase
+   end
+ 
+   def test_reassigning_the_parent_id_updates_the_object
+-    original_parent = Firm.create! :name => "original"
+-    updated_parent = Firm.create! :name => "updated"
++    client = companies(:second_client)
+ 
+-    client = Client.new("client_of" => original_parent.id)
+-    assert_equal original_parent, client.firm
+-    assert_equal original_parent, client.firm_with_condition
+-    assert_equal original_parent, client.firm_with_other_name
++    client.firm
++    client.firm_with_condition
++    firm_proxy                = client.send(:association_instance_get, :firm)
++    firm_with_condition_proxy = client.send(:association_instance_get, :firm_with_condition)
+ 
+-    client.client_of = updated_parent.id
+-    assert_equal updated_parent, client.firm
+-    assert_equal updated_parent, client.firm_with_condition
+-    assert_equal updated_parent, client.firm_with_other_name
++    assert !firm_proxy.stale_target?
++    assert !firm_with_condition_proxy.stale_target?
++    assert_equal companies(:first_firm), client.firm
++    assert_equal companies(:first_firm), client.firm_with_condition
++
++    client.client_of = companies(:another_firm).id
++
++    assert firm_proxy.stale_target?
++    assert firm_with_condition_proxy.stale_target?
++    assert_equal companies(:another_firm), client.firm
++    assert_equal companies(:another_firm), client.firm_with_condition
+   end
+ 
+   def test_polymorphic_reassignment_of_associated_id_updates_the_object
+-    member1 = Member.create!
+-    member2 = Member.create!
++    sponsor = sponsors(:moustache_club_sponsor_for_groucho)
++
++    sponsor.sponsorable
++    proxy = sponsor.send(:association_instance_get, :sponsorable)
++
++    assert !proxy.stale_target?
++    assert_equal members(:groucho), sponsor.sponsorable
+ 
+-    sponsor = Sponsor.new("sponsorable_type" => "Member", "sponsorable_id" => member1.id)
+-    assert_equal member1, sponsor.sponsorable
++    sponsor.sponsorable_id = members(:some_other_guy).id
+ 
+-    sponsor.sponsorable_id = member2.id
+-    assert_equal member2, sponsor.sponsorable
++    assert proxy.stale_target?
++    assert_equal members(:some_other_guy), sponsor.sponsorable
+   end
+ 
+   def test_polymorphic_reassignment_of_associated_type_updates_the_object
+-    member1 = Member.create!
++    sponsor = sponsors(:moustache_club_sponsor_for_groucho)
+ 
+-    sponsor = Sponsor.new("sponsorable_type" => "Member", "sponsorable_id" => member1.id)
+-    assert_equal member1, sponsor.sponsorable
++    sponsor.sponsorable
++    proxy = sponsor.send(:association_instance_get, :sponsorable)
+ 
+-    sponsor.sponsorable_type = "Firm"
+-    assert_not_equal member1, sponsor.sponsorable
+-  end
++    assert !proxy.stale_target?
++    assert_equal members(:groucho), sponsor.sponsorable
++
++    sponsor.sponsorable_type = 'Firm'
+ 
++    assert proxy.stale_target?
++    assert_equal companies(:first_firm), sponsor.sponsorable
++  end
+ end
+diff --git a/activerecord/test/cases/associations/has_many_through_associations_test.rb b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+index cf0eedb..0342e1a 100644
+--- a/activerecord/test/cases/associations/has_many_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_many_through_associations_test.rb
+@@ -19,6 +19,7 @@ require 'models/book'
+ require 'models/subscription'
+ require 'models/categorization'
+ require 'models/category'
++require 'models/essay'
+ 
+ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+   fixtures :posts, :readers, :people, :comments, :authors,
+@@ -486,4 +487,19 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
+ 
+     assert_equal [posts(:eager_other)], posts
+   end
++
++  def test_has_many_through_belongs_to_should_update_when_the_through_foreign_key_changes
++    post = posts(:eager_other)
++
++    post.author_categorizations
++    proxy = post.send(:association_instance_get, :author_categorizations)
++
++    assert !proxy.stale_target?
++    assert_equal authors(:mary).categorizations.sort_by(&:id), post.author_categorizations.sort_by(&:id)
++
++    post.author_id = authors(:david).id
++
++    assert proxy.stale_target?
++    assert_equal authors(:david).categorizations.sort_by(&:id), post.author_categorizations.sort_by(&:id)
++  end
+ end
+diff --git a/activerecord/test/cases/associations/has_one_through_associations_test.rb b/activerecord/test/cases/associations/has_one_through_associations_test.rb
+index 93a4f49..009bb88 100644
+--- a/activerecord/test/cases/associations/has_one_through_associations_test.rb
++++ b/activerecord/test/cases/associations/has_one_through_associations_test.rb
+@@ -237,4 +237,19 @@ class HasOneThroughAssociationsTest < ActiveRecord::TestCase
+   def test_has_one_through_with_default_scope_on_join_model
+     assert_equal posts(:welcome).comments.first, authors(:david).comment_on_first_posts
+   end
++
++  def test_has_one_through_belongs_to_should_update_when_the_through_foreign_key_changes
++    minivan = minivans(:cool_first)
++
++    minivan.dashboard
++    proxy = minivan.send(:association_instance_get, :dashboard)
++
++    assert !proxy.stale_target?
++    assert_equal dashboards(:cool_first), minivan.dashboard
++
++    minivan.speedometer_id = speedometers(:second).id
++
++    assert proxy.stale_target?
++    assert_equal dashboards(:second), minivan.dashboard
++  end
+ end
+diff --git a/activerecord/test/fixtures/dashboards.yml b/activerecord/test/fixtures/dashboards.yml
+index e75bf46..a4c7e0d 100644
+--- a/activerecord/test/fixtures/dashboards.yml
++++ b/activerecord/test/fixtures/dashboards.yml
+@@ -1,3 +1,6 @@
+ cool_first:
+   dashboard_id: d1
+-  name: my_dashboard
+\ No newline at end of file
++  name: my_dashboard
++second:
++  dashboard_id: d2
++  name: second
+diff --git a/activerecord/test/fixtures/members.yml b/activerecord/test/fixtures/members.yml
+index 6db945e..824840b 100644
+--- a/activerecord/test/fixtures/members.yml
++++ b/activerecord/test/fixtures/members.yml
+@@ -1,6 +1,8 @@
+ groucho:
++  id: 1
+   name: Groucho Marx
+   member_type_id: 1
+ some_other_guy:
++  id: 2
+   name: Englebert Humperdink
+   member_type_id: 2
+diff --git a/activerecord/test/fixtures/memberships.yml b/activerecord/test/fixtures/memberships.yml
+index b9722db..eed8b22 100644
+--- a/activerecord/test/fixtures/memberships.yml
++++ b/activerecord/test/fixtures/memberships.yml
+@@ -1,20 +1,20 @@
+ membership_of_boring_club:
+   joined_on: <%= 3.weeks.ago.to_s(:db) %>
+   club: boring_club
+-  member: groucho
++  member_id: 1
+   favourite: false
+   type: CurrentMembership
+ 
+ membership_of_favourite_club:
+   joined_on: <%= 3.weeks.ago.to_s(:db) %>
+   club: moustache_club
+-  member: groucho
++  member_id: 1
+   favourite: true
+   type: Membership
+ 
+ other_guys_membership:
+   joined_on: <%= 4.weeks.ago.to_s(:db) %>
+   club: boring_club
+-  member: some_other_guy
++  member_id: 2
+   favourite: false
+   type: CurrentMembership
+diff --git a/activerecord/test/fixtures/speedometers.yml b/activerecord/test/fixtures/speedometers.yml
+index 6a471ab..e12398f 100644
+--- a/activerecord/test/fixtures/speedometers.yml
++++ b/activerecord/test/fixtures/speedometers.yml
+@@ -1,4 +1,8 @@
+ cool_first:
+   speedometer_id: s1
+   name: my_speedometer
+-  dashboard_id: d1
+\ No newline at end of file
++  dashboard_id: d1
++second:
++  speedometer_id: s2
++  name: second
++  dashboard_id: d2
+diff --git a/activerecord/test/fixtures/sponsors.yml b/activerecord/test/fixtures/sponsors.yml
+index 42df895..bfc6b23 100644
+--- a/activerecord/test/fixtures/sponsors.yml
++++ b/activerecord/test/fixtures/sponsors.yml
+@@ -1,9 +1,12 @@
+ moustache_club_sponsor_for_groucho:
+   sponsor_club: moustache_club
+-  sponsorable: groucho (Member)
++  sponsorable_id: 1
++  sponsorable_type: Member
+ boring_club_sponsor_for_groucho:
+   sponsor_club: boring_club
+-  sponsorable: some_other_guy (Member)
++  sponsorable_id: 2
++  sponsorable_type: Member
+ crazy_club_sponsor_for_groucho:
+   sponsor_club: crazy_club
+-  sponsorable: some_other_guy (Member)
+\ No newline at end of file
++  sponsorable_id: 2
++  sponsorable_type: Member
+-- 
+1.7.1
+
