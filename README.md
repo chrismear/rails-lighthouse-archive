@@ -1,9 +1,9 @@
 rails-lighthouse-archive
 ========================
 
-In May 2011, the [Rails project][1] moved its issue tracking from [Lighthouse][2] to [GitHub Issues][3]. Initially, public access to the Lighthouse project was switched off entirely, provoking some negative reaction [on the mailing list][4] and [on the new issue tracker][5].
+In April 2011, the [Rails project][1] moved its issue tracking from [Lighthouse][2] to [GitHub Issues][3]. Initially, public access to the Lighthouse project was switched off entirely, provoking some negative reaction [on the mailing list][4] and [on the new issue tracker][5].
 
-As of 7 May 2011, the Lighthouse issue tracker has been reopened temporarily, to allow porting of open tickets across to the new issue tracker. It is not clear what the long-term plan for the Lighthouse project is.
+As of 6 May 2011, the Lighthouse issue tracker has been reopened temporarily, to allow porting of open tickets across to the new issue tracker. It is not clear what the long-term plan for the Lighthouse project is.
 
 There is a lot of useful history in the Lighthouse issue tracker. On the assumption that public access to it will be turned off again, this project is an attempt to archive that data publicly.
 
