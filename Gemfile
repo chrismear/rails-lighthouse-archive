@@ -1,3 +1,3 @@
 source 'http://rubygems.org'
 
-gem 'nokogiri', '~>1.4.4'
+gem 'nokogiri', '~>1.18.9'
